@@ -1,0 +1,110 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Per-app settings and fallback offsets for the automated drag runner.
+#
+# Every value below was calibrated in Claude's live check on Oct 31, 2026
+# (NOTES-autodrag.md, "Live check").  The offsets assume DP-2 at 2560x1440
+# with the 34 px Noctalia bar; re-measure if either changes.  An app with
+# no AT-SPI item and no first_item_offset aborts with "unconfigured"
+# instead of clicking blind.
+
+[workspace]
+# Calibrated live, Oct 31 (Claude): `move-floating-window -x 40 -y 40` puts
+# the window at output (40, 74).  Commands are relative to niri's working
+# area, which starts below the 34 px Noctalia bar, but
+# tile_pos_in_workspace_view reads back in OUTPUT coordinates (screenshot:
+# window top edge at y 74).  So:
+#   working_area_offset  is added to commanded boxes for the layout check
+#                        and the drop point, and taken off the usable height;
+#   view_origin_in_output stays [0, 0], because the readback (used for the
+#                        click point) is already in output coordinates.
+# Re-measure if the bar's height or position changes.
+working_area_offset = [0, 34]
+view_origin_in_output = [0, 0]
+
+[vmouse]
+# P0a2-r1 correction 3: after UI_DEV_CREATE the runner reads the sysfs name
+# with UI_GET_SYSNAME, waits for the event* node (timeout 3 s, then abort),
+# and lets the device settle before its first frame; before UI_DEV_DESTROY
+# it waits so the last release has definitely landed.
+device_settle_ms = 500
+pre_destroy_ms = 100
+
+[drag]
+threshold_px = 12        # press, then move this far before the real travel
+threshold_steps = 4      # in this many steps (3 px each)
+travel_steps = 30        # steps to the drop point
+travel_ms = 600          # spread over about this long (drives the step interval)
+hold_ms = 400            # hold still over the target before releasing
+select_settle_ms = 300   # wait after the selection click before checking
+click_to_drag_gap_ms = 1000  # P0a2-r1 correction 2: minimum time between the
+                             # selection click's release and the drag press, so
+                             # apps cannot see a double-click (which would open
+                             # the file in an external viewer — a window the
+                             # runner did not start)
+title_wait_ms = 3000     # how long Zen's title change may take
+
+[layout]
+margin = 40              # px between screen edges and between the windows
+
+[app.dolphin]
+# AT-SPI: registers only when QT_LINUX_ACCESSIBILITY_ALWAYS_ON=1 is set at
+# launch (run.sh --auto sets it); with it, items are exposed, role
+# "list item".  Observed item rect (window-relative, tiled 1120x1462):
+# sample.png at (312, 88) 135x92.
+atspi_items = true
+# The Qt frame is 6x33 px smaller than niri's tile (SSD titlebar/border).
+# Calibrated live, Oct 31 (Claude): [0, 0] is right for the floating window;
+# the click landed on sample.png and STATE_SELECTED came back true.
+window_offset_correction = [0, 0]
+# first_item_offset: deliberately absent until calibrated live (the code
+# treats a missing key as unset and aborts with "unconfigured" rather than
+# clicking blind).
+
+[app.thunar]
+# AT-SPI: the application registers (name "thunar") and exposes widgets
+# (toolbar, menus), but the file view exposes NO items (session
+# org.a11y.Status.IsEnabled == false; GTK3).  Uses the fallback offset.
+atspi_items = false
+# GTK3 CSD: the AT-SPI frame is 48x48 px LARGER than niri's tile — the
+# window-relative origin is inside a 24 px shadow border.
+window_offset_correction = [0, 0]
+# Calibrated live, Oct 31 (Claude): center of sample.png's icon, measured
+# in a screenshot of the floating 1220x1326 window placed by the runner
+# (16x16 icon (thunar shows the image at its real size)).
+# The name is historical: this points at sample.png, not at whichever
+# item is first.  Re-measure if the window size changes.
+first_item_offset = [238, 146]
+
+[app.nautilus]
+# AT-SPI: the application registers (name "org.gnome.Nautilus") but the
+# tree is only application->frame->panel->panel (18 nodes) — no file
+# items, even with GTK_A11Y=atspi.  Uses the fallback offset.
+atspi_items = false
+# GTK4 frame == niri tile size (no measurable offset, tiled).
+window_offset_correction = [0, 0]
+# Calibrated live, Oct 31 (Claude): center of sample.png's icon, measured
+# in a screenshot of the floating 1220x1326 window placed by the runner
+# (96x96 thumbnail, grid view).
+# The name is historical: this points at sample.png, not at whichever
+# item is first.  Re-measure if the window size changes.
+first_item_offset = [333, 117]
+
+[app.cosmic]
+# AT-SPI: no AT-SPI application at all (expected by the brief).
+# Uses the fallback offset.
+atspi_items = false
+window_offset_correction = [0, 0]
+# Calibrated live, Oct 31 (Claude): center of sample.png's icon, measured
+# in a screenshot of the floating 1220x1326 window placed by the runner
+# (list view, the icon at the start of the sample.png row).
+# The name is historical: this points at sample.png, not at whichever
+# item is first.  Re-measure if the window size changes.
+first_item_offset = [335, 141]
+
+[app.zen]
+# Drop point inside Zen's window, as fractions of the window size
+# (resolution-independent).  0.5 horizontally = middle of the content
+# area; 0.55 vertically aims below the toolbar into the page area.
+# Calibrated live, Oct 31 (Claude): (1910, 803) on 2560x1440 lands in the
+# page area, right of Zen's sidebar; the Dolphin drag opened the file.
+drop_point_fraction = [0.5, 0.55]

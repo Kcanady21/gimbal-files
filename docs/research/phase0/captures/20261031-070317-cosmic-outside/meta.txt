@@ -1,0 +1,10 @@
+date: 2026-10-31T07:03:26-04:00
+source: cosmic
+location: outside
+source_version: cosmic-files git 09bdd8251d5f
+cosmic_commit: 09bdd8251d5f (~/cosmic-files)
+zen_version: 1.24b
+zen_profile: gimbal-dnd (throwaway)
+moz_log_module: WidgetDrag
+niri_version: Compositor version: 26.04 (unknown commit)
+folder: /home/kyle/gimbal-dnd-test

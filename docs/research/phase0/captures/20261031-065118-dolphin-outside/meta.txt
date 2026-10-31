@@ -1,0 +1,9 @@
+date: 2026-10-31T06:51:27-04:00
+source: dolphin
+location: outside
+source_version: dolphin 25.12.3
+zen_version: 1.24b
+zen_profile: gimbal-dnd (throwaway)
+moz_log_module: WidgetDrag
+niri_version: Compositor version: 26.04 (unknown commit)
+folder: /home/kyle/gimbal-dnd-test

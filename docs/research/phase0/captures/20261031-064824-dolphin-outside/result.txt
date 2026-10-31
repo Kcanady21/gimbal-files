@@ -1,0 +1,12 @@
+zen_opened_file: aborted
+note: auto:true source=dolphin location=outside file=sample.png folder=/home/kyle/gimbal-dnd-test
+auto: true
+source: dolphin
+location: outside
+file: sample.png
+selection: n/a
+click_at: None
+drop_at: None
+title_before: Zen Browser
+raw_title: None
+aborted: layout mismatch: window 122 at (40.0, 74.0), expected (40, 40); window 123 at (1300.0, 74.0), expected (1300, 40); window 123 size (1272.0, 1398.0), expected (1220, 1360)

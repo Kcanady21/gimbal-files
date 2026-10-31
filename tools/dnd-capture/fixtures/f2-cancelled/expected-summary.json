@@ -1,0 +1,114 @@
+{
+  "attempts_match": true,
+  "dbus": {
+    "portal_calls": []
+  },
+  "drag_seen": true,
+  "location": "downloads",
+  "meta": {
+    "date": "2026-10-31T00:05:00+01:00",
+    "location": "downloads",
+    "niri_version": "26.04",
+    "source": "thunar",
+    "source_version": "thunar 4.20.7 (Xfce 4.20)",
+    "zen_version": "1.24b"
+  },
+  "parsing_notes": {
+    "dbus_log_present": false,
+    "source_log_present": true,
+    "source_messages": 11,
+    "zen_log_present": true,
+    "zen_messages": 9
+  },
+  "result": {
+    "note": "drag was cancelled mid-flight, nothing dropped",
+    "raw_answer": "n",
+    "zen_opened_file": false
+  },
+  "run": "f2-cancelled",
+  "source_app": "thunar",
+  "source_side": {
+    "action": [],
+    "all_data_sources": [
+      "wl_data_source#30 (from line 5)"
+    ],
+    "attempt": "attempt 1 of 1",
+    "cancelled": true,
+    "dnd_drop_performed": false,
+    "dnd_finished": false,
+    "drag_seen": true,
+    "drag_source_object": "wl_data_source#30",
+    "ending": "cancelled",
+    "offers": [
+      "text/uri-list",
+      "text/plain;charset=utf-8"
+    ],
+    "other_sources_excluded": [],
+    "send": [],
+    "set_actions": [
+      {
+        "args": [
+          1
+        ],
+        "decoded": [
+          [
+            "copy"
+          ]
+        ]
+      }
+    ],
+    "start_drag": {
+      "icon": "nil",
+      "origin_surface": "wl_surface#25",
+      "serial": "900",
+      "source": "wl_data_source#30"
+    },
+    "start_drag_count": 1,
+    "target": [
+      "text/uri-list"
+    ]
+  },
+  "zen_side": {
+    "accept": [],
+    "action": [],
+    "attempt_count": 1,
+    "drag_offer_object": "wl_data_offer#50",
+    "drop": [],
+    "drop_count": 0,
+    "dropped": false,
+    "enter": [
+      {
+        "offer": "wl_data_offer#50",
+        "serial": "4096",
+        "surface": "wl_surface#55"
+      }
+    ],
+    "finish": false,
+    "leave": [
+      {
+        "serial": "4100"
+      }
+    ],
+    "offers": [
+      "text/uri-list"
+    ],
+    "receive": [],
+    "set_actions": [
+      {
+        "args": [
+          1,
+          1
+        ],
+        "decoded": [
+          [
+            "copy"
+          ],
+          [
+            "copy"
+          ]
+        ]
+      }
+    ],
+    "source_actions": []
+  }
+}

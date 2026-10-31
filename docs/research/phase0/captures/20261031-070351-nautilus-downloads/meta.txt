@@ -1,0 +1,9 @@
+date: 2026-10-31T07:04:00-04:00
+source: nautilus
+location: downloads
+source_version: GNOME nautilus 50.2.2
+zen_version: 1.24b
+zen_profile: gimbal-dnd (throwaway)
+moz_log_module: WidgetDrag
+niri_version: Compositor version: 26.04 (unknown commit)
+folder: /home/kyle/Downloads/gimbal-dnd-test

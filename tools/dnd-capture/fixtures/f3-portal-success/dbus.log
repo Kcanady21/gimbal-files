@@ -1,0 +1,26 @@
+method call time=1793409000.100000 sender=:1.900 -> destination=org.freedesktop.portal.Documents serial=10 path=/org/freedesktop/portal/documents; interface=org.freedesktop.portal.FileTransfer; member=StartTransfer
+   array [
+   ]
+method return time=1793409000.110000 sender=:1.261 -> destination=:1.900 serial=200 reply_serial=10
+   string "42"
+method call time=1793409000.200000 sender=:1.900 -> destination=org.freedesktop.portal.Documents serial=11 path=/org/freedesktop/portal/documents; interface=org.freedesktop.portal.FileTransfer; member=AddFiles
+   string "42"
+   int32 58
+   array [
+   ]
+method return time=1793409000.210000 sender=:1.261 -> destination=:1.900 serial=201 reply_serial=11
+method call time=1793409000.300000 sender=:1.900 -> destination=org.freedesktop.portal.Documents serial=12 path=/org/freedesktop/portal/documents; interface=org.freedesktop.portal.FileTransfer; member=RetrieveFiles
+   string "42"
+   array [
+      dict entry(
+         string "ask"
+         variant             boolean false
+      )
+   ]
+method return time=1793409000.310000 sender=:1.261 -> destination=:1.900 serial=202 reply_serial=12
+   array [
+      string "/home/kyle/.var/app/app.zen_browser.zen/doc/2f1a/gimbal-dnd-test/sample.png"
+   ]
+method call time=1793409000.400000 sender=:1.900 -> destination=org.freedesktop.portal.Documents serial=13 path=/org/freedesktop/portal/documents; interface=org.freedesktop.portal.FileTransfer; member=StopTransfer
+   string "42"
+method return time=1793409000.410000 sender=:1.261 -> destination=:1.900 serial=203 reply_serial=13

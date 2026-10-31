@@ -1,0 +1,12 @@
+zen_opened_file: aborted
+note: stopped after select (intentional --stop-after)
+auto: true
+source: thunar
+location: outside
+file: sample.png
+selection: unverified
+click_at: (278, 220)
+drop_at: None
+title_before: Zen Browser
+raw_title: None
+aborted: stop-after select

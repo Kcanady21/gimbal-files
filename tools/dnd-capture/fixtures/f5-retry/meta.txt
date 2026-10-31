@@ -1,0 +1,6 @@
+date: 2026-10-31T00:15:00+01:00
+source: dolphin
+location: outside
+source_version: dolphin 25.12.3
+zen_version: 1.24b
+niri_version: 26.04

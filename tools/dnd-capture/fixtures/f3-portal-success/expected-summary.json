@@ -1,0 +1,194 @@
+{
+  "attempts_match": true,
+  "dbus": {
+    "portal_calls": [
+      {
+        "destination": "org.freedesktop.portal.Documents",
+        "interface": "org.freedesktop.portal.FileTransfer",
+        "kind": "method_call",
+        "member": "StartTransfer",
+        "returned": [
+          "42"
+        ],
+        "sender": ":1.900",
+        "strings": []
+      },
+      {
+        "destination": "org.freedesktop.portal.Documents",
+        "interface": "org.freedesktop.portal.FileTransfer",
+        "kind": "method_call",
+        "member": "AddFiles",
+        "returned": [],
+        "sender": ":1.900",
+        "strings": [
+          "42"
+        ]
+      },
+      {
+        "destination": "org.freedesktop.portal.Documents",
+        "interface": "org.freedesktop.portal.FileTransfer",
+        "kind": "method_call",
+        "member": "RetrieveFiles",
+        "returned": [
+          "/home/kyle/.var/app/app.zen_browser.zen/doc/2f1a/gimbal-dnd-test/sample.png"
+        ],
+        "sender": ":1.900",
+        "strings": [
+          "42",
+          "ask"
+        ]
+      },
+      {
+        "destination": "org.freedesktop.portal.Documents",
+        "interface": "org.freedesktop.portal.FileTransfer",
+        "kind": "method_call",
+        "member": "StopTransfer",
+        "returned": [],
+        "sender": ":1.900",
+        "strings": [
+          "42"
+        ]
+      }
+    ]
+  },
+  "drag_seen": true,
+  "location": "downloads",
+  "meta": {
+    "date": "2026-10-31T00:10:00+01:00",
+    "location": "downloads",
+    "niri_version": "26.04",
+    "source": "nautilus",
+    "source_version": "GNOME nautilus 50.2.2",
+    "zen_version": "1.24b"
+  },
+  "parsing_notes": {
+    "dbus_log_present": true,
+    "source_log_present": true,
+    "source_messages": 13,
+    "zen_log_present": true,
+    "zen_messages": 15
+  },
+  "result": {
+    "note": null,
+    "raw_answer": "y",
+    "zen_opened_file": true
+  },
+  "run": "f3-portal-success",
+  "source_app": "nautilus",
+  "source_side": {
+    "action": [],
+    "all_data_sources": [
+      "wl_data_source#51 (from line 5)"
+    ],
+    "attempt": "attempt 1 of 1",
+    "cancelled": false,
+    "dnd_drop_performed": true,
+    "dnd_finished": true,
+    "drag_seen": true,
+    "drag_source_object": "wl_data_source#51",
+    "ending": "dnd_drop_performed+dnd_finished",
+    "offers": [
+      "text/uri-list",
+      "application/x-moz-file"
+    ],
+    "other_sources_excluded": [],
+    "send": [
+      {
+        "fd": "58",
+        "mime": "text/uri-list"
+      }
+    ],
+    "set_actions": [
+      {
+        "args": [
+          1
+        ],
+        "decoded": [
+          [
+            "copy"
+          ]
+        ]
+      }
+    ],
+    "start_drag": {
+      "icon": "nil",
+      "origin_surface": "wl_surface#30",
+      "serial": "77",
+      "source": "wl_data_source#51"
+    },
+    "start_drag_count": 1,
+    "target": [
+      "text/uri-list"
+    ]
+  },
+  "zen_side": {
+    "accept": [
+      {
+        "mime": "text/uri-list",
+        "serial": "311"
+      }
+    ],
+    "action": [
+      {
+        "decoded": [
+          "copy"
+        ],
+        "mask": 1
+      }
+    ],
+    "attempt_count": 1,
+    "drag_offer_object": "wl_data_offer#70",
+    "drop": [
+      {
+        "serial": "312"
+      }
+    ],
+    "drop_count": 1,
+    "dropped": true,
+    "enter": [
+      {
+        "offer": "wl_data_offer#70",
+        "serial": "311",
+        "surface": "wl_surface#55"
+      }
+    ],
+    "finish": true,
+    "leave": [],
+    "offers": [
+      "text/uri-list",
+      "application/x-moz-file"
+    ],
+    "receive": [
+      {
+        "fd": "19",
+        "mime": "text/uri-list"
+      }
+    ],
+    "set_actions": [
+      {
+        "args": [
+          7,
+          1
+        ],
+        "decoded": [
+          [
+            "copy",
+            "move",
+            "ask"
+          ],
+          [
+            "copy"
+          ]
+        ]
+      }
+    ],
+    "source_actions": [
+      {
+        "decoded": [
+          "copy"
+        ],
+        "mask": 1
+      }
+    ]
+  }
+}

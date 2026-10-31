@@ -1,0 +1,4 @@
+method call time=1700000000.000001 sender=:1.50 -> destination=org.freedesktop.Notifications serial=9 path=/org/freedesktop/Notifications; interface=org.freedesktop.Notifications; member=Notify
+   string "dolphin"
+method return time=1700000000.000002 sender=:1.51 -> destination=:1.50 serial=10 reply_serial=9
+   uint32 2

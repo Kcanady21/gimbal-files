@@ -1,0 +1,492 @@
+{
+  "attempts_match": true,
+  "dbus": {
+    "portal_calls": [
+      {
+        "destination": "org.freedesktop.portal.Documents",
+        "interface": "org.freedesktop.portal.Documents",
+        "kind": "method_call",
+        "member": "GetMountPoint",
+        "returned": [
+          "/run/user/1000/doc"
+        ],
+        "sender": ":1.1277",
+        "strings": []
+      }
+    ]
+  },
+  "drag_seen": true,
+  "location": "outside",
+  "meta": {
+    "cosmic_commit": "09bdd8251d5f (~/cosmic-files)",
+    "date": "2026-10-31T07:03:26-04:00",
+    "folder": "/home/kyle/gimbal-dnd-test",
+    "location": "outside",
+    "moz_log_module": "WidgetDrag",
+    "niri_version": "Compositor version: 26.04 (unknown commit)",
+    "source": "cosmic",
+    "source_version": "cosmic-files git 09bdd8251d5f",
+    "zen_profile": "gimbal-dnd (throwaway)",
+    "zen_version": "1.24b"
+  },
+  "parsing_notes": {
+    "dbus_log_present": true,
+    "source_log_present": true,
+    "source_messages": 3379,
+    "zen_log_present": true,
+    "zen_messages": 3801
+  },
+  "result": {
+    "note": "auto:true source=cosmic location=outside file=sample.png folder=/home/kyle/gimbal-dnd-test",
+    "raw_answer": "other",
+    "zen_opened_file": null
+  },
+  "run": "20261031-070317-cosmic-outside",
+  "source_app": "cosmic",
+  "source_side": {
+    "action": [
+      2,
+      0,
+      2
+    ],
+    "all_data_sources": [
+      "wl_data_source#127 (lines 3299\u20133393)"
+    ],
+    "attempt": "attempt 1 of 1",
+    "cancelled": false,
+    "dnd_drop_performed": true,
+    "dnd_finished": true,
+    "drag_seen": true,
+    "drag_source_object": "wl_data_source#127",
+    "ending": "dnd_drop_performed+dnd_finished",
+    "offers": [
+      "text/plain",
+      "text/plain;charset=utf-8",
+      "UTF8_STRING",
+      "text/uri-list",
+      "x-special/gnome-copied-files"
+    ],
+    "other_sources_excluded": [],
+    "send": [
+      {
+        "fd": "57",
+        "mime": "text/uri-list"
+      },
+      {
+        "fd": "57",
+        "mime": "text/plain"
+      }
+    ],
+    "set_actions": [
+      {
+        "args": [
+          3
+        ],
+        "decoded": [
+          [
+            "copy",
+            "move"
+          ]
+        ]
+      }
+    ],
+    "start_drag": {
+      "icon": "wl_surface#132",
+      "origin_surface": "wl_surface#33",
+      "serial": "549670",
+      "source": "wl_data_source#127"
+    },
+    "start_drag_count": 1,
+    "target": []
+  },
+  "zen_side": {
+    "accept": [
+      {
+        "mime": null,
+        "serial": "549692"
+      },
+      {
+        "mime": "text/uri-list",
+        "serial": "549667"
+      },
+      {
+        "mime": null,
+        "serial": "549692"
+      },
+      {
+        "mime": "x-special/gnome-copied-files",
+        "serial": "549692"
+      },
+      {
+        "mime": "x-special/gnome-copied-files",
+        "serial": "549692"
+      },
+      {
+        "mime": "x-special/gnome-copied-files",
+        "serial": "549692"
+      },
+      {
+        "mime": "x-special/gnome-copied-files",
+        "serial": "549692"
+      },
+      {
+        "mime": "text/plain",
+        "serial": "549667"
+      },
+      {
+        "mime": "x-special/gnome-copied-files",
+        "serial": "549692"
+      },
+      {
+        "mime": "x-special/gnome-copied-files",
+        "serial": "549692"
+      },
+      {
+        "mime": "x-special/gnome-copied-files",
+        "serial": "549692"
+      },
+      {
+        "mime": "x-special/gnome-copied-files",
+        "serial": "549692"
+      },
+      {
+        "mime": "x-special/gnome-copied-files",
+        "serial": "549692"
+      },
+      {
+        "mime": "x-special/gnome-copied-files",
+        "serial": "549692"
+      },
+      {
+        "mime": "x-special/gnome-copied-files",
+        "serial": "549692"
+      },
+      {
+        "mime": "x-special/gnome-copied-files",
+        "serial": "549692"
+      },
+      {
+        "mime": "x-special/gnome-copied-files",
+        "serial": "549692"
+      }
+    ],
+    "action": [
+      {
+        "decoded": [
+          "move"
+        ],
+        "mask": 2
+      }
+    ],
+    "attempt_count": 1,
+    "drag_offer_object": "wl_data_offer#4278190081",
+    "drop": [
+      {
+        "serial": null
+      }
+    ],
+    "drop_count": 1,
+    "dropped": true,
+    "enter": [
+      {
+        "offer": "wl_data_offer#4278190081",
+        "serial": "549692",
+        "surface": "wl_surface#66"
+      }
+    ],
+    "finish": true,
+    "leave": [
+      {
+        "serial": null
+      }
+    ],
+    "offers": [
+      "text/plain",
+      "text/plain;charset=utf-8",
+      "UTF8_STRING",
+      "text/uri-list",
+      "x-special/gnome-copied-files"
+    ],
+    "receive": [
+      {
+        "fd": "141",
+        "mime": "text/uri-list"
+      },
+      {
+        "fd": "141",
+        "mime": "text/plain"
+      }
+    ],
+    "set_actions": [
+      {
+        "args": [
+          0,
+          0
+        ],
+        "decoded": [
+          [],
+          []
+        ]
+      },
+      {
+        "args": [
+          0,
+          0
+        ],
+        "decoded": [
+          [],
+          []
+        ]
+      },
+      {
+        "args": [
+          7,
+          2
+        ],
+        "decoded": [
+          [
+            "copy",
+            "move",
+            "ask"
+          ],
+          [
+            "move"
+          ]
+        ]
+      },
+      {
+        "args": [
+          7,
+          2
+        ],
+        "decoded": [
+          [
+            "copy",
+            "move",
+            "ask"
+          ],
+          [
+            "move"
+          ]
+        ]
+      },
+      {
+        "args": [
+          7,
+          2
+        ],
+        "decoded": [
+          [
+            "copy",
+            "move",
+            "ask"
+          ],
+          [
+            "move"
+          ]
+        ]
+      },
+      {
+        "args": [
+          7,
+          2
+        ],
+        "decoded": [
+          [
+            "copy",
+            "move",
+            "ask"
+          ],
+          [
+            "move"
+          ]
+        ]
+      },
+      {
+        "args": [
+          7,
+          2
+        ],
+        "decoded": [
+          [
+            "copy",
+            "move",
+            "ask"
+          ],
+          [
+            "move"
+          ]
+        ]
+      },
+      {
+        "args": [
+          7,
+          2
+        ],
+        "decoded": [
+          [
+            "copy",
+            "move",
+            "ask"
+          ],
+          [
+            "move"
+          ]
+        ]
+      },
+      {
+        "args": [
+          7,
+          2
+        ],
+        "decoded": [
+          [
+            "copy",
+            "move",
+            "ask"
+          ],
+          [
+            "move"
+          ]
+        ]
+      },
+      {
+        "args": [
+          7,
+          2
+        ],
+        "decoded": [
+          [
+            "copy",
+            "move",
+            "ask"
+          ],
+          [
+            "move"
+          ]
+        ]
+      },
+      {
+        "args": [
+          7,
+          2
+        ],
+        "decoded": [
+          [
+            "copy",
+            "move",
+            "ask"
+          ],
+          [
+            "move"
+          ]
+        ]
+      },
+      {
+        "args": [
+          7,
+          2
+        ],
+        "decoded": [
+          [
+            "copy",
+            "move",
+            "ask"
+          ],
+          [
+            "move"
+          ]
+        ]
+      },
+      {
+        "args": [
+          7,
+          2
+        ],
+        "decoded": [
+          [
+            "copy",
+            "move",
+            "ask"
+          ],
+          [
+            "move"
+          ]
+        ]
+      },
+      {
+        "args": [
+          7,
+          2
+        ],
+        "decoded": [
+          [
+            "copy",
+            "move",
+            "ask"
+          ],
+          [
+            "move"
+          ]
+        ]
+      },
+      {
+        "args": [
+          7,
+          2
+        ],
+        "decoded": [
+          [
+            "copy",
+            "move",
+            "ask"
+          ],
+          [
+            "move"
+          ]
+        ]
+      },
+      {
+        "args": [
+          7,
+          2
+        ],
+        "decoded": [
+          [
+            "copy",
+            "move",
+            "ask"
+          ],
+          [
+            "move"
+          ]
+        ]
+      },
+      {
+        "args": [
+          7,
+          2
+        ],
+        "decoded": [
+          [
+            "copy",
+            "move",
+            "ask"
+          ],
+          [
+            "move"
+          ]
+        ]
+      }
+    ],
+    "source_actions": [
+      {
+        "decoded": [
+          "copy",
+          "move"
+        ],
+        "mask": 3
+      }
+    ]
+  }
+}

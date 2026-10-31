@@ -1,0 +1,159 @@
+{
+  "attempts_match": true,
+  "dbus": {
+    "portal_calls": []
+  },
+  "drag_seen": true,
+  "location": "outside",
+  "meta": {
+    "date": "2026-10-31T00:15:00+01:00",
+    "location": "outside",
+    "niri_version": "26.04",
+    "source": "dolphin",
+    "source_version": "dolphin 25.12.3",
+    "zen_version": "1.24b"
+  },
+  "parsing_notes": {
+    "dbus_log_present": false,
+    "source_log_present": true,
+    "source_messages": 20,
+    "zen_log_present": true,
+    "zen_messages": 20
+  },
+  "result": {
+    "note": "first attempt was cancelled, second succeeded",
+    "raw_answer": "y",
+    "zen_opened_file": true
+  },
+  "run": "f5-retry",
+  "source_app": "dolphin",
+  "source_side": {
+    "action": [],
+    "all_data_sources": [
+      "wl_data_source#30 (lines 3\u20139)",
+      "wl_data_source#31 (from line 12)"
+    ],
+    "attempt": "attempt 2 of 2",
+    "cancelled": false,
+    "dnd_drop_performed": true,
+    "dnd_finished": true,
+    "drag_seen": true,
+    "drag_source_object": "wl_data_source#31",
+    "ending": "dnd_drop_performed+dnd_finished",
+    "offers": [
+      "text/uri-list",
+      "text/plain;charset=utf-8"
+    ],
+    "other_sources_excluded": [
+      "wl_data_source#30 (lines 3\u20139)"
+    ],
+    "send": [
+      {
+        "fd": "44",
+        "mime": "text/uri-list"
+      }
+    ],
+    "set_actions": [
+      {
+        "args": [
+          3
+        ],
+        "decoded": [
+          [
+            "copy",
+            "move"
+          ]
+        ]
+      }
+    ],
+    "start_drag": {
+      "icon": "nil",
+      "origin_surface": "wl_surface#9",
+      "serial": "700",
+      "source": "wl_data_source#31"
+    },
+    "start_drag_count": 2,
+    "target": [
+      "text/uri-list"
+    ]
+  },
+  "zen_side": {
+    "accept": [
+      {
+        "mime": "text/uri-list",
+        "serial": "950"
+      }
+    ],
+    "action": [
+      {
+        "decoded": [
+          "copy"
+        ],
+        "mask": 1
+      }
+    ],
+    "attempt_count": 2,
+    "drag_offer_object": "wl_data_offer#60",
+    "drop": [
+      {
+        "serial": "960"
+      }
+    ],
+    "drop_count": 1,
+    "dropped": true,
+    "enter": [
+      {
+        "offer": "wl_data_offer#60",
+        "serial": "900",
+        "surface": "wl_surface#55"
+      },
+      {
+        "offer": "wl_data_offer#60",
+        "serial": "950",
+        "surface": "wl_surface#55"
+      }
+    ],
+    "finish": true,
+    "leave": [
+      {
+        "serial": "910"
+      }
+    ],
+    "offers": [
+      "text/uri-list",
+      "text/plain;charset=utf-8"
+    ],
+    "receive": [
+      {
+        "fd": "12",
+        "mime": "text/uri-list"
+      }
+    ],
+    "set_actions": [
+      {
+        "args": [
+          1,
+          3
+        ],
+        "decoded": [
+          [
+            "copy"
+          ],
+          [
+            "copy",
+            "move"
+          ]
+        ]
+      }
+    ],
+    "source_actions": [
+      {
+        "decoded": [
+          "copy",
+          "move"
+        ],
+        "mask": 3
+      }
+    ]
+  }
+}

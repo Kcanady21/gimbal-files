@@ -1,0 +1,80 @@
+{
+  "attempts_match": true,
+  "dbus": {
+    "portal_calls": [
+      {
+        "destination": "org.freedesktop.portal.Documents",
+        "interface": "org.freedesktop.portal.Documents",
+        "kind": "method_call",
+        "member": "GetMountPoint",
+        "returned": [
+          "/run/user/1000/doc"
+        ],
+        "sender": ":1.1226",
+        "strings": []
+      }
+    ]
+  },
+  "drag_seen": false,
+  "location": "outside",
+  "meta": {
+    "cosmic_commit": "09bdd8251d5f (~/cosmic-files)",
+    "date": "2026-10-31T06:53:59-04:00",
+    "folder": "/home/kyle/gimbal-dnd-test",
+    "location": "outside",
+    "moz_log_module": "WidgetDrag",
+    "niri_version": "Compositor version: 26.04 (unknown commit)",
+    "source": "cosmic",
+    "source_version": "cosmic-files git 09bdd8251d5f",
+    "zen_profile": "gimbal-dnd (throwaway)",
+    "zen_version": "1.24b"
+  },
+  "parsing_notes": {
+    "dbus_log_present": true,
+    "source_log_present": true,
+    "source_messages": 3204,
+    "zen_log_present": true,
+    "zen_messages": 2602
+  },
+  "result": {
+    "note": "stopped after select (intentional --stop-after)",
+    "raw_answer": "aborted",
+    "zen_opened_file": null
+  },
+  "run": "20261031-065348-cosmic-outside",
+  "source_app": "cosmic",
+  "source_side": {
+    "action": [],
+    "all_data_sources": [],
+    "attempt": null,
+    "cancelled": false,
+    "dnd_drop_performed": false,
+    "dnd_finished": false,
+    "drag_seen": false,
+    "drag_source_object": null,
+    "ending": "no drag seen",
+    "offers": [],
+    "other_sources_excluded": [],
+    "send": [],
+    "set_actions": [],
+    "start_drag": null,
+    "start_drag_count": 0,
+    "target": []
+  },
+  "zen_side": {
+    "accept": [],
+    "action": [],
+    "attempt_count": 0,
+    "drag_offer_object": null,
+    "drop": [],
+    "drop_count": 0,
+    "dropped": false,
+    "enter": [],
+    "finish": false,
+    "leave": [],
+    "offers": [],
+    "receive": [],
+    "set_actions": [],
+    "source_actions": []
+  }
+}

@@ -1,0 +1,110 @@
+{
+  "attempts_match": true,
+  "dbus": {
+    "portal_calls": []
+  },
+  "drag_seen": true,
+  "location": "outside",
+  "meta": {
+    "date": "2026-10-31T00:15:00+01:00",
+    "location": "outside",
+    "niri_version": "26.04",
+    "source": "dolphin",
+    "source_version": "dolphin 25.12.3",
+    "zen_version": "1.24b"
+  },
+  "parsing_notes": {
+    "dbus_log_present": false,
+    "source_log_present": true,
+    "source_messages": 16,
+    "zen_log_present": true,
+    "zen_messages": 14
+  },
+  "result": {
+    "note": null,
+    "raw_answer": "n",
+    "zen_opened_file": false
+  },
+  "run": "f6-success-then-cancel",
+  "source_app": "dolphin",
+  "source_side": {
+    "action": [],
+    "all_data_sources": [
+      "wl_data_source#40 (lines 3\u20139)",
+      "wl_data_source#40 (from line 11)"
+    ],
+    "attempt": "attempt 2 of 2",
+    "cancelled": true,
+    "dnd_drop_performed": false,
+    "dnd_finished": false,
+    "drag_seen": true,
+    "drag_source_object": "wl_data_source#40",
+    "ending": "cancelled",
+    "offers": [
+      "text/uri-list",
+      "application/x-second-attempt"
+    ],
+    "other_sources_excluded": [
+      "wl_data_source#40 (lines 3\u20139)"
+    ],
+    "send": [],
+    "set_actions": [
+      {
+        "args": [
+          1
+        ],
+        "decoded": [
+          [
+            "copy"
+          ]
+        ]
+      }
+    ],
+    "start_drag": {
+      "icon": "nil",
+      "origin_surface": "wl_surface#9",
+      "serial": "1300",
+      "source": "wl_data_source#40"
+    },
+    "start_drag_count": 2,
+    "target": []
+  },
+  "zen_side": {
+    "accept": [],
+    "action": [],
+    "attempt_count": 2,
+    "drag_offer_object": "wl_data_offer#4278190081",
+    "drop": [
+      {
+        "serial": null
+      }
+    ],
+    "drop_count": 1,
+    "dropped": false,
+    "enter": [
+      {
+        "offer": "wl_data_offer#4278190080",
+        "serial": "1234",
+        "surface": "wl_surface#30"
+      },
+      {
+        "offer": "wl_data_offer#4278190081",
+        "serial": "1300",
+        "surface": "wl_surface#30"
+      }
+    ],
+    "finish": false,
+    "leave": [
+      {
+        "serial": null
+      }
+    ],
+    "offers": [
+      "text/uri-list",
+      "application/x-second-attempt"
+    ],
+    "receive": [],
+    "set_actions": [],
+    "source_actions": []
+  }
+}

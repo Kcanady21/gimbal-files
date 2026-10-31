@@ -1,0 +1,6 @@
+date: 2026-10-31T00:10:00+01:00
+source: nautilus
+location: downloads
+source_version: GNOME nautilus 50.2.2
+zen_version: 1.24b
+niri_version: 26.04

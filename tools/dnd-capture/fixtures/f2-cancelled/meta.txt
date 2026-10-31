@@ -1,0 +1,6 @@
+date: 2026-10-31T00:05:00+01:00
+source: thunar
+location: downloads
+source_version: thunar 4.20.7 (Xfce 4.20)
+zen_version: 1.24b
+niri_version: 26.04
