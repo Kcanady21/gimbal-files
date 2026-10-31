@@ -124,7 +124,7 @@ Put these in the repo's `CLAUDE.md`.
 - [ ] Project name and repository location.
   - [ ] Answer: Name = Gimbal Files
   - [ ] location /home/kyle/Documents/03.) Code-Projects/gimbal-files/
-  - [ ] create a github repo for it
+  - [x] create a github repo for it: private, https://github.com/Kcanady21/gimbal-files (Oct 31)
 
 ## Sources
 
