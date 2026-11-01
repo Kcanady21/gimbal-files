@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! The fake folder grid: a GridView over a StringList of fake names. No filesystem.
+use crate::icons::{self, MockupIcon};
 use crate::style::{CELL_W, GAP_XL, scaled};
 use gtk::SignalListItemFactory;
 use gtk::glib;
@@ -11,11 +12,12 @@ pub fn counts(items: u32) -> (u32, u32) {
     (items - items.min(4), items.min(4))
 }
 
-pub fn item_name(i: u32) -> (String, &'static str) {
+/// The cell's name and its mockup icon; files keep the theme's own icon.
+pub fn item_name(i: u32) -> (String, Option<MockupIcon>) {
     if i < 4 {
-        (format!("Folder {}", i + 1), "gimbal-folder-symbolic")
+        (format!("Folder {}", i + 1), Some(MockupIcon::Folder))
     } else {
-        (format!("File {}.txt", i + 1), "text-x-generic")
+        (format!("File {}.txt", i + 1), None)
     }
 }
 
@@ -119,7 +121,10 @@ pub fn folder_view(items: u32, tile: bool) -> gtk::ScrolledWindow {
         };
         let (_, icon) = item_name(item.position());
         if let Some(image) = cell.first_child().and_downcast::<gtk::Image>() {
-            image.set_icon_name(Some(icon));
+            match icon {
+                Some(icon) => image.set_paintable(Some(&icons::svg(icon))),
+                None => image.set_icon_name(Some("text-x-generic")),
+            }
         }
         if let Some(label) = cell.last_child().and_downcast::<gtk::Label>() {
             label.set_text(&entry.string());

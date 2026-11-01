@@ -10,7 +10,7 @@ pub mod tok {
     pub const CONTROL_H: f64 = 50.0; pub const HEADER_H: f64 = 96.0;
     pub const LINE_HAIR: f64 = 1.0; pub const LINE_THIN: f64 = 2.0; pub const LINE_MID: f64 = 3.0;
     pub const RADIUS: f64 = 12.0; pub const RADIUS_PILL: f64 = 999.0;
-    pub const GRID_MARGIN: f64 = 72.0; pub const SECTION_H: f64 = 32.0;
+    pub const GRID_MARGIN: f64 = 72.0; pub const SECTION_H: f64 = 32.0; pub const SECTION_GAP: f64 = 6.0;
     pub const PIN_ROW_H: f64 = 64.0; pub const DIR_ROW_H: f64 = 32.0; pub const STATUS_H: f64 = 64.0;
     pub const BAR_W: f64 = 209.0; pub const BAR_H: f64 = 18.0; pub const MAIN_BAR_W: f64 = 228.0; pub const MAIN_BAR_H: f64 = 20.0;
     pub const CELL_W: f64 = 97.0; pub const CELL_H: f64 = 144.0;
@@ -34,7 +34,7 @@ pub mod col {
     pub const FOCUS_RING: &str = "@accent_color";
     pub const HOVER: &str = "alpha(@window_fg_color, 0.1)"; pub const HOVER_STRONG: &str = "alpha(@window_fg_color, 0.15)";
     pub const RULE: &str = "alpha(@window_fg_color, 0.3)";
-    pub const PINNED_BG: &str = "@sidebar_bg_color"; pub const PINNED_FG: &str = "@sidebar_fg_color";
+    pub const PINNED_FG: &str = "@sidebar_fg_color";
     pub const PIN_SEL: &str = "mix(@sidebar_bg_color, @sidebar_fg_color, 0.12)";
 }
 pub use col::*;
@@ -130,6 +130,7 @@ pub fn css(scale: f64, font: Option<&str>, opacity: f64) -> String {
     let o = opacity.clamp(0.50, 1.00);
     let fill = |role: &str| format!("alpha({role}, {o:.2})");
     let (gs, gm, gxl, g2) = (p(GAP_S), p(GAP_M), p(GAP_XL), p(GAP_2XL));
+    let section_gap = p(SECTION_GAP);
     let (hair, thin, mid) = (p(LINE_HAIR), p(LINE_THIN), p(LINE_MID));
     let strip_pad = gm + mid;
     let (r, rp) = (p(RADIUS), p(RADIUS_PILL));
@@ -153,7 +154,6 @@ pub fn css(scale: f64, font: Option<&str>, opacity: f64) -> String {
     let pill_active = fill(RAISED);
     let pill_selected = fill(SELECTED);
     let pill_selected_active = fill(SELECTED_ACTIVE);
-    let pinned = fill(PINNED_BG);
     let pin_sel = fill(PIN_SEL);
     let track = fill(RAISED);
     let tile = fill(RAISED);
@@ -173,11 +173,12 @@ window.gimbal-look, window.gimbal-look.background {{ background-color: {window_b
 .gl-pill-close {{ all: unset; min-width: {close}px; min-height: {close}px; -gtk-icon-size: {close}px; padding: 0; border: {thin}px solid {FG}; border-radius: {rp}px; color: {FG}; margin-left: {gm}px; }}
 .gl-pill-close:hover {{ background-color: {HOVER_STRONG}; }} .gl-pill-close:focus-visible {{ box-shadow: 0 0 0 {thin}px {FOCUS_RING}; }}
 .gl-pill.active .gl-pill-close {{ color: {RAISED_FG}; border-color: {RAISED_FG}; }} .gl-pill.tab {{ margin-bottom: {gs}px; }}
-.gl-section {{ margin-top: {gxl}px; }}
-.gl-section-pill {{ all: unset; min-height: {sect_h}px; margin: 0 {gm}px {gs}px {gm}px; border: {thin}px solid {OUTLINE}; border-radius: {rp}px; }}
+.gl-section {{ margin-top: {section_gap}px; }}
+.gl-section-pill {{ all: unset; min-height: {sect_h}px; margin: 0 {gm}px; border: {thin}px solid {OUTLINE}; border-radius: {rp}px; }}
+.gl-section-content {{ margin-top: {gxl}px; }}
 .gl-section-pill label {{ font-size: {titem}px; }}
 .gl-section-pill:hover {{ background-color: {HOVER}; }} .gl-section-pill:focus-visible {{ box-shadow: 0 0 0 {thin}px {FOCUS_RING}; }}
-.gl-pinned {{ background-color: {pinned}; color: {PINNED_FG}; border-radius: {r}px; margin-top: {gs}px; }}
+.gl-pinned {{ color: {PINNED_FG}; border-radius: {r}px; margin-top: {gs}px; }}
 .gl-pinned-row {{ all: unset; min-height: {pinrow}px; padding: 0 {gs}px; }}
 .gl-pinned-row image {{ -gtk-icon-size: {ipin}px; }} .gl-pinned-row label {{ font-size: {titem}px; margin-left: {gs}px; }}
 .gl-pinned-row.sel {{ background-color: {pin_sel}; }}
@@ -194,7 +195,7 @@ gridview > child {{ padding: 0; }}
 .gl-tile {{ background-color: {tile}; border: {thin}px solid {OUTLINE}; border-radius: {r}px; color: {FG}; }}
 .gl-tile.focused {{ box-shadow: 0 0 0 {thin}px {FOCUS_RING}; }}
 .gl-status {{ min-height: {statush}px; font-size: {tc}px; }} .gl-num {{ font-size: {tmono}px; }} .gl-pline {{ font-size: {tmono}px; margin-left: {gm}px; }}
-.gl-collapse-strip {{ min-width: {g2}px; }} .gl-collapse-strip.left {{ padding: {strip_pad}px 0 0 {strip_pad}px; }} .gl-collapse-strip.right {{ padding: {strip_pad}px {strip_pad}px 0 0; }} .gl-action-row .gl-icon-button {{ margin-left: {gm}px; -gtk-icon-palette: {save_as_palette}; }}
+.gl-collapse-strip {{ min-width: {g2}px; }} .gl-collapse-strip.left {{ padding: {strip_pad}px 0 0 0; }} .gl-collapse-strip.right {{ padding: {strip_pad}px 0 0 0; }} .gl-action-row .gl-icon-button {{ margin-left: {gm}px; }} .gl-action-row image {{ color: {FG}; -gtk-icon-palette: {save_as_palette}; }}
 window.gimbal-look .gl-frame gridview, window.gimbal-look .gl-frame listview, window.gimbal-look .gl-frame textview, window.gimbal-look .gl-frame textview > text, window.gimbal-look .gl-frame scrolledwindow, window.gimbal-look .gl-frame viewport, window.gimbal-look .gl-frame gridview > child, window.gimbal-look windowhandle {{ background-color: transparent; }}",
         hh = p(HEADER_H), pinrow = p(PIN_ROW_H), dirrow = p(DIR_ROW_H),
         barw = p(BAR_W), barh = p(BAR_H), mbarw = p(MAIN_BAR_W), mbarh = p(MAIN_BAR_H),
@@ -236,6 +237,19 @@ mod tests {
         assert!(plain.contains("mix(@card_bg_color, @accent_color, 0.5)"));
         assert!(plain.contains("0 0 0 2px @accent_color"));
         assert!(!plain.contains("alpha(@accent_color"));
+    }
+
+    #[test]
+    fn pinned_list_has_no_fill_and_collapsed_pills_sit_six_apart() {
+        let plain = css(1.0, None, DEFAULT_OPACITY);
+        // The rows sit straight on the panel; only the selected row fills.
+        assert!(plain.contains(".gl-pinned { color: @sidebar_fg_color"));
+        assert!(!plain.contains(".gl-pinned { background-color"));
+        assert!(plain.contains(".gl-pinned-row.sel { background-color:"));
+        // Collapsed section pills are 6 apart; the 32 gap is above content.
+        assert!(plain.contains(".gl-section { margin-top: 6px; }"));
+        assert!(plain.contains(".gl-section-content { margin-top: 32px; }"));
+        assert!(plain.contains(".gl-section-pill { all: unset; min-height: 28px; margin: 0 16px;"));
     }
 
     #[test]

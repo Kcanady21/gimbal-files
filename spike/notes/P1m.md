@@ -322,3 +322,261 @@ and 10 are done as asked. Kyle tried the build and Claude confirmed:
 4. **Collapsed section pills (Kyle):** should sit about 6 px apart.
 5. **Collapsed sidebars (Kyle):** the expand button's vertical position is right; it should be
    centred horizontally in the collapsed strip.
+
+## P1m-r1 changes
+
+Built on P1m in `spike/src/bin/look-body/`. The review and live-check sections above are
+unchanged. Only files under `look-body/` and this note were touched; the temporary timer
+harness was removed before delivery.
+
+### Item by item
+
+1. **Icons through `gtk::Svg`.** New `icons.rs` holds one shared, thread-local
+   `gtk::Svg` per mockup icon (`MockupIcon::{Folder,Save,SaveAs,Discard}`) and builds
+   every image with `gtk::Image::from_paintable`. Grid folders call
+   `image.set_paintable(Some(&icons::svg(..)))`; files still call
+   `set_icon_name("text-x-generic")`. The preview's Save, Save As and Discard buttons
+   use `icons::button`, whose child is the same kind of image. The icon-theme search
+   path is gone from `main.rs`. `color` and `-gtk-icon-palette` stay in CSS on
+   `.gl-cell image`; the action row now sets `-gtk-icon-palette` on
+   `.gl-action-row image` instead of on its button. The cause of the white icons is
+   GTK's older theme-symbolic path: an icon loaded by name ignores `gpa:` slots. A
+   `GtkSvg` is a `GtkSymbolicPaintable`, so the image's CSS style passes its five
+   colours to `gtk_symbolic_paintable_snapshot_with_weight`
+   (`gtk-4.22.4:gtk/gtkrendericon.c:97-134`, especially the
+   `GTK_IS_SYMBOLIC_PAINTABLE` test at :121 and the colour lookup/call at :131-134;
+   the style is fetched from the image's icon helper at
+   `gtk-4.22.4:gtk/gtkiconhelper.c:195`, used at :227 and :235). The palette names
+   (`accent`, `error`, …) are resolved at
+   `gtk-4.22.4:gtk/gtkcssstyle.c:876-899`; `accent` is in the array at :883.
+   gtk-rs: `gtk4-0.11.5:src/auto/svg.rs:19` (`@implements SymbolicPaintable`), :35
+   (`from_bytes`); `gtk4-0.11.5:src/auto/image.rs:86` (`from_paintable`).
+2. **Columns own their tiles.** `State.columns` is now `[Vec<usize>; 2]`, with the
+   pure model in `split.rs`: `initial_columns` / `add_to_shorter` (new tiles join the
+   shorter column, left on a tie), `columns_without` (a close grows that column's
+   survivors and renumbers the ids), `columns_after_drop` (same column reorders,
+   other column swaps), `column_rects` and `rects_by_tile` (each column shares its
+   height, floor at half the visible height beyond four tiles), and `drag_layout`.
+   `set_count` now adds/removes one tile at a time; a close no longer rebuilds the
+   view. Tile handlers capture a stable `Tile.uid`, so a close's renumbering cannot
+   stale them.
+3. **Every layout change animates.** `Slot` now holds position *and* size.
+   `slide_to` interpolates both over 200 ms with the existing per-slot generation;
+   close/add/drop call `relayout(true)`, viewport and scale changes still snap with
+   `relayout(false)`. The dragged tile is moved directly each update at its old size
+   and resizes into the target slot on release. Raising still uses `insert_after`;
+   no widget is unparented in the drag path.
+4. **Pinned list has no fill.** `.gl-pinned` lost its `background-color`; the
+   `PINNED_BG` constant went with it. `.gl-pinned-row.sel` still paints the selected
+   row with `alpha(mix(@sidebar_bg_color,@sidebar_fg_color,0.12), opacity)`.
+5. **Pinned drag rebuilt.** The old rows were a `GtkBox` moved with top margins
+   while the gesture's widget-relative `dx/dy` and `reorder_child_after` changed the
+   child order mid-drag. Changing one row's margin reflowed every row below it, so
+   the pointer-to-slot arithmetic drifted and the dragged row did not track the
+   mouse. The rows now all live in one `gtk::Fixed` at absolute positions; the
+   local pointer is `gdk::Event::position()` (surface) minus the Fixed's window
+   bounds (`WidgetExt::compute_bounds`, gtk4-0.11.5:src/auto/widget.rs:166;
+   `gdk4-0.11.5:src/auto/event.rs:146`), never the gesture offset. The drag claims
+   with `drag_check_threshold` + `set_state(Claimed)` and denies the click gesture,
+   raises with `insert_after`, slides the other rows 150 ms, and settles in slot
+   order on release. Plain clicks still select.
+6. **Collapsed pills sit 6 px apart.** `.gl-section` is `margin-top: 6 × scale`;
+   the section pill lost its 8 px bottom margin; the 32 px `gap-xl` moved to
+   `.gl-section-content`, inside the revealer, so it exists only above an expanded
+   section's content.
+7. **Collapsed strip button centred.** The strip's asymmetric horizontal padding is
+   gone; two expanding spacers centre the 48 px button in the 67 px strip (24 in 34
+   at scale 0.5). `valign: Start` and the 19 px top padding (10 at 0.5) keep the
+   vertical position. A `GtkBox` ignores `halign` on its main axis, which is why the
+   spacers are used.
+
+### Unit tests (all in the look-body binary)
+
+- `split::tests`: `initial_columns_fill_the_shorter_column`,
+  `closing_from_either_column_leaves_the_other_taller`,
+  `dropping_swaps_across_columns_and_reorders_within_one`,
+  `a_dragged_tile_ends_at_the_slot_sizes`, `rects_never_overlap` (2–6 tiles, every
+  drop pair and every close), `uneven_columns_make_their_tiles_taller`,
+  `five_tiles_never_drop_below_half_the_visible_height`, `selection_indices_follow_a_close`,
+  and the drag/hit/selection tests updated to the column model.
+- `sidebar::tests`: `every_pin_reorder_moves_exactly_one_row`,
+  `pinned_drag_layout_uses_original_row_indices`,
+  `pinned_drag_follows_the_pointer_and_slides_the_others`, `pin_order_moves_one_row`.
+- `style::tests::pinned_list_has_no_fill_and_collapsed_pills_sit_six_apart`.
+- `layout::tests::the_strip_centres_the_expand_button` (scale 1.0 and 0.5).
+- `style::tests::icon_palettes_map_the_spec_table` still checks the SVG slots and the
+  palette entries.
+
+### RULES.md's four commands, from `$SPIKE`
+
+`cargo fmt --check`:
+
+```text
+(no output; rustfmt --check passes package-wide)
+```
+
+`cargo clippy --all-targets -- -D warnings`:
+
+```text
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.40s
+```
+
+`cargo test`:
+
+```text
+     Running unittests src/main.rs (target/debug/deps/gimbal_spike-27f41c3be3242da9)
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running unittests src/bin/look-body/main.rs (target/debug/deps/look_body-0c97cc23f4ccae67)
+test result: ok. 46 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running unittests src/bin/look-header/main.rs (target/debug/deps/look_header-4abd02268319d43d)
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+```
+
+`cargo build --release`:
+
+```text
+    Finished `release` profile [optimized] target(s) in 1.20s
+```
+
+### 10-second runs (release binary, from `/tmp/gimbal-spike-p1m-r1`, stopped with SIGTERM)
+
+Default:
+
+```text
+(no output)
+```
+
+`--tiles 3`:
+
+```text
+(no output)
+```
+
+`--tiles 6 --pins 14 --scale 0.5`:
+
+```text
+(no output)
+```
+
+No GTK warnings, no CSS/theme/icon warnings, no panics; the intermittent
+`VK_SUBOPTIMAL_KHR` notice did not appear in these three runs.
+
+### Temporary timer logs (harness removed before delivery)
+
+Debug binary, `GIMBAL_SPIKE_LOG=1 look-body --tiles 4`, niri-tiled 1272 × 1398.
+Item 1 (paintable type and palette), items 2–3 (4 tiles → close the left-bottom
+tile → add one; every tile's visual rect at start / 100 ms / end), items 6–7.
+
+```text
+[gimbal-look-body 1.326] temp: item1 folder image: paintable GtkSvg, palette accent @accent_color, success shade(@accent_color, 0.7), warning shade(@accent_color, 0.6), error shade(@accent_color, 0.45)
+[gimbal-look-body 1.326] temp: item1 discard image: paintable GtkSvg, palette error @window_bg_color
+[gimbal-look-body 1.327] temp: item1 save image: paintable GtkSvg, palette error @window_bg_color
+[gimbal-look-body 1.327] temp: item1 save-as image: paintable GtkSvg, palette error @window_bg_color
+[gimbal-look-body 1.327] temp: item2 start: 0:(40,0,77,563) 1:(141,0,77,563) 2:(40,587,77,563) 3:(141,587,77,563)
+[gimbal-look-body 1.327] temp: item2 start targets: 0:(40,0,77,563) 1:(141,0,77,563) 2:(40,587,77,563) 3:(141,587,77,563)
+[gimbal-look-body 1.425] temp: item2 mid close: 0:(40,0,77,1094) 1:(141,0,77,563) 3:(141,587,77,563)
+[gimbal-look-body 1.625] temp: item2 end close: 0:(40,0,77,1151) 1:(141,0,77,563) 3:(141,587,77,563)
+[gimbal-look-body 1.625] temp: item2 end close targets: 0:(40,0,77,1151) 1:(141,0,77,563) 3:(141,587,77,563)
+[gimbal-look-body 1.725] temp: item2 mid add: 0:(40,0,77,658) 1:(141,0,77,563) 3:(141,587,77,563) 4:(40,587,77,563)
+[gimbal-look-body 1.925] temp: item2 end add: 0:(40,0,77,563) 1:(141,0,77,563) 3:(141,587,77,563) 4:(40,587,77,563)
+[gimbal-look-body 1.925] temp: item2 end add targets: 0:(40,0,77,563) 1:(141,0,77,563) 3:(141,587,77,563) 4:(40,587,77,563)
+[gimbal-look-body 2.525] temp: item7 left before: button (27.0,161.0,48.0,48.0) centre x 51.0
+[gimbal-look-body 2.525] temp: item7 right before: button (1197.0,161.0,48.0,48.0) centre x 1221.0
+[gimbal-look-body 2.525] temp: item6 pill 0: top 673.0, bottom 707.0, h 34.0
+[gimbal-look-body 2.525] temp: item6 pill 1: top 713.0, bottom 747.0, h 34.0
+[gimbal-look-body 2.525] temp: item6 pill 2: top 753.0, bottom 787.0, h 34.0
+[gimbal-look-body 2.525] temp: item6 gap 1: 6.0
+[gimbal-look-body 2.525] temp: item6 gap 2: 6.0
+[gimbal-look-body 3.125] temp: item7 left: strip (8.0,142.0,67.0,1248.0) centre x 41.5; button (18.0,161.0,48.0,48.0) centre x 42.0 halign Fill
+[gimbal-look-body 3.125] temp: item7 right: strip (1197.0,142.0,67.0,1248.0) centre x 1230.5; button (1207.0,161.0,48.0,48.0) centre x 1231.0 halign Fill
+```
+
+Same timer at `--scale 0.5`:
+
+```text
+[gimbal-look-body 2.538] temp: item7 left before: button (14.0,92.0,24.0,24.0) centre x 26.0
+[gimbal-look-body 2.538] temp: item7 right before: button (1234.0,92.0,24.0,24.0) centre x 1246.0
+[gimbal-look-body 2.538] temp: item6 pill 0: top 349.0, bottom 366.0, h 17.0
+[gimbal-look-body 2.538] temp: item6 pill 1: top 369.0, bottom 386.0, h 17.0
+[gimbal-look-body 2.538] temp: item6 pill 2: top 389.0, bottom 406.0, h 17.0
+[gimbal-look-body 2.538] temp: item6 gap 1: 3.0
+[gimbal-look-body 2.538] temp: item6 gap 2: 3.0
+[gimbal-look-body 3.138] temp: item7 left: strip (4.0,82.0,34.0,1312.0) centre x 21.0; button (9.0,92.0,24.0,24.0) centre x 21.0 halign Fill
+[gimbal-look-body 3.138] temp: item7 right: strip (1234.0,82.0,34.0,1312.0) centre x 1251.0; button (1239.0,92.0,24.0,24.0) centre x 1251.0 halign Fill
+```
+
+The close animation's mid point (1094/1151) and the add's mid point (658/563) show
+the 200 ms interpolation; the target rects equal the end rects. Vertical positions
+for item 7 are identical before and after (161 at scale 1, 92 at 0.5), while the
+horizontal centre moves to the strip's centre.
+
+### Sizes and colours changed (r1)
+
+| Where | Old | New |
+|---|---|---|
+| Tile slide duration | 150 ms | 200 ms (position and size) |
+| `.gl-section` top margin | 32 (`gap-xl`) | 6 (`SECTION_GAP`) |
+| Section pill bottom margin | 8 (`gap-s`) | 0 |
+| `.gl-section-content` top margin | — | 32 (`gap-xl`) |
+| Collapsed strip horizontal padding | 19 left (left) / 19 right (right) | 0 both |
+| Collapsed strip button alignment | start (left) / end (right) | centred by two expanding spacers |
+| `.gl-pinned` background | `alpha(@sidebar_bg_color, opacity)` | none |
+| Pinned row slide duration | 150 ms | unchanged 150 ms |
+| Icon loading | icon theme by name (`gimbal-*-symbolic`) | shared `gtk::Svg` paintable |
+| Action-row palette target | `.gl-icon-button` | `.gl-action-row image` |
+
+No colour expression changed; `PINNED_BG` was removed with the fill.
+
+### Not verified live (Claude's check)
+
+- How the four SVG icons actually look through `gtk::Svg`: the folder's five tones,
+  the 0.85 paper tab, the Save As pencil outline over the translucent button, and
+  whether the shared `Svg` redraws per-image palettes correctly. The timers prove the
+  paintables are `GtkSvg` and the CSS palettes are the ones configured; the pixels
+  were not seen. [inferred]
+- The tile drag feel after the column model: swapping across columns, reordering
+  within one, the dragged tile's 200 ms resize on release, and the raise. The model
+  and rects are unit-tested; the pointer interaction is not. [inferred]
+- The pinned-row drag feel: follow from surface coordinates, the threshold claim,
+  the followers' 150 ms slides, the raised row's draw order, and that a plain click
+  still selects (the drag denies the click only after it claims). [inferred]
+- The section-pill gap and the strip centring by eye at other scales/widths; the
+  timer values above are from a 1272 × 1398 tiled window.
+- The icons' live recolour on a Noctalia theme reload (the r1 change keeps the
+  `-gtk-icon-palette` on the image; the reload path itself is unchanged from P1m).
+
+### Anything I'd change outside my files
+
+None. The `text-section`/`icon-row` stale rows in `look-style-spec.md` and the Phase 2
+GResource suggestion from P1m still stand; no file outside the brief's Output list
+was edited.
+
+## Review and live check of P1m-r1 (Claude, Nov 1, 2026): mostly passes, three fixes (P1m-r2-fixes.md)
+
+RULES.md's four commands pass (61 tests). Live, release build, DP-3 off:
+
+- **Icons:** the folders are multi-tone purple from the theme (accent front, darker back and side,
+  light paper); Save, Save As and Discard draw as their mockup shapes. `gtk::Svg` fixed it.
+- **Columns:**
+  - Closing Tab 3 (bottom left) out of 4 makes Tab 1, the left column's lone tile, full height.
+  - Dragging Tab 1 onto Tab 4 in the other column swaps them during the drag: Tab 4 moves left at
+    full height and Tab 1 takes the half-height slot. Sizes are right afterwards, with no overlap.
+- **Pinned drag:** Home follows the pointer down; the rows below slide up; it settles in slot 4
+  (`pins: moved 'Home' from slot 0 to 4`). The cause given (margins reflowing the rows) fits.
+- **Collapsed sections:** all three collapsed sit about 6 px apart.
+- **Expand buttons:** centred in their strips (left: button centre 42, strip centre 41.5; right:
+  2,519 against 2,518), at the same height as before.
+
+Needs fixing:
+
+1. **Pinned names show only "…"** at the default panel width. In the new `gtk::Fixed` each row
+   gets only its minimum width.
+2. **Section spacing is upside down.** A large gap sits between a pill and its own content, and
+   only about 6 px between that content and the next pill. The spec's earlier wording ("the
+   `gap-xl` spacing applies only above an expanded section's content") was ambiguous, Claude's
+   fault; it is corrected now.
+3. **An empty column.** With Tab 4 alone in the left column, closing it leaves the left half empty
+   and Tab 2 and Tab 1 stacked on the right. A column that empties should take a tile from the
+   other.
+
+Observation for Kyle: the collapsed strips draw no panel outline; earlier rounds drew one.

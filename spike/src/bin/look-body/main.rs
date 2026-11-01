@@ -7,6 +7,7 @@
 #[path = "../../look_shared/blur.rs"]
 mod blur;
 mod grid;
+mod icons;
 mod layout;
 mod preview;
 mod sidebar;
@@ -328,21 +329,29 @@ fn strip(icon: &str, left: bool) -> gtk::Box {
     strip.add_css_class("gl-collapse-strip");
     strip.add_css_class(if left { "left" } else { "right" });
     let button = sidebar::icon_button(icon);
-    // Keep the button on the panel's inner edge: start for the left sidebar,
-    // end for the preview, exactly as it sat in the title row.
-    button.set_halign(if left {
-        gtk::Align::Start
-    } else {
-        gtk::Align::End
-    });
+    // Vertically the button keeps the title row's start position. A Box does
+    // not honour halign on its main axis, so two expanding spacers centre the
+    // button across the collapsed strip (item 7).
     button.set_valign(gtk::Align::Start);
+    let before = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    before.set_hexpand(true);
+    let after = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    after.set_hexpand(true);
+    strip.append(&before);
     strip.append(&button);
+    strip.append(&after);
     strip
 }
 
 fn expand_button(strip: &gtk::Box) -> gtk::Button {
-    let button = strip.first_child().and_downcast::<gtk::Button>();
-    button.expect("strip holds its expand button")
+    let mut child = strip.first_child();
+    while let Some(widget) = child {
+        if let Some(button) = widget.downcast_ref::<gtk::Button>() {
+            return button.clone();
+        }
+        child = widget.next_sibling();
+    }
+    panic!("strip holds its expand button")
 }
 
 fn dev_slider(lo: f64, hi: f64, step: f64, value: f64) -> gtk::Scale {
@@ -355,10 +364,8 @@ fn dev_slider(lo: f64, hi: f64, step: f64, value: f64) -> gtk::Scale {
 fn show(app: &adw::Application, args: &Args) {
     let provider = gtk::CssProvider::new();
     let display = gtk::gdk::Display::default().expect("no display");
-    // The mockup's symbolic icons live beside this binary's source; GTK's
-    // icon theme finds them by name, so nothing loads a path directly.
-    let icons = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/bin/look-body/icons");
-    gtk::IconTheme::for_display(&display).add_search_path(&icons);
+    // The mockup icons are `gtk::Svg` paintables (see icons.rs), not icon-theme
+    // names, so no search path is needed.
     gtk::style_context_add_provider_for_display(&display, &provider, APP_PRIORITY);
     let window = adw::ApplicationWindow::builder().application(app).build();
     window.set_default_size(style::DEFAULT_W, style::DEFAULT_H);

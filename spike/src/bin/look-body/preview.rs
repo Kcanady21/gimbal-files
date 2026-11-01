@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! The preview sidebar: a read-only fake text preview with line numbers and
 //! the three action buttons (which only log — editing is Phase 2+).
-use crate::sidebar::{icon_button, rule, title_row};
+use crate::icons::{MockupIcon, button as icon_image_button};
+use crate::sidebar::{rule, title_row};
 use gtk::prelude::*;
 
 const LINES: u32 = 40;
@@ -56,9 +57,9 @@ impl PreviewPanel {
         // (the .gl-action-row CSS margin). All three only log.
         let actions = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         actions.add_css_class("gl-action-row");
-        let discard = icon_button("gimbal-discard-symbolic");
-        let save = icon_button("gimbal-save-symbolic");
-        let save_as = icon_button("gimbal-save-as-symbolic");
+        let discard = icon_image_button(MockupIcon::Discard);
+        let save = icon_image_button(MockupIcon::Save);
+        let save_as = icon_image_button(MockupIcon::SaveAs);
         for (button, name) in [
             (discard.clone(), "discard"),
             (save.clone(), "save"),

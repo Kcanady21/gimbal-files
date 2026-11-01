@@ -246,24 +246,19 @@ mod tests {
     }
 
     #[test]
-    fn the_strip_keeps_the_collapse_button_in_place() {
+    fn the_strip_centres_the_expand_button() {
         for scale in [1.0, 0.5] {
             let button = scaled(ICON_ROW, scale) + 2 * scaled(GAP_S, scale);
+            let strip = strip_width(scale);
+            // No horizontal padding: the 48 px button centres in the 67 px
+            // strip (34 px at scale 0.5 in a 34 px strip).
+            assert!(button <= strip);
+            let left = (strip - button) / 2;
+            assert!((left * 2 + button - strip).abs() <= 1);
+            // The vertical position is unchanged: panel border + padding
+            // equals the strip's top padding.
             let pad = scaled(GAP_M, scale) + scaled(LINE_MID, scale);
-            // The panel's button starts inset + border + padding from the
-            // window edge; the left strip's button starts inset + pad.
-            let panel_button_left = inset(scale) + scaled(LINE_MID, scale) + scaled(GAP_M, scale);
-            let strip_button_left = inset(scale) + pad;
-            assert_eq!(panel_button_left, strip_button_left);
-            // The strip's content area is exactly the button, so its inner
-            // edge is at the same place as the panel's inner padding edge.
-            let content = strip_width(scale) - pad;
-            assert_eq!(content, button.max(scaled(GAP_2XL, scale)));
-            // On the right, both the button's right edge and the panel's
-            // padding edge are the window's right edge minus inset and pad.
-            let right_panel = 2560 - inset(scale) - pad;
-            let strip_right = (2560 - inset(scale) - strip_width(scale)) + content;
-            assert_eq!(right_panel, strip_right);
+            assert_eq!(scaled(LINE_MID, scale) + scaled(GAP_M, scale), pad);
         }
     }
 
