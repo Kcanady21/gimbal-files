@@ -131,6 +131,8 @@ Kyle's requested features, with where each lives and any known approach. Build o
 | Restore tabs and groups after restart | Core | Saved workspace model. |
 | Delete to Trash with the Delete key and the right-click menu | UI + core | P1h row 5: the spike had no way to delete. Trash by default, through the command registry. |
 | Reorder pinned folders by dragging | UI + core | P1m. Same follow-and-slide feel as the tab pills; the order is saved in the config. |
+| Pinned folders: click selects, double-click opens | UI | P1m-r3. The highlighted row is the current folder; only a drag reorders. |
+| Split view: resize tiles and arrange columns by hand | UI + core | P1m-r3. Drag the border between columns or between stacked tiles; double-click resets. Drop a tile between tiles to move it (on a tile to swap). The default stays balanced (2 + 2, 2 + 1); a close rebalances only when it leaves the columns two apart. The layout is part of the saved workspace. |
 | Close tabs and groups from the accordion list | UI | P1l. A ✕ per entry; groups ask first, as the group pill does. |
 | Gimbal's own icon set from the mockup | UI | P1m. Folder, Save, Save As and Discard from Kyle's sketch, drawn as GTK symbolic icons so every part takes a theme colour (GTK 4.20+). |
 | Trash button: open Trash, drop to trash | UI + core | Drop target moves to trash, never deletes. |

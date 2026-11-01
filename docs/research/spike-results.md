@@ -235,3 +235,17 @@ Edit 1: yes (P1l and P1m are out). Edits 2 and 3: yes. Edit 4: yes, for now. Edi
 - **Q10:** Yes.
 
 On the strength of these answers, the look-polish briefs `P1l` (header) and `P1m` (body) are written. The verdict and plan edits were approved the same day (see above).
+
+## Rerun of rows 7–9 after the look-polish round (Kyle, Nov 1, 2026)
+
+- **Row 7 (`look-header`): pass.** The search collapse works and Kyle accepts the fade-out. Tabs and
+  groups close from the "N tabs" list. Outline weights are good. Float and close use the mockup's
+  icons (P1l-r1, P1l-r2).
+- **Row 8 (`look-body`): one more round, P1m-r3.**
+  - With six tiles, closing two from one column leaves 1 + 3; the default should rebalance to 2 + 2.
+  - Kyle wants to arrange columns by hand: drop a tile between tiles to move it. He also wants to
+    resize tiles by dragging their borders, built in the prototype now.
+  - A plain click on a pinned row moves it down one. Click should select, double-click open, and
+    only a drag reorder.
+  - The highlighted pinned row is intended: it marks the current folder.
+- **Row 9 (live scale and theme in both programs):** not reported yet.
