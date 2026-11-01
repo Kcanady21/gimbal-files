@@ -580,3 +580,195 @@ Needs fixing:
    other.
 
 Observation for Kyle: the collapsed strips draw no panel outline; earlier rounds drew one.
+
+## P1m-r2 changes
+
+Built on P1m-r1 in `spike/src/bin/look-body/`. The review and live-check sections above are
+unchanged. Only files under `look-body/` and this note were touched; the temporary timer harness was
+removed before delivery. Below, command output and timer logs are **[observed]**, GTK/gtk-rs source
+citations are **[read]**, and the live look/feel items are **[inferred]**.
+
+### Item by item
+
+1. **Pinned rows span the list.** The `GtkFixed` is replaced by `PinnedRows`, a small `gtk::Widget`
+   subclass that installs `PinnedRowLayout`, a `gtk::LayoutManager` subclass. Its `measure` returns
+   the widest child's minimum/natural width for both orientations — never the list's allocation — and
+   its `allocate` gives every row x = 0, the list's full width, the row's own natural height and the
+   y stored for it by the drag arithmetic. A `gtk::Widget::measure` call supplies the child sizes; a
+   `gsk::Transform` translation places the row at its slot y. A row's label therefore has the full
+   row width and only ellipsizes at the row's own minimum. The list's `width_request` stays unset
+   (`-1` in the log below).
+
+   I chose the layout manager over setting each row's `width_request` from the list allocation
+   because that is exactly the P1i feedback loop: a `GtkFixed`'s minimum is its children's extents,
+   so a width request fed from the allocation makes the panel's minimum grow with its allocation.
+   The manager reports one row's minimum instead. It also keeps the existing drag unchanged: the
+   rows stay in one container with absolute y values, so `insert_after`, `last_child`, the surface
+   pointer arithmetic, the 150 ms follower slides and the settle path are untouched; only `put`,
+   `move_`, `child_position` and `remove` became `append_row`, `set_y`, `y_of` and `forget`.
+
+   API: `LayoutManagerImpl::{measure, allocate}` at
+   `gtk4-0.11.5:src/subclass/layout_manager.rs:14-49`; `Widget::set_layout_manager` at
+   `gtk-4.22.4:gtk/gtkwidget.c:12968-12993`; `Widget::allocate(width, height, baseline, transform)`
+   at `gtk-4.22.4:gtk/gtkwidget.c:4148-4160` with the transform translation used by GTK itself at
+   :3869-3878; `gtk::gsk::Transform::translate` at `gsk4-0.11.5:src/transform.rs:119`. The cause of
+   the old "…" is the fixed layout allocating each child at its preferred size
+   (`gtk-4.22.4:gtk/gtkfixedlayout.c:297-322`, child measured at :251-255). `gtk_widget_get_width`
+   returns the content width (padding excluded), `gtk-4.22.4:gtk/gtkwidget.c:12821-12845`, which is
+   why the logged row content widths are 16 px less than the list's 310 px (the row's 8 px padding
+   each side).
+
+2. **Section spacing corrected.** `.gl-section-content` is now `margin: gap-s 0 (gap-xl − 6) 0`:
+   8 px below its own pill, and 26 px after the content so the next section's existing 6 px top
+   margin makes the required `gap-xl` (32). A collapsed revealer measures zero, so the next pill is
+   still 6 px below. The last section has no next pill, so
+   `.gl-section:last-child .gl-section-content` drops its bottom margin and the rule below the
+   scroller keeps its old spacing. The 6 px between collapsed pills is unchanged. Old: content
+   `margin-top: 32` (the large gap sat between the pill and its content); new:
+   `margin: 8px 0 26px 0`. The style test
+   `pinned_list_has_no_fill_and_collapsed_pills_sit_six_apart` checks the new rule.
+
+3. **No column stays empty.** `split::columns_without` now removes the tile, then, if that emptied a
+   column while the other still has two or more tiles, moves the other column's last tile across,
+   then renumbers the surviving ids. Two tiles therefore always end one per column at full height.
+   The move is a model change during a close, so the existing `relayout(true)` slides the survivor
+   into its new column over 200 ms; no new animation path was needed. The drop rule is unchanged.
+
+### Unit tests added
+
+- `split::closing_the_lone_tile_moves_one_across` — 3 → 2, lone tile on the right and on the left.
+- `split::closing_both_tiles_of_one_column_ends_two_full_height` — 4 → 3 → 2 from either column.
+- `split::the_drop_rule_still_holds_after_a_close` — swapping across and reordering within after
+  a 3 → 2 close.
+- Existing `rects_never_overlap` now also covers the rebalanced close results.
+
+### RULES.md's four commands, from `$SPIKE`
+
+`cargo fmt --check`:
+
+```text
+(no output)
+```
+
+`cargo clippy --all-targets -- -D warnings`:
+
+```text
+    Checking gimbal-spike v0.0.0 (/home/kyle/Documents/03.) Code-Projects/gimbal-files/spike)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.32s
+```
+
+`cargo test`:
+
+```text
+     Running unittests src/main.rs (target/debug/deps/gimbal_spike-27f41c3be3242da9)
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running unittests src/bin/look-body/main.rs (target/debug/deps/look_body-0c97cc23f4ccae67)
+test result: ok. 49 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running unittests src/bin/look-header/main.rs (target/debug/deps/look_header-4abd02268319d43d)
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+```
+
+`cargo build --release`:
+
+```text
+   Compiling gimbal-spike v0.0.0 (/home/kyle/Documents/03.) Code-Projects/gimbal-files/spike)
+    Finished `release` profile [optimized] target(s) in 1.32s
+```
+
+### 10-second runs (release binary, from `/tmp/gimbal-spike-p1m-r2`, stopped with SIGTERM)
+
+Default, `--tiles 3`, and `--tiles 6 --pins 14 --scale 0.5` each produced an empty log:
+
+```text
+(no output)
+```
+
+No GTK warnings, CSS/theme/icon warnings or panics; the intermittent `VK_SUBOPTIMAL_KHR` notice did
+not appear in these three runs.
+
+### Temporary timer logs (harness removed before delivery)
+
+Debug binary, `GIMBAL_SPIKE_LOG=1 look-body --tiles 4 --pins 14`, niri-tiled 1322 × 1448. The default
+panel width is 348 design px (list content 310 at scale 1) and the minimum is 300 (list content 262;
+130 at 0.5).
+
+```text
+[gimbal-look-body 1.343] temp: item1 default width: list width 310 min 66, row widths [294, 294, 294, 294, 294, 294, 294, 294, 294, 294, 294, 294, 294, 294], list min-request -1
+[gimbal-look-body 1.343] temp: item2 expanded: pill 0 top 960.0 bottom 994.0; content top 1002.0 bottom 1162.0
+[gimbal-look-body 1.343] temp: item2 expanded: gap content -> pill 1: 32.0
+[gimbal-look-body 1.343] temp: item2 expanded: pill 1 top 1194.0 bottom 1228.0; content top 1236.0 bottom 1404.0
+[gimbal-look-body 1.343] temp: item2 expanded: gap content -> pill 2: 32.0
+[gimbal-look-body 1.343] temp: item2 expanded: pill 2 top 1436.0 bottom 1470.0; content top 1478.0 bottom 1510.0
+[gimbal-look-body 1.844] temp: item1 minimum width: list width 262 min 66, row widths [246, 246, 246, 246, 246, 246, 246, 246, 246, 246, 246, 246, 246, 246], list min-request -1
+[gimbal-look-body 2.143] temp: item3 start: columns [[0, 2], [1, 3]] rects (40,0,77,563) (141,0,77,563) (40,587,77,563) (141,587,77,563)
+[gimbal-look-body 2.544] temp: item3 after close 2: columns [[0], [1, 2]] rects (40,0,77,1151) (141,0,77,563) (141,587,77,563)
+[gimbal-look-body 2.744] temp: item2 collapsed: gap pill -> pill 1: 6.0
+[gimbal-look-body 2.744] temp: item2 collapsed: gap pill -> pill 2: 6.0
+[gimbal-look-body 2.945] temp: item3 after close 0: columns [[1], [0]] rects (141,0,77,1151) (40,0,77,1151)
+```
+
+Same timer at `--scale 0.5` (no `--tiles`, so no item 3):
+
+```text
+[gimbal-look-body 1.308] temp: item1 default width: list width 154 min 33, row widths [146, 146, 146, 146, 146, 146, 146, 146, 146, 146, 146, 146, 146, 146], list min-request -1
+[gimbal-look-body 1.308] temp: item2 expanded: pill 0 top 481.0 bottom 498.0; content top 502.0 bottom 582.0
+[gimbal-look-body 1.308] temp: item2 expanded: gap content -> pill 1: 16.0
+[gimbal-look-body 1.308] temp: item2 expanded: pill 1 top 598.0 bottom 615.0; content top 619.0 bottom 703.0
+[gimbal-look-body 1.308] temp: item2 expanded: gap content -> pill 2: 16.0
+[gimbal-look-body 1.308] temp: item2 expanded: pill 2 top 719.0 bottom 736.0; content top 740.0 bottom 756.0
+[gimbal-look-body 1.809] temp: item1 minimum width: list width 130 min 33, row widths [122, 122, 122, 122, 122, 122, 122, 122, 122, 122, 122, 122, 122, 122], list min-request -1
+[gimbal-look-body 2.710] temp: item2 collapsed: gap pill -> pill 1: 3.0
+[gimbal-look-body 2.710] temp: item2 collapsed: gap pill -> pill 2: 3.0
+```
+
+At both scales the rows' content widths equal the list content width minus the row's own 8 px
+padding each side, and the minimum equals the widest row's minimum (66 / 33), independent of the
+list's allocation. Item 2's 8 / 32 / 6 become 4 / 16 / 3 at 0.5. Item 3's second close moves tile 1
+from the right column into the empty left one, leaving one full-height tile in each column.
+
+### Sizes changed (r2)
+
+| Where | Old | New |
+|---|---|---|
+| Pinned rows' container | `gtk::Fixed` (preferred-size children) | `PinnedRows` + `PinnedRowLayout` (full-width rows) |
+| Row width request | set to the list's allocated width | none (`-1`) |
+| `.gl-section-content` top margin | 32 (`gap-xl`, between pill and content) | 8 (`gap-s`, below the pill) |
+| `.gl-section-content` bottom margin | — | 26 (`gap-xl` − `SECTION_GAP`; next section adds 6) |
+
+No colour expression changed.
+
+### Not verified live (Claude's check)
+
+- That the pinned labels now draw their full names at the default panel width and ellipsize only
+  when the panel is genuinely too narrow. The widths and the list minimum are in the timer log
+  above, but the pixels were not seen. [inferred]
+- The pinned drag's feel through the new container: pointer follow, the followers' slides, the
+  raise, and a plain click still selecting. The arithmetic and y storage are unchanged; the
+  pointer interaction was not replayed. [inferred]
+- The animated cross-column move after a close (the log proves the model and end rects, not the
+  200 ms frames). [inferred]
+- The section gaps by eye at other window sizes and scales; the timer values are from the tiled
+  window above. [inferred]
+
+### Anything I'd change outside my files
+
+None. No file outside the brief's Output list was edited.
+
+
+## Review and live check of P1m-r2 (Claude, Nov 1, 2026): passes
+
+RULES.md's four commands pass (65 tests). The new `PinnedRowLayout` reports one row's width (never
+its own allocation) and the rows' bottom extent as its height, which keeps the panel's minimum
+independent of its allocation, as asked. Live, release build, DP-3 off:
+
+- **Pinned names:** shown in full across the panel. Dragging Home down still follows the pointer and
+  settles below Music (`pins: moved 'Home' from slot 0 to 4`).
+- **Section spacing:** content sits just under its pill, with the larger gap before the next pill.
+  (The 6 px between collapsed pills passed in r1 and the rule for it is unchanged.)
+- **Empty column:**
+  - 3 tiles, closing the lone right tile: Tab 3 moves across, and Tab 1 and Tab 3 sit side by side
+    at full height.
+  - 4 tiles, closing both left tiles: the two survivors end one per column at full height.
+- No GTK warnings, no panics.
+
+Every item from Kyle's P1m notes and the three reviews has now been seen working live.

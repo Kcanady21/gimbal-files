@@ -51,13 +51,28 @@ pub fn initial_columns(n: usize) -> [Vec<usize>; 2] {
     columns
 }
 
-/// Remove `tile` from its column and renumber the surviving ids, which are
-/// kept contiguous by the caller's parallel vectors. A column that loses a
-/// tile becomes shorter, so its remaining tiles grow.
+/// Remove `tile` from its column, renumber the surviving ids (which are kept
+/// contiguous by the caller's parallel vectors), and keep both columns
+/// populated: if the close empties a column while the other still has two or
+/// more tiles, the other column's last tile moves across. Two tiles therefore
+/// always end one per column, both full height. A column that loses a tile
+/// becomes shorter, so its remaining tiles grow.
 pub fn columns_without(columns: &[Vec<usize>; 2], tile: usize) -> [Vec<usize>; 2] {
     let mut out = columns.clone();
     for column in &mut out {
         column.retain(|&id| id != tile);
+    }
+    // Only move a tile when the donor keeps at least one: the column that is
+    // not empty must never become the empty one (2 → 1 has no move).
+    for empty in 0..2 {
+        let other = 1 - empty;
+        if out[empty].is_empty() && out[other].len() >= 2 {
+            let moved = out[other].pop().expect("the other column has two or more");
+            out[empty].push(moved);
+            break;
+        }
+    }
+    for column in &mut out {
         for id in column.iter_mut() {
             if *id > tile {
                 *id -= 1;
@@ -1089,6 +1104,75 @@ mod tests {
         let mut all: Vec<usize> = middle.iter().flatten().copied().collect();
         all.sort_unstable();
         assert_eq!(all, [0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn closing_the_lone_tile_moves_one_across() {
+        // Three tiles: the lone tile is the right column's only one.
+        let three = initial_columns(3);
+        assert_eq!(three, [vec![0, 2], vec![1]]);
+        let closed = columns_without(&three, 1);
+        assert_eq!(column_counts(&closed), (1, 1));
+        assert_eq!(closed, [vec![0], vec![1]]);
+        let r = rects_for(&closed);
+        assert_eq!((r[0].h, r[1].h), (760, 760));
+        assert_eq!((r[0].x, r[1].x), (40, 512));
+
+        // The same close with the lone tile on the left: the right column's
+        // last tile moves across instead of leaving the left half empty.
+        let lone_left = [vec![0], vec![1, 2]];
+        let closed = columns_without(&lone_left, 0);
+        assert_eq!(column_counts(&closed), (1, 1));
+        assert_eq!(closed, [vec![1], vec![0]]);
+        let r = rects_for(&closed);
+        assert_eq!((r[0].h, r[1].h), (760, 760));
+    }
+
+    #[test]
+    fn closing_both_tiles_of_one_column_ends_two_full_height() {
+        // 4 → 3: close the left column's bottom tile; 3 → 2: close its last
+        // tile. The right column's last tile moves left, so both survive at
+        // full height instead of stacking on the right.
+        let four = initial_columns(4);
+        let three = columns_without(&four, 2);
+        assert_eq!(three, [vec![0], vec![1, 2]]);
+        let two = columns_without(&three, 0);
+        assert_eq!(column_counts(&two), (1, 1));
+        let r = rects_for(&two);
+        assert_eq!((r[0].h, r[1].h), (760, 760));
+        assert_ne!(r[0].x, r[1].x);
+        assert!([r[0].x, r[1].x].contains(&40) && [r[0].x, r[1].x].contains(&512));
+
+        // And from the other side: close the right column's two tiles.
+        let three = columns_without(&four, 3);
+        assert_eq!(three, [vec![0, 2], vec![1]]);
+        let two = columns_without(&three, 1);
+        assert_eq!(two, [vec![0], vec![1]]);
+        assert_eq!(column_counts(&two), (1, 1));
+        let r = rects_for(&two);
+        assert_eq!((r[0].h, r[1].h), (760, 760));
+        assert_eq!((r[0].x, r[1].x), (40, 512));
+    }
+
+    #[test]
+    fn the_drop_rule_still_holds_after_a_close() {
+        // 3 → 2 leaves one tile per column; dropping either on the other
+        // still swaps them, and each takes the other's (equal) slot.
+        let three = initial_columns(3);
+        let two = columns_without(&three, 1);
+        assert_eq!(two, [vec![0], vec![1]]);
+        let swapped = columns_after_drop(&two, 0, 1).unwrap();
+        assert_eq!(swapped, [vec![1], vec![0]]);
+        let r = rects_for(&swapped);
+        assert_eq!((r[0].h, r[1].h), (760, 760));
+        assert_eq!((r[0].x, r[1].x), (512, 40));
+
+        // A same-column drop after a close still reorders within that column.
+        let four = initial_columns(4);
+        let three = columns_without(&four, 2);
+        assert_eq!(three, [vec![0], vec![1, 2]]);
+        let reordered = columns_after_drop(&three, 1, 2).unwrap();
+        assert_eq!(reordered, [vec![0], vec![2, 1]]);
     }
 
     #[test]

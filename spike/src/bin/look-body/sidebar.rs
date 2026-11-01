@@ -3,6 +3,8 @@
 //! (The preview sidebar lives in preview.rs; both share the helpers here.)
 use crate::style::{BAR_W, MAIN_BAR_W, PIN_ROW_H, scaled};
 use adw::prelude::*;
+use gtk::glib;
+use gtk::subclass::prelude::*;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
@@ -166,8 +168,8 @@ pub fn pin_drag_layout(
 }
 
 /// The drag in progress: the row's original slot, its grab offset, the
-/// pointer's local start, the fixed's origin in surface coordinates, and
-/// whether the sequence has been claimed after the threshold.
+/// pointer's local start, the rows container's origin in surface coordinates,
+/// and whether the sequence has been claimed after the threshold.
 struct PinDrag {
     from: usize,
     grab: i32,
@@ -176,14 +178,188 @@ struct PinDrag {
     claimed: bool,
 }
 
-/// The pinned list: one `gtk::Fixed` with every row at an absolute position,
-/// the way the tab pills and the tiles work. A drag raises the row with
-/// `insert_after` (never unparents it), follows the pointer read from surface
-/// coordinates, and slides the other rows out of the way. Plain clicks still
-/// select.
+/// The pinned rows' container: a plain widget whose custom `PinnedRowLayout`
+/// gives every row the list's full width at the y the drag arithmetic chose.
+/// The list's minimum width is one row's own minimum, never the allocated
+/// width — a `width_request` set from an allocation would feed the panel's
+/// minimum back into its allocation (P1i's lesson).
+mod imp {
+    use super::*;
+
+    #[derive(Default)]
+    pub struct PinnedRows {
+        /// Every row's y in the container, keyed by the widget itself.
+        pub positions: RefCell<Vec<(gtk::Widget, f64)>>,
+    }
+
+    #[glib::object_subclass]
+    impl ObjectSubclass for PinnedRows {
+        const NAME: &'static str = "GimbalPinnedRows";
+        type Type = super::PinnedRows;
+        type ParentType = gtk::Widget;
+    }
+
+    impl ObjectImpl for PinnedRows {
+        fn constructed(&self) {
+            self.parent_constructed();
+            self.obj().set_layout_manager(Some(PinnedRowLayout::new()));
+        }
+    }
+
+    impl WidgetImpl for PinnedRows {}
+}
+
+glib::wrapper! {
+    pub struct PinnedRows(ObjectSubclass<imp::PinnedRows>)
+        @extends gtk::Widget,
+        @implements gtk::Accessible, gtk::Buildable, gtk::ConstraintTarget;
+}
+
+impl PinnedRows {
+    fn new() -> Self {
+        glib::Object::new::<Self>()
+    }
+
+    fn append_row(&self, row: &gtk::Box, y: f64) {
+        row.insert_after(self, self.last_child().as_ref());
+        self.set_y(row, y);
+    }
+
+    fn set_y(&self, row: &gtk::Box, y: f64) {
+        let child: gtk::Widget = row.clone().upcast();
+        {
+            let mut positions = self.imp().positions.borrow_mut();
+            match positions.iter_mut().find(|(widget, _)| *widget == child) {
+                Some((_, slot)) => *slot = y,
+                None => positions.push((child, y)),
+            }
+        }
+        self.queue_allocate();
+    }
+
+    fn y_of(&self, row: &gtk::Box) -> f64 {
+        let child: gtk::Widget = row.clone().upcast();
+        self.y_of_widget(&child)
+    }
+
+    fn y_of_widget(&self, child: &gtk::Widget) -> f64 {
+        self.imp()
+            .positions
+            .borrow()
+            .iter()
+            .find(|(widget, _)| widget == child)
+            .map(|(_, y)| *y)
+            .unwrap_or(0.0)
+    }
+
+    fn forget(&self, child: &gtk::Widget) {
+        self.imp()
+            .positions
+            .borrow_mut()
+            .retain(|(widget, _)| widget != child);
+    }
+
+    fn clear_rows(&self) {
+        while let Some(child) = self.first_child() {
+            self.forget(&child);
+            child.unparent();
+        }
+        self.imp().positions.borrow_mut().clear();
+        self.queue_allocate();
+    }
+}
+
+/// The layout manager behind `PinnedRows`: x is always 0 and the width is the
+/// list's full allocation, so labels only ellipsize when the panel itself is
+/// too narrow. The y and height come from the row's slot arithmetic. Both
+/// orientations report the widest child as the minimum; the height request is
+/// the list's one (rows × row height).
+mod layout_imp {
+    use super::*;
+
+    #[derive(Default)]
+    pub struct PinnedRowLayout;
+
+    #[glib::object_subclass]
+    impl ObjectSubclass for PinnedRowLayout {
+        const NAME: &'static str = "GimbalPinnedRowLayout";
+        type Type = super::PinnedRowLayout;
+        type ParentType = gtk::LayoutManager;
+    }
+
+    impl ObjectImpl for PinnedRowLayout {}
+
+    impl LayoutManagerImpl for PinnedRowLayout {
+        fn request_mode(&self, _widget: &gtk::Widget) -> gtk::SizeRequestMode {
+            gtk::SizeRequestMode::ConstantSize
+        }
+
+        fn measure(
+            &self,
+            widget: &gtk::Widget,
+            orientation: gtk::Orientation,
+            for_size: i32,
+        ) -> (i32, i32, i32, i32) {
+            let rows = widget
+                .downcast_ref::<PinnedRows>()
+                .expect("PinnedRowLayout is only set on PinnedRows");
+            let mut minimum = 0;
+            let mut natural = 0;
+            let mut child = widget.first_child();
+            while let Some(widget) = child {
+                let (child_min, child_nat, _, _) = widget.measure(orientation, for_size);
+                if orientation == gtk::Orientation::Vertical {
+                    // The absolute slots make the height the bottom extent.
+                    let y = rows.y_of_widget(&widget).round() as i32;
+                    minimum = minimum.max(y + child_min);
+                    natural = natural.max(y + child_nat);
+                } else {
+                    // One row's width, not their sum: the list never asks the
+                    // panel to grow with its own allocation.
+                    minimum = minimum.max(child_min);
+                    natural = natural.max(child_nat);
+                }
+                child = widget.next_sibling();
+            }
+            (minimum, natural, -1, -1)
+        }
+
+        fn allocate(&self, widget: &gtk::Widget, width: i32, _height: i32, _baseline: i32) {
+            let rows = widget
+                .downcast_ref::<PinnedRows>()
+                .expect("PinnedRowLayout is only set on PinnedRows");
+            let mut child = widget.first_child();
+            while let Some(widget) = child {
+                let y = rows.y_of_widget(&widget);
+                let (_, natural, _, _) = widget.measure(gtk::Orientation::Vertical, width);
+                let height = natural.max(1);
+                let transform =
+                    gtk::gsk::Transform::new().translate(&gtk::graphene::Point::new(0.0, y as f32));
+                widget.allocate(width, height, -1, Some(transform));
+                child = widget.next_sibling();
+            }
+        }
+    }
+}
+
+glib::wrapper! {
+    pub struct PinnedRowLayout(ObjectSubclass<layout_imp::PinnedRowLayout>) @extends gtk::LayoutManager;
+}
+
+impl PinnedRowLayout {
+    fn new() -> Self {
+        glib::Object::new::<Self>()
+    }
+}
+
+/// The pinned list: one `PinnedRows` container with every row at an absolute
+/// position, the way the tab pills and the tiles work. A drag raises the row
+/// with `insert_after` (never unparents it), follows the pointer read from
+/// surface coordinates, and slides the other rows out of the way. Plain clicks
+/// still select.
 pub struct PinnedList {
     pub root: gtk::Box,
-    fixed: gtk::Fixed,
+    rows: PinnedRows,
     names: RefCell<Vec<String>>,
     /// The row widgets in logical slot order (the child order at rest).
     widgets: RefCell<Vec<gtk::Box>>,
@@ -201,14 +377,14 @@ impl PinnedList {
     pub fn new() -> Rc<Self> {
         let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
         root.add_css_class("gl-pinned");
-        let fixed = gtk::Fixed::new();
-        fixed.set_hexpand(true);
-        fixed.set_valign(gtk::Align::Start);
-        root.append(&fixed);
+        let rows = PinnedRows::new();
+        rows.set_hexpand(true);
+        rows.set_valign(gtk::Align::Start);
+        root.append(&rows);
         let click = gtk::GestureClick::new();
         let this = Rc::new(Self {
             root,
-            fixed,
+            rows,
             names: RefCell::new(DEFAULT_PINS.iter().map(|name| name.to_string()).collect()),
             widgets: RefCell::new(vec![]),
             gens: RefCell::new(vec![]),
@@ -243,7 +419,7 @@ impl PinnedList {
                 this.cancel_drag();
             }
         });
-        this.fixed.add_controller(drag);
+        this.rows.add_controller(drag);
         let weak = Rc::downgrade(&this);
         let click = this.click.clone();
         click.set_button(1);
@@ -252,16 +428,7 @@ impl PinnedList {
                 this.clicked(y);
             }
         });
-        this.fixed.add_controller(click);
-        // The fixed allocates children at their preferred width; keep every
-        // row as wide as the list so the selected highlight spans it.
-        let weak = Rc::downgrade(&this);
-        this.fixed
-            .connect_notify_local(Some("width"), move |fixed, _| {
-                if let Some(this) = weak.upgrade() {
-                    this.set_row_widths(fixed.width());
-                }
-            });
+        this.rows.add_controller(click);
         this.rebuild();
         this
     }
@@ -305,19 +472,16 @@ impl PinnedList {
         let widgets = self.widgets.borrow();
         for (i, row) in widgets.iter().enumerate() {
             self.bump_gen(i);
-            self.fixed.move_(row, 0.0, (i as i32 * row_h) as f64);
+            self.rows.set_y(row, (i as i32 * row_h) as f64);
         }
-        self.fixed
+        self.rows
             .set_size_request(-1, self.names_len() as i32 * row_h);
-        self.set_row_widths(self.fixed.width());
     }
 
     fn rebuild(&self) {
         self.animations.borrow_mut().clear();
         *self.drag.borrow_mut() = None;
-        while let Some(child) = self.fixed.first_child() {
-            self.fixed.remove(&child);
-        }
+        self.rows.clear_rows();
         let names = self.names.borrow().clone();
         let row_h = self.row_h();
         let mut widgets = Vec::with_capacity(names.len());
@@ -334,23 +498,13 @@ impl PinnedList {
             label.set_xalign(0.0);
             label.set_ellipsize(gtk::pango::EllipsizeMode::End);
             row.append(&label);
-            self.fixed.put(&row, 0.0, (i as i32 * row_h) as f64);
+            self.rows.append_row(&row, (i as i32 * row_h) as f64);
             widgets.push(row);
             gens.push(Rc::new(Cell::new(0)));
         }
         *self.widgets.borrow_mut() = widgets;
         *self.gens.borrow_mut() = gens;
-        self.fixed.set_size_request(-1, names.len() as i32 * row_h);
-        self.set_row_widths(self.fixed.width());
-    }
-
-    fn set_row_widths(&self, width: i32) {
-        if width <= 0 {
-            return;
-        }
-        for row in self.widgets.borrow().iter() {
-            row.set_width_request(width);
-        }
+        self.rows.set_size_request(-1, names.len() as i32 * row_h);
     }
 
     fn bump_gen(&self, row: usize) {
@@ -385,14 +539,14 @@ impl PinnedList {
             return;
         }
         let from = ((y as i32).div_euclid(row_h)).clamp(0, (n - 1) as i32) as usize;
-        // The event's position is in surface coordinates; the fixed's bounds
+        // The event's position is in surface coordinates; the rows' bounds
         // in the window (whose widget origin is the surface origin) convert
-        // the pointer into the Fixed's own space. This is the pointer offset
-        // from the surface, not the gesture's widget-relative dx/dy.
+        // the pointer into the container's own space. This is the pointer
+        // offset from the surface, not the gesture's widget-relative dx/dy.
         let origin = self
-            .fixed
+            .rows
             .root()
-            .and_then(|root| self.fixed.compute_bounds(&root))
+            .and_then(|root| self.rows.compute_bounds(&root))
             .map(|bounds| (bounds.x() as f64, bounds.y() as f64))
             .unwrap_or((0.0, 0.0));
         let grab = y - from as f64 * row_h as f64;
@@ -401,9 +555,9 @@ impl PinnedList {
         let widgets = self.widgets.borrow();
         let row = widgets[from].clone();
         drop(widgets);
-        if self.fixed.last_child().as_ref() != Some(row.clone().upcast_ref()) {
-            let last = self.fixed.last_child();
-            row.insert_after(&self.fixed, last.as_ref());
+        if self.rows.last_child().as_ref() != Some(row.clone().upcast_ref()) {
+            let last = self.rows.last_child();
+            row.insert_after(&self.rows, last.as_ref());
         }
         self.bump_gen(from);
         *self.drag.borrow_mut() = Some(PinDrag {
@@ -429,7 +583,7 @@ impl PinnedList {
             None => (drag.start.0 + dx, drag.start.1 + dy),
         };
         if !drag.claimed
-            && self.fixed.drag_check_threshold(
+            && self.rows.drag_check_threshold(
                 drag.start.0.round() as i32,
                 drag.start.1.round() as i32,
                 local.0.round() as i32,
@@ -463,9 +617,9 @@ impl PinnedList {
         for (i, row) in widgets.iter().enumerate() {
             let desired = y.get(i).copied().unwrap_or(i as i32 * row_h);
             if i == dragged {
-                self.fixed.move_(row, 0.0, desired as f64);
+                self.rows.set_y(row, desired as f64);
             } else {
-                let current = self.fixed.child_position(row).1.round() as i32;
+                let current = self.rows.y_of(row).round() as i32;
                 if current != desired {
                     self.slide_y(i, row, desired);
                 }
@@ -474,22 +628,22 @@ impl PinnedList {
     }
 
     fn slide_y(&self, row: usize, widget: &gtk::Box, to: i32) {
-        let start = self.fixed.child_position(widget).1;
+        let start = self.rows.y_of(widget);
         if (start - to as f64).abs() < 0.5 {
-            self.fixed.move_(widget, 0.0, to as f64);
+            self.rows.set_y(widget, to as f64);
             return;
         }
         let generation_cell = self.gens.borrow()[row].clone();
         let generation = generation_cell.get() + 1;
         generation_cell.set(generation);
-        let fixed = self.fixed.clone();
+        let rows = self.rows.clone();
         let w = widget.clone();
         let target = adw::CallbackAnimationTarget::new(move |v| {
             if generation_cell.get() != generation {
                 return;
             }
             let y = start + (to as f64 - start) * v;
-            fixed.move_(&w, 0.0, y);
+            rows.set_y(&w, y);
         });
         let anim = adw::TimedAnimation::new(widget, 0.0, 1.0, 150, target);
         self.animations.borrow_mut().push(anim.clone().upcast());
@@ -545,7 +699,7 @@ impl PinnedList {
         let widgets = self.widgets.borrow();
         let mut sibling: Option<gtk::Widget> = None;
         for (i, row) in widgets.iter().enumerate() {
-            row.insert_after(&self.fixed, sibling.as_ref());
+            row.insert_after(&self.rows, sibling.as_ref());
             row.remove_css_class("sel");
             if i == self.selected.get() {
                 row.add_css_class("sel");
@@ -554,7 +708,7 @@ impl PinnedList {
             self.slide_y(i, row, i as i32 * row_h);
             sibling = Some(row.clone().upcast());
         }
-        self.fixed
+        self.rows
             .set_size_request(-1, self.names_len() as i32 * row_h);
     }
 }

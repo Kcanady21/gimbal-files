@@ -131,6 +131,9 @@ pub fn css(scale: f64, font: Option<&str>, opacity: f64) -> String {
     let fill = |role: &str| format!("alpha({role}, {o:.2})");
     let (gs, gm, gxl, g2) = (p(GAP_S), p(GAP_M), p(GAP_XL), p(GAP_2XL));
     let section_gap = p(SECTION_GAP);
+    // The gap after an expanded section's content. The next section adds its
+    // own 6 px top margin, so the content's bottom margin carries the rest.
+    let section_tail = (p(GAP_XL) - section_gap).max(0);
     let (hair, thin, mid) = (p(LINE_HAIR), p(LINE_THIN), p(LINE_MID));
     let strip_pad = gm + mid;
     let (r, rp) = (p(RADIUS), p(RADIUS_PILL));
@@ -175,7 +178,8 @@ window.gimbal-look, window.gimbal-look.background {{ background-color: {window_b
 .gl-pill.active .gl-pill-close {{ color: {RAISED_FG}; border-color: {RAISED_FG}; }} .gl-pill.tab {{ margin-bottom: {gs}px; }}
 .gl-section {{ margin-top: {section_gap}px; }}
 .gl-section-pill {{ all: unset; min-height: {sect_h}px; margin: 0 {gm}px; border: {thin}px solid {OUTLINE}; border-radius: {rp}px; }}
-.gl-section-content {{ margin-top: {gxl}px; }}
+.gl-section-content {{ margin: {gs}px 0 {section_tail}px 0; }}
+.gl-section:last-child .gl-section-content {{ margin-bottom: 0; }}
 .gl-section-pill label {{ font-size: {titem}px; }}
 .gl-section-pill:hover {{ background-color: {HOVER}; }} .gl-section-pill:focus-visible {{ box-shadow: 0 0 0 {thin}px {FOCUS_RING}; }}
 .gl-pinned {{ color: {PINNED_FG}; border-radius: {r}px; margin-top: {gs}px; }}
@@ -246,9 +250,13 @@ mod tests {
         assert!(plain.contains(".gl-pinned { color: @sidebar_fg_color"));
         assert!(!plain.contains(".gl-pinned { background-color"));
         assert!(plain.contains(".gl-pinned-row.sel { background-color:"));
-        // Collapsed section pills are 6 apart; the 32 gap is above content.
+        // Collapsed section pills are 6 apart; an expanded section's content
+        // sits 8 below its pill and 32 before the next pill (26 + the next
+        // section's 6 px top margin).
         assert!(plain.contains(".gl-section { margin-top: 6px; }"));
-        assert!(plain.contains(".gl-section-content { margin-top: 32px; }"));
+        assert!(plain.contains(".gl-section-content { margin: 8px 0 26px 0; }"));
+        // The last section has no next pill, so it keeps no bottom gap.
+        assert!(plain.contains(".gl-section:last-child .gl-section-content { margin-bottom: 0; }"));
         assert!(plain.contains(".gl-section-pill { all: unset; min-height: 28px; margin: 0 16px;"));
     }
 
