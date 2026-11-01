@@ -90,6 +90,8 @@ P1i and P1j are separate small programs inside the spike (`spike/src/bin/`), so 
 
 ## Phase 2: architecture
 
+**Toolkit: GTK4 + libadwaita.** The P1h acceptance run passed the deal-breakers (drag-out to Zen from any folder, 8 of 8 rows; the 100,000-file folder), and the look rows failed only on polish. Kyle approved the verdict Nov 1. Results: `docs/research/spike-results.md`. The look-polish round P1l (header) and P1m (body) finishes Phase 1's look before Phase 2 builds on it.
+
 Start after the spike picks a toolkit. The core is UI-agnostic, so a toolkit change later costs only the UI crate.
 
 A Cargo workspace with `fm-core`, `fm-ui`, `fm-agent` and `fm-cli`: three front doors (UI, agent socket, CLI) over one core. Hotkeys, menus, the agent socket and the CLI all call the same named commands, so agents can only do what Kyle has reviewed. Build the registry and config first, with unit tests, before any UI beyond the spike.
@@ -104,6 +106,7 @@ A Cargo workspace with `fm-core`, `fm-ui`, `fm-agent` and `fm-cli`: three front 
   - **Workspace view:** one directory view, or the tiled split view (2 columns in an outer scroller, each tile with its own pill, scroller and focus ring, tiles rearranged by dragging). Fades and the search expansion use libadwaita's animations.
   - **Directory view:** GTK's virtualized grid with fixed-size cells, so the column count follows the width.
   - **Sidebars:** in draggable splits with collapse buttons. The left one scrolls as a whole: pinned list, collapsible section pills, drive bars. The right one holds the preview (GtkSourceView for text later).
+  - **One shared look module** for the whole UI: the design tokens, the generated stylesheet, the live theme watcher, the opacity setting and the blur request. In the spike each look program copied its own `style.rs` and only the spike had the theme watcher; the app has one of each (P1h).
   - **Style engine:** the stylesheet is generated from the design-token table times the scale. Every colour is a theme colour (accent for outlines, sidebar colours for the pinned list, mixes of the window colours for active and inactive pills and the drive-bar ramp, the error colour for full drives). It is regenerated live when the theme or the scale changes. Widgets never hard-code a size or a colour.
 - **`fm-agent`** (a local socket) and **`fm-cli`** (a command-line front end): both take command names and arguments and query the workspace model.
 - **Platform adapters**, each behind a small interface so a non-niri, non-Noctalia desktop only swaps the adapter: niri IPC for the Float button (Maximize elsewhere; the adapter also says whether Minimize exists), UDisks2 for mounting and drive usage, the theme watcher (whatever P1f finds), and the FileTransfer portal for drags.
@@ -123,9 +126,13 @@ Kyle's requested features, with where each lives and any known approach. Build o
 | Pull a tab out to a new window | UI | After V1 (Kyle, Oct 31). Open in New Window meanwhile. |
 | Autotheme to Noctalia | System | Spike (P1f). Every colour from the live theme; outlines use the accent colour. |
 | UI scale setting | UI + core | Spike (P1j). 50–100% in 5% steps, live; the base size for 100% is in the config. |
-| Transparent, blurred window | UI | Spike (P1k). Background-opacity setting (default 0.85) and blur requested through `ext-background-effect-v1`, as Ghostty does. |
+| Transparent, blurred window | UI | Spike (P1k). Background-opacity setting (default 0.85) and blur requested through `ext-background-effect-v1`, as Ghostty does. niri paints its focus ring as a solid block behind every window that draws its own decorations, which GTK 4 windows always do, so the see-through background shows that block unless niri has `draw-border-with-background false` for Gimbal (Kyle's config has it). Phase 2: look for a way to work on any niri setup without the rule. Telling niri through `xdg-decoration` that the window draws no decorations needs the window's `xdg_toplevel`, which GDK does not expose (`gdk4-wayland` 0.11.5), so it may not be possible from inside GTK. Fallback: document the one-line rule, and for GimbalOS ship it in its niri config (an installer matter). |
 | Collapsible, resizable sidebars and sections | UI | Spike (P1j). |
 | Restore tabs and groups after restart | Core | Saved workspace model. |
+| Delete to Trash with the Delete key and the right-click menu | UI + core | P1h row 5: the spike had no way to delete. Trash by default, through the command registry. |
+| Reorder pinned folders by dragging | UI + core | P1m. Same follow-and-slide feel as the tab pills; the order is saved in the config. |
+| Close tabs and groups from the accordion list | UI | P1l. A ✕ per entry; groups ask first, as the group pill does. |
+| Gimbal's own icon set from the mockup | UI | P1m. Folder, Save, Save As and Discard from Kyle's sketch, drawn as GTK symbolic icons so every part takes a theme colour (GTK 4.20+). |
 | Trash button: open Trash, drop to trash | UI + core | Drop target moves to trash, never deletes. |
 | Float and Minimize buttons | System | Float uses niri IPC and becomes Maximize on other desktops. Minimize is hidden under niri (no minimize there). |
 | Disk usage bar under each drive | System | Free and used space per mount; refresh on mount change. Contrast rises with fullness; error colour at 95% and above. |
@@ -153,6 +160,13 @@ Put these in the repo's `CLAUDE.md`.
 - **No new dependency without a reason.** Run `cargo-deny` in CI; reject licenses incompatible with GPL-3.0.
 - **License headers.** SPDX `GPL-3.0-or-later` in every source file.
 - **Attribution.** Ideas from Thunar, Dolphin or Nautilus are fine. Adapted code keeps its origin and license noted in a comment.
+- **GTK lessons from Phase 1** (each cost a bug or a round):
+  - Cap a list or grid view's max-columns from its width, and apply the cap from an idle: a resize queued from inside `size_allocate` is ignored. Never turn accessibility off to win speed.
+  - Never unparent a widget during a drag: that cancels its gestures. Raise it with `insert_after`.
+  - A drag inside the window handle claims its sequence once past the drag threshold, not on press.
+  - Never feed a measured or allocated width back into a minimum size; a `ScrolledWindow` with policy `Never` passes its child's minimum up to the window.
+  - Never hold a `RefCell` borrow while calling code that can re-enter it. The temporary in an `if let` scrutinee lives through the whole block.
+  - Test look changes in a floating window: niri's tiling forces the size and hides minimum-size bugs.
 - **Tests.** Unit tests for everything in `fm-core`. UI behavior is checked by Kyle against the acceptance tests.
 - **Stop and ask** before anything irreversible, or when a phase's result changes the plan.
 

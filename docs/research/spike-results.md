@@ -143,7 +143,9 @@ contrast (Q9), and reordering pinned folders (Q10).
   - A virtual device with keys delays button events by about 60 ms, so drags use the pointer-only
     device.
 
-## Verdict (for Kyle to approve)
+## Verdict (approved by Kyle, Nov 1, 2026)
+
+Kyle: "At this stage I see no reason not to use GTK4 + libadwaita as the toolkit."
 
 **GTK4 + libadwaita stays the toolkit.**
 
@@ -155,7 +157,9 @@ contrast (Q9), and reordering pinned folders (Q10).
   defaults had to be undone. The colours come from the theme. The live reload works in the spike
   and is only missing from the look programs (row 9).
 
-## Proposed plan edits (not applied; Kyle decides)
+## Plan edits (Kyle's answers Nov 1; applied to the plan)
+
+Edit 1: yes (P1l and P1m are out). Edits 2 and 3: yes. Edit 4: yes, for now. Edit 5: the niri rule is an installer matter (GimbalOS isn't public yet); Phase 2 should look for a way for the app to work on any niri setup. Applied to `Rust File Manager Plan for Claude Code.md` as written in the plan.
 
 1. **Add a Phase 1 look-polish round** before Phase 2: `P1l` for the header and `P1m` for the body.
    They would apply the fixes above and Kyle's answers to the open questions, add the live theme
@@ -230,4 +234,4 @@ contrast (Q9), and reordering pinned folders (Q10).
 - **Q9:** Yes.
 - **Q10:** Yes.
 
-On the strength of these answers, the look-polish briefs `P1l` (header) and `P1m` (body) are written. The verdict and plan edits 1–5 still wait for Kyle's approval.
+On the strength of these answers, the look-polish briefs `P1l` (header) and `P1m` (body) are written. The verdict and plan edits were approved the same day (see above).
