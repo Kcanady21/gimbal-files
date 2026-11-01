@@ -1048,3 +1048,24 @@ shadow), so every click looked like a 25 px drag. Live, release build, DP-3 off:
   - In a column of four, every tile is at the half-height floor, so nothing moves.
   - The fix is to grab the whole strip and let hand drags go below the floor.
 - **Pinned rows (Kyle):** 64 px apart is too much; Kyle chose 44.
+
+### Correction to the r3 check (Claude, Nov 1, 2026)
+
+Kyle reports that with his real mouse the vertical resize cursor appears but dragging does
+nothing. The note above was too sure. More testing with the virtual pointer, a fresh 2 + 2 window
+each time, dragging 150 px down from x 600:
+
+| Press y | Floating, full width | Tiled, full width |
+|---|---|---|
+| 728, 740 (Tab 1's frame) | no change | no change |
+| 750 (top of the strip) | **+233** (overshoot) | **+233** |
+| 757, 765 | +150 (follows) | +150 |
+| 775, 790 (next slot, beside its pill) | no change | no change |
+
+At niri's half-width tile (1,272 px), a press at 757 also follows (+150).
+
+So the virtual pointer moves the border, but the overshoot at the top of the strip shows that the
+press point and the updates disagree, and Kyle's real-mouse failure is not reproduced yet. Also new:
+at 1,272 px the two tile columns overlap each other and run under the preview panel (r3 made a
+tile's minimum the pill's 270 px; the content minimum still assumes one grid column). Both are in
+P1m-r4, with permanent border-press log lines so Kyle's run can be diagnosed.
