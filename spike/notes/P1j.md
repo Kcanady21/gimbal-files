@@ -457,3 +457,53 @@ the saved sidebar widths are back.
    `slide_gen` and `slides` with the others (or keep all per-tile state in one struct per slot so
    they can't drift apart). Not sending a round for this alone: it goes with whatever the live
    check finds.
+
+### Live check of P1j-r2 (Claude, Nov 1, 2026): needs fixes (`P1j-r3-fixes.md`)
+
+Floating window on DP-2, 2560×1406 then narrowed, pointer through the runner's virtual mouse
+(left button only: right-click menus, Ctrl/Shift selection and the section pills were not tested).
+No GTK warnings in the whole run.
+
+What passed:
+
+- **The tile drag.** Dragging Tab 1's pill onto Tab 4: mid-drag the tile follows the pointer and
+  Tabs 2-4 have already slid into place; on release it settles in the last slot and every tile
+  keeps its name. Logs: `dragging 'Tab 1' from slot 0`, `'Tab 1' moved from slot 0 to 3`.
+- **Collapse:** the left sidebar collapses to its strip, and dragging the strip doesn't widen it;
+  expanding brings it back at 348.
+- **Border drag:** dragging the preview's border widened it by about 250 px, and the tiles reflowed.
+- **Live scale** from the dev slider: everything follows, and at 0.75 each tile fits 7 columns.
+- **The window can be narrowed** (unlike P1i's header): niri's 1,600 and 1,200 px widths took
+  effect.
+
+Corrections:
+
+1. **The fast-drop bug from the review reproduces.** Tab 2 dragged onto Tab 3 and released at
+   once: Tab 3 stopped part-way through its slide, overlapping Tab 2's slot, until the next
+   relayout. Fix as the review says (reorder `slide_gen` and `slides` with the rest, or one struct
+   per slot).
+2. **Narrowing squeezes the content to nothing.** At 1,400 px the content column was about 150 px
+   with the tiles clipped behind the preview; at 1,200 it was gone, and the app drew a strip past
+   the window's right edge (its minimum width is above what niri gave it). Kyle's decision
+   (sketch-values.md, round 1, 4c): narrowing drops grid columns one at a time **down to 1**, so
+   the content keeps at least one column, and the sidebars give way first, down to their minimums
+   (348 and 360 × scale). The window's minimum width is then the two sidebar minimums plus one
+   column, and nothing may draw outside the window.
+3. **The saved preview width drifts across scale changes.** After dragging the preview to about
+   896 px: 0.75 gave 712 (expected 672), and two round trips back to 1.00 gave 917, then 906. The
+   `position` notifications that the scale change itself causes are being recorded as user drags.
+   Record only while the user drags the handle (or ignore notifications during `apply_scale` and
+   the allocation that follows), and test it: the width at 1.00 after any number of scale round
+   trips equals the width before.
+4. **Look against `sketch/split.png` and `sketch/default.png`:**
+   - Split view: each tab pill is short and centred **above** its tile's frame in the sketch; here
+     it spans the tile's full width on its top edge.
+   - The tiles aren't centred: the `2 × gap-2xl` inset is all taken from the right and bottom, so
+     there's an empty strip on the right and none on the left. Split the inset evenly.
+   - Inside a tile, the grid is a narrower dark box with 4 columns; the sketch fills the tile with
+     5. The single view shows 10 columns where the sketch has 11 at the same width: check the
+     cell's real width (padding, margins) against `cell-w` and `gap-s`.
+   - The left sidebar is missing the **Remote** section pill (Kyle's decision 4f lists Recent
+     Directories, Devices and Remote), and the main drive sits right after the other drives
+     instead of at the bottom of the panel.
+   - Home uses a folder icon; the sketch has a house (`user-home-symbolic`).
