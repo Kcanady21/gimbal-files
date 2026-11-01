@@ -208,3 +208,26 @@ contrast (Q9), and reordering pinned folders (Q10).
   (now 50 % alpha), and selected fills mix in 50 % accent (now 30 %).
 - **Q10 — Reordering pinned folders.** *Proposal:* drag a pinned row to reorder it, with the same
   follow-and-slide feel as the tab pills, in this round.
+
+## Kyle's answers (Nov 1, 2026)
+
+- **Q1:** Keep the path bar stretching into all free header space. The bug is that when the pills
+  condense into the "N tabs" accordion, or tabs and groups close, the path bar doesn't move back
+  to the left; it stays squeezed against the right. A fix, not a design change (P1l).
+- **Q2:** Yes: 6 px outlines become 3 px, and 3 px outlines become 2 px.
+- **Q3:** All three are 32 px: float, close (and minimize where shown) and the search icon.
+- **Q4:** Yes: 24 px between tiles, 8 px between a tile's pill and its frame.
+- **Q5:** Try the proposal (a column with fewer tiles makes them taller); Kyle judges it on screen.
+- **Q6:** Yes.
+- **Q7:** Yes.
+- **Q8:** Asked whether the mockup's icons can follow the theme. Yes: GTK 4.22's icon engine ties
+  each shape's fill or stroke to a named colour slot (`foreground`, `accent`, `success`,
+  `warning`, `error`), and `-gtk-icon-palette` remaps the last three per widget from CSS, so each
+  part of a multi-tone icon can take a theme colour and follow it live. Claude extracted the
+  folder, Save, Save As and Discard icons from the VectorCraft file
+  (`gimbal-files-prompts/phase1/icons/`); the mockup has no separate file icon (every grid item in
+  it is a folder), so files keep the theme's icon. The colour mapping is in `look-style-spec.md`.
+- **Q9:** Yes.
+- **Q10:** Yes.
+
+On the strength of these answers, the look-polish briefs `P1l` (header) and `P1m` (body) are written. The verdict and plan edits 1–5 still wait for Kyle's approval.
