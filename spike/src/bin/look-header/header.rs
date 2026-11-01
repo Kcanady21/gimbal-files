@@ -29,6 +29,8 @@ struct Ui {
     available: Cell<i32>,
     path: gtk::Box,
     path_label: gtk::Label,
+    /// The `gl-frame` around the body; a click anywhere in it dismisses an empty search.
+    frame: gtk::Box,
     body: gtk::Label,
     search_icon: gtk::Button,
     search: gtk::Revealer,
@@ -174,6 +176,7 @@ pub fn show(app: &adw::Application, args: &Args) {
         available: Cell::new(style::DEFAULT_W),
         path,
         path_label: path_label.clone(),
+        frame: body,
         body: body_label,
         search_icon: search_icon.clone(),
         search,
@@ -189,6 +192,10 @@ pub fn show(app: &adw::Application, args: &Args) {
     });
     let anchor = menu_button.clone();
     menu_button.connect_clicked(button_handler(&ui, move |ui| open_main_menu(ui, &anchor)));
+    // A click on the path bar or the body leaves focus on the search entry (neither is
+    // focusable), so the entry's focus-leave never fires. Close an empty search here.
+    dismiss_on_click(&ui, &ui.path);
+    dismiss_on_click(&ui, &ui.frame);
     search_icon.connect_clicked(button_handler(&ui, |ui| ui.open_search()));
     search_entry.connect_activate(|entry| log!("search", "search: {}", entry.text()));
     let focus = gtk::EventControllerFocus::new();
@@ -243,6 +250,15 @@ pub fn show(app: &adw::Application, args: &Args) {
 fn button_handler<F: Fn(&Rc<Ui>) + 'static>(ui: &Rc<Ui>, f: F) -> impl Fn(&gtk::Button) + 'static {
     let ui = ui.clone();
     move |_| f(&ui)
+}
+
+/// Dismiss an open, empty search when `target` (or a child) is clicked (P1i-r4, item 3).
+fn dismiss_on_click(ui: &Rc<Ui>, target: &impl IsA<gtk::Widget>) {
+    let click = gtk::GestureClick::new();
+    click.set_button(1);
+    let ui = ui.clone();
+    click.connect_released(move |_, _, _, _| ui.dismiss_empty_search());
+    target.add_controller(click);
 }
 
 fn window_action(window: &adw::ApplicationWindow, action: &str) {
@@ -693,6 +709,7 @@ impl Ui {
     }
 
     fn pill_clicked(self: &Rc<Self>, index: usize, modifiers: gdk::ModifierType) {
+        self.dismiss_empty_search();
         let mut model = self.model.borrow_mut();
         if modifiers.contains(gdk::ModifierType::CONTROL_MASK) {
             model.toggle(index);
@@ -811,14 +828,21 @@ impl Ui {
         if indices.len() < 2 {
             return log!("groups", "split view needs two or more selected tabs");
         }
-        for (index, pill) in self.pills.borrow().iter().enumerate() {
+        // Clone the handles so the `pills` borrow ends before the CSS calls; the timer
+        // below then borrows the model only after `group_selected` has returned.
+        let pills: Vec<gtk::Widget> = self.pills.borrow().clone();
+        for (index, pill) in pills.iter().enumerate() {
             if indices.contains(&index) {
                 pill.add_css_class("fading");
             }
         }
         let ui = self.clone();
         glib::timeout_add_local_once(Duration::from_millis(FADE_MS), move || {
-            if let Some(first) = ui.model.borrow_mut().group_selected() {
+            // Take the result into a `let` first: an `if let` scrutinee's temporary lives
+            // through the whole block, so the `borrow_mut` would still be held when
+            // `refresh()` borrows the model again (P1i-r4, item 1).
+            let first = ui.model.borrow_mut().group_selected();
+            if let Some(first) = first {
                 ui.animate_group.set(Some(first));
                 ui.refresh();
             }
@@ -863,6 +887,13 @@ impl Ui {
         log!("search", "closed");
     }
 
+    /// The same rule as focus leaving the entry: only an open, empty search closes.
+    fn dismiss_empty_search(self: &Rc<Self>) {
+        if self.search_open.get() && self.search_entry.text().is_empty() {
+            self.close_search();
+        }
+    }
+
     fn step_scale(self: &Rc<Self>, delta: f64) {
         let base = style::base();
         let next = (((self.scale.get() / base + delta) * 20.0).round() / 20.0).clamp(0.5, 1.0);
@@ -882,7 +913,10 @@ impl Ui {
             base,
             to: index,
         }));
-        if let Some(pill) = self.pills.borrow().get(index).cloned() {
+        // Clone the handle, then drop the `pills` borrow before touching GTK (P1i-r4,
+        // item 2). The old `if let` scrutinee held the borrow across the reorder.
+        let pill = self.pills.borrow().get(index).cloned();
+        if let Some(pill) = pill {
             // GtkFixed paints in child order, so relinking the pill last puts it on top.
             // Never unparent it: unparenting unmaps the pill, unmapping resets its
             // controllers, and a reset gesture cancels itself inside its own drag-begin.
@@ -895,13 +929,17 @@ impl Ui {
         let Some(drag) = self.drag.get() else { return };
         let count = self.pills.borrow().len();
         let layout = style::drag_layout(drag.index, pointer_x - drag.start_x, self.pitch(), count);
-        if let Some(pill) = self.pills.borrow().get(drag.index) {
-            self.strip.move_(pill, drag.base + layout.offset, 0.0);
+        // Each lookup clones the widget and ends its `pills` borrow at the statement, so
+        // no borrow is held across a `GtkFixed` call (P1i-r4, item 2).
+        let dragged = self.pills.borrow().get(drag.index).cloned();
+        if let Some(pill) = dragged {
+            self.strip.move_(&pill, drag.base + layout.offset, 0.0);
         }
         if layout.to != drag.to {
+            let pills: Vec<gtk::Widget> = self.pills.borrow().clone();
             for (index, slide) in layout.slides.iter().enumerate() {
                 if index != drag.index
-                    && let Some(pill) = self.pills.borrow().get(index)
+                    && let Some(pill) = pills.get(index)
                 {
                     set_slide(pill, *slide);
                 }

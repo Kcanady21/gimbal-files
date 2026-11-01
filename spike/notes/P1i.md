@@ -935,3 +935,244 @@ Needs fixing:
 2. **Minor: clicking a pill doesn't end search.** With search open and empty, clicking a pill
    makes that tab active, but the entry keeps focus and search stays open; only Escape closes it.
    The pill doesn't take keyboard focus, so the entry's focus-leave never fires.
+
+## P1i-r4 changes
+
+Three fixes from the r3 live check. Only `spike/src/bin/look-header/header.rs` and this notes file
+changed; `Cargo.toml`, the other binaries, and the review/live-check sections above are untouched,
+and every feature is kept. No line budget applies.
+
+### 1. Split View no longer crashes
+
+`split_selected`'s fade timer now takes the grouping result into a `let` first:
+
+```rust
+let first = ui.model.borrow_mut().group_selected();
+if let Some(first) = first {
+    ui.animate_group.set(Some(first));
+    ui.refresh();
+}
+```
+
+The temporary `RefMut` now ends at the `let` statement, before `refresh()` borrows the model in
+`update_layout`. The old form kept the scrutinee's temporary alive through the whole `if let`
+block, which is exactly the `RefCell already mutably borrowed` abort at `update_layout`'s
+`self.model.borrow()`.
+
+**Test (temporary timer, no input).** `GIMBAL_LOOK_TEMP_TEST=split` started a one-second timer that
+put tabs 0 and 1 in the selection, called `split_selected()`, and reported again 500 ms later
+(`FADE_MS + 300`). Release binary, `/tmp/gimbal-spike-p1ir4`, stopped by its own PID with SIGTERM:
+
+```text
+$ GIMBAL_SPIKE_LOG=1 GIMBAL_LOOK_TEMP_TEST=split ./target/release/look-header --tabs 3
+[gimbal-look-header 0.081] layout: window 2560, path min 320, fits true, overflow false
+[gimbal-look-header 0.848] window: header window shown
+[gimbal-look-header 0.855] layout: window 1272, path min 320, fits false, overflow true
+[gimbal-look-header 1.081] test: split: selected tabs 0 and 1 of 3 entries
+(look-header:91530): Gdk-WARNING **: … vkAcquireNextImageKHR(): … (VK_SUBOPTIMAL_KHR) (1000001003)
+[gimbal-look-header 1.281] layout: window 1272, path min 320, fits false, overflow true
+[gimbal-look-header 1.581] test: split: after fade 2 entries ["Group 1 · 2 tabs", "Tab 3"], first is group true
+exit=143
+```
+
+The process reached the end of the fade and logged the group; it did not abort. The `Gdk-WARNING`
+is the intermittent Vulkan/niri swapchain notice seen in earlier rounds, not a GTK CSS or layout
+warning. The whole harness (`GIMBAL_LOOK_TEMP_TEST`, the timer, all `test:` logs) is removed before
+delivery; `grep -rn "TEMP\|GIMBAL_LOOK_TEMP_TEST\|temp_test" src/bin/look-header/` prints nothing.
+
+### 2. Every `RefCell` borrow, audited
+
+The file has two `RefCell`s: `model: RefCell<Model>` and `pills: RefCell<Vec<gtk::Widget>>`.
+`drag`, `available`, `overflow`, `search_open`, `animate_group`, `dialogs` and `scale` are `Cell`s
+whose reads are `Copy` and hold no borrow. Line numbers are the delivered `header.rs`.
+
+Fixed sites — a borrow was alive while code could borrow the same cell again:
+
+| Site | What was wrong | Fix |
+|---|---|---|
+| `split_selected`, timer, 844 | `if let Some(first) = ui.model.borrow_mut().group_selected()` held the `borrow_mut` across `ui.refresh()` (item 1's abort). | Take the result into a `let`; the `RefMut` ends at that statement. |
+| `split_selected`, 833 | `for … in self.pills.borrow().iter()` held the `pills` borrow across `pill.add_css_class` for every pill. | Clone the `Vec<gtk::Widget>` first; the borrow ends at the statement. |
+| `drag_begin`, 918 | `if let Some(pill) = self.pills.borrow().get(index).cloned()` held the borrow across `insert_after` and `strip.move_`. | Look the clone up into a `let` first. |
+| `drag_move`, 934 | `if let Some(pill) = self.pills.borrow().get(drag.index)` held the borrow across `strip.move_`. | Same: clone into a `let` first. |
+| `drag_move`, 939 | The `if … && let Some(pill) = self.pills.borrow().get(index)` let-chain held the borrow across `set_slide`'s CSS-class calls. | Clone the pill vector once, then index it. |
+
+Checked and safe as delivered:
+
+| Site | Borrow | Why it cannot double-borrow |
+|---|---|---|
+| `open_pill_menu`, 393 | `model.borrow()` in a block | The block ends (borrow dropped) before the popover is built, `set_child` and `popup`. |
+| `open_pill_menu`, 417 | `borrow_mut().ungroup(index);` | A statement temporary drops at the `;`; `refresh()` is the next statement. |
+| `make_accordion`, 559 | `model.borrow()` | Statement temporary; it collects owned `String`s and ends before the popover and menu items. |
+| `make_accordion`, 562 | `borrow_mut().focus(…)` | Statement temporary; `rebuild()` is the next statement. |
+| `path_text`, 613 | `let model = borrow()` | Held across `entry.label()` and `format!` only; neither touches the model. |
+| `rebuild`, 624 | `pills.borrow_mut().clear()` | Statement temporary. |
+| `rebuild`, 626 | `model.borrow()` in a block | Ends before `make_accordion`/`make_pill` run; this is the borrow the r4 crash collided with. |
+| `rebuild`, 645 | `pills.borrow_mut().push(pill)` | Statement temporary; the `strip.put` before it is on a different statement. |
+| `rebuild`, 648 | `model.borrow()` in a block | Ends before `body.set_label`/`path_label.set_label`. |
+| `update_layout`, 679 | `model.borrow().entries.len()` | Statement temporary; ends before `header_fits` and `set_width_request`. |
+| `add_tab`, 701 | `let mut model = borrow_mut()` in a block | Ends before `log!` and `refresh`; `label()` inside does not re-borrow. |
+| `pill_clicked`, 713 | `let mut model = borrow_mut()` | Explicit `drop(model)` before `rebuild()`. The new `dismiss_empty_search()` runs before the borrow. |
+| `close_menu_click`, 724 | `let model = borrow()` | Explicit `drop(model)` before `close_indices`. |
+| `close_indices`, 735 | `if self.model.borrow_mut().close(indices)` | An `if` condition is its own temporary scope, so the borrow ends before either branch (`window.close` / `refresh`). No fix needed. |
+| `close_or_confirm`, 747 | `let … = group_of(&self.model.borrow(), …) else` | A `let` initializer's temporary ends at the end of the `let` statement; the `else` diverges and `ask` is after it. No fix needed. |
+| `rename_dialog`, 761 | same let-else form | Same; the borrow ends before `ask`, and the response closure borrows later. |
+| rename response, 774 | `borrow_mut().rename(…)` | Statement temporary; `refresh()` is the next statement. |
+| `split_selected`, 820 | `model.borrow()` in a block | Ends before the `pills` borrow at 833 and before the timer. |
+| `drag_move`, 930 | `pills.borrow().len()` | Statement temporary. |
+| `drag_end`, 961 | `borrow_mut().move_entry(…)` | Statement temporary; `log!` and `rebuild` are later statements. |
+| `key`, 984 | `if !self.model.borrow().selection.is_empty()` | `if` condition temporary scope; ends before the block. |
+| `key`, 985 | `borrow_mut().selection.clear()` | Statement temporary; `rebuild()` is the next statement. |
+
+Every other `if let` scrutinee in the file upgrades a `Weak` (`weak.upgrade()`) or matches a
+`gdk` value; none holds a `RefCell` borrow. The three temporary-scope rules behind the "safe"
+entries were checked with a scratch program under the same toolchain and edition **([observed]**,
+`rustc 1.95.0`, `--edition 2024`):
+
+```text
+$ rustc --edition 2024 borrow_scope.rs && ./borrow_scope
+thread 'main' panicked at borrow_scope.rs:26:16: RefCell already borrowed
+if condition then block ok, value 3; let-else then mutation ok;
+if-let double borrow panics: true; x 2
+```
+
+That is: an `if` condition releases before its block, a `let … else` releases at the end of the
+`let` statement, and an `if let` scrutinee stays borrowed through its then-block.
+
+### 3. Clicking a pill, the path bar or the body ends an empty search
+
+I close it from the click handlers rather than making those widgets focusable. A new method applies
+the same rule as the entry's focus-leave handler:
+
+```rust
+fn dismiss_empty_search(self: &Rc<Self>) {
+    if self.search_open.get() && self.search_entry.text().is_empty() {
+        self.close_search();
+    }
+}
+```
+
+- A pill calls it first thing in `pill_clicked`, before the model borrow and `rebuild`.
+- The path `Box` and the `gl-frame` body `Box` (kept in the new `Ui::frame` field) each get a
+  button-1 `GestureClick`; its `released` calls `dismiss_empty_search`. A click on their
+  non-focusable children (the path label, the title label) bubbles to the box, so it is covered
+  too.
+- Clicks on the search field are not on those widgets, so an open, empty search stays open there.
+  Clicks on the focusable nav/trash/window buttons and the menu already closed it through
+  focus-leave.
+
+Focus was the other option in the brief, but a pill is a `GtkCenterBox` with `all: unset`, and
+making pills, the path bar and the body focusable would change the keyboard focus order, add a
+focus ring path to widgets that are not controls, and still leave the body a label. The click
+handlers leave focus handling exactly as it was. **[inferred]** The gesture delivery itself needs
+Claude's live check; the rule was exercised without input in the temporary `search` harness
+(`open` → `dismiss_empty_search` → `open flag false`; `open` → text `"x"` →
+`dismiss_empty_search` → `open flag true`). **[observed]**
+
+### The four RULES commands (P1i-r4 final run, from `spike/`, harness removed)
+
+```text
+$ PATH="$HOME/.rustup/toolchains/1.95.0-x86_64-unknown-linux-gnu/bin:$PATH" cargo fmt --check
+(no output, exit 0)
+
+$ PATH="$HOME/.rustup/toolchains/1.95.0-x86_64-unknown-linux-gnu/bin:$PATH" cargo clippy --all-targets -- -D warnings
+    Checking gimbal-spike v0.0.0 (/home/kyle/Documents/03.) Code-Projects/gimbal-files/spike)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.22s
+(clippy exit 0)
+
+$ cargo test
+     Running unittests src/main.rs (target/debug/deps/gimbal_spike-b2015085d72c48fe)
+running 4 tests
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+
+     Running unittests src/bin/look-body/main.rs (target/debug/deps/look_body-29a8f160103fcf7b)
+running 23 tests
+test result: ok. 23 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+
+     Running unittests src/bin/look-header/main.rs (target/debug/deps/look_header-f6eea3612da1734e)
+running 5 tests
+test style::tests::drag_arithmetic ... ok
+test strip::tests::groups_close_and_move ... ok
+test tests::parses_cli ... ok
+test style::tests::header_fits_stretches_then_collapses ... ok
+test style::tests::spec_rules_and_css_shape ... ok
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+(exit 0)
+
+$ cargo build --release
+    Compiling gimbal-spike v0.0.0 (/home/kyle/Documents/03.) Code-Projects/gimbal-files/spike)
+    Finished `release` profile [optimized] target(s) in 0.92s
+(exit 0)
+```
+
+P1j's `look-body` happened to be settled during this run (23 tests), so the full suite and the
+release build covered the whole tree. `look-header`'s own `cargo build --bin look-header` and
+`cargo clippy --bin look-header -- -D warnings` also pass.
+
+### 10-second delivery runs (release, SIGTERM by PID, no warnings)
+
+Both ran the delivered binary (harness removed) in `/tmp/gimbal-spike-p1ir4`, for 9 seconds each,
+and were stopped by their own PID with SIGTERM. No pointer/keyboard injection and no
+`niri msg action` was used.
+
+```text
+$ GIMBAL_SPIKE_LOG=1 ./target/release/look-header --tabs 3
+[gimbal-look-header 0.081] layout: window 2560, path min 320, fits true, overflow false
+[gimbal-look-header 0.850] window: header window shown
+[gimbal-look-header 0.857] layout: window 1272, path min 320, fits false, overflow true
+exit=143
+
+$ GIMBAL_SPIKE_LOG=1 ./target/release/look-header --tabs 30 --scale 0.5
+[gimbal-look-header 0.082] layout: window 2560, path min 160, fits false, overflow true
+[gimbal-look-header 0.116] window: header window shown
+[gimbal-look-header 0.122] layout: window 1272, path min 160, fits false, overflow true
+exit=143
+
+$ grep -nEi "Theme parser|Gtk-WARNING|Gtk-CRITICAL|Gdk-WARNING|continuously requested|CSS" deliver3.out deliver30.out
+(no output, exit 1)
+```
+
+The 1,272 px `layout:` lines are niri tiling the window to half the output; the page size follows
+it. **[observed]**
+
+### API citations for the new code [read]
+
+- `WidgetExt::add_controller`: `gtk4-0.11.5:src/auto/widget.rs:113`.
+- `GestureClick::connect_released`: `gtk4-0.11.5:src/auto/gesture_click.rs:66`.
+- `GestureSingleExt::set_button`: `gtk4-0.11.5:src/auto/gesture_single.rs:73`.
+- `Revealer::reveals_child`, used only by the removed temporary harness:
+  `gtk4-0.11.5:src/auto/revealer.rs:71`.
+
+### Line count and process note
+
+`wc -l src/bin/look-header/*.rs`: `header.rs` 1032, `style.rs` 274, `strip.rs` 208, `main.rs` 136
+(1,650). No line budget in this brief; all features kept.
+
+The timer test and the two delivery runs used the binary's own PID (the working directory was set
+for the command rather than `cd … && binary &`, whose `$!` is the wrapper subshell).
+`pgrep -x look-header` was empty after every run and is empty at delivery.
+`/tmp/gimbal-spike-p1ir4` (logs only) and the `/tmp/opencode` scratch program are removed. No files
+outside `src/bin/look-header/` and this notes file were changed; I have nothing to ask for outside
+my files.
+
+## Review of P1i-r4 (Claude, Nov 1, 2026)
+
+All three items done as asked. The Split View fix takes the result into a `let`; the borrow audit
+covers both `RefCell`s, fixes four more sites that held a borrow across GTK calls, and backs the
+"safe" verdicts with a scratch program showing Rust 2024's temporary scopes. Search now closes
+from the pill, path and body click handlers through one `dismiss_empty_search` rule. RULES.md's
+four commands pass here (36 tests).
+
+## Live check of P1i-r4 (Claude, Nov 1, 2026): passes; P1i is done
+
+Release build, floating 2,560 × 1,406 window, DP-3 off.
+
+- **Split View:** Ctrl+click on two pills, right-click, Split View: "Group 1 · 2 tabs" appears
+  and the app keeps running (no panic).
+- **Search:** with search open and empty, a click on a pill (Tab 4 becomes active), on the path
+  bar, or on the body each closes search (`search: closed`).
+- **Pill drag (regression check):** still claims past the threshold, reorders
+  (`tabs: moved pill 0 to 2`), and the window stays put.
+- No GTK warnings, no panics.
+
+Together with the r3 check (drag, narrowing, icons, title, menus, groups), every P1i requirement
+has now been seen working live. P1i is ready for the P1h acceptance pass.
