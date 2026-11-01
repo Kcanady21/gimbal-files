@@ -32,6 +32,7 @@ Kyle drew the interface in VectorCraft (Oct 31): `~/Documents/03.) Code-Projects
 - **Layout.** A header holds the menu, back, forward, up, search, tab pills, the path bar, then trash, minimize, float and close. Below it: a left sidebar (Pinned Folders, then collapsible Recent Directories, Devices with drive bars, and Remote, with the main drive at the bottom), an icon grid in the middle with a status line, and a right preview sidebar (file name and size, text with line numbers, or an image, PDF or video preview; Discard, Save and Save As).
 - **Size.** Drawn at 1:1 for a 2560×1440 screen at scale 1. A setting scales the whole UI from 50% to 100% in 5% steps, live. What "100%" means is a base size in the config file.
 - **Font.** The family follows the desktop's UI font, as terminals do; a config setting overrides it. The sketch's type sizes apply, times the scale.
+- **Transparency.** Like Ghostty: one background-opacity setting (default 0.85; 1.0 turns it off) makes the whole window see-through, and the app asks the compositor to blur what's behind it through the `ext-background-effect-v1` Wayland protocol (niri 26.04 supports it with no niri config). Text, icons and outlines stay solid; menus and dialogs stay opaque (Kyle, Nov 1).
 - **Colour.** Every colour comes from the live desktop theme (Noctalia, which changes with the wallpaper). The sketch's greys are stand-ins that only show which parts share a colour and which are lighter. Outlines use the theme's accent colour. The active tab is the lighter pill.
 - **Tabs.** Pills with a close button. When they don't fit, they collapse into one accordion pill showing the tab count; hovering lists the tabs, and clicking one focuses it. Pills reorder by dragging. Ctrl-click toggles a pill, Shift-click selects a range.
 - **Tab groups are the split view.** Select several tabs, right-click, Split view: their pills fade out of the header and fade in over a tiled view, 2 columns wide (2 tabs fill the full height; more tabs add rows, and the whole view scrolls down). Each tile scrolls on its own, has its own pill, and can be dragged to another position. Back, forward, the path bar and the status line follow the focused tile, which gets a focus ring. Each group appears in the header as one pill ("Group N · K tabs", renameable); clicking it opens the split view. Closing tabs down to one returns to the normal view; the group pill can close the whole group after a confirmation; several selected tabs close at once from the right-click menu or a hotkey. Dragging a tab onto a group pill comes later ("Add to group" in the menu meanwhile).
@@ -81,6 +82,7 @@ Acceptance tests, run by Kyle on his own session. Run the Zen rows with the Phas
 - [ ] Header look (P1i): pill tabs with the accordion overflow and hover menu, group pills and the expanding search match the sketch
 - [ ] Body look (P1j): the tiled split view (fade in, per-tile and outer scrolling, focus ring), the grid dropping columns as the window narrows, draggable and collapsible sidebars, and collapsible section pills match the sketch
 - [ ] Theme and scale: a stylesheet built from the design tokens takes every colour from the live theme, and the scale setting resizes the whole UI live
+- [ ] Transparency (P1k): the background-opacity setting makes both look programs see-through, and the compositor blurs what's behind them
 
 Record results in `docs/research/spike-results.md`. Dragging a tab out to a new window, or into another window, was dropped from V1 (Kyle, Oct 31), so the spike no longer tests it. P1d, which was written for that, is shelved.
 
@@ -95,7 +97,7 @@ A Cargo workspace with `fm-core`, `fm-ui`, `fm-agent` and `fm-cli`: three front 
 - **`fm-core`** (no GTK; GIO for file I/O, trash, mounts and file watching):
   - **Command registry.** Every action is a named command with arguments: open, trash, new tab, split view, close group, close selected tabs, toggle sidebar, set scale, and so on. Menus, hotkeys, the agent socket and the CLI only ever call commands.
   - **Workspace model**, plain data the UI observes: windows hold tab groups, and groups hold tabs. A group with one tab shows as a normal tab; two or more is the split view. Each tab has its path, back/forward history, selection and scroll position. Each window has one focused tab. The model is saved, so the session comes back after a restart, and agents read the same state Kyle sees.
-  - **Config (TOML):** hotkeys, per-folder sort overrides, pinned folders, collapsed sections and sidebars, the scale setting, and the base size that defines 100%.
+  - **Config (TOML):** hotkeys, per-folder sort overrides, pinned folders, collapsed sections and sidebars, the scale setting, the base size that defines 100%, and the background opacity.
   - **File operations** with trash by default, dry-run and undo.
 - **`fm-ui`** (GTK4, libadwaita as parts):
   - **Header:** our own tab strip (tab pills, group pills, the accordion pill and its hover menu, drag to reorder), the expanding search pill, the stretching path bar, and window buttons. The Trash button is a drop target.
@@ -121,6 +123,7 @@ Kyle's requested features, with where each lives and any known approach. Build o
 | Pull a tab out to a new window | UI | After V1 (Kyle, Oct 31). Open in New Window meanwhile. |
 | Autotheme to Noctalia | System | Spike (P1f). Every colour from the live theme; outlines use the accent colour. |
 | UI scale setting | UI + core | Spike (P1j). 50–100% in 5% steps, live; the base size for 100% is in the config. |
+| Transparent, blurred window | UI | Spike (P1k). Background-opacity setting (default 0.85) and blur requested through `ext-background-effect-v1`, as Ghostty does. |
 | Collapsible, resizable sidebars and sections | UI | Spike (P1j). |
 | Restore tabs and groups after restart | Core | Saved workspace model. |
 | Trash button: open Trash, drop to trash | UI + core | Drop target moves to trash, never deletes. |
