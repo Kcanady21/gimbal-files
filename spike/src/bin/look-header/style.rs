@@ -27,6 +27,11 @@ pub mod col {
 }
 pub use col::*;
 
+/// The float icon's front-window fill (the mockup's grey face) is the `error` palette slot
+/// remapped to the window background, so it hides the back window's outline. The outlines
+/// stay on `foreground` (the image's inherited `color`).
+pub const FLOAT_PALETTE: &str = "error @window_bg_color";
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Fit {
     pub fits: bool,
@@ -179,6 +184,8 @@ window.gimbal-look, window.gimbal-look.background {{ background-color: {window_b
 .gl-icon-button.nav {{ margin-right: {gl}px; }}
 .gl-icon-button.searchbtn {{ min-width: {isearch}px; -gtk-icon-size: {isearch}px; }}
 .gl-icon-button.winbtn {{ min-width: {iwin}px; min-height: {iwin}px; -gtk-icon-size: {iwin}px; margin-left: {gl}px; }}
+.gl-icon-button.float {{ -gtk-icon-palette: {float_palette}; }}
+.gl-icon-button.float image {{ -gtk-icon-size: {iwin}px; }}
 .gl-search {{ margin-right: {gl}px; }}
 .gl-strip {{ margin-right: {gxl}px; }}
 .gl-field .gl-icon-button {{ min-width: {inav}px; min-height: {inav}px; -gtk-icon-size: {inav}px; }}
@@ -216,7 +223,8 @@ window.gimbal-look, window.gimbal-look.background {{ background-color: {window_b
 .gl-menu-item:disabled {{ color: alpha({FG}, 0.45); }}
 .gl-menu-item:focus-visible {{ box-shadow: 0 0 0 {thin}px {FOCUS_RING}; }}
 window.gimbal-look .gl-frame gridview, window.gimbal-look .gl-frame listview, window.gimbal-look .gl-frame textview, window.gimbal-look .gl-frame textview > text, window.gimbal-look .gl-frame scrolledwindow, window.gimbal-look .gl-frame viewport, window.gimbal-look .gl-frame gridview > child, window.gimbal-look windowhandle {{ background-color: transparent; }}
-"
+",
+        float_palette = FLOAT_PALETTE,
     )
 }
 
@@ -250,6 +258,29 @@ mod tests {
         assert!(plain.contains("mix(shade(@window_bg_color, 0.8), @accent_color, 0.5)"));
         assert!(plain.contains("box-shadow: 0 0 0 2px @accent_color"));
         assert!(!plain.contains("alpha(@accent_color, 0.5)"));
+    }
+
+    #[test]
+    fn float_icon_is_symbolic_and_maps_the_front_fill() {
+        let svg = include_str!("icons/float.svg");
+        // The mockup's two window paths, kept exactly (same ids and viewBox).
+        assert!(svg.contains("viewBox=\"0 0 28.08 25.12\""));
+        assert!(svg.contains("id=\"back-window\"") && svg.contains("id=\"front-window\""));
+        assert_eq!(svg.matches("d=\"M ").count(), 2);
+        // Both outlines take the foreground slot; only the front window has a fill.
+        assert_eq!(svg.matches("gpa:stroke=\"foreground\"").count(), 2);
+        assert_eq!(svg.matches("gpa:fill=").count(), 1);
+        assert!(svg.contains("gpa:fill=\"error\""));
+        // Symbolic icons carry no colour literals of their own.
+        assert!(!svg.contains('#'));
+        assert!(!svg.contains("rgb("));
+        let full = css(1.0, None, DEFAULT_OPACITY);
+        assert!(
+            full.contains(".gl-icon-button.float { -gtk-icon-palette: error @window_bg_color; }")
+        );
+        assert!(full.contains(".gl-icon-button.float image { -gtk-icon-size: 32px; }"));
+        let half = css(0.5, None, DEFAULT_OPACITY);
+        assert!(half.contains(".gl-icon-button.float image { -gtk-icon-size: 16px; }"));
     }
 
     #[test]

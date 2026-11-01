@@ -425,3 +425,150 @@ crossfades and hides the field after the fade. RULES.md's four commands pass her
   part of its square, so it still looks tiny next to close. The mockup has its own float icon:
   P1l-r1 draws that one.
 - No GTK warnings, no panics.
+
+## P1l-r1 changes
+
+The float button now draws Kyle's mockup icon instead of Adwaita's glyph. [observed]
+
+### What changed
+
+- `src/bin/look-header/icons/float.svg` (new): `phase1/icons/float.svg` converted to a GTK 4.22
+  symbolic SVG. The `viewBox`, both `d` strings, `stroke-width="3"`, caps and joins are unchanged
+  (geometry copied exactly). `back-window` keeps `fill="none"`; `front-window` takes
+  `gpa:fill="error"`; both take `gpa:stroke="foreground"`.
+- `header.rs`: `FLOAT_ICON` is `include_bytes!("icons/float.svg")`; `float_button()` builds
+  `gtk::Svg::from_bytes(&glib::Bytes::from_static(..))`, wraps it in
+  `gtk::Image::from_paintable(Some(&svg))`, and gives the button `gl-icon-button winbtn float`.
+  The `float` action in `desktop_buttons()` now goes through `float_button()`; the other desktop
+  buttons still use the icon theme. [observed]
+- `style.rs`: `FLOAT_PALETTE = "error @window_bg_color"`, emitted as
+  `.gl-icon-button.float { -gtk-icon-palette: …; }`; the image gets
+  `-gtk-icon-size: icon-window × scale` (32 at 1.0, 16 at 0.5). The image inherits the palette
+  and the button's `color: @window_fg_color`, so the strokes are `foreground`.
+- No fixed colours in the SVG or the new CSS. [observed]
+
+Why `gtk::Svg` rather than an icon name: GTK's icon-theme loader for `-symbolic.svg` uses the old
+symbolic path and ignores `gpa:` slots (P1m's live test: all white). `GtkSvg` implements
+`GtkSymbolicPaintable`, and GTK passes the image's `color` and `-gtk-icon-palette` into
+`snapshot_symbolic` at draw time, so every slot recolours with the theme. [read]
+
+### Temporary timer log (removed before delivery)
+
+Probe: a `glib::timeout_add_local_once(800 ms)` cloned the float button, read
+`image.paintable()`, the image/button allocation, `image.pixel_size()` and the palette expression;
+it was gated by `GIMBAL_SPIKE_FLOAT_PROBE=1` and has been deleted from `header.rs`. [observed]
+
+```
+$ GIMBAL_SPIKE_FLOAT_PROBE=1 target/debug/look-header --tabs 3 --scale 1.0
+temp: float paintable=GtkSvg image=32x32 button=32x32 pixel_size=-1 palette="error @window_bg_color" (error -> window_bg Some(RGBA { red: 0.09411765, green: 0.023529412, blue: 0.21568628, alpha: 1.0 })) color=RGBA { red: 0.9490196, green: 0.9490196, blue: 0.9529412, alpha: 1.0 }
+
+$ GIMBAL_SPIKE_FLOAT_PROBE=1 target/debug/look-header --tabs 3 --scale 0.5
+temp: float paintable=GtkSvg image=16x16 button=16x16 pixel_size=-1 palette="error @window_bg_color" (error -> window_bg Some(RGBA { red: 0.09411765, green: 0.023529412, blue: 0.21568628, alpha: 1.0 })) color=RGBA { red: 0.9490196, green: 0.9490196, blue: 0.9529412, alpha: 1.0 }
+```
+
+`pixel_size=-1` is why `-gtk-icon-size` drives the size:
+`gtk-4.22.4:gtk/gtkiconhelper.c:403-410` returns the CSS `-gtk-icon-size` when no explicit pixel
+size is set. The 32 → 16 change proves the CSS size reaches the image at both scales. A live
+`Ctrl+=`/`Ctrl+-` regenerates the same string and reloads the same provider (`step_scale`), but only
+the CLI values were measured. The icon box is square; the mockup's 28.08:25.12 aspect ratio is
+fitted inside it (`gtkiconhelper.c:186-240`), so at 32 it paints about 32 × 28.6, matching the
+mockup's proportions.
+
+The style-context dump only printed custom properties (`--window-bg-color`, …), not normal style
+properties, so the log records the palette expression and the resolved `@window_bg_color` rather
+than a `-gtk-icon-palette: …` line. The mapping itself is asserted from the source: `foreground`
+comes from `color`, and `error`/`warning`/`success`/`accent` come from `-gtk-icon-palette`
+(`gtk-4.22.4:gtk/gtkcssstyle.c:876-899`). [read]
+
+### Verified
+
+From `$SPIKE`, with rustup 1.95.0 on `PATH` for `fmt`/`clippy`:
+
+```
+$ PATH="$T:$PATH" cargo fmt --check
+(no output, exit 0)
+
+$ PATH="$T:$PATH" cargo clippy --all-targets -- -D warnings
+    Checking gimbal-spike v0.0.0 (/home/kyle/Documents/03.) Code-Projects/gimbal-files/spike)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.43s
+
+$ cargo test
+...
+     Running unittests src/main.rs (target/debug/deps/gimbal_spike-…)
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+
+     Running unittests src/bin/look-body/main.rs (target/debug/deps/look_body-…)
+test result: ok. 43 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+
+     Running unittests src/bin/look-header/main.rs (target/debug/deps/look_header-…)
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+
+$ cargo build --release
+    Finished `release` profile [optimized] target(s) in 1.32s
+```
+
+`cargo build --bin look-header` and
+`PATH="$T:$PATH" cargo clippy --bin look-header -- -D warnings` also pass. [observed]
+
+`style::tests::float_icon_is_symbolic_and_maps_the_front_fill` checks the mockup ids and viewBox,
+two `gpa:stroke="foreground"` outlines, exactly one `gpa:fill` (`error`), no `#`/`rgb(` colour
+literals, the palette rule and `-gtk-icon-size` 32 at scale 1.0 / 16 at 0.5. [observed]
+
+10-second runs (stopped by PID with SIGTERM; `pgrep -x look-header` empty afterwards):
+`release/look-header --tabs 3` and `release/look-header --tabs 30 --scale 0.5` both printed an
+empty stderr — no Gtk-WARNING/Gtk-CRITICAL/GLib-GObject warnings, no panics. The intermittent
+`VK_SUBOPTIMAL_KHR` notice did not appear in these runs. [observed]
+
+### API citations [read]
+
+- `gtk::Svg::from_bytes`: `gtk4-0.11.5:src/auto/svg.rs:35`; `Svg` implements
+  `GdkPaintable, SymbolicPaintable`: `:19-21`.
+- `gtk::Image::from_paintable`: `gtk4-0.11.5:src/auto/image.rs:86`.
+- `glib::Bytes::from_static`: `glib-0.22.*:src/bytes.rs:57`.
+- Symbolic SVG slots: `gtk-4.22.4:docs/reference/gtk/icon-format.md:96-118` (supported elements
+  and attributes), `:120-150` (`gpa` namespace; `gpa:stroke`/`gpa:fill` names at `:132-133`),
+  `:152-154` (`-symbolic.svg` naming).
+- Palette remap: `-gtk-icon-palette` registration and flags at
+  `gtk-4.22.4:gtk/gtkcssstylepropertyimpl.c:886-892`; parser at
+  `gtk-4.22.4:gtk/gtkcsspalettevalue.c:318-361`; default palette includes the four names at
+  `:298-312`; resolution of `foreground` from `color` and the four palette names at
+  `gtk-4.22.4:gtk/gtkcssstyle.c:876-899`.
+- How an image passes its colours to a symbolic paintable:
+  `gtk-4.22.4:gtk/gtkrendericon.c:97-152` (`GTK_IS_SYMBOLIC_PAINTABLE`, five colours from
+  `gtk_css_style_lookup_symbolic_colors`, `snapshot_with_weight`), reached from
+  `gtk-4.22.4:gtk/gtkiconhelper.c:186-240`.
+- `-gtk-icon-size`: `gtk-4.22.4:gtk/gtkcssstylepropertyimpl.c:1280`; used as the icon size when
+  `pixel_size == -1`: `gtk-4.22.4:gtk/gtkiconhelper.c:403-410`.
+- Theme redraw: `-gtk-icon-palette` carries `GTK_CSS_AFFECTS_ICON_REDRAW_SYMBOLIC`
+  (`gtkcssstylepropertyimpl.c:891`), the same mechanism P1m's live accent test exercised.
+
+### Not verified live (Claude's live check)
+
+- How it looks next to close at 32 px: the mockup's two-window icon versus Adwaita's glyph, the
+  stroke weight, and whether the front window's `@window_bg_color` fill fully hides the back
+  window's outline. The geometry is exact and the allocation is 32 × 32, but the pixels were not
+  seen. [inferred]
+- The live theme reload's effect on the icon pixels: the palette uses `@window_bg_color`, and GTK's
+  symbolic-redraw flag is read above, but no recolour was observed on screen. [inferred]
+- The live `Ctrl+=`/`Ctrl+-` rescale of the float icon: the 32 and 16 px sizes came from two
+  launches, not from a key-driven reload mid-run. [inferred]
+- The 0.5-scale look (16 × 16 allocation): legibility at that size is visual. [inferred]
+
+### Things I would change outside these files
+
+- Nothing. Only `src/bin/look-header/` and this notes section were intentionally edited. The
+  package-wide `cargo fmt`/`cargo test`/`cargo clippy`/`cargo build --release` commands that
+  RULES.md requires ran while P1m's agent was also editing `src/bin/look-body/`; no look-body file
+  was edited by hand.
+
+
+## Review and live check of P1l-r1 (Claude, Nov 1, 2026): passes
+
+The float icon is the mockup's two overlapping windows, converted with its geometry intact,
+drawn as a `gtk::Svg` on a `gtk::Image`, and sized by `-gtk-icon-size` (32 at 1.0, 16 at 0.5).
+RULES.md's four commands pass (61 tests). Live: the float button shows both windows at full size,
+with the front window's fill hiding the back window's outline, in theme colours. No warnings.
+
+Observation for Kyle, not a defect: next to the new float icon, Adwaita's close ✕ now looks the
+smaller of the two. The mockup has its own close icon (VectorCraft group 66) if Kyle wants them
+to match.

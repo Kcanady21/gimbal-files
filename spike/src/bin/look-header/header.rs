@@ -11,6 +11,10 @@ use std::time::Duration;
 
 const FADE_MS: u64 = 200;
 
+/// The mockup's float icon, drawn as a `gtk::Svg` paintable: the icon theme's older
+/// symbolic path ignores `gpa:` slots, so loading it by name would lose the fills.
+static FLOAT_ICON: &[u8] = include_bytes!("icons/float.svg");
+
 #[derive(Clone, Copy)]
 struct DragState {
     index: usize,
@@ -146,7 +150,11 @@ pub fn show(app: &adw::Application, args: &Args) {
     row.append(&trash);
     let mut win_buttons = Vec::new();
     for (icon, action) in desktop_buttons() {
-        let button = icon_button(icon, "winbtn");
+        let button = if *action == "float" {
+            float_button()
+        } else {
+            icon_button(icon, "winbtn")
+        };
         row.append(&button);
         win_buttons.push((button, *action));
     }
@@ -335,6 +343,20 @@ fn icon_button(icon_name: &str, extra: &str) -> gtk::Button {
         button.add_css_class(extra);
     }
     button.set_child(Some(&gtk::Image::from_icon_name(icon_name)));
+    button.set_valign(gtk::Align::Center);
+    button
+}
+
+/// The float control: the mockup's two windows as a symbolic `gtk::Svg` paintable.
+/// `gtk::Image` passes its CSS `color` (foreground) and `-gtk-icon-palette` (the
+/// front window's `error` slot, remapped to the window background) to the SVG.
+fn float_button() -> gtk::Button {
+    let svg = gtk::Svg::from_bytes(&glib::Bytes::from_static(FLOAT_ICON));
+    let button = gtk::Button::new();
+    button.add_css_class("gl-icon-button");
+    button.add_css_class("winbtn");
+    button.add_css_class("float");
+    button.set_child(Some(&gtk::Image::from_paintable(Some(&svg))));
     button.set_valign(gtk::Align::Center);
     button
 }

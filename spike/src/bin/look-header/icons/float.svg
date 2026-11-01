@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="28.08" height="25.12" viewBox="0 0 28.08 25.12" gpa:version="1">
+<!-- Extracted from Gimbal-Files.vectorcraft, Default layer, group 77 "Float Window" (Nov 1, 2026).
+     Geometry is exact. Both outlines are the foreground slot; the front window's fill is the
+     `error` palette slot, remapped to @window_bg_color in look-header/style.rs, so it hides the
+     back window's outline. -->
+  <path id="back-window" d="M 10.01 1.50 L 22.81 1.50 C 24.89 1.50, 26.58 3.19, 26.58 5.28 L 26.58 17.06 C 26.58 19.15, 24.89 20.84, 22.81 20.84 L 10.01 20.84 C 7.93 20.84, 6.24 19.15, 6.24 17.06 L 6.24 5.28 C 6.24 3.19, 7.93 1.50, 10.01 1.50 Z" fill="none" gpa:stroke="foreground" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+  <path id="front-window" d="M 5.28 4.28 L 18.07 4.28 C 20.16 4.28, 21.85 5.97, 21.85 8.06 L 21.85 19.84 C 21.85 21.93, 20.16 23.62, 18.07 23.62 L 5.28 23.62 C 3.19 23.62, 1.50 21.93, 1.50 19.84 L 1.50 8.06 C 1.50 5.97, 3.19 4.28, 5.28 4.28 Z" gpa:fill="error" gpa:stroke="foreground" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>
