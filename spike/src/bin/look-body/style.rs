@@ -11,7 +11,7 @@ pub mod tok {
     pub const LINE_HAIR: f64 = 1.0; pub const LINE_THIN: f64 = 2.0; pub const LINE_MID: f64 = 3.0;
     pub const RADIUS: f64 = 12.0; pub const RADIUS_PILL: f64 = 999.0;
     pub const GRID_MARGIN: f64 = 72.0; pub const SECTION_H: f64 = 32.0; pub const SECTION_GAP: f64 = 6.0;
-    pub const PIN_ROW_H: f64 = 64.0; pub const DIR_ROW_H: f64 = 32.0; pub const STATUS_H: f64 = 64.0;
+    pub const PIN_ROW_H: f64 = 44.0; pub const DIR_ROW_H: f64 = 32.0; pub const STATUS_H: f64 = 64.0;
     pub const BAR_W: f64 = 209.0; pub const BAR_H: f64 = 18.0; pub const MAIN_BAR_W: f64 = 228.0; pub const MAIN_BAR_H: f64 = 20.0;
     pub const CELL_W: f64 = 97.0; pub const CELL_H: f64 = 144.0;
     pub const SIDEBAR_W: f64 = 348.0; pub const SIDEBAR_MIN: f64 = 300.0;
@@ -171,7 +171,7 @@ window.gimbal-look, window.gimbal-look.background {{ background-color: {window_b
 .gl-icon-button {{ all: unset; color: {FG}; padding: {gs}px; min-width: {irow}px; min-height: {irow}px; border-radius: {r}px; -gtk-icon-size: {irow}px; }}
 .gl-icon-button:hover {{ background-color: {HOVER}; }} .gl-icon-button:focus-visible {{ box-shadow: 0 0 0 {thin}px {FOCUS_RING}; }}
 .gl-pill {{ all: unset; min-height: {pill_h}px; padding: 0 {gm}px; border: {mid}px solid {OUTLINE}; border-radius: {rp}px; background-color: {pill_bg}; color: {FG}; }}
-.gl-pill label {{ font-size: {tc}px; }} .gl-pill.tab {{ min-width: {pill_w}px; }}
+.gl-pill label {{ font-size: {tc}px; }} .gl-pill.tab.wide {{ min-width: {pill_w}px; }}
 .gl-pill.active {{ background-color: {pill_active}; color: {RAISED_FG}; }}
 .gl-pill.selected {{ background-color: {pill_selected}; }} .gl-pill.active.selected {{ background-color: {pill_selected_active}; }}
 .gl-pill-close {{ all: unset; min-width: {close}px; min-height: {close}px; -gtk-icon-size: {close}px; padding: 0; border: {thin}px solid {FG}; border-radius: {rp}px; color: {FG}; margin-left: {gm}px; }}

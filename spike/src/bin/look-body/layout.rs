@@ -8,7 +8,7 @@
 //! here are visible panel widths and every position helper adds the inset.
 
 use crate::style::{
-    CELL_W, GAP_2XL, GAP_M, GAP_S, GRID_MARGIN, ICON_ROW, LINE_MID, LINE_THIN, PREVIEW_MIN,
+    CELL_W, GAP_2XL, GAP_L, GAP_M, GAP_S, GRID_MARGIN, ICON_ROW, LINE_MID, PREVIEW_MIN,
     SIDEBAR_MIN, scaled,
 };
 
@@ -60,15 +60,18 @@ pub fn strip_width(scale: f64) -> i32 {
     scaled(GAP_2XL, scale).max(button) + scaled(GAP_M, scale) + scaled(LINE_MID, scale)
 }
 
-/// The narrowest content column that still shows one grid column: the worse
-/// of the single view (a `grid-margin` inset each side plus one cell) and
-/// the split view (a `gap-2xl` Fixed inset each side, the tile's
-/// `line-thin` border, a `gap-m` tile-grid margin each side, one cell).
+/// The narrowest content column: the worse of the single view (a
+/// `grid-margin` inset each side plus one cell) and the split view (a
+/// `gap-2xl` Fixed inset each side, the `gap-l` gutter and two columns of the
+/// true tile minimum). Since P1m-r4 a tile may be narrower than a full pill
+/// (`min_column_width` is one cell and the pill shrinks), so two real
+/// columns — not one — are what the split needs. The window floor follows
+/// this number, so at half width the sidebars give way before the two
+/// columns can overlap.
 pub fn one_column_width(scale: f64) -> i32 {
     let cell = scaled(CELL_W, scale);
     let single = 2 * scaled(GRID_MARGIN, scale) + cell;
-    let split =
-        2 * scaled(GAP_2XL, scale) + 2 * scaled(GAP_M, scale) + 2 * scaled(LINE_THIN, scale) + cell;
+    let split = 2 * scaled(GAP_2XL, scale) + scaled(GAP_L, scale) + 2 * cell;
     single.max(split)
 }
 
@@ -160,22 +163,20 @@ mod tests {
             min,
             2 * inset(1.0) + scaled(SIDEBAR_MIN, 1.0) + 2 * HANDLE + one_column_width(1.0) + 360
         );
-        // The split view's one-column width is now 213 (2 × gap-2xl view
-        // inset + 2 × gap-m tile margin + 2 × line-thin 2 + one cell), so the
-        // single view's 241 still dominates and the floor stays 919.
-        assert_eq!(min, 919);
+        // The split view needs two true columns now: 2 × gap-2xl view inset +
+        // gap-l gutter + 2 × one cell = 298, so it sets the floor (976).
+        assert_eq!(min, 976);
     }
 
     #[test]
-    fn one_column_counts_the_thinner_tile_margin() {
+    fn one_column_counts_the_two_split_columns() {
         let cell = scaled(CELL_W, 1.0);
-        let split =
-            2 * scaled(GAP_2XL, 1.0) + 2 * scaled(GAP_M, 1.0) + 2 * scaled(LINE_THIN, 1.0) + cell;
-        assert_eq!(split, 213);
-        // The single view's 2 × grid-margin + cell (241) still dominates.
-        assert_eq!(one_column_width(1.0), 241);
-        assert_eq!(one_column_width(0.5), 121);
-        assert!(one_column_width(1.0) > split);
+        let split = 2 * scaled(GAP_2XL, 1.0) + scaled(GAP_L, 1.0) + 2 * cell;
+        assert_eq!(split, 298);
+        // The single view's 2 × grid-margin + cell (241) is narrower.
+        assert_eq!(one_column_width(1.0), 298);
+        assert_eq!(one_column_width(0.5), 150);
+        assert!(one_column_width(1.0) > 2 * scaled(GAP_2XL, 1.0) + cell);
     }
 
     #[test]
@@ -242,7 +243,7 @@ mod tests {
                 + one_column_width(1.0)
                 + strip_width(1.0)
         );
-        assert_eq!(min, 393);
+        assert_eq!(min, 450);
     }
 
     #[test]

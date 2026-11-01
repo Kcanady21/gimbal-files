@@ -10,7 +10,8 @@
 //! * **shares** — each column's tile heights as fractions of its available
 //!   height, and the left column's width as a fraction of the width left
 //!   after the gutter. Storing fractions (never pixels) keeps a window
-//!   resize or a scale change proportional;
+//!   resize or a scale change proportional; a hand-dragged column that came
+//!   from the half-height floor may sum above one and keep scrolling;
 //! * **layout** — the slot rects those shares produce.
 //!
 //! The drag gesture rides the static `Fixed` (never a moving pill: every
@@ -19,7 +20,10 @@
 //! collapse). One gesture decides at the press whether it will move a tile
 //! (press on a pill) or a border (press on a gutter), so the two can never
 //! fight; nothing is claimed or moved before the drag threshold.
-use crate::style::{CELL_H, CELL_W, CONTROL_H, GAP_2XL, GAP_L, GAP_S, LINE_THIN, PILL_W, scaled};
+use crate::style::{
+    CELL_H, CELL_W, CONTROL_H, GAP_2XL, GAP_L, GAP_M, GAP_S, ICON_TAB_CLOSE, LINE_MID, LINE_THIN,
+    PILL_W, TEXT_CONTROL, scaled,
+};
 use adw::prelude::*;
 use gtk::glib;
 use std::cell::{Cell, RefCell};
@@ -69,26 +73,34 @@ pub struct Viewport {
 }
 
 /// Everything a layout needs: the columns, their height shares, the column
-/// width share and the viewport.
+/// width share, the viewport, the scroll offset and whether each column is
+/// still on its default layout (and so keeps the half-height floor).
 #[derive(Clone, Copy)]
 pub struct Board<'a> {
     pub columns: &'a [Vec<usize>; 2],
     pub heights: &'a [Vec<f64>; 2],
     pub width_share: f64,
     pub view: Viewport,
+    pub scroll: i32,
+    pub floored: [bool; 2],
 }
 
 impl Board<'_> {
-    /// The committed slot layout of these columns and shares.
+    /// The committed slot layout of these columns and shares, with each
+    /// column's scroll offset applied: a column that fits in the viewport
+    /// stays pinned at the scroll position while the taller one scrolls.
     pub fn slots(&self) -> [Vec<Rect>; 2] {
-        layout(
+        let mut slots = layout_floored(
             self.columns,
             self.heights,
             self.width_share,
             self.view.w,
             self.view.h,
             self.view.scale,
-        )
+            self.floored,
+        );
+        offset_slots(&mut slots, self.view.h, self.view.scale, self.scroll);
+        slots
     }
 
     /// The rect of every tile, indexed by tile id.
@@ -97,12 +109,57 @@ impl Board<'_> {
     }
 }
 
-/// The narrowest a column may be dragged: one grid column wide. The tab pill
-/// is `PILL_W` wide and GTK will not shrink it (a Box's minimum includes its
-/// children), so that own minimum is the binding floor — a narrower column
-/// would draw the pill over the gutter.
+/// The narrowest a column may be dragged: one grid column wide. A tile can be
+/// narrower than its `PILL_W` pill: the pill loses its 270 px minimum below
+/// that width and its label ellipsizes, and the tile's content sits in a
+/// clipping scroller, so nothing draws over the gutter (P1m-r4 item 4).
 pub fn min_column_width(scale: f64) -> i32 {
-    scaled(CELL_W, scale).max(scaled(PILL_W, scale))
+    scaled(CELL_W, scale)
+}
+
+/// Whether a tab pill at `tile_w` is wide enough for the design's `PILL_W`.
+/// Below it the `wide` class (and CSS `min-width`) comes off.
+pub fn pill_is_wide(tile_w: i32, scale: f64) -> bool {
+    tile_w >= scaled(PILL_W, scale)
+}
+
+/// The label's natural-width cap in characters for a tile `tile_w` wide, so a
+/// pill below `PILL_W` shrinks with the column and ellipsizes instead of
+/// drawing its close button outside the tile. The overhead is the pill's
+/// padding, border, close ring and its gap-m margin.
+pub fn pill_label_chars(tile_w: i32, scale: f64) -> i32 {
+    let overhead = pill_overhead(scale);
+    let char_w = pill_char_width(scale);
+    ((tile_w - overhead).max(0) / char_w).max(1)
+}
+
+fn pill_overhead(scale: f64) -> i32 {
+    2 * scaled(GAP_M, scale)
+        + 2 * scaled(LINE_MID, scale)
+        + scaled(ICON_TAB_CLOSE, scale)
+        + scaled(GAP_M, scale)
+}
+
+fn pill_char_width(scale: f64) -> i32 {
+    (scaled(TEXT_CONTROL, scale) * 3 / 5).max(1)
+}
+
+/// The width the pill actually takes in a tile `tile_w` wide: `PILL_W` when
+/// the tile is wide enough, otherwise the shrinking pill's overhead plus its
+/// capped label. The hit tests use this so the strip beside a narrow pill
+/// still grabs.
+pub fn pill_width(tile_w: i32, scale: f64) -> i32 {
+    if tile_w <= 0 {
+        return 0;
+    }
+    if pill_is_wide(tile_w, scale) {
+        scaled(PILL_W, scale).min(tile_w)
+    } else {
+        // The names are "Tab 1".."Tab 10": six characters is the widest, so
+        // the shrunk pill is never wider than this, and the strip beside it
+        // keeps its grab area.
+        (pill_overhead(scale) + 6 * pill_char_width(scale)).min(tile_w)
+    }
 }
 
 /// The shortest a tile's slot may be dragged: its pill, the pill's gap and
@@ -111,18 +168,15 @@ pub fn min_slot_height(scale: f64) -> i32 {
     scaled(CONTROL_H + GAP_S + CELL_H, scale)
 }
 
-/// The half-visible-height floor that applies beyond four tiles, else 0.
+/// The half-visible-height floor that a default layout applies beyond four
+/// tiles, else 0. A hand-dragged column ignores it (item 2): its border may
+/// shrink a tile to `min_slot_height`.
 pub fn half_floor(total: usize, f: &Frame) -> i32 {
     if total > 4 {
         ((f.inner_h - f.gutter) / 2).max(1)
     } else {
         0
     }
-}
-
-/// The minimum a border drag keeps on each side.
-pub fn slot_minimum(total: usize, f: &Frame, scale: f64) -> i32 {
-    min_slot_height(scale).max(half_floor(total, f))
 }
 
 /// Equal shares for `n` slots; what a reset (double-click, add, close) sets.
@@ -166,42 +220,39 @@ pub fn width_share_after_drag(share: f64, avail: i32, dx: i32, min_w: i32) -> f6
     left as f64 / avail as f64
 }
 
-/// The new height shares for column slots that sum to `avail_h` px after
-/// dragging the border at `border` (1..n, between slots border−1 and border)
-/// by `dy` px. Both neighbours keep `min_h`; a pair that is already tighter
-/// than two minimums cannot be resized and is returned unchanged.
-pub fn heights_after_drag(
-    shares: &[f64],
-    avail_h: i32,
-    border: usize,
-    dy: i32,
-    min_h: i32,
-) -> Vec<f64> {
-    let n = shares.len();
-    if n < 2 || border == 0 || border >= n || avail_h <= 0 {
-        return shares.to_vec();
+/// The new pixel sizes for column slots after dragging the border at
+/// `border` (1..n, between slots border−1 and border) by `dy` px. Both
+/// neighbours keep `min_h`; a pair that is already tighter than two
+/// minimums cannot be resized and is returned unchanged. Working in pixels
+/// (the slot heights the pointer saw, floor or no floor) keeps the pointer
+/// delta exact and lets a hand drag go below the default half-height floor.
+pub fn sizes_after_drag(sizes: &[i32], border: usize, dy: i32, min_h: i32) -> Vec<i32> {
+    let n = sizes.len();
+    if n < 2 || border == 0 || border >= n {
+        return sizes.to_vec();
     }
-    let mut px: Vec<i32> = shares
-        .iter()
-        .map(|s| ((avail_h as f64 * s).round() as i32).max(1))
-        .collect();
-    let pair = px[border - 1] + px[border];
+    let pair = sizes[border - 1].saturating_add(sizes[border]);
     let min_h = min_h.max(1);
     if pair < 2 * min_h {
-        return shares.to_vec();
+        return sizes.to_vec();
     }
-    let first = (px[border - 1] + dy).clamp(min_h, pair - min_h);
-    px[border - 1] = first;
-    px[border] = pair - first;
-    px.iter().map(|p| *p as f64 / avail_h as f64).collect()
+    let mut out = sizes.to_vec();
+    let first = (sizes[border - 1] + dy).clamp(min_h, pair - min_h);
+    out[border - 1] = first;
+    out[border] = pair - first;
+    out
 }
 
 /// The slot rects of both columns, left first, top to bottom. A slot is the
 /// tile's pill plus its frame: the pill is `control-h` tall and sits `gap-s`
 /// above the frame. Each column's slots share its available height by the
 /// stored shares, so a column with fewer tiles gets taller ones, whichever
-/// column it is. Beyond four tiles every slot keeps at least half the visible
-/// height and the view scrolls.
+/// column it is. A default layout beyond four tiles keeps every slot at least
+/// half the visible height and the view scrolls; a hand drag clears that
+/// column's floor and may shrink a tile to `min_slot_height`.
+/// Default-floor convenience wrapper over `layout_floored` (tests and the
+/// default model path).
+#[cfg(test)]
 pub fn layout(
     columns: &[Vec<usize>; 2],
     heights: &[Vec<f64>; 2],
@@ -209,6 +260,27 @@ pub fn layout(
     view_w: i32,
     view_h: i32,
     scale: f64,
+) -> [Vec<Rect>; 2] {
+    layout_floored(
+        columns,
+        heights,
+        width_share,
+        view_w,
+        view_h,
+        scale,
+        [true, true],
+    )
+}
+
+/// `layout` with each column's half-height floor selectable (item 2).
+pub fn layout_floored(
+    columns: &[Vec<usize>; 2],
+    heights: &[Vec<f64>; 2],
+    width_share: f64,
+    view_w: i32,
+    view_h: i32,
+    scale: f64,
+    floored: [bool; 2],
 ) -> [Vec<Rect>; 2] {
     let counts = [columns[0].len(), columns[1].len()];
     let total = counts[0] + counts[1];
@@ -231,6 +303,7 @@ pub fn layout(
             (right_w, f.inset + left_w + gap)
         };
         let avail = (f.inner_h - (n as i32 - 1) * gap).max(1);
+        let floor = if floored[column] { half } else { 0 };
         let mut y = 0;
         let mut out = Vec::with_capacity(n);
         for row in 0..n {
@@ -238,12 +311,45 @@ pub fn layout(
             let h = ((avail as f64 * share.clamp(0.0, 1.0)).round() as i32)
                 .max(1)
                 .max(pill + 1)
-                .max(half);
+                .max(floor);
             out.push(Rect { x, y, w, h });
             y += h + gap;
         }
         out
     })
+}
+
+/// Whether one column's tiles fit inside the visible height.
+pub fn column_fits(slots: &[Rect], view_h: i32, scale: f64) -> bool {
+    let f = frame(1, view_h, scale);
+    slots
+        .last()
+        .map(|last| last.y + last.h <= f.inner_h + 1)
+        .unwrap_or(true)
+}
+
+/// Each column's y offset for a scroll value (item 1): a column whose tiles
+/// fit stays pinned at the scroll offset, so it does not move on screen; a
+/// taller column keeps offset 0 and scrolls with the shared content.
+pub fn column_offsets(slots: &[Vec<Rect>; 2], view_h: i32, scale: f64, scroll: i32) -> [i32; 2] {
+    let scroll = scroll.max(0);
+    [0, 1].map(|column| {
+        if column_fits(&slots[column], view_h, scale) {
+            scroll
+        } else {
+            0
+        }
+    })
+}
+
+/// Move each column's slots by its scroll offset, in place.
+pub fn offset_slots(slots: &mut [Vec<Rect>; 2], view_h: i32, scale: f64, scroll: i32) {
+    let offsets = column_offsets(slots, view_h, scale, scroll);
+    for (column, column_slots) in slots.iter_mut().enumerate() {
+        for slot in column_slots {
+            slot.y += offsets[column];
+        }
+    }
 }
 
 /// The rect of every tile, indexed by tile id, from its column and row.
@@ -547,7 +653,20 @@ pub enum Border {
     Heights { column: usize, row: usize },
 }
 
-pub fn border_at(slots: &[Vec<Rect>; 2], x: i32, y: i32) -> Option<Border> {
+/// The pill's own region inside a slot (its top `control-h`, centred and at
+/// most the column's width).
+fn pill_zone(r: Rect, x: i32, y: i32, scale: f64) -> bool {
+    let pw = pill_width(r.w, scale);
+    let px = r.x + (r.w - pw) / 2;
+    let ph = scaled(CONTROL_H, scale);
+    x >= px && x < px + pw && y >= r.y && y < r.y + ph
+}
+
+/// A border under the pointer: the gutter between the columns, or the whole
+/// strip between two stacked tiles of one column (item 2). The strip runs
+/// from the upper tile's frame bottom to the lower tile's frame top, and
+/// grabs everywhere except on the lower tile's pill itself.
+pub fn border_at(slots: &[Vec<Rect>; 2], x: i32, y: i32, scale: f64) -> Option<Border> {
     let (left, right) = (&slots[0], &slots[1]);
     if !left.is_empty() && !right.is_empty() {
         let left_end = left[0].x + left[0].w;
@@ -562,6 +681,8 @@ pub fn border_at(slots: &[Vec<Rect>; 2], x: i32, y: i32) -> Option<Border> {
             return Some(Border::Columns);
         }
     }
+    let pill_h = scaled(CONTROL_H, scale);
+    let gap_s = scaled(GAP_S, scale);
     for (column, s) in slots.iter().enumerate() {
         if s.len() < 2 {
             continue;
@@ -572,8 +693,8 @@ pub fn border_at(slots: &[Vec<Rect>; 2], x: i32, y: i32) -> Option<Border> {
         }
         for row in 1..s.len() {
             let top = s[row - 1].y + s[row - 1].h;
-            let bottom = s[row].y;
-            if y >= top && y < bottom {
+            let next_frame_top = s[row].y + pill_h + gap_s;
+            if y >= top && y < next_frame_top && !pill_zone(s[row], x, y, scale) {
                 return Some(Border::Heights { column, row });
             }
         }
@@ -603,14 +724,16 @@ pub fn drag_layout(
         match apply_drop(board.columns, from, drop) {
             Some(next) => {
                 let next_heights = heights_after_change(board.columns, board.heights, &next);
-                let slots = layout(
+                let mut slots = layout_floored(
                     &next,
                     &next_heights,
                     board.width_share,
                     board.view.w,
                     board.view.h,
                     board.view.scale,
+                    board.floored,
                 );
+                offset_slots(&mut slots, board.view.h, board.view.scale, board.scroll);
                 for (column, tiles) in next.iter().enumerate() {
                     for (row, &tile) in tiles.iter().enumerate() {
                         if let (Some(slot), true) = (slots[column].get(row), tile < out.len()) {
@@ -648,9 +771,9 @@ fn adjusted(index: usize, removed: usize, length: usize) -> usize {
 /// `PILL_W` wide, centred above the tile's frame, starting at the tile rect's
 /// top and `control-h` tall.
 pub fn pill_at(rects: &[Rect], x: i32, y: i32, scale: f64) -> Option<usize> {
-    let pw = scaled(PILL_W, scale);
     let ph = scaled(CONTROL_H, scale);
     rects.iter().position(|r| {
+        let pw = pill_width(r.w, scale);
         let px = r.x + (r.w - pw) / 2;
         x >= px.max(r.x) && x < (px + pw).min(r.x + r.w) && y >= r.y && y < r.y + ph
     })
@@ -661,7 +784,7 @@ pub fn press_on_pill(x: f64, y: f64, tile_w: i32, scale: f64) -> bool {
     if tile_w <= 0 {
         return false;
     }
-    let pw = scaled(PILL_W, scale).min(tile_w);
+    let pw = pill_width(tile_w, scale);
     let px = (tile_w - pw) / 2;
     let ph = scaled(CONTROL_H, scale);
     x >= px as f64 && x < (px + pw) as f64 && y >= 0.0 && y < ph as f64
@@ -723,8 +846,12 @@ struct State {
     columns: [Vec<usize>; 2], // column -> tile ids, top to bottom
     /// Each column's slot heights as shares of its available height.
     heights: [Vec<f64>; 2],
+    /// Whether each column still uses the default layout's half-height floor.
+    floored: [bool; 2],
     /// The left column's share of the width left after the gutter.
     width_share: f64,
+    /// The outer scroller's vertical value: a fitting column is pinned there.
+    scroll: i32,
     widgets: Vec<gtk::Box>, // indexed by tile id: the outer pill+frame box
     frames: Vec<gtk::Box>,
     pills: Vec<gtk::Box>,
@@ -746,6 +873,8 @@ impl State {
                 h: self.view[1],
                 scale: self.scale,
             },
+            scroll: self.scroll,
+            floored: self.floored,
         }
     }
 
@@ -766,16 +895,19 @@ enum Drag {
     Tile {
         from: usize,
         grab: (i32, i32),
+        press: (i32, i32),
         targets: Vec<Rect>,
     },
     /// The column border: the width share follows the pointer.
-    Width { share: f64, avail: i32 },
-    /// A border between two stacked tiles: the height shares follow.
+    Width { share: f64, press_x: i32 },
+    /// A border between two stacked tiles: the height shares follow. `sizes`
+    /// are the pixel heights the pointer saw at the press, so the delta is
+    /// applied once, in the same space (item 5).
     Height {
         column: usize,
         border: usize,
-        shares: Vec<f64>,
-        avail: i32,
+        sizes: Vec<i32>,
+        press_y: i32,
     },
 }
 
@@ -819,6 +951,7 @@ struct Inner {
     slots: RefCell<Vec<Slot>>,
     drag: RefCell<Option<Drag>>,
     cursor: Cell<Cursor>,
+    scroll_pending: Cell<bool>,
 }
 
 /// Cloneable handle; the widgets and model live in the Rc.
@@ -835,6 +968,43 @@ fn watch_viewport(inner: &Rc<Inner>, axis: usize, adj: &gtk::Adjustment) {
             inner.relayout(false);
         }
     });
+}
+
+/// Follow the outer scroller's value (item 1). The layout change is scheduled
+/// in an idle: a `value` notify can arrive while the ScrolledWindow is inside
+/// its own allocation, where moving or resizing children is ignored or warns.
+fn watch_scroll(inner: &Rc<Inner>, adj: &gtk::Adjustment) {
+    let weak = Rc::downgrade(inner);
+    adj.connect_value_changed(move |adj| {
+        if let Some(inner) = weak.upgrade() {
+            let value = adj.value().round() as i32;
+            if inner.state.borrow().scroll != value {
+                inner.state.borrow_mut().scroll = value;
+                inner.schedule_scroll();
+            }
+        }
+    });
+}
+
+/// The pointer in the Fixed's own content space: the surface position minus
+/// the window's surface transform (the client-side shadow GTK subtracts for
+/// gesture points) and the Fixed's bounds in the window. Presses, hover and
+/// every drag update go through this one conversion (item 5).
+fn pointer_in_fixed<W: IsA<gtk::Widget>>(
+    fixed: &W,
+    event: Option<&gtk::gdk::Event>,
+) -> Option<(f64, f64)> {
+    let (sx, sy) = event?.position()?;
+    let transform = fixed
+        .native()
+        .map(|native| native.surface_transform())
+        .unwrap_or((0.0, 0.0));
+    let root = fixed.root()?;
+    let bounds = fixed.compute_bounds(&root)?;
+    Some((
+        sx - transform.0 - bounds.x() as f64,
+        sy - transform.1 - bounds.y() as f64,
+    ))
 }
 
 impl SplitView {
@@ -869,7 +1039,9 @@ impl SplitView {
                     tiles: vec![],
                     columns: [vec![], vec![]],
                     heights: [vec![], vec![]],
+                    floored: [true, true],
                     width_share: 0.5,
+                    scroll: 0,
                     widgets: vec![],
                     frames: vec![],
                     pills: vec![],
@@ -884,21 +1056,23 @@ impl SplitView {
                 slots: RefCell::new(vec![]),
                 drag: RefCell::new(None),
                 cursor: Cell::new(Cursor::None),
+                scroll_pending: Cell::new(false),
             }),
         };
         this.inner.handle.replace(Some(this.clone()));
         watch_viewport(&this.inner, 1, &this.inner.outer.vadjustment());
         watch_viewport(&this.inner, 0, &this.inner.outer.hadjustment());
+        watch_scroll(&this.inner, &this.inner.outer.vadjustment());
         // One drag gesture for tiles and borders: the press decides which.
         // It never claims (gtkgesturedrag.c claims nothing), so clicks keep
         // working; nothing moves before the threshold.
         let drag = gtk::GestureDrag::new();
         let begin_view = this.clone();
-        drag.connect_drag_begin(move |_, sx, sy| begin_view.inner.begin_drag(sx, sy));
+        drag.connect_drag_begin(move |g, sx, sy| begin_view.inner.begin_drag(g, sx, sy));
         let update_view = this.clone();
-        drag.connect_drag_update(move |_, dx, dy| update_view.inner.update_drag(dx, dy));
+        drag.connect_drag_update(move |g, dx, dy| update_view.inner.update_drag(g, dx, dy));
         let end_view = this.clone();
-        drag.connect_drag_end(move |_, dx, dy| end_view.inner.end_drag(dx, dy));
+        drag.connect_drag_end(move |g, dx, dy| end_view.inner.end_drag(g, dx, dy));
         let cancel_view = this.clone();
         drag.connect_cancel(move |_, _| cancel_view.inner.cancel_drag());
         this.inner.fixed.add_controller(drag);
@@ -982,7 +1156,9 @@ impl Inner {
             st.tiles.clear();
             st.columns = [vec![], vec![]];
             st.heights = [vec![], vec![]];
+            st.floored = [true, true];
             st.width_share = 0.5;
+            st.scroll = 0;
             st.pills.clear();
             st.frames.clear();
             st.rects.clear();
@@ -1031,6 +1207,7 @@ impl Inner {
             let column = add_to_shorter(&mut st.columns, index);
             // A column that gained a tile goes back to equal shares.
             st.heights[column] = equal_shares(st.columns[column].len());
+            st.floored[column] = true;
             st.widgets.push(tile.clone());
             st.frames.push(frame);
             st.pills.push(pill);
@@ -1089,6 +1266,11 @@ impl Inner {
             let old_heights = st.heights.clone();
             let next = columns_without(&old_columns, index);
             st.heights = heights_after_change(&old_columns, &old_heights, &next);
+            for column in 0..2 {
+                if old_columns[column].len() != next[column].len() {
+                    st.floored[column] = true;
+                }
+            }
             st.columns = next;
             st.tiles.remove(index);
             st.widgets.remove(index);
@@ -1116,14 +1298,34 @@ impl Inner {
     /// Recompute every tile's rect and move it there: immediately for a
     /// viewport/scale/border change, over 200 ms for a close, an add or a drop.
     fn relayout(&self, animate: bool) {
-        let (rects, widgets) = {
+        let (rects, widgets, pills, scale) = {
             let mut st = self.state.borrow_mut();
             let rects = st.rects();
             st.rects = rects;
-            (st.rects.clone(), st.widgets.clone())
+            (
+                st.rects.clone(),
+                st.widgets.clone(),
+                st.pills.clone(),
+                st.scale,
+            )
         };
         for (slot, widget) in widgets.iter().enumerate() {
             if let Some(&rect) = rects.get(slot) {
+                if let Some(pill) = pills.get(slot) {
+                    let wide = pill_is_wide(rect.w, scale);
+                    if wide {
+                        pill.add_css_class("wide");
+                    } else {
+                        pill.remove_css_class("wide");
+                    }
+                    if let Some(label) = pill.first_child().and_downcast::<gtk::Label>() {
+                        label.set_max_width_chars(if wide {
+                            -1
+                        } else {
+                            pill_label_chars(rect.w, scale)
+                        });
+                    }
+                }
                 if animate {
                     self.slide_to(slot, widget, rect);
                 } else {
@@ -1131,6 +1333,27 @@ impl Inner {
                 }
             }
         }
+    }
+
+    /// Re-apply the layout after a scroll, one idle later (see `watch_scroll`).
+    fn schedule_scroll(&self) {
+        if self.scroll_pending.replace(true) {
+            return;
+        }
+        let Some(handle) = self.handle.borrow().clone() else {
+            self.scroll_pending.set(false);
+            return;
+        };
+        let weak = Rc::downgrade(&handle.inner);
+        glib::idle_add_local_once(move || {
+            if let Some(inner) = weak.upgrade() {
+                inner.scroll_pending.set(false);
+                // A tile drag owns the visuals until it ends.
+                if inner.drag.borrow().is_none() {
+                    inner.relayout(false);
+                }
+            }
+        });
     }
 
     fn refresh_classes(&self) {
@@ -1155,14 +1378,28 @@ impl Inner {
     }
 
     /// One tile: the tab pill sits short and centred *above* the framed pane.
+    /// Both live in a clipping scroller whose measure is zero in both axes:
+    /// a `GtkFixed` allocates a child its *preferred* size, not the size it
+    /// was asked for (gtk-4.22.4:gtk/gtkfixedlayout.c:297-322), and a
+    /// ScrolledWindow with an EXTERNAL policy measures zero
+    /// (gtk-4.22.4:gtk/gtkscrolledwindow.c:1847-1851), so the tile can be
+    /// narrower than its pill without drawing over the neighbour (item 4).
     fn tile_widget(name: &str, items: u32) -> (gtk::Box, gtk::Box, gtk::Box, gtk::Button) {
         let outer = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        let clip = gtk::ScrolledWindow::new();
+        clip.set_policy(gtk::PolicyType::External, gtk::PolicyType::External);
+        clip.set_propagate_natural_width(false);
+        clip.set_propagate_natural_height(false);
+        clip.set_hexpand(true);
+        clip.set_vexpand(true);
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
         let pill = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         pill.add_css_class("gl-pill");
         pill.add_css_class("tab");
         pill.set_halign(gtk::Align::Center);
         let label = gtk::Label::new(Some(name));
         label.set_hexpand(true);
+        label.set_ellipsize(gtk::pango::EllipsizeMode::End);
         pill.append(&label);
         let close = gtk::Button::new();
         close.add_css_class("gl-pill-close");
@@ -1174,8 +1411,10 @@ impl Inner {
         frame.add_css_class("gl-tile");
         frame.set_vexpand(true);
         frame.append(&crate::grid::folder_view(items, true));
-        outer.append(&pill);
-        outer.append(&frame);
+        content.append(&pill);
+        content.append(&frame);
+        clip.set_child(Some(&content));
+        outer.append(&clip);
         (outer, frame, pill, close)
     }
 
@@ -1272,20 +1511,19 @@ impl Inner {
 
     /// A press anywhere in the view: a pill starts a tile drag, a border
     /// starts a resize. Nothing moves until the pointer passes the threshold.
-    fn begin_drag(&self, sx: f64, sy: f64) {
-        let (rects, columns, slots, scale, view, width_share, heights) = {
+    /// The press point, the hit test and every later update are in the
+    /// Fixed's content space via `pointer_in_fixed` (item 5).
+    fn begin_drag(&self, gesture: &gtk::GestureDrag, sx: f64, sy: f64) {
+        let (rects, slots, scale, width_share) = {
             let st = self.state.borrow();
-            (
-                st.rects.clone(),
-                st.columns.clone(),
-                st.slots(),
-                st.scale,
-                st.view,
-                st.width_share,
-                st.heights.clone(),
-            )
+            (st.rects.clone(), st.slots(), st.scale, st.width_share)
         };
-        if let Some(slot) = pill_at(&rects, sx as i32, sy as i32, scale) {
+        let (px, py) = pointer_in_fixed(&self.fixed, gesture.current_event().as_ref())
+            .map(|(x, y)| (x.round() as i32, y.round() as i32))
+            .unwrap_or((sx.round() as i32, sy.round() as i32));
+        let border = border_at(&slots, px, py, scale);
+        crate::log!("split", "border press at ({px}, {py}) hit {border:?}");
+        if let Some(slot) = pill_at(&rects, px, py, scale) {
             let Some(rect) = rects.get(slot).copied() else {
                 return;
             };
@@ -1295,7 +1533,8 @@ impl Inner {
             let name = self.state.borrow().tiles[slot].name.clone();
             *self.drag.borrow_mut() = Some(Drag::Tile {
                 from: slot,
-                grab: (sx as i32 - rect.x, sy as i32 - rect.y),
+                grab: (px - rect.x, py - rect.y),
+                press: (px, py),
                 targets: rects,
             });
             self.bump_gen(slot);
@@ -1304,37 +1543,37 @@ impl Inner {
                 let last = self.fixed.last_child();
                 widget.insert_after(&self.fixed, last.as_ref());
             }
-            crate::log!("split", "dragging '{name}' from slot {slot}");
+            crate::log!(
+                "split",
+                "tile press at ({px}, {py}) on '{name}' slot {slot}"
+            );
             return;
         }
-        let Some(border) = border_at(&slots, sx as i32, sy as i32) else {
+        let Some(border) = border else {
             return;
         };
-        let f = frame(view[0], view[1], scale);
         match border {
             Border::Columns => {
-                let avail = (f.inner_w - f.gutter).max(1);
                 *self.drag.borrow_mut() = Some(Drag::Width {
                     share: width_share,
-                    avail,
+                    press_x: px,
                 });
-                crate::log!("split", "resizing the column border");
+                crate::log!("split", "resizing the column border from x {px}");
             }
             Border::Heights { column, row } => {
-                let n = columns[column].len();
-                let avail = (f.inner_h - (n as i32 - 1) * f.gutter).max(1);
+                let sizes: Vec<i32> = slots[column].iter().map(|r| r.h).collect();
                 *self.drag.borrow_mut() = Some(Drag::Height {
                     column,
                     border: row,
-                    shares: heights[column].clone(),
-                    avail,
+                    sizes,
+                    press_y: py,
                 });
                 crate::log!("split", "resizing column {column} at border {row}");
             }
         }
     }
 
-    fn update_drag(&self, dx: f64, dy: f64) {
+    fn update_drag(&self, gesture: &gtk::GestureDrag, dx: f64, dy: f64) {
         let Some(drag) = self.drag.borrow().clone() else {
             return;
         };
@@ -1342,9 +1581,10 @@ impl Inner {
             Drag::Tile {
                 from,
                 grab,
+                press,
                 targets,
             } => {
-                let (columns, heights, width_share, rects, widgets, view, scale) = {
+                let (columns, heights, width_share, rects, widgets, view, scale, scroll, floored) = {
                     let st = self.state.borrow();
                     (
                         st.columns.clone(),
@@ -1354,13 +1594,16 @@ impl Inner {
                         st.widgets.clone(),
                         st.view,
                         st.scale,
+                        st.scroll,
+                        st.floored,
                     )
                 };
                 let Some(&rect) = rects.get(from) else {
                     return;
                 };
-                let px = rect.x + grab.0 + dx as i32;
-                let py = rect.y + grab.1 + dy as i32;
+                let (px, py) = pointer_in_fixed(&self.fixed, gesture.current_event().as_ref())
+                    .map(|(x, y)| (x.round() as i32, y.round() as i32))
+                    .unwrap_or((press.0 + dx.round() as i32, press.1 + dy.round() as i32));
                 let board = Board {
                     columns: &columns,
                     heights: &heights,
@@ -1370,6 +1613,8 @@ impl Inner {
                         h: view[1],
                         scale,
                     },
+                    scroll,
+                    floored,
                 };
                 let (drop, layout) = drag_layout(&board, &rects, from, px, py, grab);
                 let size = (rect.w, rect.h);
@@ -1391,33 +1636,54 @@ impl Inner {
                 *self.drag.borrow_mut() = Some(Drag::Tile {
                     from,
                     grab,
+                    press,
                     targets: layout,
                 });
             }
-            Drag::Width { share, avail } => {
-                let scale = self.state.borrow().scale;
-                let next = width_share_after_drag(share, avail, dx as i32, min_column_width(scale));
+            Drag::Width { share, press_x } => {
+                let (scale, view) = {
+                    let st = self.state.borrow();
+                    (st.scale, st.view)
+                };
+                let f = frame(view[0], view[1], scale);
+                let avail = (f.inner_w - f.gutter).max(1);
+                let (px, _) = pointer_in_fixed(&self.fixed, gesture.current_event().as_ref())
+                    .map(|(x, _)| (x.round() as i32, 0))
+                    .unwrap_or((press_x + dx.round() as i32, 0));
+                let next =
+                    width_share_after_drag(share, avail, px - press_x, min_column_width(scale));
                 self.state.borrow_mut().width_share = next;
                 self.relayout(false);
             }
             Drag::Height {
                 column,
                 border,
-                shares,
-                avail,
+                sizes,
+                press_y,
             } => {
                 let (scale, view) = {
                     let st = self.state.borrow();
                     (st.scale, st.view)
                 };
+                let (_, py) = pointer_in_fixed(&self.fixed, gesture.current_event().as_ref())
+                    .map(|(_, y)| (0, y.round() as i32))
+                    .unwrap_or((0, press_y + dy.round() as i32));
+                let dy = py - press_y;
                 let f = frame(view[0], view[1], scale);
-                let total = {
+                let n = {
                     let st = self.state.borrow();
-                    st.columns[0].len() + st.columns[1].len()
+                    st.columns[column].len()
                 };
-                let min_h = slot_minimum(total, &f, scale);
-                let next = heights_after_drag(&shares, avail, border, dy as i32, min_h);
-                self.state.borrow_mut().heights[column] = next;
+                let avail = (f.inner_h - (n as i32 - 1) * f.gutter).max(1);
+                let next_px = sizes_after_drag(&sizes, border, dy, min_slot_height(scale));
+                let next: Vec<f64> = next_px.iter().map(|px| *px as f64 / avail as f64).collect();
+                {
+                    let mut st = self.state.borrow_mut();
+                    st.heights[column] = next.clone();
+                    // A hand drag owns this column's heights: no half floor.
+                    st.floored[column] = false;
+                }
+                crate::log!("split", "border drag dy {dy} shares {next:?}");
                 self.relayout(false);
             }
         }
@@ -1425,11 +1691,11 @@ impl Inner {
 
     /// Settle: a tile drop commits, otherwise everything slides back. Border
     /// drags have already written their shares.
-    fn end_drag(&self, dx: f64, dy: f64) {
+    fn end_drag(&self, gesture: &gtk::GestureDrag, dx: f64, dy: f64) {
         let Some(drag) = self.drag.borrow_mut().take() else {
             return;
         };
-        let Drag::Tile { from, grab, .. } = drag else {
+        let Drag::Tile { from, press, .. } = drag else {
             return;
         };
         let (columns, heights, rects, widgets, scale) = {
@@ -1442,11 +1708,9 @@ impl Inner {
                 st.scale,
             )
         };
-        let Some(&rect) = rects.get(from) else {
-            return;
-        };
-        let px = rect.x + grab.0 + dx as i32;
-        let py = rect.y + grab.1 + dy as i32;
+        let (px, py) = pointer_in_fixed(&self.fixed, gesture.current_event().as_ref())
+            .map(|(x, y)| (x.round() as i32, y.round() as i32))
+            .unwrap_or((press.0 + dx.round() as i32, press.1 + dy.round() as i32));
         let drop = drop_at(&columns, &rects, from, px, py, scale);
         let landed = drop.and_then(|d| apply_drop(&columns, from, d).map(|next| (d, next)));
         match landed {
@@ -1496,8 +1760,11 @@ impl Inner {
 
     /// A double-click on a border resets it to equal shares, animated.
     fn reset_border(&self, x: f64, y: f64) {
-        let slots = self.state.borrow().slots();
-        match border_at(&slots, x as i32, y as i32) {
+        let (slots, scale) = {
+            let st = self.state.borrow();
+            (st.slots(), st.scale)
+        };
+        match border_at(&slots, x.round() as i32, y.round() as i32, scale) {
             Some(Border::Columns) => {
                 self.state.borrow_mut().width_share = 0.5;
                 self.relayout(true);
@@ -1507,6 +1774,7 @@ impl Inner {
                 {
                     let mut st = self.state.borrow_mut();
                     st.heights[column] = equal_shares(st.columns[column].len());
+                    st.floored[column] = true;
                 }
                 self.relayout(true);
                 crate::log!("split", "reset column {column} to equal shares");
@@ -1517,8 +1785,11 @@ impl Inner {
 
     /// The hover cursor over a border.
     fn hover(&self, x: f64, y: f64) {
-        let slots = self.state.borrow().slots();
-        let cursor = match border_at(&slots, x as i32, y as i32) {
+        let (slots, scale) = {
+            let st = self.state.borrow();
+            (st.slots(), st.scale)
+        };
+        let cursor = match border_at(&slots, x.round() as i32, y.round() as i32, scale) {
             Some(Border::Columns) => Cursor::Width,
             Some(Border::Heights { .. }) => Cursor::Height,
             None => Cursor::None,
@@ -1933,25 +2204,22 @@ mod tests {
     #[test]
     fn border_drags_clamp_at_the_minimums() {
         let f = frame(VIEW.0, VIEW.1, 1.0);
-        let total = 4;
-        let min = slot_minimum(total, &f, 1.0);
+        let min = min_slot_height(1.0);
         let avail = f.inner_h - 3 * f.gutter;
+        let sizes = vec![avail / 2, avail / 2];
         // Pull the first border far up: the first slot stops at the minimum.
-        let shares = heights_after_drag(&equal_shares(2), avail, 1, -2000, min);
-        let first = (avail as f64 * shares[0]).round() as i32;
-        let second = (avail as f64 * shares[1]).round() as i32;
-        assert_eq!(first, min);
-        assert!(second >= min);
-        assert!(first + second <= avail);
+        let next = sizes_after_drag(&sizes, 1, -2000, min);
+        assert_eq!(next[0], min);
+        assert!(next[1] >= min);
+        assert_eq!(next[0] + next[1], sizes[0] + sizes[1]);
         // And far down: the second slot stops at the minimum.
-        let shares = heights_after_drag(&equal_shares(2), avail, 1, 2000, min);
-        let first = (avail as f64 * shares[0]).round() as i32;
-        let second = (avail as f64 * shares[1]).round() as i32;
-        assert_eq!(second, min);
-        assert!(first >= min);
-        // The width border clamps to one grid column / the pill, both sides.
+        let next = sizes_after_drag(&sizes, 1, 2000, min);
+        assert_eq!(next[1], min);
+        assert!(next[0] >= min);
+        // The width border clamps to one grid column, both sides.
         let min_w = min_column_width(1.0);
         let avail_w = f.inner_w - f.gutter;
+        assert_eq!(min_w, scaled(CELL_W, 1.0));
         assert_eq!(
             (avail_w as f64 * width_share_after_drag(0.5, avail_w, -9999, min_w)).round() as i32,
             min_w
@@ -1962,16 +2230,16 @@ mod tests {
         );
         assert!(min_w >= scaled(CELL_W, 1.0));
         // A pair that is already below two minimums cannot be resized.
-        let tight = vec![0.5, 0.5];
-        assert_eq!(heights_after_drag(&tight, 100, 1, 10, 202), tight);
+        let tight = vec![100, 100];
+        assert_eq!(sizes_after_drag(&tight, 1, 10, 202), tight);
     }
 
     #[test]
     fn a_double_click_resets_a_border_to_equal_shares() {
         // The reset is the model's own equal shares.
         assert_eq!(equal_shares(3), vec![1.0 / 3.0; 3]);
-        let dragged = heights_after_drag(&equal_shares(3), 1000, 1, 120, 100);
-        assert_ne!(dragged, equal_shares(3));
+        let dragged = sizes_after_drag(&[500, 500, 500], 1, 120, 100);
+        assert_ne!(dragged, vec![500, 500, 500]);
         assert_eq!(equal_shares(3), vec![1.0 / 3.0; 3]);
         // The column border's reset is the equal width share.
         let min_w = min_column_width(1.0);
@@ -1984,22 +2252,25 @@ mod tests {
     fn shares_survive_a_window_resize() {
         let f = frame(VIEW.0, VIEW.1, 1.0);
         let avail = f.inner_h - f.gutter;
-        let shares = heights_after_drag(&equal_shares(2), avail, 1, 200, slot_minimum(4, &f, 1.0));
-        let big = layout(
+        let sizes = sizes_after_drag(&[avail / 2, avail / 2], 1, 200, min_slot_height(1.0));
+        let shares: Vec<f64> = sizes.iter().map(|px| *px as f64 / avail as f64).collect();
+        let big = layout_floored(
             &initial_columns(4),
             &[shares.clone(), equal_shares(2)],
             0.7,
             1400,
             1600,
             1.0,
+            [false, true],
         );
-        let small = layout(
+        let small = layout_floored(
             &initial_columns(4),
             &[shares.clone(), equal_shares(2)],
             0.7,
             1000,
             1200,
             1.0,
+            [false, true],
         );
         // The ratio of the two stacked tiles stays the same at both sizes.
         let ratio = |s: &[Rect]| s[0].h as f64 / s[1].h as f64;
@@ -2008,13 +2279,14 @@ mod tests {
         let w = |s: &[Vec<Rect>; 2]| s[0][0].w as f64 / (s[0][0].w + s[1][0].w) as f64;
         assert!((w(&big) - w(&small)).abs() < 0.05);
         // At scale 0.5 the proportions hold too.
-        let half = layout(
+        let half = layout_floored(
             &initial_columns(4),
             &[shares, equal_shares(2)],
             0.7,
             1400,
             1600,
             0.5,
+            [false, true],
         );
         assert!((w(&big) - w(&half)).abs() < 0.05);
     }
@@ -2104,28 +2376,136 @@ mod tests {
     }
 
     #[test]
-    fn border_hit_test() {
+    fn border_hit_test_covers_the_whole_strip_except_the_pill() {
         let columns = initial_columns(4);
         let rects = rects_for(&columns);
         let slots = slots_of(&columns, &rects);
         let gap = scaled(GAP_L, 1.0);
         // The column gutter, at any height.
         let x = slots[0][0].x + slots[0][0].w + gap / 2;
-        assert_eq!(border_at(&slots, x, 40), Some(Border::Columns));
-        // The border between the left column's tiles.
-        let y = slots[0][0].y + slots[0][0].h + gap / 2;
+        assert_eq!(border_at(&slots, x, 40, 1.0), Some(Border::Columns));
+        // The left column's strip: frame bottom to the next tile's frame top,
+        // every integer y, at an x clear of the pill.
+        let edge = slots[0][0].x + 5;
+        let top = slots[0][0].y + slots[0][0].h;
+        let bottom = slots[0][1].y + scaled(CONTROL_H, 1.0) + scaled(GAP_S, 1.0);
+        for y in top..bottom {
+            assert_eq!(
+                border_at(&slots, edge, y, 1.0),
+                Some(Border::Heights { column: 0, row: 1 }),
+                "y {y} in the strip"
+            );
+        }
+        // The next frame itself is not a border.
+        assert_eq!(border_at(&slots, edge, bottom, 1.0), None);
+        // On the lower pill it is not a border either ...
+        let lower = slots[0][1];
+        let pw = scaled(PILL_W, 1.0).min(lower.w);
+        let pill_x = lower.x + (lower.w - pw) / 2 + pw / 2;
+        let pill_y = lower.y + scaled(CONTROL_H, 1.0) / 2;
+        assert_eq!(border_at(&slots, pill_x, pill_y, 1.0), None);
+        // ... but the gutter band at the same x still is (the pill is only
+        // the lower tile's top control-h).
         assert_eq!(
-            border_at(&slots, slots[0][0].x + 40, y),
+            border_at(&slots, pill_x, top + 1, 1.0),
             Some(Border::Heights { column: 0, row: 1 })
         );
         // A tile's middle is no border.
-        assert_eq!(border_at(&slots, slots[0][0].x + 40, 100), None);
-        // The right column's own border is at its own y.
-        let y = slots[1][0].y + slots[1][0].h + gap / 2;
-        assert_eq!(
-            border_at(&slots, slots[1][0].x + 40, y),
-            Some(Border::Heights { column: 1, row: 1 })
+        assert_eq!(border_at(&slots, edge, 100, 1.0), None);
+        // The right column's own strip is at its own y.
+        let top = slots[1][0].y + slots[1][0].h;
+        let bottom = slots[1][1].y + scaled(CONTROL_H, 1.0) + scaled(GAP_S, 1.0);
+        for y in top..bottom {
+            assert_eq!(
+                border_at(&slots, slots[1][0].x + 5, y, 1.0),
+                Some(Border::Heights { column: 1, row: 1 }),
+                "right y {y}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_short_column_is_pinned_and_a_tall_one_scrolls() {
+        let heights = |columns: &[Vec<usize>; 2]| {
+            [
+                equal_shares(columns[0].len()),
+                equal_shares(columns[1].len()),
+            ]
+        };
+        // 4 + 1: the lone tile fits; four floored tiles do not.
+        let four_one = [vec![0, 1, 2, 3], vec![4]];
+        let s = layout(&four_one, &heights(&four_one), 0.5, VIEW.0, VIEW.1, 1.0);
+        assert_eq!(column_offsets(&s, VIEW.1, 1.0, 90), [0, 90]);
+        assert!(!column_fits(&s[0], VIEW.1, 1.0));
+        assert!(column_fits(&s[1], VIEW.1, 1.0));
+        // 3 + 3: both columns are floored past the view, so both scroll.
+        let three_three = initial_columns(6);
+        let s = layout(
+            &three_three,
+            &heights(&three_three),
+            0.5,
+            VIEW.0,
+            VIEW.1,
+            1.0,
         );
+        assert_eq!(column_offsets(&s, VIEW.1, 1.0, 90), [0, 0]);
+        // 2 + 1: both fit, so both stay pinned (and the scroller has no range).
+        let two_one = [vec![0, 1], vec![2]];
+        let s = layout(&two_one, &heights(&two_one), 0.5, VIEW.0, VIEW.1, 1.0);
+        assert_eq!(column_offsets(&s, VIEW.1, 1.0, 0), [0, 0]);
+        assert!(column_fits(&s[0], VIEW.1, 1.0));
+        // A 2 + 2 column that fits at 1400 stops fitting at 100: the pill plus
+        // one grid row is now taller than half the view.
+        let four = initial_columns(4);
+        let tall = layout(&four, &heights(&four), 0.5, VIEW.0, 1400, 1.0);
+        let short = layout(&four, &heights(&four), 0.5, VIEW.0, 100, 1.0);
+        assert!(column_fits(&tall[0], 1400, 1.0));
+        assert!(!column_fits(&short[0], 100, 1.0));
+        assert_eq!(column_offsets(&short, 100, 1.0, 30), [0, 0]);
+    }
+
+    #[test]
+    fn a_hand_drag_reaches_the_minimum_not_the_half_floor() {
+        // 4 + 1: the default layout floors the four-tile column at half the
+        // view. A hand drag may take one of its tiles down to pill + one grid
+        // row, below that floor.
+        let four_one = [vec![0, 1, 2, 3], vec![4]];
+        let heights = [equal_shares(4), equal_shares(1)];
+        let s = layout(&four_one, &heights, 0.5, VIEW.0, VIEW.1, 1.0);
+        let f = frame(VIEW.0, VIEW.1, 1.0);
+        let half = half_floor(5, &f);
+        assert_eq!(s[0][0].h, half);
+        let min = min_slot_height(1.0);
+        assert!(min < half);
+        let sizes: Vec<i32> = s[0].iter().map(|r| r.h).collect();
+        let next = sizes_after_drag(&sizes, 1, -10_000, min);
+        assert_eq!(next[0], min);
+        // The pair keeps its sum, so the neighbour grows; the floor is gone.
+        assert_eq!(next[1], 2 * half - min);
+        assert!(next[1] > half);
+        // The hand-drag layout drops the floor and renders the minimum.
+        let avail = f.inner_h - 3 * f.gutter;
+        let shares: Vec<f64> = next.iter().map(|px| *px as f64 / avail as f64).collect();
+        let hand = layout_floored(
+            &four_one,
+            &[shares, equal_shares(1)],
+            0.5,
+            VIEW.0,
+            VIEW.1,
+            1.0,
+            [false, true],
+        );
+        assert_eq!(hand[0][0].h, min);
+        // The default layout still floors it.
+        let floored = layout(
+            &four_one,
+            &[equal_shares(4), equal_shares(1)],
+            0.5,
+            VIEW.0,
+            VIEW.1,
+            1.0,
+        );
+        assert_eq!(floored[0][0].h, half);
     }
 
     #[test]
@@ -2204,6 +2584,8 @@ mod tests {
                 h: VIEW.1,
                 scale: 1.0,
             },
+            scroll: 0,
+            floored: [true, true],
         };
         let (drop, preview) = drag_layout(&board, &rects, 0, other.x + 10, other.y + 10, (0, 0));
         assert_eq!(drop, Some(Drop::Swap(1)));
@@ -2243,6 +2625,8 @@ mod tests {
                 h: VIEW.1,
                 scale: 1.0,
             },
+            scroll: 0,
+            floored: [true, true],
         };
         let (_, preview) = drag_layout(&board, &rects, 0, 900, 700, (30, 20));
         assert_eq!(

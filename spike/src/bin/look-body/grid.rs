@@ -143,7 +143,19 @@ pub fn folder_view(items: u32, tile: bool) -> gtk::ScrolledWindow {
     }
     let scroller = gtk::ScrolledWindow::new();
     scroller.set_child(Some(&grid));
-    scroller.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
+    // A tile may be narrower than one cell (P1m-r4 item 4): EXTERNAL measures
+    // zero in the horizontal direction (gtk-4.22.4:gtk/gtkscrolledwindow.c:1847-1851),
+    // so the tile's clipping scroller can shrink it without the grid setting
+    // a minimum that would overlap the neighbouring tile. The single view
+    // keeps NEVER: it always has a column.
+    scroller.set_policy(
+        if tile {
+            gtk::PolicyType::External
+        } else {
+            gtk::PolicyType::Never
+        },
+        gtk::PolicyType::Automatic,
+    );
     // Natural sizes must not pin the window's minimum size; the viewport decides.
     scroller.set_propagate_natural_width(false);
     scroller.set_propagate_natural_height(false);

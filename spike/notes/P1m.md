@@ -1069,3 +1069,199 @@ press point and the updates disagree, and Kyle's real-mouse failure is not repro
 at 1,272 px the two tile columns overlap each other and run under the preview panel (r3 made a
 tile's minimum the pill's 270 px; the content minimum still assumes one grid column). Both are in
 P1m-r4, with permanent border-press log lines so Kyle's run can be diagnosed.
+
+## P1m-r4 changes
+
+### Item 1: a fitting column is pinned while the taller one scrolls
+
+`split.rs` keeps one outer `ScrolledWindow`. `State` now carries the scroller's `scroll` value.
+`column_fits` says whether a column's last frame bottom is inside the visible `inner_h`, and
+`column_offsets` returns `scroll` for a fitting column and `0` for a taller one; `offset_slots`
+moves the fitted column's slots (and so its widgets) to `scroll`. `Board` carries `scroll`, so the
+layout, hit test, drop zones and drop line all use the same offset. `watch_scroll` follows
+`vadjustment`'s `value`; `schedule_scroll` re-applies the layout in one `glib::idle_add_local_once`,
+never inside the scroller's allocation. A tile drag owns the visuals until it ends.
+
+Live at 1,272 × 1,398 with 4 + 1 (the temporary timer put Tab 4 alone and the other four left):
+
+```text
+[gimbal-look-body 1.619] temp: item1 lone tile at scroll 0: Some(Rect { x: 161, y: 0, w: 97, h: 1151 })
+[gimbal-look-body 1.619] temp: item1 lone tile at scroll 566: Some(Rect { x: 161, y: 566, w: 97, h: 1151 })
+[gimbal-look-body 1.619] temp: item1 lone tile at scroll 1133: Some(Rect { x: 161, y: 1133, w: 97, h: 1151 })
+[gimbal-look-body 2.321] temp: item1 actual lone tile at half: Some(Rect { x: 478, y: 143, w: 97, h: 1151 })
+[gimbal-look-body 2.621] temp: item1 actual lone tile at max: Some(Rect { x: 478, y: 142, w: 97, h: 1151 })
+```
+
+The model y moves by exactly the scroll value, and the actual window-space y stays at 142/143: the
+lone tile is pinned at full visible height while the left column's content height is 2,324 px for a
+1,191 px page (range 1,133). [observed]
+
+### Item 2: the whole strip grabs; hand drags ignore the half-height floor
+
+`border_at(slots, x, y, scale)` now takes the whole strip from `slot[row-1]`'s frame bottom to
+`slot[row]`'s frame top (`y + control-h + gap-s`), and only rejects the lower tile's own pill
+(`pill_zone`, which uses the shrinking pill width). The cursor and the press still call the same
+function (hover uses `border_at`, `begin_drag` calls it once and reuses the result for the log and
+the drag).
+
+The default half-height floor is now selected per column by `State.floored`: true after build, add,
+close and a double-click reset, false as soon as a hand drag moves a border. `layout_floored` applies
+`half_floor` only to a floored column. Border drags work from the actual pixel sizes the pointer saw
+(`Drag::Height.sizes`) through `sizes_after_drag`, so they are no longer expressed as shares of an
+`avail` captured at the press.
+
+The temporary hit-test scan down x = 45 in the 4-tile column (transitions only):
+
+```text
+[gimbal-look-body 1.620] temp: item2 border at x 45, y 563: Some(Heights { column: 0, row: 1 })
+[gimbal-look-body 1.620] temp: item2 border at x 45, y 587: None
+[gimbal-look-body 1.620] temp: item2 border at x 45, y 637: Some(Heights { column: 0, row: 1 })
+[gimbal-look-body 1.620] temp: item2 border at x 45, y 645: None
+[gimbal-look-body 1.620] temp: item2 border at x 45, y 1150: Some(Heights { column: 0, row: 2 })
+...
+```
+
+The 24 px gutter and the 8 px gap below the lower pill grab; the pill's own 50 px band does not.
+[observed, model scan]
+
+### Item 3: pinned rows 44 px apart
+
+`PIN_ROW_H` is 44 (was 64). `PinnedList::row_h` is the only pitch the row layout, drag arithmetic,
+slides, `sel` hit test and container height use, so the change follows everywhere; the stylesheet's
+`.gl-pinned-row { min-height: 44px }` comes from the same token. [read + inferred]
+
+### Item 4: the split view at half width
+
+I chose the first option: tiles may be narrower than a full pill, the pill shrinks and the label
+ellipsizes, and the content minimum accounts for two true columns (one `CELL_W` each) so the
+sidebars give way first.
+
+- `min_column_width` is one cell again (97 at scale 1), not `max(CELL_W, PILL_W)`.
+- `one_column_width`'s split branch is `2 × gap-2xl + gap-l + 2 × CELL_W` = 298 at scale 1 (150 at
+  0.5), up from 213; the window floor is 976 at scale 1 (was 919). At 1,272 px the content keeps
+  exactly 298 px: the left sidebar gives 40 px (348 → 308), the preview keeps 648.
+- A tile's content now sits in a `ScrolledWindow` with EXTERNAL policies. `GtkFixed` allocates a
+  child its *preferred* size (`gtk-4.22.4:gtk/gtkfixedlayout.c:297-322`), while a ScrolledWindow
+  with an EXTERNAL/never policy measures zero (`gtk-4.22.4:gtk/gtkscrolledwindow.c:1847-1851`); so
+  the tile is allocated exactly its slot and clips instead of drawing over its neighbour.
+- The tile grid's own scroller is EXTERNAL horizontally for the same reason.
+- `.gl-pill.tab` no longer has a hard 270 px minimum; `.gl-pill.tab.wide` gets it back when the
+  column is at least `PILL_W` wide. Below that, `relayout` caps the label with
+  `set_max_width_chars` (from `pill_label_chars`) and the label ellipsizes. The hit tests use
+  `pill_width`, the same estimate.
+
+At 1,272 × 1,398 (actual allocations in the window, after the temporary 4 + 1 setup):
+
+```text
+[gimbal-look-body 2.020] temp: item4 tile 0: Rect { x: 357, y: 142, w: 97, h: 563 }
+[gimbal-look-body 2.020] temp: item4 tile 1: Rect { x: 357, y: 729, w: 97, h: 563 }
+[gimbal-look-body 2.021] temp: item4 tile 2: Rect { x: 357, y: 1316, w: 97, h: 563 }
+[gimbal-look-body 2.021] temp: item4 tile 3: Rect { x: 357, y: 1903, w: 97, h: 563 }
+[gimbal-look-body 2.021] temp: item4 tile 4: Rect { x: 478, y: 142, w: 97, h: 1151 }
+[gimbal-look-body 2.021] temp: item4 window 1272: preview x 616 w 648
+```
+
+Left column 357–454, right 478–575 (24 px gutter), preview starts at 616 and ends at 1,264 with the
+8 px window inset: no tile is under the preview and the two columns do not touch. [observed]
+
+### Item 5: one coordinate space for border drags, and permanent logs
+
+The r3 code used two spaces: `begin_drag` hit-tested with the gesture's press point (widget-relative,
+`gtk-4.22.4:gtk/gtkgesture.c:1271-1307`; `drag-begin` passes the start point relative to the widget
+allocation, `gtk-4.22.4:gtk/gtkgesturedrag.c:118-124`), then `drag_update` applied GTK's cumulative
+`dy` to a *share* vector through `heights_after_drag`, which converted shares to pixels with the
+`avail` captured at the press and divided by that same old `avail`. `layout` then multiplied those
+shares by the viewport's *current* `avail`. Any change of `avail` (the page size or the Fixed's
+allocation moving with the scroller) rescales the pointer delta — a 150 px move becomes 233 px when
+the captured avail was the smaller one. The top of the strip is where the first update re-allocates,
+so it showed the worst case. [inferred from the r3 code + Claude's numbers; no pointer was injected]
+
+Now `pointer_in_fixed` is the single conversion for the press, hover-independent hit test and every
+update: surface position (`gdk::Event::position`) minus the window's `surface_transform` minus the
+Fixed's `compute_bounds` in the window — the same surface-space correction the pinned rows got in
+r3. `Drag::Tile` stores the press point, `Drag::Width` the press x, `Drag::Height` the press y and
+the actual pixel sizes; updates compute `dy = pointer_y − press_y` and apply it once in pixels.
+`pointer_in_fixed` falls back to `press + (dx, dy)` if the event is unavailable.
+
+Permanent log lines (all through `crate::log!`, so they appear only with `GIMBAL_SPIKE_LOG=1`):
+
+```text
+split: border press at (<x>, <y>) hit Some(Heights { column: c, row: r })   or hit None
+split: border drag dy <dy> shares [<f64>, ...]
+split: tile press at (<x>, <y>) on '<name>' slot <n>
+split: resizing the column border from x <x>
+```
+
+### Tests added or changed
+
+- `a_short_column_is_pinned_and_a_tall_one_scrolls`: 4 + 1 → `[0, scroll]`, 3 + 3 → `[0, 0]`,
+  2 + 1 → `[scroll, scroll]`, and a 2 + 2 column that fits at 1,400 but not at 100.
+- `a_hand_drag_reaches_the_minimum_not_the_half_floor`: a 4-tile floored column's pair goes from
+  half/half to `min/2·half−min`, and `layout_floored` with that column unfloored renders the
+  minimum while the default still renders half.
+- `border_hit_test_covers_the_whole_strip_except_the_pill`: every integer y in three strips,
+  both columns, plus the pill band and the frame top.
+- `border_drags_clamp_at_the_minimums`, `a_double_click_resets_a_border_to_equal_shares` and
+  `shares_survive_a_window_resize` now use `sizes_after_drag` and `layout_floored`.
+- The layout tests expect the new split content minimum (298 / 976 / 450 collapsed).
+
+### RULES.md's four commands
+
+```text
+$ PATH="$T:$PATH" cargo fmt --check
+(no output; exit 0)
+
+$ PATH="$T:$PATH" cargo clippy --all-targets -- -D warnings
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.04s
+
+$ cargo test
+     Running unittests src/main.rs
+running 4 tests
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+     Running unittests src/bin/look-body/main.rs
+running 58 tests
+test result: ok. 58 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+     Running unittests src/bin/look-header/main.rs
+running 12 tests
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+
+$ cargo build --release
+    Finished `release` profile [optimized] target(s) in 0.02s
+```
+
+### 10-second release runs (stopped with SIGTERM)
+
+`look-body` and `look-body --tiles 5` each printed only the allowed intermittent
+`Gdk-WARNING ... VK_SUBOPTIMAL_KHR ... (1000001003)` notice (232 bytes); `look-body --tiles 6
+--pins 14 --scale 0.5` was empty. No other GTK warnings and no panics. An earlier run of the same
+three produced fully empty logs. [observed]
+
+### Not verified live (Claude's check)
+
+- The real-mouse border drag: the press/update path and logs are in place, but no pointer was
+  injected (RULES). The 150 px drag should now be exactly 150 px at every press y.
+- The feel of the pinned column while wheeling (the idle applies one layout per frame, and a tile
+  drag defers it until release). [inferred]
+- The shrinking pill's ellipsis at 1,272 px and while dragging the column border through 270 px;
+  the max-width-chars estimate is 3/5 of `TEXT_CONTROL` per character. [inferred]
+- The 44 px pinned rows' drag and double-click feel. [inferred]
+
+### Anything I'd change outside my files
+
+- None required. `look-style-spec.md` could note `.gl-pill.tab.wide` (the 270 px minimum only while
+  the column has room) and the tile's clipping scroller; I did not edit it.
+
+
+## Review and live check of P1m-r4 (Claude, with Kyle's findings, Nov 1, 2026): passes; one change (P1m-r5)
+
+RULES.md's four commands pass (74 tests). Kyle: scrolling works, the pinned rows have good spacing,
+and the border drag is close. Live, release build, tiled window, DP-3 off:
+
+- **Half width (1,272 px):** no overlap. The tiles narrow, their pills shorten to "…", and the
+  preview starts after the content column.
+- **Border drag:** presses at y 750 and 757 in a full-width 2 + 2 both log
+  `split: border drag dy 150` with the same shares, and the screenshots are identical (an earlier
+  edge reading of mine picked the wrong outline). The r3 overshoot is gone.
+- **Change (Kyle):** dragging a vertical border should push the tiles below instead of shrinking
+  the one below. Dragging up mirrors that, and the last tile fills a column shorter than the view.
+  Rule in the spec; brief P1m-r5.
