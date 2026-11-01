@@ -10,10 +10,10 @@ pub mod tok {
     pub const CONTROL_H: f64 = 50.0; pub const HEADER_H: f64 = 96.0;
     pub const LINE_HAIR: f64 = 1.0; pub const LINE_THIN: f64 = 3.0; pub const LINE_MID: f64 = 6.0; pub const LINE_HEAVY: f64 = 10.0;
     pub const RADIUS: f64 = 12.0; pub const RADIUS_PILL: f64 = 999.0;
-    pub const GRID_MARGIN: f64 = 72.0; pub const SECTION_H: f64 = 40.0; pub const DRIVE_PITCH: f64 = 54.0;
+    pub const GRID_MARGIN: f64 = 72.0; pub const SECTION_H: f64 = 40.0;
     pub const PIN_ROW_H: f64 = 64.0; pub const DIR_ROW_H: f64 = 32.0; pub const STATUS_H: f64 = 64.0;
     pub const BAR_W: f64 = 209.0; pub const BAR_H: f64 = 18.0; pub const MAIN_BAR_W: f64 = 228.0; pub const MAIN_BAR_H: f64 = 20.0;
-    pub const CELL_W: f64 = 120.0; pub const CELL_H: f64 = 144.0;
+    pub const CELL_W: f64 = 97.0; pub const CELL_H: f64 = 144.0;
     pub const SIDEBAR_W: f64 = 348.0; pub const SIDEBAR_MIN: f64 = 260.0;
     pub const PREVIEW_W: f64 = 648.0; pub const PREVIEW_MIN: f64 = 360.0;
     pub const PILL_W: f64 = 270.0;
@@ -121,7 +121,7 @@ window.gimbal-look {{ background-color: {BG}; color: {FG}; font-size: {tc}px; {f
 .gl-pill.selected {{ background-color: {SELECTED}; }} .gl-pill.active.selected {{ background-color: {SELECTED_ACTIVE}; }}
 .gl-pill-close {{ all: unset; min-width: {close}px; min-height: {close}px; -gtk-icon-size: {close}px; padding: 0; border: {thin}px solid {FG}; border-radius: {rp}px; color: {FG}; margin-left: {gm}px; }}
 .gl-pill-close:hover {{ background-color: {HOVER_STRONG}; }} .gl-pill-close:focus-visible {{ box-shadow: 0 0 0 {thin}px {FOCUS_RING}; }}
-.gl-pill.active .gl-pill-close {{ color: {RAISED_FG}; border-color: {RAISED_FG}; }} .gl-tile .gl-pill {{ margin-bottom: {gl}px; }}
+.gl-pill.active .gl-pill-close {{ color: {RAISED_FG}; border-color: {RAISED_FG}; }} .gl-pill.tab {{ margin-bottom: {gl}px; }}
 .gl-section {{ margin-top: {gxl}px; }}
 .gl-section-pill {{ all: unset; min-height: {sect_h}px; margin: 0 {gm}px {gs}px {gm}px; border: {thin}px solid {OUTLINE}; border-radius: {rp}px; }}
 .gl-section-pill label {{ font-size: {tsec}px; }}
@@ -131,19 +131,20 @@ window.gimbal-look {{ background-color: {BG}; color: {FG}; font-size: {tc}px; {f
 .gl-pinned-row image {{ -gtk-icon-size: {irow}px; }} .gl-pinned-row label {{ font-size: {tsec}px; margin-left: {gs}px; }}
 .gl-pinned-row.sel {{ background-color: {PIN_SEL}; }}
 .gl-dir-row {{ min-height: {dirrow}px; }} .gl-dir-row label {{ font-size: {trow}px; }}
-.gl-drive-name {{ font-size: {trow}px; }} .gl-drive-block {{ margin-bottom: {dpitch}px; }}
+.gl-drive-name {{ font-size: {trow}px; }} .gl-drive-block {{ margin-bottom: {gs}px; }}
 .gl-drive-track {{ min-width: {barw}px; min-height: {barh}px; background-color: {RAISED}; }} .gl-drive-track.main {{ min-width: {mbarw}px; min-height: {mbarh}px; }}
 .gl-drive-fill {{ min-height: {barh}px; }} .gl-drive-fill.main {{ min-height: {mbarh}px; }}
 {bars}
 .gl-drive-label {{ font-size: {ttiny}px; }} .gl-drive-cap {{ font-size: {ttiny}px; margin-left: {gs}px; }} .gl-main-label {{ font-size: {tsmall}px; }}
-.gl-grid {{ border-spacing: {gs}px; margin: {g2}px {gmar}px 0 {gmar}px; }} .gl-grid.tile {{ margin: {g2}px; }}
+.gl-grid {{ border-spacing: {gxl}px; margin: {g2}px {gmar}px 0 {gmar}px; }} .gl-grid.tile {{ margin: {g2}px; }}
+gridview > child {{ padding: 0; }}
 .gl-cell {{ min-width: {cellw}px; min-height: {cellh}px; }}
 .gl-cell image {{ -gtk-icon-size: {igrid}px; color: {FG}; }} .gl-cell label {{ font-size: {trow}px; }}
 .gl-tile {{ background-color: {RAISED}; border: {thin}px solid {OUTLINE}; border-radius: {r}px; color: {FG}; }}
 .gl-tile.focused {{ box-shadow: 0 0 0 {thin}px {FOCUS_RING}; }}
 .gl-status {{ min-height: {statush}px; font-size: {tc}px; }} .gl-num {{ font-size: {tmono}px; }} .gl-pline {{ font-size: {tmono}px; margin-left: {gm}px; }}
 .gl-collapse-strip {{ min-width: {g2}px; }} .gl-action-row .gl-icon-button {{ margin-left: {gm}px; }}",
-        hh = p(HEADER_H), pinrow = p(PIN_ROW_H), dirrow = p(DIR_ROW_H), dpitch = p(DRIVE_PITCH),
+        hh = p(HEADER_H), pinrow = p(PIN_ROW_H), dirrow = p(DIR_ROW_H),
         barw = p(BAR_W), barh = p(BAR_H), mbarw = p(MAIN_BAR_W), mbarh = p(MAIN_BAR_H),
         cellw = p(CELL_W), cellh = p(CELL_H), igrid = p(ICON_GRID), gmar = p(GRID_MARGIN),
         statush = p(STATUS_H), bars = bar_css(),

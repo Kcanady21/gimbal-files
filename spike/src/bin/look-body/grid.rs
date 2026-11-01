@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! The fake folder grid: a GridView over a StringList of fake names. No filesystem.
-use crate::style::{CELL_W, GAP_S, GRID_MARGIN, scaled};
+use crate::style::{CELL_W, GAP_XL, scaled};
 use gtk::SignalListItemFactory;
 use gtk::prelude::*;
 use std::cell::{Cell, RefCell};
@@ -18,14 +18,13 @@ pub fn item_name(i: u32) -> (String, &'static str) {
 }
 
 /// The `max-columns` cap for a grid viewport `view_w` wide: how many columns
-/// fit at the minimum cell width (the `grid-margin` CSS side margins
-/// subtracted), plus one. The tile grid uses a smaller margin, so the cap is
-/// conservative there — never below what the width allows.
+/// fit at the minimum cell width, plus one. `view_w` is the grid's own
+/// allocation — its CSS margins sit outside it — so nothing is subtracted
+/// here; the cap sits one above what fits and therefore never binds.
 pub fn max_columns(view_w: i32, scale: f64) -> i32 {
     let cell = scaled(CELL_W, scale).max(1);
-    let gap = scaled(GAP_S, scale);
-    let avail = (view_w - 2 * scaled(GRID_MARGIN, scale)).max(0);
-    ((avail + gap) / (cell + gap)).max(1) + 1
+    let gap = scaled(GAP_XL, scale);
+    ((view_w + gap) / (cell + gap)).max(1) + 1
 }
 
 thread_local! {
@@ -41,7 +40,12 @@ fn update_cap(scroller: &gtk::ScrolledWindow) {
     };
     let width = scroller.hadjustment().page_size() as i32;
     let scale = SCALE.with(Cell::get);
-    grid.set_max_columns(max_columns(width, scale).max(1) as u32);
+    let cap = max_columns(width, scale).max(1) as u32;
+    grid.set_max_columns(cap);
+    crate::log!(
+        "grid",
+        "viewport {width} px at scale {scale:.2} → cap {cap}"
+    );
 }
 
 /// Called by `apply_scale` after a scale change: every grid's cap depends on
@@ -60,7 +64,9 @@ pub fn set_scale(scale: f64) {
 }
 
 /// One folder view: a ScrolledWindow with a GridView of `items` fake cells.
-pub fn folder_view(items: u32) -> gtk::ScrolledWindow {
+/// `tile` selects the tile-grid margins (`.gl-grid.tile`); the single view
+/// keeps the `grid-margin` insets.
+pub fn folder_view(items: u32, tile: bool) -> gtk::ScrolledWindow {
     let list = gtk::StringList::new(&[]);
     (0..items).for_each(|i| list.append(&item_name(i).0));
     let factory = SignalListItemFactory::new();
@@ -106,6 +112,9 @@ pub fn folder_view(items: u32) -> gtk::ScrolledWindow {
         .max_columns(1)
         .build();
     grid.add_css_class("gl-grid");
+    if tile {
+        grid.add_css_class("tile");
+    }
     let scroller = gtk::ScrolledWindow::new();
     scroller.set_child(Some(&grid));
     scroller.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
@@ -147,12 +156,12 @@ mod tests {
 
     #[test]
     fn column_cap() {
-        // The sketch's content viewport: 11 columns fit at the 128 px pitch,
-        // and the cap sits one above what fits.
-        assert_eq!(max_columns(1544, 1.0), 12);
+        // The sketch's content viewport: 11 columns fit at the 129 px pitch
+        // (cell 97 + gap-xl 32), and the cap sits one above what fits.
+        assert_eq!(max_columns(1544, 1.0), 13);
         assert!(max_columns(1544, 1.0) >= 11);
         // A split tile's viewport allows fewer columns (5 in the sketch).
-        assert_eq!(max_columns(695, 1.0), 5);
+        assert_eq!(max_columns(695, 1.0), 6);
         assert!(max_columns(695, 1.0) < max_columns(1544, 1.0));
         // At scale 0.5 roughly double the columns fit the same viewport.
         let half = max_columns(1544, 0.5);

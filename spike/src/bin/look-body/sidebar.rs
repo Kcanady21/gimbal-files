@@ -13,6 +13,7 @@ const BAR_LABEL_CLASSES: [&str; 3] = ["bar-label-lo", "bar-label-hi", "bar-label
 
 pub fn pin_icon(name: &str) -> &'static str {
     match name {
+        "Home" => "user-home-symbolic",
         "Documents" => "folder-documents-symbolic",
         "Downloads" => "folder-download-symbolic",
         "Music" => "folder-music-symbolic",

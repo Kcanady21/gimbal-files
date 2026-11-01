@@ -5,6 +5,7 @@
 //! columns, both sidebars, live scaling, all in our own `gl-` CSS.
 //! `#[rustfmt::skip]` stays only on the constant tables, per the review.
 mod grid;
+mod layout;
 mod preview;
 mod sidebar;
 mod split;
@@ -130,6 +131,7 @@ fn main() -> glib::ExitCode {
 
 struct Ui {
     provider: gtk::CssProvider,
+    window: adw::ApplicationWindow,
     base: f64,
     setting: Cell<f64>,
     font: Option<String>,
@@ -150,6 +152,10 @@ struct Ui {
     /// scale change re-applies them scaled.
     left_width: Cell<f64>,
     right_width: Cell<f64>,
+    /// The positions `apply_positions` last applied: a `position` notify
+    /// with any other value is a user drag (correction 3).
+    expected_left: Cell<i32>,
+    expected_right: Cell<i32>,
     split: split::SplitView,
 }
 
@@ -172,42 +178,72 @@ impl Ui {
         self.left.borrow_mut().set_scale(s);
         self.split.set_scale(s);
         grid::set_scale(s);
-        self.apply_positions();
-        let (lw, pw) = (
-            scaled(self.left_width.get(), s),
-            scaled(self.right_width.get(), s),
+        self.apply_positions(true);
+        let (w, _) = self.body_widths();
+        crate::log!(
+            "layout",
+            "scale {s:.2}: left {}, content {}, preview {}",
+            w.left,
+            w.content,
+            w.preview
         );
-        crate::log!("layout", "scale {s:.2}: left {lw}, preview {pw}");
     }
 
-    /// Where the left handle should sit: the strip width while collapsed,
-    /// else the sidebar's saved width (design px, applied scaled).
-    fn left_target(&self) -> i32 {
-        let width = if self.left_collapsed.get() {
-            GAP_2XL
+    /// The pure widths function (layout.rs) driven by the window's current
+    /// width, the saved sidebar widths and the collapse flags.
+    fn body_widths(&self) -> (layout::BodyWidths, i32) {
+        layout::body_widths(
+            self.window.width(),
+            self.scale(),
+            self.left_width.get(),
+            self.right_width.get(),
+            self.left_collapsed.get(),
+            self.right_collapsed.get(),
+        )
+    }
+
+    /// Where the inner handle must sit for the preview to be `preview` wide
+    /// (the position lives in a width−handle space, gtkpaned.c:1362).
+    fn right_position(&self, preview: i32) -> i32 {
+        self.inner.width() - layout::HANDLE - preview
+    }
+
+    /// Drive the outer paned from the widths function and keep the window at
+    /// least one grid column wide. Each applied position is remembered in
+    /// `expected_*`, so a `position` notify that differs from it is a user
+    /// drag, not an echo of our own application (which only ever notifies
+    /// with the applied value — gtkpaned.c:1917).
+    ///
+    /// The preview width needs the inner paned's current allocation. This
+    /// runs from the outer's max-position notify while the window is
+    /// mid-resize, where the inner is not re-allocated yet: applying then
+    /// gets clamped against the old allocation and the clamp's echo would
+    /// pollute the saved width. So `apply_preview` is false on that path and
+    /// the inner's own next max-position notify applies it instead
+    /// (`right_dirty`); scale and collapse changes have fresh allocations
+    /// and pass true.
+    fn apply_positions(&self, apply_preview: bool) {
+        let (w, min_w) = self.body_widths();
+        self.window.set_size_request(min_w, -1);
+        self.expected_left.set(w.left);
+        self.outer.set_position(w.left);
+        if apply_preview && self.inner.width() > 0 {
+            let pos = self.right_position(w.preview);
+            self.expected_right.set(pos);
+            self.inner.set_position(pos);
         } else {
-            self.left_width.get()
-        };
-        scaled(width, self.scale())
+            self.right_dirty.set(true);
+        }
     }
+}
 
-    /// Where the right handle should sit: the preview is the end child, so
-    /// its width = max-position + its minimum − the position.
-    fn right_target(&self) -> i32 {
-        let s = self.scale();
-        let (min_w, pane_w) = (scaled(PREVIEW_MIN, s), scaled(self.right_width.get(), s));
-        let extra = if self.right_collapsed.get() {
-            0
-        } else {
-            min_w - pane_w
-        };
-        self.inner.max_position() + extra
-    }
-
-    fn apply_positions(&self) {
-        self.outer.set_position(self.left_target());
-        self.inner.set_position(self.right_target());
-    }
+/// A `position` notify records a new saved width only when it reports a
+/// position `apply_positions` did not apply itself — i.e. a user drag of
+/// the handle. The notifications a scale change or a window resize cause
+/// are echoes of our own application and must not touch the saved widths
+/// (correction 3).
+fn dragged(expected: i32, position: i32) -> Option<f64> {
+    (position != expected).then_some(position as f64)
 }
 
 /// `paned.connect_notify_local` with the `Rc<Ui>` wired in.
@@ -240,7 +276,7 @@ fn wire_collapse(ui: &Rc<Ui>, trigger: &gtk::Button, left: bool, collapse: bool)
             };
             ui.inner.set_end_child(Some(&child));
         }
-        ui.apply_positions();
+        ui.apply_positions(false);
         let side = if left { "left" } else { "preview" };
         let action = if collapse { "collapsed" } else { "expanded" };
         crate::log!("sidebar", "{action} {side} sidebar");
@@ -292,7 +328,13 @@ fn show(app: &adw::Application, args: &Args) {
         dev.append(b);
     }
     dev.append(&drive_ctl);
-    root.append(&dev);
+    // The dev bar is harness furniture: in an EXTERNAL scroller it never
+    // pins the window's minimum width, so the body's own one-column floor
+    // is what stops a narrowing window.
+    let dev_scroll = gtk::ScrolledWindow::new();
+    dev_scroll.set_child(Some(&dev));
+    dev_scroll.set_policy(gtk::PolicyType::External, gtk::PolicyType::Never);
+    root.append(&dev_scroll);
 
     // Empty strip standing in for P1i's header.
     let slot = gtk::Box::new(gtk::Orientation::Horizontal, 0);
@@ -321,7 +363,7 @@ fn show(app: &adw::Application, args: &Args) {
     // Content column: folder view / split view, then rule and status line.
     let stack = gtk::Stack::new();
     stack.set_vexpand(true);
-    let single = grid::folder_view(args.items);
+    let single = grid::folder_view(args.items, false);
     stack.add_named(&single, Some("single"));
     let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
     content.append(&stack);
@@ -363,6 +405,7 @@ fn show(app: &adw::Application, args: &Args) {
 
     let ui = Rc::new(Ui {
         provider,
+        window: window.clone(),
         base: style::base(),
         setting: Cell::new(args.scale),
         font: args.font.clone(),
@@ -378,6 +421,8 @@ fn show(app: &adw::Application, args: &Args) {
         right_dirty: Cell::new(true),
         left_width: Cell::new(SIDEBAR_W),
         right_width: Cell::new(PREVIEW_W),
+        expected_left: Cell::new(0),
+        expected_right: Cell::new(0),
         split,
     });
     outer.set_start_child(Some(&ui.left_root));
@@ -385,42 +430,73 @@ fn show(app: &adw::Application, args: &Args) {
     inner.set_end_child(Some(&ui.right_root));
 
     // The saved widths are set before the first allocation (a position set
-    // then is honoured, clamped, by gtk_paned_compute_position). The right
-    // paned re-applies while right_dirty is set: a collapse/expand swap
-    // changes max-position, which GTK only computes at allocation time.
-    on_notify(&ui, &inner, "max-position", |ui, paned| {
-        if ui.right_dirty.get() && paned.max_position() > 0 {
+    // then is honoured, clamped, by gtk_paned_compute_position). The inner
+    // paned re-applies the preview width while right_dirty is set: at
+    // startup and after every collapse/expand swap its max-position is only
+    // computed at allocation time, and a window resize defers to it too
+    // (see `apply_positions`).
+    on_notify(&ui, &inner, "max-position", |ui, _| {
+        if ui.right_dirty.get() && ui.inner.max_position() > 0 {
             ui.right_dirty.set(false);
-            ui.inner.set_position(ui.right_target());
+            let (w, _) = ui.body_widths();
+            let pos = ui.right_position(w.preview);
+            ui.expected_right.set(pos);
+            ui.inner.set_position(pos);
+        }
+    });
+    // Every window-width change reaches here (max-position = allocation −
+    // handle − end-child minimum): re-split the body from the widths
+    // function, so narrowing drops grid columns and then gives the
+    // sidebars way, and widening restores the saved widths.
+    on_notify(&ui, &outer, "max-position", |ui, _| {
+        if ui.outer.max_position() > 0 {
+            ui.apply_positions(false);
         }
     });
     // Dragging a sidebar border updates the saved width (kept in design px,
-    // so a scale change re-applies it scaled). While a sidebar is collapsed
-    // its strip must keep the strip width: snap the handle back whenever
-    // anything moves it. gtk_paned_set_position only notifies on a real
-    // change, so the guard converges. Recording is suppressed while
-    // right_dirty is set: startup and collapse swaps notify with positions
-    // that aren't the saved width's.
+    // so a scale change re-applies it scaled); anything we applied ourselves
+    // is an echo and must not record: neither the value apply_positions set
+    // (`dragged`) nor the position the widths function implies for the
+    // current window (`implied` — apply_positions can run against a not
+    // yet re-allocated paned during a window resize, and GTK then clamps
+    // the applied position, notifying the implied one). While a sidebar is
+    // collapsed its strip must keep the strip width: snap the handle back
+    // whenever anything moves it. gtk_paned_set_position only notifies on a
+    // real change, so the guard converges (gtkpaned.c:1917).
     on_notify(&ui, &outer, "position", |ui, paned| {
+        let position = paned.position();
         if ui.left_collapsed.get() {
-            let target = ui.left_target();
-            if paned.position() != target {
+            let target = ui.body_widths().0.left;
+            if position != target {
                 paned.set_position(target);
             }
         } else {
-            ui.left_width.set(paned.position() as f64 / ui.scale());
+            let implied = ui.body_widths().0.left;
+            if let Some(px) = dragged(ui.expected_left.get(), position)
+                && position != implied
+            {
+                ui.left_width.set(px / ui.scale());
+                ui.expected_left.set(position);
+            }
         }
     });
     on_notify(&ui, &inner, "position", |ui, paned| {
+        let position = paned.position();
         if ui.right_collapsed.get() {
-            let target = ui.right_target();
-            if paned.position() != target {
+            let target = ui.right_position(ui.body_widths().0.preview);
+            if position != target {
                 paned.set_position(target);
             }
-        } else if !ui.right_dirty.get() {
-            // Inverse of right_target: width = max-position + min − position.
-            let width = paned.max_position() + scaled(PREVIEW_MIN, ui.scale()) - paned.position();
-            ui.right_width.set(width as f64 / ui.scale());
+        } else {
+            let implied = ui.right_position(ui.body_widths().0.preview);
+            if !ui.right_dirty.get()
+                && dragged(ui.expected_right.get(), position).is_some()
+                && position != implied
+            {
+                let width = ui.inner.width() - layout::HANDLE - position;
+                ui.right_width.set(width as f64 / ui.scale());
+                ui.expected_right.set(position);
+            }
         }
     });
     // Dev bar wiring.
@@ -488,5 +564,26 @@ mod tests {
         for case in cases.split('|') {
             assert!(parse(case).is_err(), "{case:?} should be rejected");
         }
+    }
+
+    #[test]
+    fn only_a_user_drag_records_a_width() {
+        // Applying a saved width notifies with the applied value: no record.
+        assert_eq!(dragged(348, 348), None);
+        // A drag does record, and afterwards that position is the expected
+        // one — further echoes of it stay silent.
+        assert_eq!(dragged(348, 500), Some(500.0));
+        assert_eq!(dragged(500, 500), None);
+        // The scale-change sequence: each apply is expected, so the saved
+        // width is never touched (correction 3).
+        let mut expected = 348;
+        let mut saved = 348.0;
+        for applied in [261i32, 348, 174, 348] {
+            if let Some(px) = dragged(expected, applied) {
+                saved = px;
+                expected = applied;
+            }
+        }
+        assert_eq!(saved, 348.0);
     }
 }

@@ -507,3 +507,274 @@ Corrections:
      Directories, Devices and Remote), and the main drive sits right after the other drives
      instead of at the bottom of the panel.
    - Home uses a folder icon; the sketch has a house (`user-home-symbolic`).
+
+## P1j-r3 changes
+
+Fixes per the review finding and the live check above. 2,314 lines under `src/bin/look-body/` (no
+budget). Only `src/bin/look-body/{main,split,grid,sidebar,style}.rs`, the new
+`src/bin/look-body/layout.rs`, and this file changed; `Cargo.toml` untouched.
+
+1. **Per-slot state moves together (review finding + live-check 1).** `split.rs` now has one
+   `Slot { pos, slide, generation }` struct per slot (`Inner.slots`), replacing r2's three
+   parallel vectors — a reorder *cannot* leave a generation behind. `move_tile` reorders
+   `tiles`, `widgets`, `frames`, `pills` and `slots` through the one pure helper
+   `slot_move(&mut Vec<T>, from, to)`. Unit tested (`reorder_moves_every_per_slot_field_with_the_tile`):
+   a test double of `Slot` (tile id, generation, position) is moved 0→3 then 2→1 and every
+   field is asserted to sit with its tile. The fast drop (Tab 2 onto Tab 3, released inside the
+   150 ms slide) can no longer strand a displaced tile: the settle bumps the generation that
+   moved with the tile, not the one left in the old slot.
+2. **Pure widths function drives the Paneds (live-check 2).** New `layout.rs`:
+   `body_widths(window_w, scale, left_saved, right_saved, left_collapsed, right_collapsed) →
+   (BodyWidths { left, content, preview }, min_window)`. It subtracts the `gl-frame` border and
+   the 1 px paned handle, puts the expanded sidebars at their saved widths (design px × scale,
+   floored at their minimums), a collapsed sidebar at its `gap-2xl` strip, and gives the content
+   what is left; below one grid column the expanded sidebars give way — left first, then the
+   preview — down to their minimums. `one_column_width` is the worse of the single view
+   (`2 × grid-margin + cell`) and the split view (Fixed insets + tile border + tile-grid margins
+   + cell) = 263 px at scale 1. `min_window` (904 px at scale 1, both expanded) is applied as the
+   window's size request, so nothing draws outside the window. Both Paneds are driven from it:
+   the outer position on every window-width change (they arrive as outer `max-position` notifies)
+   and on scale/collapse changes; the inner from its own `max-position` notify. Four unit tests
+   cover the sketch defaults (348 | 1543 | 648 at 2560), the give-way order and floors, the
+   collapsed strips, and that give-way never touches the saved widths.
+   **Deviation to flag:** the live check says "down to their minimums (348 and 360 × scale)";
+   348 is the left sidebar's *default* width, and I kept `SIDEBAR_MIN` = 260 (the token table's
+   minimum since P1j, which the earlier reviews passed) as the floor. If Kyle wants the left
+   panel to stop at 348, that is a one-token change.
+3. **Saved widths survive scale round trips (live-check 3).** A `position` notify records only
+   when it differs from *both* the position `apply_positions` last applied (`dragged`, the
+   expected-value guard) and the position the widths function implies for the current window —
+   the echoes our own application and GTK's clamps produce never record. The preview width is
+   applied from the inner paned's own `max-position` notify while a window resize is in flight
+   (`apply_positions(apply_preview: false)` on that path): applying against the not-yet-
+   re-allocated inner paned got clamped, and the clamp's echo was the 631/364 drift measured
+   before the fix. Unit tested (`only_a_user_drag_records_a_width`, including a simulated
+   scale-change notify sequence), plus the timer log below.
+4. **Sketch conformance (live-check 4).**
+   - Split pills: the tile widget is now pill + frame; the pill is `PILL_W` (270) wide,
+     `halign Center`, sitting *above* the `gl-tile` frame with the `gap-l` margin
+     (`.gl-pill.tab { margin-bottom: gap-l }`). `pill_at` hit-tests the centred pill only, so
+     tile drags start on the pill as the sketch draws it.
+   - Tile centring: `tile_rects` insets `gap-2xl` on *every* side (x starts at the margin), and
+     `relayout` no longer subtracts the inset from the view — the 2 × `gap-2xl` splits evenly
+     left/right and top/bottom.
+   - Grid fill and column count, measured: the sketch's cell is 97 px wide with a ~31 px column
+     gap (pitch 128), while we had `CELL_W` 120 + `gap-s` 8 — the same pitch but the smaller gap
+     wastes the tail, and the *real* culprit on top was libadwaita's
+     `gridview > child { padding: 3px }` inflating every column by 6 px. Now: `CELL_W` 97 (kept
+     `CELL_H` 144 so 2-line labels are not clipped), `border-spacing: gap-xl` (32), and
+     `gridview > child { padding: 0 }` in our CSS. `max_columns` no longer subtracts the grid
+     margins (the viewport it reads is the grid's own allocation, margins outside it) — with the
+     old conservative cap it would have *bound* below the real fit. Measured with the temporary
+     harness: single view grid viewport 1390 px → cells exactly 97 (min 97, nat 97, alloc 97),
+     cap 12, **11 columns** — the sketch's count; tile grid 621 px cells area → items 98 × 144
+     at pitch 130, **5 columns** filling the 707 px tile — the sketch's count. Row pitch is
+     176 px (144 + 32), taller than the sketch's 144: our labels wrap to two lines, the
+     sketch's are single-line. Flagging for Kyle.
+   - Remote section + main drive: the sidebar always *built* the Remote section (it is in
+     `sections`), and the main drive was already the last child of the panel — but every
+     `gl-drive-block` carried a `margin-bottom` of the whole 54 px *pitch*, bloating each block
+     to ~100 px and overflowing the panel, which is what the live check saw. The margin is now
+     `gap-s`, so a block is name + bar + 8 ≈ the sketch's 54 px pitch. Measured at
+     2560 × 1406: panel 1236 tall, scroller viewport 1086, sections at y 457 / 702 / 949 — the
+     Remote pill and its "No remotes" row are inside the visible viewport — and the main drive
+     block sits at y 1136–1192, pinned at the panel bottom under its rule.
+   - Home icon: `pin_icon("Home")` → `user-home-symbolic`.
+   - Also found and fixed while measuring: the tile grids never got their `.gl-grid.tile` class
+     (r1/r2 dead CSS), so they used the 72 px single-view margins — 4 columns in a tile where
+     the sketch has 5. `folder_view(items, tile)` now sets it.
+5. **Two root-cause fixes for "narrowing squeezes the content to nothing"** (live-check 2's
+   underlying bug): the split view's ScrolledWindow had a NEVER horizontal policy, which makes
+   the split view's *minimum* width the tiles' full extent (gtkscrolledwindow.c:1897) — the
+   content column could never shrink, the sidebars clamped against it and one recorded clamp
+   echo as a saved width. It is now `PolicyType::External` horizontally (tiles always fit by
+   construction; no scrollbar is drawn). Same class of bug in the dev bar: it is harness
+   furniture but pinned the window's minimum at ~1175 px, so it moved into an EXTERNAL scroller
+   too; the window now reaches the body's own 904 px floor.
+
+### Verified
+
+RULES.md's four commands (from `spike/`):
+
+```text
+$ PATH="$HOME/.rustup/toolchains/1.95.0-x86_64-unknown-linux-gnu/bin:$PATH" cargo fmt --check
+(exit 0, no output)
+
+$ PATH="$HOME/.rustup/toolchains/1.95.0-x86_64-unknown-linux-gnu/bin:$PATH" cargo clippy --all-targets -- -D warnings
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.27s
+
+$ cargo test
+     Running unittests src/main.rs …                    test result: ok. 4 passed
+     Running unittests src/bin/look-body/main.rs …      test result: ok. 23 passed
+     Running unittests src/bin/look-header/main.rs …    test result: ok. 5 passed
+(look-body's 23: CLI ×2, style rules 1+2 + scaled token + drive classes, grid counts + column cap,
+tile_rects ×4 (centred insets), tile + pill hit tests, slot_move reorder ×1, drag ×4, layout.rs ×4,
+recording guard ×1)
+
+$ cargo build --release
+    Finished `release` profile [optimized] target(s) in 0.80s
+```
+
+10-second runs (release binary, stopped by PID with SIGTERM; both exit 143):
+
+```text
+$ ./target/release/look-body                                 # stderr 232 bytes, css_warnings=0
+(look-body:73862): Gdk-WARNING **: … vkAcquireNextImageKHR(): … (VK_SUBOPTIMAL_KHR) (1000001003)
+  — the same intermittent Gdk swapchain notice as r2, not a GTK CSS warning.
+$ ./target/release/look-body --tiles 6 --pins 14 --scale 0.5 # stderr 0 bytes, css_warnings=0
+$ grep -cE "Theme parser|Gtk-WARNING|Gtk-CRITICAL" …         # 0 and 0 [observed]
+$ GIMBAL_SPIKE_LOG=1 … --tiles 3 --scale 0.75
+[gimbal-look-body 0.085] layout: scale 0.75: left 261, content 0, preview 486   # pre-allocation
+```
+
+### Temporary shrink/round-trip timer (removed before delivery; its log)
+
+A `glib::timeout_add_local` harness (350 ms ticks) shrank the window with `set_default_size`
+from 2560 to 900 in 166 px steps, widened back, then made two scale round trips
+(1.0 → 0.75 → 0.5 → 0.75 → 1.0), logging the computed and measured widths and the saved widths;
+a final tick dumped widget allocations. Run twice (single view, and `--tiles 2`). Single view
+(run also logged each grid cap recomputation):
+
+```text
+[gimbal-look-body 1.537] temp: set_default_size 2394x1406
+[gimbal-look-body 1.538] grid: viewport 1232 px at scale 1.00 → cap 10
+[gimbal-look-body 2.588] grid: viewport 734 px at scale 1.00 → cap 6        # columns drop one at a time
+[gimbal-look-body 4.005] grid: viewport 118 px at scale 1.00 → cap 2
+[gimbal-look-body 4.688] temp: set_default_size 900x1406
+[gimbal-look-body 5.038] temp: A: after shrink 2560→900: window 904 (min 904): computed left 260 content 263 preview 360; measured outer pos 260, inner pos 262 (alloc 623), content box 262 px
+[gimbal-look-body 5.038] temp: A: after shrink 2560→900: saved left 348.0 preview 648.0 at scale 1.00
+[gimbal-look-body 5.739] temp: B: after widen back to 2560: window 2552 (min 904): computed left 348 content 1535 preview 648; measured outer pos 348, inner pos 1534 (alloc 2183), content box 1534 px
+[gimbal-look-body 5.739] temp: B: after widen back to 2560: saved left 348.0 preview 648.0 at scale 1.00
+[gimbal-look-body 7.489] temp: C: after scale round trips 1.0→0.75→0.5→0.75→1.0: window 2552 (min 904): computed left 348 content 1535 preview 648; measured outer pos 348, inner pos 1534 (alloc 2183), content box 1534 px
+[gimbal-look-body 7.489] temp: C: after scale round trips …: saved left 348.0 preview 648.0 at scale 1.00
+[gimbal-look-body 7.489] temp: C: cell 0 alloc 97 (min 97, nat 97), item widget 97, grid 1390, viewport 1390 px, cap 12
+```
+
+(The window settles at 2552, not 2560 — that is what the compositor gives the default-sized
+window; 1535 px of content still shows the sketch's 11 columns. At 900 requested the window
+stops at its 904 px floor with left 260, preview 360 and content 263 = exactly one column;
+the sidebars' saved widths are untouched and spring back on widening. Before the fix, the same
+run recorded `preview 631.0` at A and `364.0` in the split run — the leak above.)
+
+Split view (`--tiles 2`), same phases — saved widths also stayed 348.0/648.0 through shrink,
+widen and both round trips. The final tick's allocation dump (excerpt):
+
+```text
+GtkBox [vertical] 707x1091+40,40                          # tile 1: inset 40 left, tile 707 wide
+  GtkBox [horizontal tab gl-pill active] 270x74+218,0     # pill 270 wide, centred (218 ≈ (707−270)/2), 74 = 50 + 24 gap
+  GtkBox [vertical focused gl-tile] 707x1017+0,74         # frame below the pill
+    GtkGridView [view gl-grid tile] 701x1011+0,0
+      GtkListItemWidget [activatable] 98x144+0,0          # cells 98 px, x pitch 130 → 5 columns
+      GtkListItemWidget [activatable] 98x144+130,0
+      GtkListItemWidget [activatable] 98x144+260,0
+      GtkListItemWidget [activatable] 98x144+390,0
+      GtkListItemWidget [activatable] 98x144+520,0        # 5 per row, filling the tile
+```
+
+Column-count measurement summary: single view viewport 1390 px → 11 columns at the 129 px pitch
+(97 + gap-xl 32), the sketch's 11; split tile 621 px cells area → 5 columns, the sketch's 5.
+
+### API citations for the new work
+
+- `gtk_paned_size_allocate` puts the end child at `start + handle_size` and gives it
+  `width − start − handle` (gtk-4.22.4:gtk/gtkpaned.c:1355–1376), and feeds
+  `MAX(1, width − handle_size)` to `gtk_paned_calc_position` (:1362) — hence `layout::HANDLE`
+  and the position = allocation − handle − preview arithmetic; the resize auto-adjust in
+  `gtk_paned_compute_position` (position_set branch, :1146–1159) re-derives the position from
+  the resize flags on every allocation, which is why recording needs the expected-value *and*
+  implied-value guards.
+- `gtk_scrolled_window_measure` folds the child's minimum into the ScrolledWindow's minimum
+  only under a NEVER policy (gtk-4.22.4:gtk/gtkscrolledwindow.c:1839–1905); EXTERNAL keeps the
+  minimum out — the split view's and dev bar's policy change.
+- `gtk_grid_view_compute_n_columns` uses the cell's *minimum* width when the opposite axis's
+  scroll policy is MINIMUM (gtk-4.22.4:gtk/gtkgridview.c:620–640), and
+  `column_width = MAX(computed, col_min)` (:786–788) — cells expand to fill, so the grid fills
+  the tile. The default scroll policy is MINIMUM
+  (gtk-4.22.4:gtk/gtkscrollable.c:95–99, :106–110).
+- `gtk_list_base_get_border_spacing` reads the widget's own CSS `border-spacing`
+  (gtk-4.22.4:gtk/gtklistbase.c:2207–2226).
+- libadwaita styles `gridview > child { padding: 3px; border-radius: … }`
+  (libadwaita-1.9.1:src/stylesheet/widgets/_views.scss:53–56) — the 6 px per-column inflation;
+  our `gridview > child { padding: 0 }` overrides it (application priority). Recorded per spec
+  rule 4: this is an Adwaita default we deliberately undo.
+- `gtk_fixed_layout_measure` sums the children's extents into the Fixed's minimum
+  (gtk-4.22.4:gtk/gtkfixedlayout.c:224–252) — with the old NEVER policy that minimum reached
+  the paneds; with EXTERNAL it stops at the ScrolledWindow.
+- `WidgetExt::width` (gtk4-0.11.5:src/auto/widget.rs:852) for the window/paned widths;
+  `WidgetExt::measure` (:1000) in the (now removed) harness.
+- The distro cargo still reserves `gen` (rust issue #117078): the slot's field is
+  `generation`.
+
+### Not verifiable without a live session (Claude/Kyle check)
+
+- Drag feel after the tile restructure: the pill is now centred, so drags start on the pill
+  only; `pill_at`'s centred hit region and the grab offset are unit tested but the feel is not.
+- The split pill's look against `sketch/split.png` (short, centred, above the frame), the
+  even tile insets, and 5 columns filling each tile.
+- Sidebar borders: a user drag must still record (the guards must not swallow real drags —
+  only echoes are filtered); narrowing gives the sidebars way to 260/360 × scale and widening
+  restores the dragged widths.
+- The collapsed strips still snap back and expand at the saved width.
+- Live scale still rescales everything (the widths function re-applies on
+  `apply_scale`).
+- The drive-bar contrast/labels are untouched; the main drive still sits pinned at the panel
+  bottom while the sections scroll.
+
+## Review of P1j-r3 (Claude, Nov 1, 2026)
+
+Read the diff and the new `layout.rs` against the r3 brief. Per-slot state is one `Slot` struct
+moved by the single `slot_move` helper; `body_widths` is pure and tested; the recording guard
+(`dragged` plus the implied-position check) is sound; the look changes match the sketch notes.
+RULES.md's four commands pass here too (32 tests).
+
+The flagged deviation is right: the P1j brief's token table gives the sidebar minimums as 260 and
+360. My r3 brief's "348" was the left sidebar's default, not its minimum, so `SIDEBAR_MIN` 260
+stays. One small note for Phase 2: `gridview > child { padding: 0 }` is global; scope it under
+`.gl-grid` in the real app.
+
+## Live check of P1j-r3 (Claude, Nov 1, 2026): r3 items pass, three new findings (P1j-r4-fixes.md)
+
+Release build, floating 2,560 × 1,406 window on DP-2 (DP-3 off), with the extended virtual
+pointer (right button, Ctrl, Shift, Escape).
+
+Passes:
+
+- **Fast drops (item 1).** Eleven drops released within about 100 ms of the move (six across,
+  five down and back): every tile ends in its slot, none stranded or overlapping, all 11
+  `drag ended` lines logged. A slow drag still slides the others while the dragged tile follows.
+- **Narrowing (item 2).** At 1,600 the grid drops to 3 columns with both sidebars at full width;
+  at 1,200 and 1,000 the content holds one column while the sidebars give way; asked for 900, the
+  window stops at its 904 px floor. Nothing draws past the window edge. Widening back to 2,560
+  restores both borders to the pixel (352 and 1,902).
+- **Saved widths (item 3).** Left border dragged to 420: two round trips to 75% and back leave
+  it at 424 px on screen, unchanged. Preview dragged to 698: two round trips leave it at 1,852,
+  unchanged. Collapsing and expanding the left sidebar restores the same borders.
+- **Look (item 4).** Split pills are short and centred above their tiles; the tile pair is
+  centred in the column; the single view has 11 columns and a tile 5 at the default widths;
+  Remote shows "No remotes"; the main drive sits at the bottom; Home has the house icon.
+- Closing tiles with ✕ down to one returns to the single view. No GTK warnings.
+- The border grab spot sits on the frame borders (left at x 356, inside the left frame's border;
+  preview at 1,906, inside the preview frame's border), not on the 1 px separator itself. That
+  works; Kyle can judge by hand whether it is easy enough to find.
+
+Needs fixing:
+
+1. **Ctrl and Shift selection on tile pills never selects more than one tile.** Each tile's
+   capture-phase `GestureClick` (`attach_handlers`) runs `focus(id)` on every left press, before
+   the pill's handler, and `focus` clears every tile's `selected` flag and moves the focus. So
+   Ctrl+click keeps only the clicked tile, and Shift+click's range starts from the slot `focus`
+   just set, so it covers only that tile. Logged order for each click: `tile N capture press`,
+   then `pill N pressed … CONTROL_MASK`. Present since r1; it couldn't be tested before. The
+   multi-tile Close therefore can't be reached either.
+2. **The pill's right-click menu opens in the wrong place.** `popup_menu` parents the popover to
+   the outer ScrolledWindow with no `pointing_to`, so the "Close" popover appears at the bottom
+   centre of the split view, over the status line, far from the pill that was clicked.
+3. **The left sidebar clips its contents at its minimum.** At 1,200 and below (sidebar at 260)
+   the panel is cut off on its left edge: "nned Folders", the pin icons and "ecent Directories"
+   are clipped. The panel's contents are wider than 260, and the paned shrinks the child below
+   its minimum by cutting it off. The preview's long text lines clip on the right too, which is
+   fine for a text view; its title row fits.
+
+Testing note for later checks: a virtual device that has keys as well as a pointer gets its
+first absolute move dropped and its button events delayed by about 60 ms (the press arrives
+after six motion events). Use the plain pointer for drags and the extended one only for clicks.
