@@ -186,6 +186,7 @@ window.gimbal-look, window.gimbal-look.background {{ background-color: {window_b
 .gl-icon-button.winbtn {{ min-width: {iwin}px; min-height: {iwin}px; -gtk-icon-size: {iwin}px; margin-left: {gl}px; }}
 .gl-icon-button.float {{ -gtk-icon-palette: {float_palette}; }}
 .gl-icon-button.float image {{ -gtk-icon-size: {iwin}px; }}
+.gl-icon-button.close image {{ -gtk-icon-size: {iwin}px; }}
 .gl-search {{ margin-right: {gl}px; }}
 .gl-strip {{ margin-right: {gxl}px; }}
 .gl-field .gl-icon-button {{ min-width: {inav}px; min-height: {inav}px; -gtk-icon-size: {inav}px; }}
@@ -281,6 +282,26 @@ mod tests {
         assert!(full.contains(".gl-icon-button.float image { -gtk-icon-size: 32px; }"));
         let half = css(0.5, None, DEFAULT_OPACITY);
         assert!(half.contains(".gl-icon-button.float image { -gtk-icon-size: 16px; }"));
+    }
+
+    #[test]
+    fn close_icon_is_symbolic_with_foreground_strokes() {
+        let svg = include_str!("icons/close.svg");
+        // The mockup's close icon, kept exactly (same ids, square viewBox).
+        assert!(svg.contains("viewBox=\"0 0 28.08 28.08\""));
+        assert!(svg.contains("id=\"stroke-1\"") && svg.contains("id=\"stroke-2\""));
+        assert_eq!(svg.matches("d=\"M ").count(), 2);
+        // Both strokes take the foreground slot; the close icon has no fill.
+        assert_eq!(svg.matches("gpa:stroke=\"foreground\"").count(), 2);
+        assert!(!svg.contains("gpa:fill="));
+        // Symbolic icons carry no colour literals of their own.
+        assert!(!svg.contains('#'));
+        assert!(!svg.contains("rgb("));
+        let full = css(1.0, None, DEFAULT_OPACITY);
+        assert!(full.contains(".gl-icon-button.close image { -gtk-icon-size: 32px; }"));
+        assert!(!full.contains(".gl-icon-button.close { -gtk-icon-palette"));
+        let half = css(0.5, None, DEFAULT_OPACITY);
+        assert!(half.contains(".gl-icon-button.close image { -gtk-icon-size: 16px; }"));
     }
 
     #[test]

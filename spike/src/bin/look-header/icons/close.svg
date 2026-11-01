@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="28.08" height="28.08" viewBox="0 0 28.08 28.08" gpa:version="1">
+<!-- Extracted from Gimbal-Files.vectorcraft, Default layer, group 66 "Close Window" (Nov 1, 2026).
+     Geometry is exact. The view box is the float icon's 28.08 px width, square and centred on the X,
+     so at the same icon size both icons draw with the same stroke weight. Both strokes are the
+     foreground slot. -->
+  <path id="stroke-1" d="M 3.75 3.75 L 24.33 24.33" fill="none" gpa:stroke="foreground" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+  <path id="stroke-2" d="M 3.75 24.33 L 24.26 3.82" fill="none" gpa:stroke="foreground" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

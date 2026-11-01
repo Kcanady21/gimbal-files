@@ -572,3 +572,169 @@ with the front window's fill hiding the back window's outline, in theme colours.
 Observation for Kyle, not a defect: next to the new float icon, Adwaita's close ✕ now looks the
 smaller of the two. The mockup has its own close icon (VectorCraft group 66) if Kyle wants them
 to match.
+
+## P1l-r2 changes
+
+The window's close button now draws Kyle's mockup ✕ instead of Adwaita's
+`window-close-symbolic`, using the same drawing path as the float icon. Only the title-bar close
+button changed; the ✕ in tab pills, the accordion list and dialogs still uses the icon theme.
+[observed]
+
+### What changed
+
+- `src/bin/look-header/icons/close.svg` (new): `phase1/icons/close.svg` converted to a GTK 4.22
+  symbolic SVG. The square `viewBox="0 0 28.08 28.08"`, both `d` strings, `stroke-width="3"`,
+  caps and joins are unchanged (geometry copied exactly). Both paths are `fill="none"` with
+  `gpa:stroke="foreground"`; the original `stroke="#000000"` is gone, so no fixed colour remains.
+  [observed]
+- `header.rs`: `CLOSE_ICON` is `include_bytes!("icons/close.svg")`. The float and close buttons
+  now share `svg_button(bytes, class)`, which builds
+  `gtk::Svg::from_bytes(&glib::Bytes::from_static(..))`, wraps it in
+  `gtk::Image::from_paintable`, and gives the button `gl-icon-button winbtn` plus the extra class
+  (`float` / `close`). `close_button()` is selected for the `close` action in `desktop_buttons()`
+  in both branches (niri and non-niri); every other window action still uses `icon_button` and
+  the icon theme. [observed]
+- `style.rs`: `.gl-icon-button.close image { -gtk-icon-size: {iwin}px; }` mirrors the float rule,
+  so the SVG image is `icon-window × scale` (32 at 1.0, 16 at 0.5). The image inherits the
+  button's `color: @window_fg_color` from `.gl-icon-button`, so both strokes are the `foreground`
+  slot. There is no `-gtk-icon-palette` rule for close because the icon has no palette slots.
+  [observed]
+
+Why the same drawing path: GTK's icon-theme loader for `-symbolic.svg` uses the old symbolic
+path and ignores `gpa:` slots (P1m's live test: all white), and the mockup's geometry must stay
+exact. `GtkSvg` implements `GtkSymbolicPaintable`, so GTK passes the image's `color` into
+`snapshot_symbolic` at draw time and the strokes recolour with the theme. [read]
+
+### Size and stroke match with the float icon
+
+Both SVGs keep a 28.08 px wide view box, so when each is fitted into the same 32 × 32 icon box
+the scale factor is 32/28.08 ≈ 1.140 and a `stroke-width="3"` draws about 3.42 px in both. The
+float icon is 28.08 × 25.12 (it paints about 32 × 28.6 inside the square box, letterboxed); the
+close icon is square at 28.08 × 28.08 and centred on the ✕, so it paints 32 × 32. [read]
+[inferred]
+
+### Temporary timer log (removed before delivery)
+
+Probe: a `glib::timeout_add_local_once(800 ms)` took the float and close buttons from the
+window-control list, read each one's child `gtk::Image`, its `paintable()`, its allocation,
+`pixel_size()`, and the button allocation. It was gated by `GIMBAL_SPIKE_ICON_PROBE=1` and has
+been deleted from `header.rs`. [observed]
+
+```
+$ GIMBAL_SPIKE_ICON_PROBE=1 target/debug/look-header --tabs 3 --scale 1.0
+temp: float paintable=GtkSvg image=32x32 button=32x32 pixel_size=-1
+temp: close paintable=GtkSvg image=32x32 button=32x32 pixel_size=-1
+
+$ GIMBAL_SPIKE_ICON_PROBE=1 target/debug/look-header --tabs 3 --scale 0.5
+temp: float paintable=GtkSvg image=16x16 button=16x16 pixel_size=-1
+temp: close paintable=GtkSvg image=16x16 button=16x16 pixel_size=-1
+```
+
+Both are `GtkSvg` paintables at both scales, and both image and button allocations are the
+square `icon-window` size. `pixel_size=-1` is why `-gtk-icon-size` drives the size
+(`gtk-4.22.4:gtk/gtkiconhelper.c:403-410`); the 32 → 16 change proves the CSS size reaches both
+images. The probe runs were stopped by PID with SIGTERM; `pgrep -x look-header` was empty
+afterwards. [observed]
+
+### Verified
+
+From `$SPIKE`, with rustup 1.95.0 on `PATH` for `fmt`/`clippy`:
+
+```
+$ PATH="$T:$PATH" cargo fmt --check
+(no output, exit 0)
+
+$ PATH="$T:$PATH" cargo clippy --all-targets -- -D warnings
+    Checking gimbal-spike v0.0.0 (.../spike)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.24s
+
+$ cargo test
+     Running unittests src/main.rs (target/debug/deps/gimbal_spike-…)
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+
+     Running unittests src/bin/look-body/main.rs (target/debug/deps/look_body-…)
+test result: ok. 46 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+
+     Running unittests src/bin/look-header/main.rs (target/debug/deps/look_header-…)
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+
+$ cargo build --release
+    Finished `release` profile [optimized] target(s) in 1.39s
+```
+
+`cargo build --bin look-header` and
+`PATH="$T:$PATH" cargo clippy --bin look-header -- -D warnings` also pass. [observed]
+
+`style::tests::close_icon_is_symbolic_with_foreground_strokes` checks the square viewBox, the
+two mockup path ids, two `gpa:stroke="foreground"` outlines, no `gpa:fill`, no `#`/`rgb(` colour
+literals, `.gl-icon-button.close image` at 32 px for scale 1.0 and 16 px for 0.5, and that close
+has no palette rule. [observed]
+
+10-second runs (release, stopped by PID with SIGTERM; `pgrep -x look-header` empty afterwards):
+
+```
+$ GIMBAL_SPIKE_LOG=1 ./target/release/look-header --tabs 3
+... theme, blur and layout lines ...
+exit=143   (no Gtk-WARNING, Gtk-CRITICAL, CSS or panics)
+
+$ GIMBAL_SPIKE_LOG=1 ./target/release/look-header --tabs 30 --scale 0.5
+... theme, blur and layout lines ...
+exit=143   (no Gtk-WARNING, Gtk-CRITICAL, CSS or panics)
+```
+
+The intermittent `VK_SUBOPTIMAL_KHR` Gdk-WARNING did not appear in these runs. [observed]
+
+### Harness removal
+
+```
+$ grep -rn "PROBE\|TEMP\|temp_" src/bin/look-header/
+(no output, exit 1)
+```
+
+No `Cargo.toml`, `src/theme.rs`, `src/look_shared/` or other binary was edited. [observed]
+
+### API citations [read]
+
+- `gtk::Svg::from_bytes`: `gtk4-0.11.5:src/auto/svg.rs:35`; `Svg` implements
+  `GdkPaintable, SymbolicPaintable`: `:19-21`.
+- `gtk::Image::from_paintable`: `gtk4-0.11.5:src/auto/image.rs:86`; `paintable`: `:157`;
+  `pixel_size`: `:164`.
+- `glib::Bytes::from_static`: `glib-0.22.*:src/bytes.rs:57`.
+- Symbolic SVG slots: `gtk-4.22.4:docs/reference/gtk/icon-format.md:96-118` (supported elements
+  and attributes), `:120-150` (`gpa` namespace; `gpa:stroke`/`gpa:fill` names at `:132-133`),
+  `:152-154` (`-symbolic.svg` naming).
+- Palette remap: `-gtk-icon-palette` registration and flags at
+  `gtk-4.22.4:gtk/gtkcssstylepropertyimpl.c:886-892`; parser at
+  `gtk-4.22.4:gtk/gtkcsspalettevalue.c:318-361`; default palette includes the four names at
+  `:298-312`; resolution of `foreground` from `color` and the four palette names at
+  `gtk-4.22.4:gtk/gtkcssstyle.c:876-899`.
+- How an image passes its colours to a symbolic paintable:
+  `gtk-4.22.4:gtk/gtkrendericon.c:97-152`, reached from
+  `gtk-4.22.4:gtk/gtkiconhelper.c:186-240`.
+- `-gtk-icon-size` used as the icon size when `pixel_size == -1`:
+  `gtk-4.22.4:gtk/gtkiconhelper.c:403-410`.
+
+### Not verified live (Claude's live check)
+
+- How the mockup's ✕ looks next to the float icon: the geometry and allocation are exact
+  (above), but the drawn pixels and stroke weight were not seen. [inferred]
+- Whether the square close icon's extents sit where Adwaita's glyph did, and whether the ✕ reads
+  too large or small at 32 px. [inferred]
+- The live theme reload's effect on the close strokes: both use the `foreground` slot and the
+  same symbolic-redraw mechanism as float, but no recolour was observed on screen. [inferred]
+- The live `Ctrl+=`/`Ctrl+-` rescale of the close icon: the 32 and 16 px sizes came from two
+  launches, not a key-driven reload mid-run. [inferred]
+- The 0.5-scale look (16 × 16 allocation): legibility at that size is visual. [inferred]
+
+### Things I would change outside these files
+
+- Nothing. Only `src/bin/look-header/` and this notes section were edited. The package-wide
+  commands ran while P1m's agent may also be editing `src/bin/look-body/`; no look-body file was
+  edited by hand.
+
+## Review and live check of P1l-r2 (Claude, Nov 1, 2026): passes; P1l is done
+
+The window's close button draws the mockup's ✕ through the same `gtk::Svg` path as float, from a
+square view box the float icon's width, so both draw at the same stroke weight. Only the window
+button changed. RULES.md's four commands pass (65 tests). Live: the ✕ now matches the float icon
+in size and weight; no warnings.

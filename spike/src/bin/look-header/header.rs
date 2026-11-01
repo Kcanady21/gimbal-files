@@ -15,6 +15,11 @@ const FADE_MS: u64 = 200;
 /// symbolic path ignores `gpa:` slots, so loading it by name would lose the fills.
 static FLOAT_ICON: &[u8] = include_bytes!("icons/float.svg");
 
+/// The mockup's close icon, drawn the same way as the float icon: both strokes take
+/// the `foreground` slot. It shares the float icon's 28.08 px square view box, so at
+/// `icon-window` the two draw with the same stroke weight.
+static CLOSE_ICON: &[u8] = include_bytes!("icons/close.svg");
+
 #[derive(Clone, Copy)]
 struct DragState {
     index: usize,
@@ -150,10 +155,10 @@ pub fn show(app: &adw::Application, args: &Args) {
     row.append(&trash);
     let mut win_buttons = Vec::new();
     for (icon, action) in desktop_buttons() {
-        let button = if *action == "float" {
-            float_button()
-        } else {
-            icon_button(icon, "winbtn")
+        let button = match *action {
+            "float" => float_button(),
+            "close" => close_button(),
+            _ => icon_button(icon, "winbtn"),
         };
         row.append(&button);
         win_buttons.push((button, *action));
@@ -347,18 +352,28 @@ fn icon_button(icon_name: &str, extra: &str) -> gtk::Button {
     button
 }
 
-/// The float control: the mockup's two windows as a symbolic `gtk::Svg` paintable.
-/// `gtk::Image` passes its CSS `color` (foreground) and `-gtk-icon-palette` (the
-/// front window's `error` slot, remapped to the window background) to the SVG.
-fn float_button() -> gtk::Button {
-    let svg = gtk::Svg::from_bytes(&glib::Bytes::from_static(FLOAT_ICON));
+/// A window control drawn from one of the mockup's symbolic SVGs. `gtk::Image`
+/// passes its CSS `color` (foreground) and `-gtk-icon-palette` to the SVG.
+fn svg_button(bytes: &'static [u8], extra: &str) -> gtk::Button {
+    let svg = gtk::Svg::from_bytes(&glib::Bytes::from_static(bytes));
     let button = gtk::Button::new();
     button.add_css_class("gl-icon-button");
     button.add_css_class("winbtn");
-    button.add_css_class("float");
+    button.add_css_class(extra);
     button.set_child(Some(&gtk::Image::from_paintable(Some(&svg))));
     button.set_valign(gtk::Align::Center);
     button
+}
+
+/// The float control: the mockup's two windows. The image's `-gtk-icon-palette`
+/// maps the front window's `error` slot to the window background.
+fn float_button() -> gtk::Button {
+    svg_button(FLOAT_ICON, "float")
+}
+
+/// The window's close control: the mockup's ✕, both strokes on `foreground`.
+fn close_button() -> gtk::Button {
+    svg_button(CLOSE_ICON, "close")
 }
 
 fn menu_item(
