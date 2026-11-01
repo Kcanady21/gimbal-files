@@ -72,6 +72,68 @@ pub fn pill_at(rects: &[Rect], x: i32, y: i32, scale: f64) -> Option<usize> {
     })
 }
 
+/// Whether a press at (x, y) inside a `tile_w`-wide tile landed on its pill
+/// (the same centred `PILL_W × control-h` region as `pill_at`, in the tile's
+/// own coordinates). Used by the tile's capture-phase handler: a press on
+/// the pill belongs to the pill's selection handler, which needs the
+/// pre-press focus and anchor.
+pub fn press_on_pill(x: f64, y: f64, tile_w: i32, scale: f64) -> bool {
+    if tile_w <= 0 {
+        return false;
+    }
+    let pw = scaled(PILL_W, scale).min(tile_w);
+    let px = (tile_w - pw) / 2;
+    let ph = scaled(CONTROL_H, scale);
+    x >= px as f64 && x < (px + pw) as f64 && y >= 0.0 && y < ph as f64
+}
+
+/// Which tiles are focused, which is the Shift anchor, and which are
+/// selected. Indexed by slot.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Selection {
+    pub focus: usize,
+    pub anchor: usize,
+    pub selected: Vec<bool>,
+}
+
+impl Selection {
+    pub fn new(n: usize) -> Self {
+        Self {
+            focus: 0,
+            anchor: 0,
+            selected: vec![false; n],
+        }
+    }
+}
+
+/// The selection rules, pure: a plain click focuses its tile and clears the
+/// selection, Ctrl toggles the clicked tile, and Shift selects the range
+/// from the anchor (the last plain click, i.e. the previous focus) to the
+/// clicked tile. Ctrl does not move the anchor, so Ctrl then Shift extends
+/// from the last plain click, like a file manager.
+pub fn selection_after(state: &Selection, slot: usize, ctrl: bool, shift: bool) -> Selection {
+    let mut next = state.clone();
+    if slot >= next.selected.len() {
+        return next;
+    }
+    if ctrl {
+        next.selected[slot] = !next.selected[slot];
+        next.focus = slot;
+    } else if shift {
+        let (from, to) = (state.anchor.min(slot), state.anchor.max(slot));
+        next.selected.fill(false);
+        for selected in next.selected.iter_mut().take(to + 1).skip(from) {
+            *selected = true;
+        }
+        next.focus = slot;
+    } else {
+        next.selected.fill(false);
+        next.focus = slot;
+        next.anchor = slot;
+    }
+    next
+}
+
 /// Moves the element at `from` to index `to` in place — the one helper every
 /// per-slot vector's reorder goes through, so per-slot state always moves
 /// with its tile (the r2 fast-drop bug was one vector left behind).
@@ -131,7 +193,6 @@ pub fn drag_layout(
 struct Tile {
     id: usize,
     name: String,
-    selected: bool,
 }
 
 struct State {
@@ -140,7 +201,7 @@ struct State {
     frames: Vec<gtk::Box>,  // indexed by slot: the framed pane inside it
     pills: Vec<gtk::Box>,
     rects: Vec<Rect>,
-    focused: usize,
+    selection: Selection,
     scale: f64,
     view: [i32; 2],
 }
@@ -228,7 +289,7 @@ impl SplitView {
                     frames: vec![],
                     pills: vec![],
                     rects: vec![],
-                    focused: 0,
+                    selection: Selection::new(0),
                     scale: 1.0,
                     view: [0, 0],
                 }),
@@ -268,10 +329,9 @@ impl SplitView {
                 .map(|i| Tile {
                     id: i,
                     name: format!("Tab {i}"),
-                    selected: false,
                 })
                 .collect();
-            st.focused = 0;
+            st.selection = Selection::new(n);
         }
         self.inner.rebuild();
     }
@@ -339,11 +399,10 @@ impl Inner {
                 generation: Rc::new(Cell::new(0)),
             });
         }
-        let focus = st.focused;
         drop(st);
         *self.slots.borrow_mut() = slots;
         self.relayout();
-        self.refresh_classes(focus);
+        self.refresh_classes();
     }
 
     fn relayout(&self) {
@@ -362,10 +421,11 @@ impl Inner {
         }
     }
 
-    fn refresh_classes(&self, focus: usize) {
+    fn refresh_classes(&self) {
         let st = self.state.borrow();
+        let focus = st.selection.focus;
         for (i, (pill, frame)) in st.pills.iter().zip(&st.frames).enumerate() {
-            let selected = st.tiles[i].selected;
+            let selected = st.selection.selected.get(i).copied().unwrap_or(false);
             for class in ["active", "selected"] {
                 pill.remove_css_class(class);
             }
@@ -413,11 +473,20 @@ impl Inner {
         pill: &gtk::Box,
         close: &gtk::Button,
     ) {
-        // Clicking anywhere in a tile focuses it (capture: wins over the grid).
+        // Clicking anywhere in a tile focuses it (capture: wins over the grid)
+        // — except on the pill, where the pill's own handler decides with the
+        // modifiers: a capture-phase focus here would clear the selection and
+        // move the Shift anchor before the pill reads it (live-check 1).
         let click = gtk::GestureClick::new();
         click.set_propagation_phase(gtk::PropagationPhase::Capture);
         let click_view = view.clone();
-        click.connect_pressed(move |_, _, _, _| click_view.inner.focus(id));
+        let click_tile = tile.clone();
+        click.connect_pressed(move |_, _, x, y| {
+            let scale = click_view.inner.state.borrow().scale;
+            if !press_on_pill(x, y, click_tile.width(), scale) {
+                click_view.inner.focus(id);
+            }
+        });
         tile.add_controller(click);
         // Pill: plain/Ctrl/Shift click focuses or selects; right-click opens
         // the menu. Dragging is handled by the Fixed's gesture.
@@ -574,31 +643,27 @@ impl Inner {
             slot_move(&mut st.widgets, from, to);
             slot_move(&mut st.frames, from, to);
             slot_move(&mut st.pills, from, to);
-            st.focused = to;
+            slot_move(&mut st.selection.selected, from, to);
+            st.selection.focus = to;
+            st.selection.anchor = to;
         }
         slot_move(&mut self.slots.borrow_mut(), from, to);
         let (widget, rect) = {
             let st = self.state.borrow();
             (st.widgets[to].clone(), st.rects[to])
         };
-        self.refresh_classes(to);
+        self.refresh_classes();
         self.slide_to(to, &widget, rect);
         let name = self.state.borrow().tiles[to].name.clone();
         crate::log!("split", "'{name}' moved from slot {from} to {to}");
     }
 
+    /// A plain press anywhere in a tile: focus it and clear the selection.
     fn focus(&self, id: usize) {
         let Some(slot) = self.slot_of(id) else {
             return;
         };
-        {
-            let mut st = self.state.borrow_mut();
-            st.focused = slot;
-            for t in &mut st.tiles {
-                t.selected = false;
-            }
-        }
-        self.refresh_classes(slot);
+        self.apply_selection(slot, false, false);
     }
 
     fn pill_pressed(&self, g: &gtk::GestureClick, id: usize) {
@@ -612,29 +677,27 @@ impl Inner {
         let Some(slot) = self.slot_of(id) else {
             return;
         };
-        let prev_focus = self.state.borrow().focused;
-        {
-            let mut st = self.state.borrow_mut();
-            st.focused = slot;
-            if ctrl {
-                if let Some(t) = st.tiles.get_mut(slot) {
-                    t.selected = !t.selected;
-                }
-            } else if shift {
-                let (from, to) = (prev_focus.min(slot), prev_focus.max(slot));
-                for t in st.tiles.iter_mut().take(to + 1).skip(from) {
-                    t.selected = true;
-                }
-            } else {
-                for t in &mut st.tiles {
-                    t.selected = false;
-                }
-            }
-        }
-        self.refresh_classes(slot);
+        self.apply_selection(slot, ctrl, shift);
     }
 
+    /// Run the pure selection rules from `selection_after` and repaint.
+    fn apply_selection(&self, slot: usize, ctrl: bool, shift: bool) {
+        {
+            let mut st = self.state.borrow_mut();
+            st.selection = selection_after(&st.selection, slot, ctrl, shift);
+        }
+        self.refresh_classes();
+    }
+
+    /// The right-click menu: parented to the clicked pill, so it opens at the
+    /// pill the press landed on (live-check 2).
     fn popup_menu(&self, id: usize) {
+        let Some(slot) = self.slot_of(id) else {
+            return;
+        };
+        let Some(pill) = self.state.borrow().pills.get(slot).cloned() else {
+            return;
+        };
         let pop = gtk::Popover::new();
         let button = gtk::Button::with_label("Close");
         let view = self.handle.borrow().as_ref().unwrap().clone();
@@ -645,7 +708,7 @@ impl Inner {
         });
         pop.set_child(Some(&button));
         pop.connect_closed(move |_| pop_gone.unparent());
-        pop.set_parent(&self.outer);
+        pop.set_parent(&pill);
         pop.popup();
     }
 
@@ -656,7 +719,7 @@ impl Inner {
         let remaining = {
             let mut st = self.state.borrow_mut();
             let mut targets: Vec<usize> = (0..st.tiles.len())
-                .filter(|&i| st.tiles[i].selected)
+                .filter(|&i| st.selection.selected.get(i).copied().unwrap_or(false))
                 .collect();
             if targets.is_empty() {
                 targets.push(slot);
@@ -666,10 +729,12 @@ impl Inner {
                     st.tiles.remove(i);
                 }
             }
-            if st.focused >= st.tiles.len() {
-                st.focused = st.tiles.len() - 1;
-            }
-            st.tiles.len()
+            let remaining = st.tiles.len();
+            let focus = st.selection.focus.min(remaining - 1);
+            st.selection = Selection::new(remaining);
+            st.selection.focus = focus;
+            st.selection.anchor = focus;
+            remaining
         };
         if remaining == 1 {
             (self.on_exit)();
@@ -751,6 +816,65 @@ mod tests {
             pill_at(&rects, rects[1].x + (rects[1].w - 270) / 2, r.y + 10, 1.0),
             Some(1)
         );
+    }
+
+    #[test]
+    fn plain_click_clears_and_focuses() {
+        let mut state = Selection::new(4);
+        state.selected = vec![true, true, true, true];
+        state.focus = 3;
+        state.anchor = 1;
+        let next = selection_after(&state, 2, false, false);
+        assert_eq!(next.focus, 2);
+        assert_eq!(next.anchor, 2);
+        assert_eq!(next.selected, [false, false, false, false]);
+    }
+
+    #[test]
+    fn ctrl_click_adds_and_removes() {
+        let mut state = Selection::new(4);
+        state.focus = 0;
+        state.anchor = 0;
+        let added = selection_after(&state, 2, true, false);
+        assert_eq!(added.selected, [false, false, true, false]);
+        assert_eq!((added.focus, added.anchor), (2, 0));
+        let second = selection_after(&added, 3, true, false);
+        assert_eq!(second.selected, [false, false, true, true]);
+        let removed = selection_after(&second, 2, true, false);
+        assert_eq!(removed.selected, [false, false, false, true]);
+        let empty = selection_after(&removed, 3, true, false);
+        assert_eq!(empty.selected, [false, false, false, false]);
+        // Ctrl never moves the Shift anchor.
+        assert_eq!(empty.anchor, 0);
+    }
+
+    #[test]
+    fn shift_click_selects_the_range_from_the_previous_focus() {
+        let mut state = Selection::new(5);
+        // A plain click on slot 0 is the previous focus and the anchor.
+        state = selection_after(&state, 0, false, false);
+        let range = selection_after(&state, 3, false, true);
+        assert_eq!(range.selected, [true, true, true, true, false]);
+        assert_eq!(range.focus, 3);
+        assert_eq!(range.anchor, 0);
+        // Backwards from the anchor works too, and replaces the selection.
+        let back = selection_after(&range, 1, false, true);
+        assert_eq!(back.selected, [true, true, false, false, false]);
+        assert_eq!(back.focus, 1);
+    }
+
+    #[test]
+    fn tile_press_on_the_pill_is_not_a_plain_focus() {
+        // Pill 270 wide, centred in a 500 px tile at scale 1.
+        assert!(press_on_pill(200.0, 10.0, 500, 1.0));
+        assert!(!press_on_pill(100.0, 10.0, 500, 1.0)); // left of it
+        assert!(!press_on_pill(200.0, 60.0, 500, 1.0)); // below it
+        // At 0.5 the pill is 135 wide and the region halves.
+        assert!(press_on_pill(100.0, 10.0, 250, 0.5));
+        assert!(!press_on_pill(50.0, 10.0, 250, 0.5));
+        // A tile narrower than the pill uses the whole tile width.
+        assert!(press_on_pill(50.0, 10.0, 100, 1.0));
+        assert!(!press_on_pill(-1.0, 10.0, 100, 1.0));
     }
 
     /// A test double of `Slot`: whatever a slot owns must follow its tile.

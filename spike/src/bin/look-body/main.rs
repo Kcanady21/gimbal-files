@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! P1j-r2: the body look — split view with tile identity and a live drag
-//! (the gesture rides the static gtk::Fixed), saved sidebar widths that a
-//! drag updates and a scale change keeps (scaled), width-driven grid
+//! P1j-r4: the body look — split view with tile identity, a live drag (the
+//! gesture rides the static gtk::Fixed) and a pure selection model for
+//! Ctrl/Shift clicks, a pill-parented right-click menu, saved sidebar widths
+//! that a drag updates and a scale change keeps (scaled), width-driven grid
 //! columns, both sidebars, live scaling, all in our own `gl-` CSS.
 //! `#[rustfmt::skip]` stays only on the constant tables, per the review.
 mod grid;

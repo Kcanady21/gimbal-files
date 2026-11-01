@@ -104,7 +104,10 @@ mod tests {
         assert_eq!(w.content, 2560 - 20 - 348 - HANDLE - 648);
         // The sketch's 1544 px content minus the paned handle.
         assert_eq!(w.content, 1543);
-        assert_eq!(min, 20 + 260 + HANDLE + one_column_width(1.0) + 360);
+        assert_eq!(
+            min,
+            20 + scaled(SIDEBAR_MIN, 1.0) + HANDLE + one_column_width(1.0) + 360
+        );
     }
 
     #[test]
@@ -118,7 +121,7 @@ mod tests {
         // Midway: the left gives way first, the preview part-way, and the
         // content is pinned at exactly one column.
         let (w, _) = body_widths(1000, 1.0, 348.0, 648.0, false, false);
-        assert_eq!(w.left, 260);
+        assert_eq!(w.left, scaled(SIDEBAR_MIN, 1.0));
         assert!(w.preview > 360 && w.preview < 648);
         assert_eq!(w.content, one_column_width(1.0));
         // At the implied minimum: sidebars at their minimums, one column.
@@ -126,7 +129,7 @@ mod tests {
         let (w, _) = body_widths(min, 1.0, 348.0, 648.0, false, false);
         assert_eq!(
             (w.left, w.content, w.preview),
-            (260, one_column_width(1.0), 360)
+            (scaled(SIDEBAR_MIN, 1.0), one_column_width(1.0), 360)
         );
     }
 
@@ -149,6 +152,9 @@ mod tests {
         // Scale 0.5 halves every width, minimums included.
         let (w, min) = body_widths(2560, 0.5, 348.0, 648.0, false, false);
         assert_eq!((w.left, w.preview), (174, 324));
-        assert_eq!(min, 10 + 130 + HANDLE + one_column_width(0.5) + 180);
+        assert_eq!(
+            min,
+            10 + scaled(SIDEBAR_MIN, 0.5) + HANDLE + one_column_width(0.5) + 180
+        );
     }
 }

@@ -778,3 +778,192 @@ Needs fixing:
 Testing note for later checks: a virtual device that has keys as well as a pointer gets its
 first absolute move dropped and its button events delayed by about 60 ms (the press arrives
 after six motion events). Use the plain pointer for drags and the extended one only for clicks.
+
+## P1j-r4 changes
+
+Fixes per "Review of P1j-r3" and the live check above. 2,459 lines under
+`src/bin/look-body/` (no budget). Only
+`src/bin/look-body/{main,split,sidebar,style,layout}.rs` and this file changed;
+`Cargo.toml` untouched.
+
+1. **Ctrl/Shift selection (live-check 1).** The tile's capture-phase click no longer
+   focuses on a press that lands on the pill: `press_on_pill(x, y, tile_w, scale)`
+   (pure, in `split.rs`) tests the same centred `PILL_W × control-h` region as
+   `pill_at`, in the tile's own coordinates. On the frame/grid it still calls the plain
+   focus, so "a plain click anywhere in a tile focuses it" holds; on the pill the
+   pre-press focus and anchor survive for the pill's handler. The rules are one pure
+   function, `selection_after(&Selection { focus, anchor, selected }, slot, ctrl, shift)`:
+   plain clears and sets focus = anchor = slot, Ctrl toggles the clicked tile and only
+   moves focus (the anchor stays, as in a file manager), Shift replaces the selection
+   with the anchor..slot range (the anchor is the last plain click, i.e. the previous
+   focus) and moves focus. `State` now holds one `Selection`; `refresh_classes` reads
+   it, drag reorders `selected` with the other per-slot vectors, and
+   `close_selected_or` closes **every** selected tile, not just one. Unit tests:
+   `plain_click_clears_and_focuses`, `ctrl_click_adds_and_removes`,
+   `shift_click_selects_the_range_from_the_previous_focus`,
+   `tile_press_on_the_pill_is_not_a_plain_focus`.
+2. **Pill menu (live-check 2).** `popup_menu` resolves the clicked tile's slot and
+   parents the popover to that pill (`pop.set_parent(&pills[slot])`) instead of the
+   outer ScrolledWindow; `closed` still unparents it. A popover has its own surface,
+   so it takes no part in the pill's layout: `gtk_widget_should_layout` excludes
+   GtkNative children (`gtk-4.22.4:gtk/gtkwidget.c:13016–13039`; the popover's own
+   measure is `gtk-4.22.4:gtk/gtkpopover.c:1543–1598`). The menu now opens at the pill.
+3. **Left sidebar at its minimum (live-check 3).** Every label that can be long now
+   ellipsizes at the end: the shared `title_row` title (also the preview's), section
+   pill labels, directory rows, drive names and capacity labels, and pin rows (whose
+   labels also hexpand). The title keeps `hexpand`, so the collapse button is the part
+   that survives. Section pills shrink to the panel: their labels are ellipsized and
+   their minimum is only padding + border.
+
+   The drive bars are fixed by the sketch (209 px, main 228 px) and their row cannot
+   shrink below the track, so per the brief I raised the token instead. Measured with
+   the token still at 260: `measure()` reported **292 px** total minimum at scale 1.0
+   (248 content + 44 panel chrome = `line-mid` 6 × 2 + `gap-m` 16 × 2 = 44; 228 main
+   bar + `gap-s` 8 + an ellipsized capacity ~12 = 248), and **146 px** at 0.5. The
+   paned position was 260/130, so GTK grew the panel to its minimum and took the
+   difference from the content (gtkpaned.c:1374–1385: a start child wider than its
+   allocation is given `start_child_width`). `SIDEBAR_MIN` is now **300** (150 at
+   0.5), which leaves 8 px of slack over the measured 292. **Consequence:** the
+   body's window floor rises from 904 to **944 px** at scale 1.0 (474 at 0.5); that is
+   the real minimum of the sketch's fixed 228 px bar plus panel chrome, and the timer
+   log below shows a request for 904 stopping at 944.
+
+### Temporary minimum-width timer (removed before delivery; its log)
+
+A `glib::timeout_add_local` harness (400 ms ticks) logged the left panel's
+`measure(HORIZONTAL, -1)` minimum next to its allocated width, then asked for 904 px
+at scale 1.0, asked for 904 at scale 0.5, and finally asked for the 0.5 floor. The
+log's `allocated` is `allocation().width()` (the full allocation; `WidgetExt::width()`
+is content width, gtk-4.22.4:gtk/gtkwidget.c:12821–12845, :4330–4340) and
+`paned position` is what `body_widths` drove:
+
+```text
+[gimbal-look-body 0.919] temp: A 2560 scale 1.00: window 1272 (min 944), left measured min 300 (nat 316), allocated 340 (content 296), paned position 340, computed 340
+[gimbal-look-body 2.121] temp: B 904 scale 1.00: window 944 (min 944), left measured min 300 (nat 316), allocated 300 (content 256), paned position 300, computed 300
+[gimbal-look-body 3.321] temp: C 904 scale 0.50: window 904 (min 474), left measured min 150 (nat 158), allocated 174 (content 152), paned position 174, computed 174
+[gimbal-look-body 4.523] temp: D floor scale 0.50: window 474 (min 474), left measured min 150 (nat 158), allocated 150 (content 128), paned position 150, computed 150
+```
+
+At both floors the measured minimum equals the allocated width (300 = 300 at 1.0;
+150 = 150 at 0.5), i.e. the panel's minimum is never above what `body_widths` gives
+it. The measured value is the width request in those two lines; the underlying
+content minima are the 292/146 measured before the token was raised. `nat 316/158`
+shows how much the ellipsized labels would like at full width. [observed]
+
+### Verified
+
+RULES.md's four commands (from `spike/`):
+
+```text
+$ PATH="$HOME/.rustup/toolchains/1.95.0-x86_64-unknown-linux-gnu/bin:$PATH" cargo fmt --check
+(exit 0, no output)
+
+$ PATH="$HOME/.rustup/toolchains/1.95.0-x86_64-unknown-linux-gnu/bin:$PATH" cargo clippy --all-targets -- -D warnings
+    Checking gimbal-spike v0.0.0 (/home/kyle/Documents/03.) Code-Projects/gimbal-files/spike)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.25s
+
+$ cargo test
+     Running unittests src/main.rs …                    test result: ok. 4 passed
+     Running unittests src/bin/look-body/main.rs …      test result: ok. 27 passed
+     Running unittests src/bin/look-header/main.rs …    test result: ok. 5 passed
+(look-body's 27: CLI ×2, style ×3, grid ×2, tile_rects ×4, tile/pill hit tests ×2,
+slot reorder ×1, drag ×4, layout ×4, recording guard ×1, plain/Ctrl/Shift selection
+×3, pill press ×1)
+
+$ cargo build --release
+   Compiling gimbal-spike v0.0.0 (…)
+    Finished `release` profile [optimized] target(s) in 0.83s
+```
+
+10-second runs (final release binary, from `/tmp/gimbal-spike-p1j-r4`, stopped by PID
+with SIGTERM; both exit 143):
+
+```text
+$ ./target/release/look-body                                 # stderr 0 bytes, css_warnings=0
+$ ./target/release/look-body --tiles 6 --pins 14 --scale 0.5 # stderr 0 bytes, css_warnings=0
+$ grep -cE "Theme parser|Gtk-WARNING|Gtk-CRITICAL" run*.err # 0 and 0 [observed]
+```
+
+Earlier 10-second runs showed the same intermittent `Gdk-WARNING …
+vkAcquireNextImageKHR() … (VK_SUBOPTIMAL_KHR)` Vulkan swapchain notice as r2/r3; it
+is a Gdk presentation notice, not a GTK CSS warning, and did not appear in the final
+two runs.
+
+### API citations for the new work
+
+- `gtk_widget_get_width` returns the **content** width (allocation minus CSS
+  border/padding), gtk-4.22.4:gtk/gtkwidget.c:12821–12845 and :4330–4340; `measure`
+  includes border/padding. That is why the harness logs both allocated and content
+  widths next to the measured minimum.
+- `GtkPaned` grows a child to its measured minimum when the stored position is
+  smaller: gtkpaned.c:1374–1385. This is the mechanism that took width from the
+  content at `SIDEBAR_MIN` 260 and the reason the token now covers the panel's real
+  minimum.
+- Ellipsized labels report an ellipsis-sized minimum (`gtk_label_measure` →
+  `get_width_for_height`, gtk-4.22.4:gtk/gtklabel.c:1295–1340), which is what lets
+  the title, section pills, pin rows and drive labels shrink.
+- `GestureClick` press coordinates are widget-relative (gtkgesture.c:1281; dispatch
+  translation at gtkwidget.c:4975/:5008, already cited in the r2 notes), so
+  `press_on_pill` can decide from the press point in the tile's own space.
+- Popovers are `GtkNative` and therefore excluded from a parent's measure/allocation
+  by `gtk_widget_should_layout` (gtkwidget.c:13016–13039); parenting one to the pill
+  does not change the pill's size.
+
+### Not verifiable without a live session (Claude/Kyle check)
+
+- Ctrl+click selects/deselects several pills, Shift+click ranges from the previous
+  plain click, and right-click → Close with several selected closes them all
+  [inferred]; the pure rules and the capture-skip are unit tested.
+- The right-click menu appears at the clicked pill [inferred]; it is now a child of
+  that pill.
+- The left panel at 944 px (scale 1.0) / 474 px (scale 0.5): no clipped labels, the
+  title and section labels ellipsize, the section pills stay inside the panel, and the
+  collapse button is visible [observed only as measurements, visual is Claude's].
+- The panel at the new minimum still matches the sketch's spacing (the raise only
+  changes how narrow the window can get; the default 348 px look is untouched).
+
+## Review of P1j-r4 (Claude, Nov 1, 2026)
+
+The selection rules are now one pure function (`selection_after`) with four tests, and the tile's
+capture-phase press skips `focus` when it lands on the pill (`press_on_pill`, tested). The menu is
+parented to the pill. Raising `SIDEBAR_MIN` to 300 is the brief's allowed route: the main drive bar
+is a fixed 228 px from the sketch, and the measured panel minimum is 292. RULES.md's four commands
+pass here (36 tests).
+
+One regression in the look: to ellipsize, `dir_row` and `drive_block` set `xalign(0.0)`, so the
+directory names and drive names are now left-aligned. The P1j brief says the drive name is
+centred, and the sketch (`sketch/default.png`) centres both. An ellipsized label can stay centred.
+
+## Live check of P1j-r4 (Claude, Nov 1, 2026): items pass, two fixes left (P1j-r5-fixes.md)
+
+Release build, floating 2,560 × 1,406 window, DP-3 off.
+
+Passes:
+
+- **Selection (item 1).** Click Tab 1, Ctrl+click Tab 2 and Tab 4: both show the selected fill.
+  Click Tab 1, Shift+click Tab 4: all four are selected. A plain click inside a tile's grid clears
+  the selection and focuses that tile.
+- **Menu (item 2).** Right-click on Tab 4's pill opens "Close" directly under that pill. With Tab 2
+  and Tab 4 selected, Close removes both and leaves Tab 1 and Tab 3.
+- **Sidebar minimum (item 3).** At the 904 px floor, at scale 1.0 and 0.5, nothing in the left
+  panel is clipped; long labels end in "…".
+- Fast drops (regression check): six 100 ms drops, all six `drag ended`, every tile in its slot.
+- No GTK warnings, no panics.
+
+Needs fixing:
+
+1. **Every split view after the first shows one column per tile.** The first split after launch
+   has 5 columns per tile. After any rebuild (switching Split 2 → Split 4, or closing tiles) each
+   tile's grid shows a single column with 625 px wide cells, though a probe shows
+   `max_columns 6`, cell minimum 97 and page size 625 on those grids. Nudging the window width
+   restores 5 columns at once. So the cap is applied but never laid out. `update_cap` runs from the
+   h-adjustment's `page-size` notify. That notify fires while the grid is inside its own size
+   allocation (a scrollable sets its adjustment's page size during `size_allocate`), and the
+   `queue_resize` that `set_max_columns` makes there is lost. A deferred apply (for example, an
+   idle callback that sets the cap) or applying the cap outside allocation should fix it. This
+   matters for Phase 2 too: P1e's listing uses the same notify → `set_max_columns` pattern.
+2. **Directory and drive names lost their centring** (see the review above).
+
+Also seen: the probe still found a grid from the previous split alive and unmapped after a
+rebuild, so the weak list in `grid.rs` can hold old grids until they are dropped. Not a bug for
+the prototype; noted for Phase 2.

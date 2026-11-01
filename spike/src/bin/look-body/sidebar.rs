@@ -42,6 +42,8 @@ pub fn title_row(title: &str, icon: &str) -> (gtk::Box, gtk::Button) {
     label.add_css_class("gl-title");
     label.set_hexpand(true);
     label.set_xalign(0.0);
+    // The title yields to the collapse button at the panel's minimum width.
+    label.set_ellipsize(gtk::pango::EllipsizeMode::End);
     let button = icon_button(icon);
     row.append(&label);
     row.append(&button);
@@ -78,12 +80,15 @@ fn drive_block(name: &str, cap: &str, main: bool) -> (gtk::Box, gtk::Box, gtk::L
     block.add_css_class("gl-drive-block");
     let name_label = gtk::Label::new(Some(name));
     name_label.add_css_class("gl-drive-name");
+    name_label.set_xalign(0.0);
+    name_label.set_ellipsize(gtk::pango::EllipsizeMode::End);
     block.append(&name_label);
     let row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     row.set_halign(gtk::Align::Center);
     row.append(&overlay);
     let cap_label = gtk::Label::new(Some(cap));
     cap_label.add_css_class("gl-drive-cap");
+    cap_label.set_ellipsize(gtk::pango::EllipsizeMode::End);
     mark(&cap_label, main, "gl-main-label");
     row.append(&cap_label);
     block.append(&row);
@@ -108,7 +113,10 @@ fn set_fullness(fill: &gtk::Box, label: &gtk::Label, fullness: f64, bar_w: f64, 
 fn dir_row(text: &str) -> gtk::Box {
     let row = gtk::Box::new(gtk::Orientation::Vertical, 0);
     row.add_css_class("gl-dir-row");
-    row.append(&gtk::Label::new(Some(text)));
+    let label = gtk::Label::new(Some(text));
+    label.set_xalign(0.0);
+    label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    row.append(&label);
     row
 }
 
@@ -165,7 +173,9 @@ impl LeftPanel {
             section.add_css_class("gl-section");
             let pill = gtk::Button::new();
             pill.add_css_class("gl-section-pill");
-            pill.set_child(Some(&gtk::Label::new(Some(name))));
+            let pill_label = gtk::Label::new(Some(name));
+            pill_label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+            pill.set_child(Some(&pill_label));
             let revealer = gtk::Revealer::new();
             revealer.set_transition_type(gtk::RevealerTransitionType::SlideDown);
             revealer.set_transition_duration(200);
@@ -245,7 +255,11 @@ impl LeftPanel {
                 row.add_css_class("sel");
             }
             row.append(&gtk::Image::from_icon_name(pin_icon(name)));
-            row.append(&gtk::Label::new(Some(name)));
+            let label = gtk::Label::new(Some(name));
+            label.set_hexpand(true);
+            label.set_xalign(0.0);
+            label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+            row.append(&label);
             self.pins_box.append(&row);
         }
     }

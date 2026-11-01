@@ -14,7 +14,7 @@ pub mod tok {
     pub const PIN_ROW_H: f64 = 64.0; pub const DIR_ROW_H: f64 = 32.0; pub const STATUS_H: f64 = 64.0;
     pub const BAR_W: f64 = 209.0; pub const BAR_H: f64 = 18.0; pub const MAIN_BAR_W: f64 = 228.0; pub const MAIN_BAR_H: f64 = 20.0;
     pub const CELL_W: f64 = 97.0; pub const CELL_H: f64 = 144.0;
-    pub const SIDEBAR_W: f64 = 348.0; pub const SIDEBAR_MIN: f64 = 260.0;
+    pub const SIDEBAR_W: f64 = 348.0; pub const SIDEBAR_MIN: f64 = 300.0;
     pub const PREVIEW_W: f64 = 648.0; pub const PREVIEW_MIN: f64 = 360.0;
     pub const PILL_W: f64 = 270.0;
     pub const TEXT_TITLE: f64 = 32.0; pub const TEXT_SECTION: f64 = 28.0; pub const TEXT_CONTROL: f64 = 24.0; pub const TEXT_ROW: f64 = 20.0;
