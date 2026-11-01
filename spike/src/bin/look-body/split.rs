@@ -9,6 +9,7 @@
 //! new rects over 150 ms.
 use crate::style::{CONTROL_H, GAP_2XL, PILL_W, scaled};
 use adw::prelude::*;
+use gtk::glib;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
@@ -229,10 +230,12 @@ struct Slot {
 
 struct Inner {
     outer: gtk::ScrolledWindow,
+    /// The crossfade around `outer` (the P1i fade, now a `GtkRevealer`
+    /// instead of a widget fade; see P1k).
+    revealer: gtk::Revealer,
     fixed: gtk::Fixed,
     state: RefCell<State>,
     items: u32,
-    fade: RefCell<Option<adw::Animation>>,
     on_exit: Rc<dyn Fn()>,
     /// Self handle, set right after construction (an intentional cycle: the
     /// view lives as long as the window).
@@ -246,11 +249,6 @@ struct Inner {
 #[derive(Clone)]
 pub struct SplitView {
     inner: Rc<Inner>,
-}
-
-fn opacity_target(outer: &gtk::ScrolledWindow) -> adw::CallbackAnimationTarget {
-    let outer = outer.clone();
-    adw::CallbackAnimationTarget::new(move |v| outer.set_opacity(v))
 }
 
 /// The viewport size (the adjustment's page size) drives tile_rects; relayout
@@ -278,9 +276,16 @@ impl SplitView {
         outer.set_policy(gtk::PolicyType::External, gtk::PolicyType::Automatic);
         outer.set_propagate_natural_width(false);
         outer.set_propagate_natural_height(false);
+        // Crossfade for the P1i fade.
+        let revealer = gtk::Revealer::new();
+        revealer.set_transition_type(gtk::RevealerTransitionType::Crossfade);
+        revealer.set_transition_duration(250);
+        revealer.set_child(Some(&outer));
+        revealer.set_reveal_child(false);
         let this = Self {
             inner: Rc::new(Inner {
                 outer,
+                revealer,
                 fixed,
                 items,
                 state: RefCell::new(State {
@@ -293,7 +298,6 @@ impl SplitView {
                     scale: 1.0,
                     view: [0, 0],
                 }),
-                fade: RefCell::new(None),
                 on_exit,
                 handle: RefCell::new(None),
                 slots: RefCell::new(vec![]),
@@ -318,8 +322,8 @@ impl SplitView {
         this
     }
 
-    pub fn widget(&self) -> &gtk::ScrolledWindow {
-        &self.inner.outer
+    pub fn widget(&self) -> &gtk::Revealer {
+        &self.inner.revealer
     }
 
     pub fn set_count(&self, n: usize) {
@@ -342,30 +346,21 @@ impl SplitView {
     }
 
     pub fn fade_in(&self) {
-        let outer = self.inner.outer.clone();
-        let target = opacity_target(&outer);
-        self.play(adw::TimedAnimation::new(&outer, 0.0, 1.0, 250, target));
+        self.inner.revealer.set_reveal_child(true);
     }
 
     /// Fade the tiles out, then run `done` (the caller switches the stack).
     pub fn fade_out(&self, done: Box<dyn Fn()>) {
-        let outer = self.inner.outer.clone();
-        let target = opacity_target(&outer);
-        let anim = adw::TimedAnimation::new(&outer, 1.0, 0.0, 250, target);
+        self.inner.revealer.set_reveal_child(false);
         let weak = Rc::downgrade(&self.inner);
-        anim.connect_done(move |_| {
-            if let Some(inner) = weak.upgrade() {
+        glib::timeout_add_local_once(std::time::Duration::from_millis(250), move || {
+            // A new fade-in during the transition cancels the switch.
+            if let Some(inner) = weak.upgrade()
+                && !inner.revealer.reveals_child()
+            {
                 done();
-                inner.outer.set_opacity(1.0);
-                inner.fade.borrow_mut().take();
             }
         });
-        self.play(anim);
-    }
-
-    fn play(&self, anim: adw::TimedAnimation) {
-        self.inner.fade.replace(Some(anim.upcast()));
-        self.inner.fade.borrow().as_ref().unwrap().play();
     }
 }
 

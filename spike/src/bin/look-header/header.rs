@@ -36,8 +36,10 @@ struct Ui {
     search: gtk::Revealer,
     search_entry: gtk::Entry,
     scale: Cell<f64>,
+    opacity: Cell<f64>,
     font: Option<String>,
     provider: gtk::CssProvider,
+    blur: crate::blur::Blur,
     model: RefCell<Model>,
     overflow: Cell<bool>,
     search_open: Cell<bool>,
@@ -71,8 +73,9 @@ pub fn show(app: &adw::Application, args: &Args) {
         .build();
     window.add_css_class("gimbal-look");
     let scale = style::base() * args.scale;
+    let opacity = style::opacity();
     let provider = gtk::CssProvider::new();
-    provider.load_from_string(&style::css(scale, args.font.as_deref()));
+    provider.load_from_string(&style::css(scale, args.font.as_deref(), opacity));
     if let Some(display) = gdk::Display::default() {
         gtk::style_context_add_provider_for_display(
             &display,
@@ -168,6 +171,7 @@ pub fn show(app: &adw::Application, args: &Args) {
     root.append(&handle);
     root.append(&body);
     window.set_content(Some(&root));
+    let blur = crate::blur::Blur::attach(window.upcast_ref(), scale, opacity);
     let ui = Rc::new(Ui {
         window: window.clone(),
         strip,
@@ -182,8 +186,10 @@ pub fn show(app: &adw::Application, args: &Args) {
         search,
         search_entry: search_entry.clone(),
         scale: Cell::new(scale),
+        opacity: Cell::new(opacity),
         font: args.font.clone(),
         provider,
+        blur,
         model: RefCell::new(Model::new(args.tabs)),
         overflow: Cell::new(false),
         search_open: Cell::new(false),
@@ -537,16 +543,29 @@ fn make_pill(
         }
     });
     pill.add_controller(drag);
+    let wrapper = pill_revealer(&pill);
     if ui.animate_group.get() == Some(index) {
-        pill.add_css_class("fading");
-        let weak = pill.downgrade();
+        wrapper.set_reveal_child(false);
+        let weak = wrapper.downgrade();
         glib::timeout_add_local_once(Duration::from_millis(20), move || {
-            if let Some(pill) = weak.upgrade() {
-                pill.remove_css_class("fading");
+            if let Some(wrapper) = weak.upgrade() {
+                wrapper.set_reveal_child(true);
             }
         });
     }
-    pill.upcast()
+    wrapper.upcast()
+}
+
+/// A crossfade around one pill, so the P1i group transition does not fade
+/// text through CSS `opacity` on the pill itself.
+fn pill_revealer(pill: &impl IsA<gtk::Widget>) -> gtk::Revealer {
+    let revealer = gtk::Revealer::new();
+    revealer.add_css_class("gl-pill-wrap");
+    revealer.set_transition_type(gtk::RevealerTransitionType::Crossfade);
+    revealer.set_transition_duration(FADE_MS as u32);
+    revealer.set_child(Some(pill));
+    revealer.set_reveal_child(true);
+    revealer
 }
 
 fn make_accordion(ui: &Rc<Ui>, count: usize) -> gtk::Widget {
@@ -588,7 +607,7 @@ fn make_accordion(ui: &Rc<Ui>, count: usize) -> gtk::Widget {
             popover.unparent();
         }
     });
-    pill.upcast()
+    pill_revealer(&pill).upcast()
 }
 
 impl Ui {
@@ -832,8 +851,10 @@ impl Ui {
         // below then borrows the model only after `group_selected` has returned.
         let pills: Vec<gtk::Widget> = self.pills.borrow().clone();
         for (index, pill) in pills.iter().enumerate() {
-            if indices.contains(&index) {
-                pill.add_css_class("fading");
+            if indices.contains(&index)
+                && let Some(revealer) = pill.downcast_ref::<gtk::Revealer>()
+            {
+                revealer.set_reveal_child(false);
             }
         }
         let ui = self.clone();
@@ -898,8 +919,12 @@ impl Ui {
         let base = style::base();
         let next = (((self.scale.get() / base + delta) * 20.0).round() / 20.0).clamp(0.5, 1.0);
         self.scale.set(base * next);
-        self.provider
-            .load_from_string(&style::css(self.scale.get(), self.font.as_deref()));
+        self.provider.load_from_string(&style::css(
+            self.scale.get(),
+            self.font.as_deref(),
+            self.opacity.get(),
+        ));
+        self.blur.set_scale(self.scale.get());
         log!("scale", "setting {next:.2}, scale {:.3}", self.scale.get());
         self.refresh();
     }

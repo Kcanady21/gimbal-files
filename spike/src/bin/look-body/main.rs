@@ -6,6 +6,8 @@
 //! columns applied outside allocation, inset side panels (no window frame),
 //! both sidebars, live scaling, all in our own `gl-` CSS.
 //! `#[rustfmt::skip]` stays only on the constant tables, per the review.
+#[path = "../../look_shared/blur.rs"]
+mod blur;
 mod grid;
 mod layout;
 mod preview;
@@ -136,7 +138,9 @@ struct Ui {
     window: adw::ApplicationWindow,
     base: f64,
     setting: Cell<f64>,
+    opacity: Cell<f64>,
     font: Option<String>,
+    blur: blur::Blur,
     /// Left sidebar | (content | preview): two nested horizontal Paneds.
     outer: gtk::Paned,
     inner: gtk::Paned,
@@ -166,12 +170,25 @@ impl Ui {
         self.base * self.setting.get()
     }
 
+    /// Regenerate the stylesheet on the same provider (scale and opacity).
+    fn reload_css(&self) {
+        let css = style::css(self.scale(), self.font.as_deref(), self.opacity.get());
+        self.provider.load_from_string(&css);
+    }
+
+    /// The dev bar's opacity slider: CSS first, then the blur region.
+    fn apply_opacity(&self) {
+        self.reload_css();
+        self.blur.set_opacity(self.opacity.get());
+        crate::log!("opacity", "setting {:.2}", self.opacity.get());
+    }
+
     /// Regenerate the stylesheet on the same provider and re-apply the
     /// Rust-side sizes that read the same token table × scale.
     fn apply_scale(&self) {
         let s = self.scale();
-        let css = style::css(s, self.font.as_deref());
-        self.provider.load_from_string(&css);
+        self.reload_css();
+        self.blur.set_scale(s);
         let px = |t: f64| scaled(t, s);
         self.left_root.set_width_request(px(SIDEBAR_MIN));
         self.left_strip.set_width_request(px(GAP_2XL));
@@ -327,12 +344,15 @@ fn show(app: &adw::Application, args: &Args) {
     window.add_css_class("gimbal-look");
     let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
     window.set_content(Some(&root));
+    let opacity = style::opacity();
 
     // Dev bar: plain default widgets, part of the harness, not the design.
     let dev = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     let scale_ctl = dev_slider(0.50, 1.00, 0.05, args.scale);
+    let opacity_ctl = dev_slider(0.50, 1.00, 0.05, opacity);
     let drive_ctl = dev_slider(0.0, 1.0, 0.01, args.drives.first().copied().unwrap_or(0.5));
     dev.append(&scale_ctl);
+    dev.append(&opacity_ctl);
     let split_buttons = [2usize, 3, 4, 6].map(|n| gtk::Button::with_label(&format!("Split {n}")));
     for b in &split_buttons {
         dev.append(b);
@@ -419,12 +439,15 @@ fn show(app: &adw::Application, args: &Args) {
     view_slot.replace(Some(split.clone()));
     stack.add_named(split.widget(), Some("split"));
 
+    let blur = blur::Blur::attach(window.upcast_ref(), style::base() * args.scale, opacity);
     let ui = Rc::new(Ui {
         provider,
         window: window.clone(),
         base: style::base(),
         setting: Cell::new(args.scale),
+        opacity: Cell::new(opacity),
         font: args.font.clone(),
+        blur,
         outer: outer.clone(),
         inner: inner.clone(),
         left: left.clone(),
@@ -519,6 +542,11 @@ fn show(app: &adw::Application, args: &Args) {
     scale_ctl.connect_value_changed(move |s| {
         ui_scale.setting.set(s.value());
         ui_scale.apply_scale();
+    });
+    let ui_opacity = ui.clone();
+    opacity_ctl.connect_value_changed(move |s| {
+        ui_opacity.opacity.set(s.value());
+        ui_opacity.apply_opacity();
     });
     for (n, button) in [2usize, 3, 4, 6].iter().zip(&split_buttons) {
         let ui = ui.clone();

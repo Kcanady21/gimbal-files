@@ -8,7 +8,7 @@
 //! here are visible panel widths and every position helper adds the inset.
 
 use crate::style::{
-    CELL_W, GAP_2XL, GAP_S, GRID_MARGIN, LINE_THIN, PREVIEW_MIN, SIDEBAR_MIN, scaled,
+    CELL_W, GAP_2XL, GAP_M, GAP_S, GRID_MARGIN, LINE_THIN, PREVIEW_MIN, SIDEBAR_MIN, scaled,
 };
 
 /// The 1 px separator Adwaita draws between a paned's children
@@ -51,11 +51,12 @@ pub fn preview_from_position(inner_w: i32, position: i32, scale: f64) -> i32 {
 /// The narrowest content column that still shows one grid column: the worse
 /// of the single view (a `grid-margin` inset each side plus one cell) and
 /// the split view (a `gap-2xl` Fixed inset each side, the tile's
-/// `line-thin` border, a `gap-2xl` tile-grid margin each side, one cell).
+/// `line-thin` border, a `gap-m` tile-grid margin each side, one cell).
 pub fn one_column_width(scale: f64) -> i32 {
     let cell = scaled(CELL_W, scale);
     let single = 2 * scaled(GRID_MARGIN, scale) + cell;
-    let split = 4 * scaled(GAP_2XL, scale) + 2 * scaled(LINE_THIN, scale) + cell;
+    let split =
+        2 * scaled(GAP_2XL, scale) + 2 * scaled(GAP_M, scale) + 2 * scaled(LINE_THIN, scale) + cell;
     single.max(split)
 }
 
@@ -147,7 +148,23 @@ mod tests {
             min,
             2 * inset(1.0) + scaled(SIDEBAR_MIN, 1.0) + 2 * HANDLE + one_column_width(1.0) + 360
         );
-        assert_eq!(min, 941);
+        // The split view's one-column width is now 215 (2 × gap-2xl view
+        // inset + 2 × gap-m tile margin + 2 × line-thin + one cell), so the
+        // single view's 241 dominates and the floor is 919, 22 px below the
+        // old gap-2xl tile margin's 941.
+        assert_eq!(min, 919);
+    }
+
+    #[test]
+    fn one_column_counts_the_thinner_tile_margin() {
+        let cell = scaled(CELL_W, 1.0);
+        let split =
+            2 * scaled(GAP_2XL, 1.0) + 2 * scaled(GAP_M, 1.0) + 2 * scaled(LINE_THIN, 1.0) + cell;
+        assert_eq!(split, 215);
+        // The single view's 2 × grid-margin + cell (241) still dominates.
+        assert_eq!(one_column_width(1.0), 241);
+        assert_eq!(one_column_width(0.5), 121);
+        assert!(one_column_width(1.0) > split);
     }
 
     #[test]

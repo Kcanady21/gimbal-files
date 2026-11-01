@@ -45,12 +45,38 @@ pub struct DragLayout {
     pub slides: Vec<f64>,
 }
 
+pub const DEFAULT_OPACITY: f64 = 0.85;
+
 pub fn base() -> f64 {
     std::env::var("GIMBAL_LOOK_BASE")
         .ok()
         .and_then(|v| v.parse().ok())
         .filter(|v: &f64| v.is_finite() && *v > 0.0)
         .unwrap_or(1.0)
+}
+
+/// A valid `GIMBAL_LOOK_OPACITY` value, or `None` when it is unparsable or
+/// outside 0.50–1.00. The caller falls back to `DEFAULT_OPACITY`.
+pub fn parse_opacity(raw: &str) -> Option<f64> {
+    raw.trim()
+        .parse::<f64>()
+        .ok()
+        .filter(|v| v.is_finite() && (0.50..=1.00).contains(v))
+}
+
+/// The window opacity from the environment (the config file's stand-in).
+/// An invalid value falls back to 0.85 with exactly one log line.
+pub fn opacity() -> f64 {
+    match std::env::var("GIMBAL_LOOK_OPACITY") {
+        Ok(raw) => parse_opacity(&raw).unwrap_or_else(|| {
+            crate::log!(
+                "opacity",
+                "GIMBAL_LOOK_OPACITY={raw:?} is not 0.50–1.00; using {DEFAULT_OPACITY:.2}"
+            );
+            DEFAULT_OPACITY
+        }),
+        Err(_) => DEFAULT_OPACITY,
+    }
 }
 
 pub fn scaled(token: f64, scale: f64) -> i32 {
@@ -110,11 +136,13 @@ pub fn drag_layout(from: usize, dx: f64, pitch: f64, count: usize) -> DragLayout
 }
 
 /// One CSS rule per line, so Kyle and Claude can read and diff it live.
-pub fn css(scale: f64, font: Option<&str>) -> String {
+pub fn css(scale: f64, font: Option<&str>, opacity: f64) -> String {
     let p = |token: f64| scaled(token, scale);
     let font = font
         .map(|family| format!("font-family: \"{}\";", family.replace(['"', '\\', ';'], "")))
         .unwrap_or_default();
+    let o = opacity.clamp(0.50, 1.00);
+    let fill = |role: &str| format!("alpha({role}, {o:.2})");
     let (gs, gm, gl, gxl, g2xl) = (p(GAP_S), p(GAP_M), p(GAP_L), p(GAP_XL), p(GAP_2XL));
     let (ch, hh, inset) = (p(CONTROL_H), p(HEADER_H), p(HEADER_INSET));
     let (thin, mid, heavy) = (p(LINE_THIN), p(LINE_MID), p(LINE_HEAVY));
@@ -134,10 +162,15 @@ pub fn css(scale: f64, font: Option<&str>) -> String {
     let trash_inner = (p(TRASH) - 2 * thin).max(1);
     let close_inner = (itc - 2 * thin).max(1);
     let pitch = p(PILL_W) + p(GAP_L);
+    let window_bg = fill(BG);
+    let pill_bg = fill(RECESSED);
+    let pill_active = fill(RAISED);
+    let pill_selected = fill(SELECTED);
+    let pill_selected_active = fill(SELECTED_ACTIVE);
     format!(
         "\
-window.gimbal-look {{ background-color: {BG}; color: {FG}; font-size: {tc}px; {font} }}
-.gl-header {{ min-height: {hh}px; padding: 0 {inset}px; background-color: {BG}; }}
+window.gimbal-look, window.gimbal-look.background {{ background-color: {window_bg}; color: {FG}; font-size: {tc}px; {font} }}
+.gl-header {{ min-height: {hh}px; padding: 0 {inset}px; }}
 .gl-icon-button {{ all: unset; color: {FG}; padding: 0 {gs}px; min-width: {inav}px; min-height: {ch}px; border-radius: {ri}px; -gtk-icon-size: {inav}px; }}
 .gl-icon-button:hover {{ background-color: {HOVER}; }}
 .gl-icon-button:active {{ background-color: {ACTIVE}; }}
@@ -148,7 +181,7 @@ window.gimbal-look {{ background-color: {BG}; color: {FG}; font-size: {tc}px; {f
 .gl-search {{ margin-right: {gl}px; }}
 .gl-strip {{ margin-right: {gxl}px; }}
 .gl-field .gl-icon-button {{ min-width: {inav}px; min-height: {inav}px; -gtk-icon-size: {inav}px; }}
-.gl-field {{ min-height: {inner_h}px; padding: 0 {gm}px; border: {mid}px solid {OUTLINE}; border-radius: {r}px; background-color: {BG}; color: {FG}; }}
+.gl-field {{ min-height: {inner_h}px; padding: 0 {gm}px; border: {mid}px solid {OUTLINE}; border-radius: {r}px; color: {FG}; }}
 .gl-field:focus-within {{ box-shadow: 0 0 0 {thin}px {FOCUS_RING}; }}
 .gl-field label {{ font-size: {tc}px; }}
 .gl-field entry {{ all: unset; padding: 0; background-color: transparent; color: {FG}; caret-color: {FG}; font-size: {tc}px; }}
@@ -157,20 +190,20 @@ window.gimbal-look {{ background-color: {BG}; color: {FG}; font-size: {tc}px; {f
 .gl-search-field {{ min-width: {search_w}px; }}
 .gl-search-glyph {{ -gtk-icon-size: {inav}px; margin-right: {gm}px; color: {FG}; }}
 .gl-path-label {{ font-size: {tc}px; }}
-.gl-pill {{ all: unset; min-height: {inner_h}px; padding: 0 {gm}px; border: {mid}px solid {OUTLINE}; border-radius: {rp}px; background-color: {RECESSED}; color: {FG}; transition: opacity 200ms, background-color 120ms, transform 150ms; }}
+.gl-pill {{ all: unset; min-height: {inner_h}px; padding: 0 {gm}px; border: {mid}px solid {OUTLINE}; border-radius: {rp}px; background-color: {pill_bg}; color: {FG}; transition: background-color 120ms; }}
 .gl-pill.tab, .gl-pill.group {{ min-width: {pill_w}px; }}
-.gl-pill.active {{ background-color: {RAISED}; color: {RAISED_FG}; }}
-.gl-pill.selected {{ background-color: {SELECTED}; }}
-.gl-pill.active.selected {{ background-color: {SELECTED_ACTIVE}; }}
-.gl-pill.fading {{ opacity: 0; }}
-.gl-pill.slide-left {{ transform: translateX(-{pitch}px); }}
-.gl-pill.slide-right {{ transform: translateX({pitch}px); }}
+.gl-pill.active {{ background-color: {pill_active}; color: {RAISED_FG}; }}
+.gl-pill.selected {{ background-color: {pill_selected}; }}
+.gl-pill.active.selected {{ background-color: {pill_selected_active}; }}
+.gl-pill-wrap {{ transition: transform 150ms; }}
+.gl-pill-wrap.slide-left {{ transform: translateX(-{pitch}px); }}
+.gl-pill-wrap.slide-right {{ transform: translateX({pitch}px); }}
 .gl-pill label {{ font-size: {tc}px; }}
 .gl-pill-close {{ all: unset; min-width: {close_inner}px; min-height: {close_inner}px; -gtk-icon-size: {close_inner}px; border: {thin}px solid {FG}; border-radius: {rp}px; color: {FG}; margin-left: {gm}px; }}
 .gl-pill-close:hover {{ background-color: {HOVER_STRONG}; }}
 .gl-pill.active .gl-pill-close {{ color: {RAISED_FG}; border-color: {RAISED_FG}; }}
 .gl-pill-close:focus-visible {{ box-shadow: 0 0 0 {thin}px {FOCUS_RING}; }}
-.gl-frame {{ margin: 0 {gs}px {gs}px {gs}px; border: {heavy}px solid {OUTLINE}; border-radius: {r}px; background-color: {BG}; }}
+.gl-frame {{ margin: 0 {gs}px {gs}px {gs}px; border: {heavy}px solid {OUTLINE}; border-radius: {r}px; }}
 .gl-title {{ font-size: {tt}px; color: {FG}; }}
 .gl-trash {{ all: unset; min-width: {trash_inner}px; min-height: {trash_inner}px; -gtk-icon-size: {iwin}px; border: {thin}px solid {OUTLINE}; border-radius: {r}px; color: {FG}; margin-left: {gl}px; }}
 .gl-trash:hover {{ background-color: {HOVER}; }}
@@ -178,8 +211,9 @@ window.gimbal-look {{ background-color: {BG}; color: {FG}; font-size: {tc}px; {f
 .gl-menu {{ padding: {gs}px; }}
 .gl-menu-item {{ all: unset; min-height: {g2xl}px; padding: {gs}px {gm}px; border-radius: {ri}px; color: {FG}; font-size: {trow}px; }}
 .gl-menu-item:hover {{ background-color: {HOVER}; }}
-.gl-menu-item:disabled {{ opacity: 0.45; }}
+.gl-menu-item:disabled {{ color: alpha({FG}, 0.45); }}
 .gl-menu-item:focus-visible {{ box-shadow: 0 0 0 {thin}px {FOCUS_RING}; }}
+window.gimbal-look .gl-frame gridview, window.gimbal-look .gl-frame listview, window.gimbal-look .gl-frame textview, window.gimbal-look .gl-frame textview > text, window.gimbal-look .gl-frame scrolledwindow, window.gimbal-look .gl-frame viewport, window.gimbal-look .gl-frame gridview > child, window.gimbal-look windowhandle {{ background-color: transparent; }}
 "
     )
 }
@@ -190,12 +224,14 @@ mod tests {
 
     #[test]
     fn spec_rules_and_css_shape() {
-        let plain = css(1.0, None);
+        let plain = css(1.0, None, DEFAULT_OPACITY);
         for bad in ["#", "rgb(", "hsl(", "red", "white", "black"] {
             assert!(!plain.contains(bad), "colour literal {bad:?}");
         }
         assert!(!plain.contains("font-family"));
-        assert!(css(1.0, Some("Fira Sans")).contains("font-family: \"Fira Sans\";"));
+        assert!(
+            css(1.0, Some("Fira Sans"), DEFAULT_OPACITY).contains("font-family: \"Fira Sans\";")
+        );
         assert_eq!(scaled(GAP_L, 0.5), 12);
         for line in plain.lines() {
             assert!(
@@ -203,6 +239,22 @@ mod tests {
                 "two rules on one line: {line}"
             );
         }
+        assert!(plain.contains("alpha(@window_bg_color, 0.85)"));
+        assert!(!plain.contains(".gl-header { background-color"));
+    }
+
+    #[test]
+    fn opacity_parsing_falls_back() {
+        assert_eq!(parse_opacity("0.50"), Some(0.50));
+        assert_eq!(parse_opacity("1"), Some(1.0));
+        assert_eq!(parse_opacity(" 0.85 "), Some(0.85));
+        for bad in ["0.49", "1.01", "x", "", "NaN", "inf"] {
+            assert_eq!(parse_opacity(bad), None, "{bad:?} should be invalid");
+        }
+        // The stylesheet also clamps a value that bypasses the parser (the
+        // live slider and the direct callers).
+        assert!(css(1.0, None, 0.2).contains("alpha(@window_bg_color, 0.50)"));
+        assert!(css(1.0, None, 1.5).contains("alpha(@window_bg_color, 1.00)"));
     }
 
     #[test]

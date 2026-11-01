@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! P1i: a standalone header look, built on adw::ApplicationWindow so libadwaita's
 //! stylesheet is loaded, and drawn entirely by our own `gl-` CSS.
+#[path = "../../look_shared/blur.rs"]
+mod blur;
 mod header;
 mod strip;
 mod style;
