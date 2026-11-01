@@ -562,3 +562,43 @@ Line count under `src/bin/look-header/`: `header.rs` 971, `style.rs` 274, `strip
 re-adds a widget. The `drag: update` / `drag: cancel` logs give the live check a clear signal, and
 the main menu now unparents its popover on close. The four RULES commands pass on the combined
 tree (21 tests); the 10-second `--tabs 3` run printed no GTK CSS warnings. 1,589 lines, no budget.
+
+### Live check of P1i-r2 (Claude, Nov 1, 2026): needs fixes (`P1i-r3-fixes.md`)
+
+Floating 2560×1406 on DP-2, `--tabs 3`, pointer through the runner's virtual mouse (left button
+only, so right-click menus, Ctrl/Shift selection and keys were not tested this time).
+
+What passed: the layout at 2560 matches the sketch's order and proportions; the path bar takes the
+free width with Trash and the window buttons at the right edge; no Minimize under niri; no GTK CSS
+warnings. Search opens and pushes the pills and path bar right.
+
+1. **The pill drag moves the window instead.** Dragging Tab 1 to the right logged three
+   `drag: update` lines (dx 5, 0, 5), then `drag: cancel`, and the whole window moved about 480 px.
+   The header is inside a `gtk::WindowHandle`, whose own drag gesture claims the sequence once the
+   pointer passes the drag threshold and starts a window move (`gtkwindowhandle.c:424-458`). The
+   r2 fix was right (the cancel no longer comes from unparenting), but nothing stops the handle.
+   Fix: in the pill's `drag-update`, once the offset passes the drag threshold
+   (`WidgetExt::drag_check_threshold`), claim the sequence with
+   `gesture.set_state(gtk::EventSequenceState::Claimed)`. A claim denies the sequence to every
+   gesture that handles the event later along the pick stack (`gtkwidget.c:11918-11935`), and the
+   pill's bubble-phase gesture runs before its ancestor the handle. Don't claim in `drag-begin`:
+   that would also deny the pill's own click gesture, and plain clicks would stop focusing pills.
+2. **The window can't be narrowed, and closing search makes it grow without limit.**
+   - Asking niri for a 1,500 px width left the window at 2,560: the path bar's `width_request`
+     is a minimum, and the scroller's `PolicyType::Never` passes its child's minimum up to the
+     window, so the header can never shrink and the overflow collapse can't happen in a floating
+     window. (Your r1 run at `--tabs 30` seemed to work because niri was tiling it and forcing
+     the size.)
+   - Closing search runs `update_layout` before the revealer has finished closing, so the row is
+     briefly wider than the window; the window grows to fit, the new page size raises the path
+     bar's minimum again, and so on: the log climbs 2,560 → 2,996 → … → 7,908 px, GTK prints
+     "layout continuously requested, giving up after 4 tries", and the window ends 7,728 px wide.
+   - Fix both the same way: stop feeding the measured width back in as a minimum. Give the path
+     bar `width_request = PATH_MIN × scale` and `hexpand`, so it takes the free space by itself,
+     and use `header_fits` only to decide the collapse. Make sure the header's minimum width can
+     go below the window's (`PolicyType::External` on the scroller, which never propagates the
+     child's minimum, or no scroller at all), and say which you chose.
+3. **The Forward button shows a broken-image square:** `go-forward-symbolic` is not in this
+   Adwaita (`/usr/share/icons/Adwaita/symbolic/actions/` has `go-next-symbolic`). Use
+   `go-next-symbolic`, and check every icon name the prototype uses against the installed theme.
+4. **Minor:** the placeholder title sits at the top of the body; the brief asked for it centred.

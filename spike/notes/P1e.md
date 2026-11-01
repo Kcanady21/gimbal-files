@@ -823,3 +823,21 @@ file changed; the dnd hook calls are unchanged; the four RULES commands pass on 
 3. Not dropping a11y to win the number was the right call. Phase 2 note: the plan should keep
    the width-derived cap as a rule for every list or grid view, and an upstream GTK report on
    realizing child contexts eagerly is worth filing.
+
+### Live check of P1e-r2 (Claude, Nov 1, 2026): passes
+
+1220×1326 floating window on DP-2, `/tmp/gimbal-spike-100k` regenerated with
+`make-big-dir.sh 100000` after the 07:15 reboot, `WAYLAND_DEBUG` off for timings.
+
+- **Navigation by a real double-click** from `/tmp`: **396, 389, 431 ms** (2,015-2,149 ms before
+  r2). It opens at `sub-00` with 9 columns; no one-column first frame was visible in `/tmp` or the
+  100k folder.
+- **Up works:** 100k → `/tmp` → `/`, twice over, no panic; the process stayed up. Peak RSS with one
+  tab: 233 MB.
+- **Scrolling got better, not worse,** with the smaller pool: the same 3.3 s scrollbar drag through
+  99k items gave **201 frames, longest gap 34 ms, median 15 ms** (`WAYLAND_DEBUG` on for this run
+  only), against 62 frames and a 65 ms longest gap in the first live check.
+- Note: the very first `/tmp` load after the reboot took 745 ms for 35 items, then 76-94 ms on
+  every later load: a cold cache (icon theme, file types), not the listing.
+
+P1e is done for Phase 1.
