@@ -5,10 +5,10 @@
 pub mod tok {
     pub const GAP_S: f64 = 8.0; pub const GAP_M: f64 = 16.0; pub const GAP_L: f64 = 24.0; pub const GAP_XL: f64 = 32.0; pub const GAP_2XL: f64 = 40.0;
     pub const CONTROL_H: f64 = 50.0; pub const HEADER_H: f64 = 96.0; pub const HEADER_INSET: f64 = 24.0;
-    pub const LINE_THIN: f64 = 3.0; pub const LINE_MID: f64 = 6.0; pub const LINE_HEAVY: f64 = 10.0;
+    pub const LINE_THIN: f64 = 2.0; pub const LINE_MID: f64 = 3.0; pub const LINE_HEAVY: f64 = 10.0;
     pub const RADIUS: f64 = 12.0; pub const RADIUS_PILL: f64 = 999.0; pub const RADIUS_ICON: f64 = 4.0;
     pub const TEXT_TITLE: f64 = 32.0; pub const TEXT_CONTROL: f64 = 24.0; pub const TEXT_ROW: f64 = 20.0;
-    pub const ICON_NAV: f64 = 32.0; pub const ICON_SEARCH: f64 = 44.0; pub const ICON_WINDOW: f64 = 24.0; pub const ICON_TAB_CLOSE: f64 = 28.0;
+    pub const ICON_NAV: f64 = 32.0; pub const ICON_SEARCH: f64 = 32.0; pub const ICON_WINDOW: f64 = 32.0; pub const ICON_TAB_CLOSE: f64 = 28.0;
     pub const PILL_W: f64 = 270.0; pub const SEARCH_W: f64 = 496.0; pub const PATH_MIN: f64 = 320.0;
     pub const TRASH: f64 = 48.0; pub const DEFAULT_W: i32 = 2560; pub const DEFAULT_H: i32 = 1440;
 }
@@ -19,8 +19,8 @@ pub mod col {
     pub const BG: &str = "@window_bg_color"; pub const FG: &str = "@window_fg_color"; pub const OUTLINE: &str = "@accent_color";
     pub const RAISED: &str = "@card_bg_color"; pub const RAISED_FG: &str = "@card_fg_color";
     pub const RECESSED: &str = "shade(@window_bg_color, 0.8)";
-    pub const SELECTED: &str = "mix(shade(@window_bg_color, 0.8), @accent_color, 0.3)";
-    pub const SELECTED_ACTIVE: &str = "mix(@card_bg_color, @accent_color, 0.3)"; pub const FOCUS_RING: &str = "alpha(@accent_color, 0.5)";
+    pub const SELECTED: &str = "mix(shade(@window_bg_color, 0.8), @accent_color, 0.5)";
+    pub const SELECTED_ACTIVE: &str = "mix(@card_bg_color, @accent_color, 0.5)"; pub const FOCUS_RING: &str = "@accent_color";
     pub const HOVER: &str = "alpha(@window_fg_color, 0.1)"; pub const ACTIVE: &str = "alpha(@window_fg_color, 0.2)";
     pub const HOVER_STRONG: &str = "alpha(@window_fg_color, 0.15)"; pub const SELECTION: &str = "alpha(@accent_color, 0.35)";
     pub const PLACEHOLDER: &str = "alpha(@window_fg_color, 0.5)";
@@ -159,6 +159,7 @@ pub fn css(scale: f64, font: Option<&str>, opacity: f64) -> String {
     let pill_w = (p(PILL_W) - 2 * gm - 2 * mid).max(1);
     let inner_h = (ch - 2 * mid).max(1);
     let search_w = (p(SEARCH_W) - 2 * gm - 2 * mid).max(1);
+    let search_entry_w = (search_w - isearch - gm).max(1);
     let trash_inner = (p(TRASH) - 2 * thin).max(1);
     let close_inner = (itc - 2 * thin).max(1);
     let pitch = p(PILL_W) + p(GAP_L);
@@ -188,6 +189,7 @@ window.gimbal-look, window.gimbal-look.background {{ background-color: {window_b
 .gl-field entry > text > selection {{ background-color: {SELECTION}; color: {BG}; }}
 .gl-field entry > text > placeholder {{ color: {PLACEHOLDER}; }}
 .gl-search-field {{ min-width: {search_w}px; }}
+.gl-search-field entry {{ min-width: {search_entry_w}px; }}
 .gl-search-glyph {{ -gtk-icon-size: {inav}px; margin-right: {gm}px; color: {FG}; }}
 .gl-path-label {{ font-size: {tc}px; }}
 .gl-pill {{ all: unset; min-height: {inner_h}px; padding: 0 {gm}px; border: {mid}px solid {OUTLINE}; border-radius: {rp}px; background-color: {pill_bg}; color: {FG}; transition: background-color 120ms; }}
@@ -199,7 +201,7 @@ window.gimbal-look, window.gimbal-look.background {{ background-color: {window_b
 .gl-pill-wrap.slide-left {{ transform: translateX(-{pitch}px); }}
 .gl-pill-wrap.slide-right {{ transform: translateX({pitch}px); }}
 .gl-pill label {{ font-size: {tc}px; }}
-.gl-pill-close {{ all: unset; min-width: {close_inner}px; min-height: {close_inner}px; -gtk-icon-size: {close_inner}px; border: {thin}px solid {FG}; border-radius: {rp}px; color: {FG}; margin-left: {gm}px; }}
+.gl-pill-close {{ all: unset; min-width: {close_inner}px; min-height: {close_inner}px; padding: 0; -gtk-icon-size: {close_inner}px; border: {thin}px solid {FG}; border-radius: {rp}px; color: {FG}; margin-left: {gm}px; }}
 .gl-pill-close:hover {{ background-color: {HOVER_STRONG}; }}
 .gl-pill.active .gl-pill-close {{ color: {RAISED_FG}; border-color: {RAISED_FG}; }}
 .gl-pill-close:focus-visible {{ box-shadow: 0 0 0 {thin}px {FOCUS_RING}; }}
@@ -241,6 +243,13 @@ mod tests {
         }
         assert!(plain.contains("alpha(@window_bg_color, 0.85)"));
         assert!(!plain.contains(".gl-header { background-color"));
+        // Nov 1 spec: 3 / 2 outlines, 32 px header icons, full focus ring, 0.5 selection.
+        assert!(plain.contains("border: 3px solid @accent_color"));
+        assert!(plain.contains("border: 2px solid @accent_color"));
+        assert!(plain.contains("-gtk-icon-size: 32px"));
+        assert!(plain.contains("mix(shade(@window_bg_color, 0.8), @accent_color, 0.5)"));
+        assert!(plain.contains("box-shadow: 0 0 0 2px @accent_color"));
+        assert!(!plain.contains("alpha(@accent_color, 0.5)"));
     }
 
     #[test]
@@ -264,7 +273,7 @@ mod tests {
             wide.fits && wide.path_width > 960,
             "the path must stretch past 960: {wide:?}"
         );
-        for available in 1536..=2560 {
+        for available in 1540..=2560 {
             let fit = header_fits(available, 2, 1.0);
             assert!(fit.fits && fit.path_width >= 320, "at {available}: {fit:?}");
         }
@@ -272,17 +281,17 @@ mod tests {
             header_fits(1600, 2, 1.0),
             Fit {
                 fits: true,
-                path_width: 384
+                path_width: 380
             }
         );
         assert_eq!(
-            header_fits(1536, 2, 1.0),
+            header_fits(1540, 2, 1.0),
             Fit {
                 fits: true,
                 path_width: 320
             }
         );
-        let collapsed = header_fits(1535, 2, 1.0);
+        let collapsed = header_fits(1539, 2, 1.0);
         assert!(
             !collapsed.fits && collapsed.path_width == 320,
             "{collapsed:?}"
@@ -291,17 +300,17 @@ mod tests {
             header_fits(800, 2, 0.5),
             Fit {
                 fits: true,
-                path_width: 192
+                path_width: 190
             }
         );
         assert_eq!(
-            header_fits(768, 2, 0.5),
+            header_fits(770, 2, 0.5),
             Fit {
                 fits: true,
                 path_width: 160
             }
         );
-        assert!(!header_fits(767, 2, 0.5).fits);
+        assert!(!header_fits(769, 2, 0.5).fits);
         assert!(header_fits(1600, 2, 0.5).path_width > 480);
     }
 

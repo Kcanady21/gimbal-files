@@ -6,6 +6,8 @@ mod blur;
 mod header;
 mod strip;
 mod style;
+#[path = "../../theme.rs"]
+mod theme;
 use gtk::prelude::*;
 use gtk::{gio, glib};
 use std::sync::OnceLock;
@@ -101,6 +103,7 @@ fn main() -> glib::ExitCode {
         .application_id("io.github.kcanady21.GimbalLookHeader")
         .flags(gio::ApplicationFlags::NON_UNIQUE)
         .build();
+    app.connect_startup(theme::init);
     app.connect_activate(move |app| header::show(app, &args));
     app.run_with_args::<&str>(&[])
 }

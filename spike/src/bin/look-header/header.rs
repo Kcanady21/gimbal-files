@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! The header: nav, expanding search, pill strip, path bar and window controls.
-use crate::strip::{Entry, Model};
+use crate::strip::{Closed, Entry, Model};
 use crate::style;
 use crate::{Args, log};
 use adw::prelude::*;
@@ -34,6 +34,7 @@ struct Ui {
     body: gtk::Label,
     search_icon: gtk::Button,
     search: gtk::Revealer,
+    search_field: gtk::Box,
     search_entry: gtk::Entry,
     scale: Cell<f64>,
     opacity: Cell<f64>,
@@ -102,13 +103,18 @@ pub fn show(app: &adw::Application, args: &Args) {
     glyph.add_css_class("gl-search-glyph");
     field.append(&glyph);
     let search_entry = gtk::Entry::new();
-    search_entry.set_hexpand(true);
     search_entry.set_placeholder_text(Some("Search"));
     field.append(&search_entry);
     let search = gtk::Revealer::new();
-    search.set_transition_type(gtk::RevealerTransitionType::SlideRight);
+    // Crossfade, not SlideRight: a slide translates the field left by
+    // `width - child_width` and the revealer does not clip, so its outline painted
+    // under the nav buttons while it closed (P1l item 2).
+    search.set_transition_type(gtk::RevealerTransitionType::Crossfade);
     search.set_transition_duration(200);
     search.set_child(Some(&field));
+    // A closed crossfade revealer still measures its child, so the field starts
+    // hidden; `open_search` shows it again just before the fade in.
+    field.set_visible(false);
     let search_box = hbox(&["gl-search"]);
     search_box.set_valign(gtk::Align::Center);
     search_box.append(&search_icon);
@@ -184,6 +190,7 @@ pub fn show(app: &adw::Application, args: &Args) {
         body: body_label,
         search_icon: search_icon.clone(),
         search,
+        search_field: field,
         search_entry: search_entry.clone(),
         scale: Cell::new(scale),
         opacity: Cell::new(opacity),
@@ -568,20 +575,15 @@ fn pill_revealer(pill: &impl IsA<gtk::Widget>) -> gtk::Revealer {
     revealer
 }
 
-fn make_accordion(ui: &Rc<Ui>, count: usize) -> gtk::Widget {
+fn make_accordion(ui: &Rc<Ui>) -> gtk::Widget {
     let pill = gtk::CenterBox::new();
     pill.add_css_class("gl-pill");
-    pill.set_center_widget(Some(&gtk::Label::new(Some(&format!("{count} tabs")))));
+    let label = gtk::Label::new(None);
+    pill.set_center_widget(Some(&label));
     let popover = gtk::Popover::new();
     popover.set_parent(&pill);
     let menu = vbox(&["gl-menu"]);
-    let names: Vec<String> = ui.model.borrow().entries.iter().map(Entry::label).collect();
-    for (index, name) in names.iter().enumerate() {
-        menu_item(ui, &popover, &menu, name, true, move |ui| {
-            ui.model.borrow_mut().focus(index, false);
-            ui.rebuild();
-        });
-    }
+    fill_accordion(ui, &popover, &menu, &label);
     popover.set_child(Some(&menu));
     let motion = gtk::EventControllerMotion::new();
     let weak = popover.downgrade();
@@ -608,6 +610,95 @@ fn make_accordion(ui: &Rc<Ui>, count: usize) -> gtk::Widget {
         }
     });
     pill_revealer(&pill).upcast()
+}
+
+/// Fill the accordion popover's list from the model: one row per entry with a ✕ that
+/// closes it. Re-run after a close so the open list updates in place (P1l item 3).
+fn fill_accordion(ui: &Rc<Ui>, popover: &gtk::Popover, menu: &gtk::Box, label: &gtk::Label) {
+    while let Some(child) = menu.first_child() {
+        menu.remove(&child);
+    }
+    let entries = ui.model.borrow().entries.clone();
+    label.set_label(&format!("{} tabs", ui.model.borrow().count()));
+    for (index, entry) in entries.iter().enumerate() {
+        let row = hbox(&["gl-accordion-row"]);
+        let choose = gtk::Button::new();
+        choose.add_css_class("gl-menu-item");
+        choose.set_hexpand(true);
+        choose.set_child(Some(
+            &gtk::Label::builder()
+                .label(entry.label())
+                .halign(gtk::Align::Start)
+                .hexpand(true)
+                .build(),
+        ));
+        let ui_choose = ui.clone();
+        let popover_choose = popover.clone();
+        choose.connect_clicked(move |_| {
+            take_down(&popover_choose);
+            ui_choose.model.borrow_mut().focus(index, false);
+            ui_choose.refresh();
+        });
+        row.append(&choose);
+        let close = gtk::Button::new();
+        close.add_css_class("gl-pill-close");
+        close.set_valign(gtk::Align::Center);
+        close.set_child(Some(&gtk::Image::from_icon_name("window-close-symbolic")));
+        let ui_close = ui.clone();
+        let popover_close = popover.clone();
+        let menu_close = menu.clone();
+        let label_close = label.clone();
+        close.connect_clicked(move |_| {
+            let group = ui_close
+                .model
+                .borrow()
+                .entries
+                .get(index)
+                .is_some_and(Entry::is_group);
+            if group {
+                let ui_ask = ui_close.clone();
+                let popover_ask = popover_close.clone();
+                let menu_ask = menu_close.clone();
+                let label_ask = label_close.clone();
+                ui_close.confirm_group(index, move |_| {
+                    close_list_entry(&ui_ask, index, &popover_ask, &menu_ask, &label_ask)
+                });
+            } else {
+                close_list_entry(&ui_close, index, &popover_close, &menu_close, &label_close);
+            }
+        });
+        row.append(&close);
+        menu.append(&row);
+    }
+}
+
+/// Close one row's entry from the open accordion list. The list is filled again in
+/// place while the header stays collapsed; when the pills fit again, a normal rebuild
+/// replaces the accordion (and its popover) with pills.
+fn close_list_entry(
+    ui: &Rc<Ui>,
+    index: usize,
+    popover: &gtk::Popover,
+    menu: &gtk::Box,
+    label: &gtk::Label,
+) {
+    let Some(closed) = ui.model.borrow_mut().close_entry(index) else {
+        return;
+    };
+    log!("tabs", "closed from the list: {closed:?}");
+    if closed == Closed::WindowEmpty {
+        log!("tabs", "last tab closed, closing window");
+        ui.window.close();
+        return;
+    }
+    ui.update_text();
+    ui.update_layout();
+    if !ui.overflow.get() {
+        ui.rebuild();
+        return;
+    }
+    fill_accordion(ui, popover, menu, label);
+    popover.popup();
 }
 
 impl Ui {
@@ -641,17 +732,16 @@ impl Ui {
             self.strip.remove(&child);
         }
         self.pills.borrow_mut().clear();
-        let (entries, focused, selection, count) = {
+        let (entries, focused, selection) = {
             let model = self.model.borrow();
             (
                 model.entries.clone(),
                 model.focused,
                 model.selection.clone(),
-                model.count(),
             )
         };
         let pills: Vec<gtk::Widget> = if self.overflow.get() {
-            vec![make_accordion(self, count)]
+            vec![make_accordion(self)]
         } else {
             entries
                 .iter()
@@ -663,6 +753,12 @@ impl Ui {
             self.strip.put(&pill, index as f64 * self.pitch(), 0.0);
             self.pills.borrow_mut().push(pill);
         }
+        self.update_text();
+        self.animate_group.set(None);
+    }
+
+    /// The body title and the path bar's label, from the focused entry.
+    fn update_text(&self) {
         let (title, path) = {
             let model = self.model.borrow();
             let title = match model.entries.get(model.focused) {
@@ -679,13 +775,15 @@ impl Ui {
         };
         self.body.set_label(&title);
         self.path_label.set_label(&path);
-        self.animate_group.set(None);
     }
 
     /// Recompute the overflow decision. True if the pill display has to be rebuilt.
     fn update_layout(&self) -> bool {
         let scale = self.scale.get();
-        let search = if self.search_open.get() {
+        // The field is still drawn during its 200 ms fade-out, so reserve its
+        // space until it is actually hidden (not just until `search_open` clears).
+        let searching = self.search_open.get() || self.search_field.get_visible();
+        let search = if searching {
             ((style::SEARCH_W - (style::ICON_SEARCH + 2.0 * style::GAP_S)) * scale).round() as i32
         } else {
             0
@@ -695,8 +793,11 @@ impl Ui {
         } else {
             ((style::ICON_WINDOW + 2.0 * style::GAP_S + style::GAP_L) * scale).round() as i32
         };
-        let count = self.model.borrow().entries.len();
-        let fit = style::header_fits(self.available.get() - search - desktop, count, scale);
+        let (entries, tabs) = {
+            let model = self.model.borrow();
+            (model.entries.len(), model.count())
+        };
+        let fit = style::header_fits(self.available.get() - search - desktop, entries, scale);
         // Only a token minimum: the path then takes the free width with hexpand. Never
         // feed the measured free/allocated width back in as a minimum (P1i-r3, item 2).
         let path_min = style::scaled(style::PATH_MIN, scale);
@@ -707,9 +808,10 @@ impl Ui {
             self.available.get(),
             path_min,
             fit.fits,
-            !fit.fits
+            !fit.fits && tabs > 1
         );
-        let collapsed = !fit.fits;
+        // One tab never needs an accordion, even if the window is very narrow.
+        let collapsed = !fit.fits && tabs > 1;
         let changed = collapsed != self.overflow.get();
         self.overflow.set(collapsed);
         changed
@@ -763,6 +865,11 @@ impl Ui {
         if !group {
             return self.close_indices(&[index]);
         }
+        self.confirm_group(index, move |ui| ui.close_indices(&[index]));
+    }
+
+    /// The group-close confirmation shared by a group pill's ✕ and the accordion's ✕.
+    fn confirm_group(self: &Rc<Self>, index: usize, action: impl Fn(&Rc<Ui>) + 'static) {
         let Some((name, count)) = group_of(&self.model.borrow(), index) else {
             return;
         };
@@ -772,7 +879,7 @@ impl Ui {
             "close",
             "Close",
             true,
-            move |ui| ui.close_indices(&[index]),
+            action,
         );
     }
 
@@ -875,6 +982,7 @@ impl Ui {
             self.search_entry.grab_focus();
             return;
         }
+        self.search_field.set_visible(true);
         self.search_open.set(true);
         self.search_icon.set_visible(false);
         self.search.set_reveal_child(true);
@@ -901,7 +1009,9 @@ impl Ui {
             if let Some(ui) = weak.upgrade()
                 && !ui.search_open.get()
             {
+                ui.search_field.set_visible(false);
                 ui.search_icon.set_visible(true);
+                ui.relayout();
             }
         });
         self.relayout();

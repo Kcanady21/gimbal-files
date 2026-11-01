@@ -37,6 +37,17 @@ pub struct Model {
     next: usize,
 }
 
+/// What closing one entry from the accordion's list did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Closed {
+    /// A single tab closed; this many tabs remain in the window.
+    Tab { remaining: usize },
+    /// A group closed; it held `tabs`, and this many tabs remain.
+    Group { tabs: usize, remaining: usize },
+    /// No tabs remain, so the caller should close the window.
+    WindowEmpty,
+}
+
 impl Model {
     pub fn new(tabs: usize) -> Self {
         let mut model = Self {
@@ -113,6 +124,25 @@ impl Model {
         }
         self.focused = focused.saturating_sub(before).min(self.entries.len() - 1);
         false
+    }
+
+    /// Close one entry from the accordion list: a tab closes itself, a group closes
+    /// every tab it holds, and focus moves to a neighbour. Pure model logic; the UI
+    /// asks a group's confirmation before calling this. `None` for a stale index.
+    pub fn close_entry(&mut self, index: usize) -> Option<Closed> {
+        let (group, tabs) = match self.entries.get(index)? {
+            Entry::Tab(_) => (false, 1),
+            Entry::Group { tabs, .. } => (true, tabs.len()),
+        };
+        if self.close(&[index]) {
+            return Some(Closed::WindowEmpty);
+        }
+        let remaining = self.count();
+        Some(if group {
+            Closed::Group { tabs, remaining }
+        } else {
+            Closed::Tab { remaining }
+        })
     }
 
     /// Turn selected separate tabs into one group at the first one's slot.
@@ -204,5 +234,31 @@ mod tests {
         );
         assert!(!model.close(&[0]));
         assert!(model.close(&[0]));
+    }
+
+    #[test]
+    fn closes_from_the_accordion_list() {
+        // A tab closes itself; the window keeps the other two.
+        let mut model = Model::new(3);
+        assert_eq!(model.close_entry(1), Some(Closed::Tab { remaining: 2 }));
+        assert_eq!(model.entries.len(), 2);
+        assert_eq!(model.focused, 0);
+        // A group closes all its tabs at once; two other tabs remain.
+        let mut model = Model::new(4);
+        model.selection.extend([0, 1]);
+        assert_eq!(model.group_selected(), Some(0));
+        assert_eq!(
+            model.close_entry(0),
+            Some(Closed::Group {
+                tabs: 2,
+                remaining: 2
+            })
+        );
+        assert_eq!(model.entries.len(), 2);
+        // The last tab empties the model, which asks the caller to close the window.
+        let mut model = Model::new(1);
+        assert_eq!(model.close_entry(0), Some(Closed::WindowEmpty));
+        assert!(model.entries.is_empty());
+        assert_eq!(model.close_entry(0), None);
     }
 }
