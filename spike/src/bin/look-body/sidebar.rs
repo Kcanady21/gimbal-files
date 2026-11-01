@@ -80,7 +80,7 @@ fn drive_block(name: &str, cap: &str, main: bool) -> (gtk::Box, gtk::Box, gtk::L
     block.add_css_class("gl-drive-block");
     let name_label = gtk::Label::new(Some(name));
     name_label.add_css_class("gl-drive-name");
-    name_label.set_xalign(0.0);
+    name_label.set_xalign(0.5);
     name_label.set_ellipsize(gtk::pango::EllipsizeMode::End);
     block.append(&name_label);
     let row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
@@ -114,7 +114,7 @@ fn dir_row(text: &str) -> gtk::Box {
     let row = gtk::Box::new(gtk::Orientation::Vertical, 0);
     row.add_css_class("gl-dir-row");
     let label = gtk::Label::new(Some(text));
-    label.set_xalign(0.0);
+    label.set_xalign(0.5);
     label.set_ellipsize(gtk::pango::EllipsizeMode::End);
     row.append(&label);
     row

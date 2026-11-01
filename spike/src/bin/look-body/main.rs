@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! P1j-r4: the body look — split view with tile identity, a live drag (the
+//! P1j-r5: the body look — split view with tile identity, a live drag (the
 //! gesture rides the static gtk::Fixed) and a pure selection model for
 //! Ctrl/Shift clicks, a pill-parented right-click menu, saved sidebar widths
 //! that a drag updates and a scale change keeps (scaled), width-driven grid
-//! columns, both sidebars, live scaling, all in our own `gl-` CSS.
+//! columns applied outside allocation, inset side panels (no window frame),
+//! both sidebars, live scaling, all in our own `gl-` CSS.
 //! `#[rustfmt::skip]` stays only on the constant tables, per the review.
 mod grid;
 mod layout;
@@ -176,6 +177,18 @@ impl Ui {
         self.left_strip.set_width_request(px(GAP_2XL));
         self.right_root.set_width_request(px(PREVIEW_MIN));
         self.right_strip.set_width_request(px(GAP_2XL));
+        // The side panels are inset gap-s from the window's outer side and
+        // bottom (the sketch's frame is gone); a collapsed strip keeps the
+        // same insets. Tops stay directly under the header.
+        let inset = layout::inset(s);
+        self.left_root.set_margin_start(inset);
+        self.left_root.set_margin_bottom(inset);
+        self.left_strip.set_margin_start(inset);
+        self.left_strip.set_margin_bottom(inset);
+        self.right_root.set_margin_end(inset);
+        self.right_root.set_margin_bottom(inset);
+        self.right_strip.set_margin_end(inset);
+        self.right_strip.set_margin_bottom(inset);
         self.left.borrow_mut().set_scale(s);
         self.split.set_scale(s);
         grid::set_scale(s);
@@ -183,7 +196,7 @@ impl Ui {
         let (w, _) = self.body_widths();
         crate::log!(
             "layout",
-            "scale {s:.2}: left {}, content {}, preview {}",
+            "scale {s:.2}: left {}, content {}, preview {} (inset {inset})",
             w.left,
             w.content,
             w.preview
@@ -203,10 +216,11 @@ impl Ui {
         )
     }
 
-    /// Where the inner handle must sit for the preview to be `preview` wide
-    /// (the position lives in a width−handle space, gtkpaned.c:1362).
+    /// Where the inner handle must sit for the preview to be `preview` px
+    /// wide (the position lives in a width−handle space, gtkpaned.c:1362;
+    /// the preview's end margin is the window's gap-s inset).
     fn right_position(&self, preview: i32) -> i32 {
-        self.inner.width() - layout::HANDLE - preview
+        layout::preview_position(self.inner.width(), preview, self.scale())
     }
 
     /// Drive the outer paned from the widths function and keep the window at
@@ -226,8 +240,9 @@ impl Ui {
     fn apply_positions(&self, apply_preview: bool) {
         let (w, min_w) = self.body_widths();
         self.window.set_size_request(min_w, -1);
-        self.expected_left.set(w.left);
-        self.outer.set_position(w.left);
+        let left = layout::left_position(w.left, self.scale());
+        self.expected_left.set(left);
+        self.outer.set_position(left);
         if apply_preview && self.inner.width() > 0 {
             let pos = self.right_position(w.preview);
             self.expected_right.set(pos);
@@ -466,17 +481,16 @@ fn show(app: &adw::Application, args: &Args) {
     // real change, so the guard converges (gtkpaned.c:1917).
     on_notify(&ui, &outer, "position", |ui, paned| {
         let position = paned.position();
+        let visible = layout::left_from_position(position, ui.scale());
         if ui.left_collapsed.get() {
-            let target = ui.body_widths().0.left;
+            let target = layout::left_position(ui.body_widths().0.left, ui.scale());
             if position != target {
                 paned.set_position(target);
             }
         } else {
-            let implied = ui.body_widths().0.left;
-            if let Some(px) = dragged(ui.expected_left.get(), position)
-                && position != implied
-            {
-                ui.left_width.set(px / ui.scale());
+            let implied = layout::left_position(ui.body_widths().0.left, ui.scale());
+            if dragged(ui.expected_left.get(), position).is_some() && position != implied {
+                ui.left_width.set(visible as f64 / ui.scale());
                 ui.expected_left.set(position);
             }
         }
@@ -494,7 +508,7 @@ fn show(app: &adw::Application, args: &Args) {
                 && dragged(ui.expected_right.get(), position).is_some()
                 && position != implied
             {
-                let width = ui.inner.width() - layout::HANDLE - position;
+                let width = layout::preview_from_position(ui.inner.width(), position, ui.scale());
                 ui.right_width.set(width as f64 / ui.scale());
                 ui.expected_right.set(position);
             }

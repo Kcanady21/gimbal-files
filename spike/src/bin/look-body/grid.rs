@@ -2,8 +2,10 @@
 //! The fake folder grid: a GridView over a StringList of fake names. No filesystem.
 use crate::style::{CELL_W, GAP_XL, scaled};
 use gtk::SignalListItemFactory;
+use gtk::glib;
 use gtk::prelude::*;
 use std::cell::{Cell, RefCell};
+use std::rc::Rc;
 
 pub fn counts(items: u32) -> (u32, u32) {
     (items - items.min(4), items.min(4))
@@ -46,6 +48,25 @@ fn update_cap(scroller: &gtk::ScrolledWindow) {
         "grid",
         "viewport {width} px at scale {scale:.2} → cap {cap}"
     );
+}
+
+/// Apply the cap outside allocation. The h-adjustment's `page-size` notify
+/// fires while the ScrolledWindow is inside its own `size_allocate`, and a
+/// `queue_resize` made there is silently ignored (gtk-4.22.4:gtk/gtkwidget.c:3709–3712):
+/// `gtk_widget_allocate` clears resize_queued and alloc_needed unconditionally
+/// after size_allocate returns (:4347–4356), so the reallocation the cap asked
+/// for never happens. One idle per grid is enough: while it is pending, later
+/// page-size notifications coalesce into it, and the idle reads the current
+/// width and scale when it runs.
+fn schedule_cap(scroller: &gtk::ScrolledWindow, pending: Rc<Cell<bool>>) {
+    if pending.replace(true) {
+        return;
+    }
+    let scroller = scroller.clone();
+    glib::idle_add_local_once(move || {
+        pending.set(false);
+        update_cap(&scroller);
+    });
 }
 
 /// Called by `apply_scale` after a scale change: every grid's cap depends on
@@ -123,11 +144,15 @@ pub fn folder_view(items: u32, tile: bool) -> gtk::ScrolledWindow {
     scroller.set_propagate_natural_height(false);
     scroller.set_vexpand(true);
     // The viewport width (the h-adjustment's page size) drives the cap, so
-    // recompute it on every width change.
+    // recompute it on every width change — in an idle, never in the
+    // allocation that fires the notify (see `schedule_cap`).
     let watched = scroller.clone();
+    let pending = Rc::new(Cell::new(false));
     scroller
         .hadjustment()
-        .connect_notify_local(Some("page-size"), move |_, _| update_cap(&watched));
+        .connect_notify_local(Some("page-size"), move |_, _| {
+            schedule_cap(&watched, pending.clone());
+        });
     let weak = gtk::glib::WeakRef::new();
     weak.set(Some(&scroller));
     SCROLLERS.with(|grids| grids.borrow_mut().push(weak));

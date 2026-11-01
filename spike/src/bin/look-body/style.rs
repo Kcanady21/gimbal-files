@@ -8,7 +8,7 @@
 pub mod tok {
     pub const GAP_S: f64 = 8.0; pub const GAP_M: f64 = 16.0; pub const GAP_L: f64 = 24.0; pub const GAP_XL: f64 = 32.0; pub const GAP_2XL: f64 = 40.0;
     pub const CONTROL_H: f64 = 50.0; pub const HEADER_H: f64 = 96.0;
-    pub const LINE_HAIR: f64 = 1.0; pub const LINE_THIN: f64 = 3.0; pub const LINE_MID: f64 = 6.0; pub const LINE_HEAVY: f64 = 10.0;
+    pub const LINE_HAIR: f64 = 1.0; pub const LINE_THIN: f64 = 3.0; pub const LINE_MID: f64 = 6.0;
     pub const RADIUS: f64 = 12.0; pub const RADIUS_PILL: f64 = 999.0;
     pub const GRID_MARGIN: f64 = 72.0; pub const SECTION_H: f64 = 40.0;
     pub const PIN_ROW_H: f64 = 64.0; pub const DIR_ROW_H: f64 = 32.0; pub const STATUS_H: f64 = 64.0;
@@ -89,7 +89,7 @@ pub fn css(scale: f64, font: Option<&str>) -> String {
         .map(|f| format!("font-family: \"{}\";", f.replace(['"', '\\', ';'], "")))
         .unwrap_or_default();
     let (gs, gm, gl, gxl, g2) = (p(GAP_S), p(GAP_M), p(GAP_L), p(GAP_XL), p(GAP_2XL));
-    let (hair, thin, mid, heavy) = (p(LINE_HAIR), p(LINE_THIN), p(LINE_MID), p(LINE_HEAVY));
+    let (hair, thin, mid) = (p(LINE_HAIR), p(LINE_THIN), p(LINE_MID));
     let (r, rp) = (p(RADIUS), p(RADIUS_PILL));
     let (tt, tsec, tc, trow, tmono, tsmall, ttiny) = (
         p(TEXT_TITLE),
@@ -109,7 +109,7 @@ pub fn css(scale: f64, font: Option<&str>) -> String {
     format!(
         "\
 window.gimbal-look {{ background-color: {BG}; color: {FG}; font-size: {tc}px; {font} }}
-.gl-frame {{ border: {heavy}px solid {OUTLINE}; border-radius: {r}px; background-color: {BG}; }} .gl-header-slot {{ min-height: {hh}px; }}
+.gl-frame {{ background-color: {BG}; }} .gl-header-slot {{ min-height: {hh}px; }}
 .gl-panel {{ border: {mid}px solid {OUTLINE}; border-radius: {r}px; padding: {gm}px; background-color: {BG}; }}
 .gl-title {{ font-size: {tt}px; }} .gl-rule {{ min-height: {hair}px; background-color: {RULE}; }}
 .gl-rule.inset {{ margin-left: {gxl}px; margin-right: {gxl}px; }}

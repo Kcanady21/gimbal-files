@@ -967,3 +967,202 @@ Needs fixing:
 Also seen: the probe still found a grid from the previous split alive and unmapped after a
 rebuild, so the weak list in `grid.rs` can hold old grids until they are dropped. Not a bug for
 the prototype; noted for Phase 2.
+
+## P1j-r5 changes
+
+Fixes per "Review of P1j-r4" and "Live check of P1j-r4": the deferred grid cap, centred
+directory/drive names, and the sketch change that removed the window frame. 2,568 lines under
+`src/bin/look-body/` (no budget). Only
+`src/bin/look-body/{grid,layout,main,sidebar,style}.rs` and this file changed; `Cargo.toml`
+untouched.
+
+1. **The grid cap is applied outside allocation (live-check 1).** `grid.rs`'s `page-size`
+   notify no longer calls `set_max_columns` inline. It calls `schedule_cap`, which keeps one
+   `Rc<Cell<bool>>` pending flag per scroller: the first notify after the flag clears queues
+   `glib::idle_add_local_once`, later notifies before it runs coalesce, and the idle reads the
+   current page size and scale and applies the cap. `apply_scale` (`grid::set_scale`) still
+   applies directly; a slider event is not inside an allocation.
+   The GTK reason, read in the pinned source: `gtk_widget_queue_resize`'s own documentation says
+   calls made from inside `size_allocate` "will be silently ignored"
+   (`gtk-4.22.4:gtk/gtkwidget.c:3709–3712`), and `gtk_widget_allocate` implements that by
+   clearing `resize_queued` and `alloc_needed` unconditionally after the `size_allocate`
+   vfunc returns (`gtkwidget.c:4347–4356`). The h-adjustment's page size is set by the
+   ScrolledWindow during its own allocation, so the resize that `set_max_columns` asked for there
+   was discarded. Applying it from an idle runs after that allocation and queues a resize that
+   survives. [read] for the GTK lines, [observed] for the log below.
+2. **Directory and drive names are centred again (review + live-check 2).** `sidebar.rs`'s
+   `dir_row` label and `drive_block` name label are back to `xalign(0.5)`; both keep
+   `EllipsizeMode::End`. Pinned rows and the panel title stay `xalign(0.0)`.
+3. **No window frame; the side panels are inset (sketch change).** `style.rs` drops the
+   `LINE_HEAVY` token and renders `.gl-frame` as a plain `background-color` box with no border
+   and no radius. `main.rs` gives the left panel and its collapsed strip `margin-start` and
+   `margin-bottom`, and the preview and its strip `margin-end` and `margin-bottom`, each equal to
+   `layout::inset(scale)` = `gap-s × scale`; tops keep no margin, so the panels start directly
+   under the header. `apply_scale` re-applies the margins with the scale.
+   `layout.rs` replaces the old `2 × line-heavy` frame with `2 × inset`, and now also counts
+   **both** nested paned handles instead of the r3/r4 approximation of one, so the content at the
+   window floor is exactly one grid column. `left_position`/`preview_position` and their inverses
+   convert between a paned position (which includes the panel's margin) and the visible panel
+   width the saved-width cells hold. The tests were updated (defaults, floor, give-way,
+   collapsed strips, scale 0.5) and a new `insets_and_positions_agree` test checks the position
+   arithmetic. `LINE_HEAVY` is no longer referenced anywhere in `look-body`. [observed] in the
+   timer log below.
+
+### Verified
+
+RULES.md's four commands (from `spike/`):
+
+```text
+$ PATH="$HOME/.rustup/toolchains/1.95.0-x86_64-unknown-linux-gnu/bin:$PATH" cargo fmt --check
+(exit 0, no output)
+
+$ PATH="$HOME/.rustup/toolchains/1.95.0-x86_64-unknown-linux-gnu/bin:$PATH" cargo clippy --all-targets -- -D warnings
+    Checking gimbal-spike v0.0.0 (/home/kyle/Documents/03.) Code-Projects/gimbal-files/spike)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.26s
+
+$ cargo test
+     Running unittests src/main.rs …                    test result: ok. 4 passed
+     Running unittests src/bin/look-body/main.rs …      test result: ok. 28 passed
+     Running unittests src/bin/look-header/main.rs …    test result: ok. 5 passed
+(look-body's 28: the previous 27 plus `layout::tests::insets_and_positions_agree`)
+
+$ cargo build --release
+    Finished `release` profile [optimized] target(s) in 0.80s
+```
+
+10-second runs of the final release binary, from `/tmp/gimbal-spike-p1j-r5`, stopped by PID with
+SIGTERM (both exit 143):
+
+```text
+$ ./target/release/look-body                                 # final1.err 0 bytes, css_warnings=0
+$ ./target/release/look-body --tiles 6 --pins 14 --scale 0.5 # final2.err 0 bytes, css_warnings=0
+$ grep -cE "Theme parser|Gtk-WARNING|Gtk-CRITICAL|css" final1.err final2.err   # 0 and 0
+```
+
+Earlier runs sometimes print the same intermittent `Gdk-WARNING … vkAcquireNextImageKHR() …
+(VK_SUBOPTIMAL_KHR)` Vulkan notice as r2–r4; it is not a GTK CSS warning. The two final runs above
+printed nothing. [observed]
+
+### Temporary item 3 timer (removed before delivery; its log)
+
+A `glib::timeout_add_local` harness (600 ms ticks) set scale 1.00, requested 2,560 wide, then
+requested the computed minimum width; repeated at scale 0.50. Each sample logged the window's
+content size, both panels' `compute_bounds` rectangles in window coordinates (the border rect,
+which excludes the widget margins — `gtk-4.22.4:gtk/gtkwidget.c:10638–10681`), and the gaps from
+each panel to the window's left/right/bottom edges. Run for 9 s, stopped by PID with SIGTERM:
+
+```text
+[gimbal-look-body 1.428] temp: item3: request 2560 at scale 1.00
+[gimbal-look-body 2.028] temp: item3 2560 scale 1.00: window 2552×1398, inset 8; left 348×1248 at 8,142 gaps L 8 R 2196 B 8; preview 648×1248 at 1896,142 gaps L 1896 R 8 B 8
+[gimbal-look-body 2.628] temp: item3: request minimum 941 at scale 1.00
+[gimbal-look-body 3.229] temp: item3 minimum scale 1.00: window 941×1398, inset 8; left 300×1248 at 8,142 gaps L 8 R 633 B 8; preview 360×1248 at 573,142 gaps L 573 R 8 B 8
+[gimbal-look-body 3.829] temp: item3: request 2560 at scale 0.50
+[gimbal-look-body 4.429] temp: item3 2560 scale 0.50: window 2552×1398, inset 4; left 174×1312 at 4,82 gaps L 4 R 2374 B 4; preview 324×1312 at 2224,82 gaps L 2224 R 4 B 4
+[gimbal-look-body 5.029] temp: item3: request minimum 473 at scale 0.50
+[gimbal-look-body 5.630] temp: item3 minimum scale 0.50: window 473×1398, inset 4; left 150×1312 at 4,82 gaps L 4 R 319 B 4; preview 180×1312 at 289,82 gaps L 289 R 4 B 4
+```
+
+Every panel's window-side gap and bottom gap equals `gap-s × scale` (8 at 1.00, 4 at 0.50); the
+left panel is flush left with that inset, the preview flush right with it, and both stop one
+`gap-s` above the window's bottom. The window settles at 2,552 when asked for 2,560, as in
+earlier rounds (the compositor's size for the default-sized window). The floors are the new
+`body_widths` minima: 941 at scale 1.00 and 473 at 0.50. [observed]
+
+### Temporary item 1 timer (removed before delivery; its log)
+
+A `glib::timeout_add_local` harness (700 ms ticks) requested 2,560 wide, entered split view with
+2 tiles, switched to 4, then closed one through `close_selected_or` (the real close path). After
+each step it walked the live (mapped) tile grids and logged `max_columns()`, the grid's width and
+the first cell's allocated width. Run for 9 s, stopped by PID with SIGTERM:
+
+```text
+[gimbal-look-body 1.550] temp: item1: request 2560 wide
+[gimbal-look-body 2.253] temp: item1: entered split view with 2 tiles
+[gimbal-look-body 2.951] temp: item1: window 2552 wide
+[gimbal-look-body 2.951] temp: item1 2 tiles: tile grid cap 6 width 623 first cell 99
+[gimbal-look-body 2.951] temp: item1 2 tiles: tile grid cap 6 width 623 first cell 99
+[gimbal-look-body 2.951] temp: item1 2 tiles: 2 mapped tile grids
+[gimbal-look-body 3.657] temp: item1: switched to 4 tiles
+[gimbal-look-body 4.352] temp: item1: window 2552 wide
+[gimbal-look-body 4.352] temp: item1 4 tiles: tile grid cap 6 width 623 first cell 99
+[gimbal-look-body 4.352] temp: item1 4 tiles: tile grid cap 6 width 623 first cell 99
+[gimbal-look-body 4.352] temp: item1 4 tiles: tile grid cap 6 width 623 first cell 99
+[gimbal-look-body 4.352] temp: item1 4 tiles: tile grid cap 6 width 623 first cell 99
+[gimbal-look-body 4.352] temp: item1 4 tiles: 4 mapped tile grids
+[gimbal-look-body 5.059] temp: item1: closed one tile
+[gimbal-look-body 5.754] temp: item1: window 2552 wide
+[gimbal-look-body 5.754] temp: item1 after close: tile grid cap 6 width 623 first cell 99
+[gimbal-look-body 5.754] temp: item1 after close: tile grid cap 6 width 623 first cell 99
+[gimbal-look-body 5.754] temp: item1 after close: tile grid cap 6 width 623 first cell 99
+[gimbal-look-body 5.754] temp: item1 after close: 3 mapped tile grids
+```
+
+After both rebuilds every tile grid has cap 6 on a 623 px grid and a 99 px first cell — five
+columns, never the grid's full width. (Without the fix, the same grid reported cap 6 but its cell
+was the full 625 px, the live-check symptom.) [observed]
+
+### API citations for the new work
+
+- `gtk_widget_queue_resize` from inside `size_allocate` is ignored by design
+  (`gtk-4.22.4:gtk/gtkwidget.c:3709–3712`); `gtk_widget_allocate` clears
+  `resize_queued`/`alloc_needed` after the vfunc returns (`gtkwidget.c:4347–4356`). This is why
+  the page-size notify path now goes through an idle.
+- `glib::idle_add_local_once` takes an `FnOnce` and runs on the main context's thread, with no
+  `Send` bound (`glib-0.22.10:src/source.rs:353`); suitable for a non-`Send` `ScrolledWindow`.
+- Widget margins (`set_margin_*`) are outside the size request: `gtk_widget_adjust_size_request`
+  applies `width_request` first and then adds the margins (`gtk-4.22.4:gtk/gtkwidget.c:8026–8045`),
+  and the allocation subtracts them (`gtkwidget.c:4247–4252`). So a panel with `width_request`
+  `SIDEBAR_MIN` and a `gap-s` start margin has a visible width of `SIDEBAR_MIN` and a paned
+  allocation of `inset + SIDEBAR_MIN`, which is what `layout::left_position` returns. For size
+  requests with a known opposite size the margins are also removed/added around the measure
+  (`gtk-4.22.4:gtk/gtksizerequest.c:198,206,241–242,282–283`). [read]
+- `gtk_widget_compute_bounds` returns the border rectangle in the target's coordinate space
+  (`gtk-4.22.4:gtk/gtkwidget.c:10638–10681`), which is what the timer used for the panel
+  allocations and gaps.
+- `WidgetExt::set_margin_start/end/bottom` are the Rust bindings used
+  (`gtk4-0.11.5:src/auto/widget.rs:1297,1305,1313`).
+
+### Not verifiable without a live session (Claude/Kyle check)
+
+- The centred directory rows and drive names while ellipsized, at panel widths from 348 down to
+  the 300 minimum [inferred from the label properties; visual is Claude's].
+- The side panels' rounded bottom corners and `gap-s` insets against the sketch, at both scales
+  (the timer measured the geometry, not the look) [observed as geometry, visual inferred].
+- A real Split 2 → Split 4 → ✕ close sequence through the dev bar and pill buttons; the timer
+  used the same `set_count`/`close_selected_or` code paths but not the widgets' gestures.
+- Dragging either sidebar border after the inset change, then a scale round trip: the
+  position/width helpers are unit-tested, the feel is not [inferred].
+
+### Anything I'd change outside my files
+
+Nothing. `Cargo.toml` was not edited; no existing file outside `src/bin/look-body/` was touched.
+
+
+## Review of P1j-r5 (Claude, Nov 1, 2026)
+
+All three items done as asked. The cap goes through one coalesced idle per grid
+(`schedule_cap`), with the GTK lines that explain the lost resize (`gtkwidget.c:3709–3712`, the
+documented "silently ignored", and `:4347–4356`, where the flags are cleared). The labels are back
+to `xalign 0.5` with their ellipsizing kept. The frame border is gone, the panels and strips carry
+`gap-s` margins, and `layout.rs` converts between paned positions and visible widths in one place,
+with a new test. A real fix found along the way: `body_widths` now counts both paned handles, not
+one. RULES.md's four commands pass here (37 tests).
+
+## Live check of P1j-r5 (Claude, Nov 1, 2026): passes; P1j is done
+
+Release build, floating 2,560 × 1,406 window, DP-3 off.
+
+- **Grid cap (item 1).** Through the real dev-bar buttons, Split 2 then Split 4: every tile shows 5
+  columns. Closing Tab 4 and Tab 2 with their ✕ buttons (two more rebuilds): both remaining tiles
+  still show 5 columns.
+- **Centred names (item 2).** Directory and drive names are centred again, as in the sketch.
+- **No frame, inset panels (item 3).** No window frame; both panels show their rounded bottoms.
+  Measured on screen: left, right and both bottom gaps are 8 px at scale 1.0 and 4 px at 0.5. Asked
+  for 900, the window stops at 941 px (the new floor) with the left, right and bottom gaps still 8.
+  Widening back restores the layout.
+- **Saved widths with the new position maths.** Left border dragged to about 500: three scale
+  round trips leave it at 497–502 px on screen, unchanged.
+- No GTK warnings, no panics.
+
+With r3–r5, every P1j requirement has been seen working live. P1j is ready for the P1h acceptance
+pass.

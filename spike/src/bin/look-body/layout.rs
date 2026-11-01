@@ -3,9 +3,12 @@
 //! left sidebar, the content column and the preview sidebar, and the minimum
 //! window width that still shows one grid column. Both Paneds are driven
 //! from this function; the content column itself just takes what is left.
+//! Since Nov 1 the side panels are inset from the window's outer and bottom
+//! edges by `gap-s` (the sketch has no window frame), so the widths returned
+//! here are visible panel widths and every position helper adds the inset.
 
 use crate::style::{
-    CELL_W, GAP_2XL, GRID_MARGIN, LINE_HEAVY, LINE_THIN, PREVIEW_MIN, SIDEBAR_MIN, scaled,
+    CELL_W, GAP_2XL, GAP_S, GRID_MARGIN, LINE_THIN, PREVIEW_MIN, SIDEBAR_MIN, scaled,
 };
 
 /// The 1 px separator Adwaita draws between a paned's children
@@ -14,6 +17,36 @@ use crate::style::{
 /// start + handle), and `position` lives in a (width − handle) space
 /// (gtkpaned.c:1362: calc_position gets MAX(1, width − handle_size)).
 pub const HANDLE: i32 = 1;
+
+/// A `gap-s` inset at one scale: the side panels' window-side and bottom
+/// margin, and the space `body_widths` reserves on each side of the window.
+pub fn inset(scale: f64) -> i32 {
+    scaled(GAP_S, scale)
+}
+
+/// The outer paned's position for a left panel `left` px wide (its allocation
+/// includes the inset as its start margin).
+pub fn left_position(left: i32, scale: f64) -> i32 {
+    inset(scale) + left
+}
+
+/// The inner paned's position for a preview `preview` px wide (its allocation
+/// includes the inset as its end margin).
+pub fn preview_position(inner_w: i32, preview: i32, scale: f64) -> i32 {
+    inner_w - HANDLE - inset(scale) - preview
+}
+
+/// A visible left-panel width from the outer paned's position (inverse of
+/// `left_position`).
+pub fn left_from_position(position: i32, scale: f64) -> i32 {
+    (position - inset(scale)).max(0)
+}
+
+/// A visible preview width from the inner paned's position (inverse of
+/// `preview_position`).
+pub fn preview_from_position(inner_w: i32, position: i32, scale: f64) -> i32 {
+    (inner_w - HANDLE - inset(scale) - position).max(0)
+}
 
 /// The narrowest content column that still shows one grid column: the worse
 /// of the single view (a `grid-margin` inset each side plus one cell) and
@@ -26,7 +59,9 @@ pub fn one_column_width(scale: f64) -> i32 {
     single.max(split)
 }
 
-/// The body's widths at one window width.
+/// The body's widths at one window width. `left` and `preview` are visible
+/// panel widths; `content` is the content column between the two paned
+/// handles.
 #[derive(Debug, PartialEq, Eq)]
 pub struct BodyWidths {
     pub left: i32,
@@ -34,13 +69,14 @@ pub struct BodyWidths {
     pub preview: i32,
 }
 
-/// Split `window_w` (minus the `gl-frame` border) into left | content |
-/// preview. The expanded sidebars sit at their saved widths (design px ×
-/// scale) while the content still has one grid column; below that they give
-/// way — left first — down to their minimums, so the content keeps its
-/// column. A collapsed sidebar is its `gap-2xl` strip. Also returns the
-/// minimum window width that keeps one column visible, which the caller
-/// sets as the window's size request so nothing draws outside the window.
+/// Split `window_w` into left | content | preview. The expanded sidebars sit
+/// at their saved widths (design px × scale) while the content still has one
+/// grid column; below that they give way — left first — down to their
+/// minimums, so the content keeps its column. A collapsed sidebar is its
+/// `gap-2xl` strip. The window's `gap-s` inset on each side and the two paned
+/// handles are subtracted first. Also returns the minimum window width that
+/// keeps one column visible, which the caller sets as the window's size
+/// request so nothing draws outside the window.
 pub fn body_widths(
     window_w: i32,
     scale: f64,
@@ -49,11 +85,11 @@ pub fn body_widths(
     left_collapsed: bool,
     right_collapsed: bool,
 ) -> (BodyWidths, i32) {
-    let frame = 2 * scaled(LINE_HEAVY, scale);
+    let edge = inset(scale);
     let strip = scaled(GAP_2XL, scale);
     let (lmin, rmin) = (scaled(SIDEBAR_MIN, scale), scaled(PREVIEW_MIN, scale));
     let min_content = one_column_width(scale);
-    let avail = (window_w - frame).max(0);
+    let avail = (window_w - 2 * edge).max(0);
     let mut left = if left_collapsed {
         strip
     } else {
@@ -64,7 +100,7 @@ pub fn body_widths(
     } else {
         scaled(right_saved, scale).max(rmin)
     };
-    let mut content = avail - left - HANDLE - preview; // may go negative
+    let mut content = avail - left - 2 * HANDLE - preview; // may go negative
     // window_w == 0 means "not yet allocated" (a pre-allocation call): the
     // saved widths must be applied as they are, no give-way yet.
     if window_w > 0 && content < min_content && !left_collapsed {
@@ -78,9 +114,9 @@ pub fn body_widths(
         content += give;
     }
     let content = content.max(0);
-    let min_window = frame
+    let min_window = 2 * edge
         + if left_collapsed { strip } else { lmin }
-        + HANDLE
+        + 2 * HANDLE
         + min_content
         + if right_collapsed { strip } else { rmin };
     (
@@ -96,17 +132,45 @@ pub fn body_widths(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::style::GAP_S;
 
     #[test]
     fn defaults_match_the_sketch() {
         let (w, min) = body_widths(2560, 1.0, 348.0, 648.0, false, false);
         assert_eq!((w.left, w.preview), (348, 648));
-        assert_eq!(w.content, 2560 - 20 - 348 - HANDLE - 648);
-        // The sketch's 1544 px content minus the paned handle.
-        assert_eq!(w.content, 1543);
+        assert_eq!(w.content, 2560 - 2 * inset(1.0) - 348 - 2 * HANDLE - 648);
+        // Two handles (outer and inner) and a 2 × gap-s inset instead of the
+        // old 2 × line-heavy frame: 16 + 2 in place of 20 + 1, so three px
+        // more content than the old 1543; the sketch's content is 1544.
+        assert_eq!(w.content, 1546);
         assert_eq!(
             min,
-            20 + scaled(SIDEBAR_MIN, 1.0) + HANDLE + one_column_width(1.0) + 360
+            2 * inset(1.0) + scaled(SIDEBAR_MIN, 1.0) + 2 * HANDLE + one_column_width(1.0) + 360
+        );
+        assert_eq!(min, 941);
+    }
+
+    #[test]
+    fn insets_and_positions_agree() {
+        assert_eq!(inset(1.0), scaled(GAP_S, 1.0));
+        assert_eq!(inset(0.5), 4);
+        let (w, _) = body_widths(2560, 1.0, 348.0, 648.0, false, false);
+        // The left panel's allocation starts gap-s in from the window edge.
+        let outer = left_position(w.left, 1.0);
+        assert_eq!(outer, 356);
+        assert_eq!(outer - w.left, inset(1.0));
+        // The inner paned starts after the outer handle; its position is the
+        // content width, and the preview keeps its own gap-s from the right.
+        let inner_w = 2560 - outer - HANDLE;
+        let inner = preview_position(inner_w, w.preview, 1.0);
+        assert_eq!(inner, w.content);
+        let inner_x = outer + HANDLE;
+        assert_eq!(2560 - (inner_x + inner + HANDLE + w.preview), inset(1.0));
+        // The inverse helpers round-trip a dragged border.
+        assert_eq!(left_from_position(500, 1.0), 492);
+        assert_eq!(
+            preview_from_position(inner_w, 700, 1.0),
+            inner_w - 1 - 8 - 700
         );
     }
 
@@ -116,7 +180,7 @@ mod tests {
         let (w, _) = body_widths(1400, 1.0, 348.0, 648.0, false, false);
         assert_eq!(
             (w.left, w.content, w.preview),
-            (348, 1400 - 20 - 348 - HANDLE - 648, 648)
+            (348, 1400 - 2 * inset(1.0) - 348 - 2 * HANDLE - 648, 648)
         );
         // Midway: the left gives way first, the preview part-way, and the
         // content is pinned at exactly one column.
@@ -131,6 +195,9 @@ mod tests {
             (w.left, w.content, w.preview),
             (scaled(SIDEBAR_MIN, 1.0), one_column_width(1.0), 360)
         );
+        // One pixel narrower and the content loses its column.
+        let (w, _) = body_widths(min - 1, 1.0, 348.0, 648.0, false, false);
+        assert!(w.content < one_column_width(1.0));
     }
 
     #[test]
@@ -138,7 +205,10 @@ mod tests {
         let (w, min) = body_widths(2560, 1.0, 348.0, 648.0, true, true);
         assert_eq!((w.left, w.preview), (40, 40));
         assert!(w.content > one_column_width(1.0));
-        assert_eq!(min, 20 + 40 + HANDLE + one_column_width(1.0) + 40);
+        assert_eq!(
+            min,
+            2 * inset(1.0) + 40 + 2 * HANDLE + one_column_width(1.0) + 40
+        );
     }
 
     #[test]
@@ -154,7 +224,7 @@ mod tests {
         assert_eq!((w.left, w.preview), (174, 324));
         assert_eq!(
             min,
-            10 + scaled(SIDEBAR_MIN, 0.5) + HANDLE + one_column_width(0.5) + 180
+            2 * inset(0.5) + scaled(SIDEBAR_MIN, 0.5) + 2 * HANDLE + one_column_width(0.5) + 180
         );
     }
 }
