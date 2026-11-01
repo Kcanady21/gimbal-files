@@ -19,12 +19,16 @@ impl PreviewPanel {
     pub fn new() -> Self {
         let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
         root.add_css_class("gl-panel");
-        let (row, button) = title_row("File Name (25 MB)", "sidebar-show-right-symbolic");
+        let (row, button) = title_row("File Name (25 MB)", "sidebar-show-right-symbolic", false);
         root.append(&row);
         root.append(&rule());
         // The lines scroll on their own; the action row stays at the bottom.
+        // EXTERNAL horizontally: the viewport width, not the text's natural
+        // width, allocates the labels, so their text wraps to the panel as it
+        // shrinks (a Never policy would clip a wider label instead).
         let scroll = gtk::ScrolledWindow::new();
-        scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
+        scroll.set_policy(gtk::PolicyType::External, gtk::PolicyType::Automatic);
+        scroll.set_propagate_natural_width(false);
         scroll.set_vexpand(true);
         let lines = gtk::Box::new(gtk::Orientation::Vertical, 0);
         for n in 1..=LINES {
@@ -32,12 +36,15 @@ impl PreviewPanel {
             let num = gtk::Label::new(Some(&n.to_string()));
             num.add_css_class("gl-num");
             num.set_xalign(1.0);
+            num.set_valign(gtk::Align::Start);
             num.set_width_chars(2);
             let text = gtk::Label::new(Some(&fake_line(n)));
             text.add_css_class("gl-pline");
             text.set_xalign(0.0);
+            text.set_valign(gtk::Align::Start);
             text.set_hexpand(true);
-            text.set_ellipsize(gtk::pango::EllipsizeMode::End);
+            text.set_wrap(true);
+            text.set_wrap_mode(gtk::pango::WrapMode::WordChar);
             row.append(&num);
             row.append(&text);
             lines.append(&row);
@@ -49,9 +56,9 @@ impl PreviewPanel {
         // (the .gl-action-row CSS margin). All three only log.
         let actions = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         actions.add_css_class("gl-action-row");
-        let discard = icon_button("edit-undo-symbolic");
-        let save = icon_button("document-save-symbolic");
-        let save_as = icon_button("document-save-as-symbolic");
+        let discard = icon_button("gimbal-discard-symbolic");
+        let save = icon_button("gimbal-save-symbolic");
+        let save_as = icon_button("gimbal-save-as-symbolic");
         for (button, name) in [
             (discard.clone(), "discard"),
             (save.clone(), "save"),

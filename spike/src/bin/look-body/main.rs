@@ -1,10 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! P1j-r5: the body look — split view with tile identity, a live drag (the
-//! gesture rides the static gtk::Fixed) and a pure selection model for
-//! Ctrl/Shift clicks, a pill-parented right-click menu, saved sidebar widths
-//! that a drag updates and a scale change keeps (scaled), width-driven grid
-//! columns applied outside allocation, inset side panels (no window frame),
-//! both sidebars, live scaling, all in our own `gl-` CSS.
+//! P1m: P1j-r5's body plus the P1h acceptance polish: gap-l split tiles,
+//! uneven taller columns, the Nov 1 sidebar hierarchy and contrast, circular
+//! close rings, wrapped preview text, draggable pinned rows, the mockup's
+//! symbolic icons, the spike's live theme reload and Ctrl+= / Ctrl+-.
 //! `#[rustfmt::skip]` stays only on the constant tables, per the review.
 #[path = "../../look_shared/blur.rs"]
 mod blur;
@@ -14,6 +12,8 @@ mod preview;
 mod sidebar;
 mod split;
 mod style;
+#[path = "../../theme.rs"]
+mod theme;
 
 use adw::prelude::*;
 use gtk::STYLE_PROVIDER_PRIORITY_APPLICATION as APP_PRIORITY;
@@ -22,7 +22,7 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::OnceLock;
 use std::time::Instant;
-use style::{GAP_2XL, PREVIEW_MIN, PREVIEW_W, SIDEBAR_MIN, SIDEBAR_W, scaled};
+use style::{PREVIEW_MIN, PREVIEW_W, SIDEBAR_MIN, SIDEBAR_W, scaled};
 
 static START: OnceLock<Instant> = OnceLock::new();
 static ENABLED: OnceLock<bool> = OnceLock::new();
@@ -77,6 +77,12 @@ fn parse_scale(raw: &str) -> Result<f64, String> {
     Ok(scale)
 }
 
+/// One Ctrl+= / Ctrl+- step: 0.05, snapped to the slider's grid and clamped to
+/// the setting's 0.50–1.00 range. The dev bar slider uses the same value.
+pub fn stepped_scale(current: f64, delta: f64) -> f64 {
+    (((current + delta) / 0.05).round() * 0.05).clamp(0.50, 1.00)
+}
+
 impl Args {
     pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Self, String> {
         let args: Vec<String> = args.into_iter().collect();
@@ -129,6 +135,7 @@ fn main() -> glib::ExitCode {
         .application_id("io.github.kcanady21.GimbalLookBody")
         .flags(gio::ApplicationFlags::NON_UNIQUE)
         .build();
+    app.connect_startup(theme::init);
     app.connect_activate(move |app| show(app, &args));
     app.run_with_args::<&str>(&[])
 }
@@ -191,9 +198,9 @@ impl Ui {
         self.blur.set_scale(s);
         let px = |t: f64| scaled(t, s);
         self.left_root.set_width_request(px(SIDEBAR_MIN));
-        self.left_strip.set_width_request(px(GAP_2XL));
+        self.left_strip.set_width_request(layout::strip_width(s));
         self.right_root.set_width_request(px(PREVIEW_MIN));
-        self.right_strip.set_width_request(px(GAP_2XL));
+        self.right_strip.set_width_request(layout::strip_width(s));
         // The side panels are inset gap-s from the window's outer side and
         // bottom (the sketch's frame is gone); a collapsed strip keeps the
         // same insets. Tops stay directly under the header.
@@ -316,10 +323,20 @@ fn wire_collapse(ui: &Rc<Ui>, trigger: &gtk::Button, left: bool, collapse: bool)
     });
 }
 
-fn strip(icon: &str) -> gtk::Box {
+fn strip(icon: &str, left: bool) -> gtk::Box {
     let strip = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     strip.add_css_class("gl-collapse-strip");
-    strip.append(&sidebar::icon_button(icon));
+    strip.add_css_class(if left { "left" } else { "right" });
+    let button = sidebar::icon_button(icon);
+    // Keep the button on the panel's inner edge: start for the left sidebar,
+    // end for the preview, exactly as it sat in the title row.
+    button.set_halign(if left {
+        gtk::Align::Start
+    } else {
+        gtk::Align::End
+    });
+    button.set_valign(gtk::Align::Start);
+    strip.append(&button);
     strip
 }
 
@@ -338,6 +355,10 @@ fn dev_slider(lo: f64, hi: f64, step: f64, value: f64) -> gtk::Scale {
 fn show(app: &adw::Application, args: &Args) {
     let provider = gtk::CssProvider::new();
     let display = gtk::gdk::Display::default().expect("no display");
+    // The mockup's symbolic icons live beside this binary's source; GTK's
+    // icon theme finds them by name, so nothing loads a path directly.
+    let icons = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/bin/look-body/icons");
+    gtk::IconTheme::for_display(&display).add_search_path(&icons);
     gtk::style_context_add_provider_for_display(&display, &provider, APP_PRIORITY);
     let window = adw::ApplicationWindow::builder().application(app).build();
     window.set_default_size(style::DEFAULT_W, style::DEFAULT_H);
@@ -413,12 +434,12 @@ fn show(app: &adw::Application, args: &Args) {
     let left = Rc::new(RefCell::new(sidebar::LeftPanel::new(&args.drives)));
     left.borrow_mut().set_pin_count(args.pins);
     let left_root = left.borrow().root.clone();
-    let left_strip = strip("sidebar-show-symbolic");
+    let left_strip = strip("sidebar-show-symbolic", true);
 
     // Preview sidebar and its collapse strip.
     let right = preview::PreviewPanel::new();
     let right_root = right.root.clone();
-    let right_strip = strip("sidebar-show-right-symbolic");
+    let right_strip = strip("sidebar-show-right-symbolic", false);
 
     // Split view. A slot breaks the cycle: on_exit fades out and returns to
     // the single folder view. Every tile shows the same fake item count, so
@@ -575,6 +596,25 @@ fn show(app: &adw::Application, args: &Args) {
         stack.set_visible_child_name("split");
         ui.split.fade_in();
     }
+    // Ctrl+= / Ctrl+- step the same slider the dev bar uses (±0.05), so the
+    // scale setting and the whole stylesheet move together.
+    let keys = gtk::EventControllerKey::new();
+    let scale_keys = scale_ctl.clone();
+    keys.connect_key_pressed(move |_, key, _, modifiers| {
+        if !modifiers.contains(gtk::gdk::ModifierType::CONTROL_MASK) {
+            return glib::Propagation::Proceed;
+        }
+        let step = match key {
+            gtk::gdk::Key::equal | gtk::gdk::Key::plus | gtk::gdk::Key::KP_Add => 0.05,
+            gtk::gdk::Key::minus | gtk::gdk::Key::KP_Subtract => -0.05,
+            _ => return glib::Propagation::Proceed,
+        };
+        let next = stepped_scale(scale_keys.value(), step);
+        scale_keys.set_value(next);
+        crate::log!("scale", "key {key:?}: setting {next:.2}");
+        glib::Propagation::Stop
+    });
+    window.add_controller(keys);
     ui.apply_scale();
     window.present();
 }
@@ -607,6 +647,15 @@ mod tests {
         for case in cases.split('|') {
             assert!(parse(case).is_err(), "{case:?} should be rejected");
         }
+    }
+
+    #[test]
+    fn ctrl_scale_steps_and_clamps() {
+        assert_eq!(stepped_scale(1.0, 0.05), 1.0);
+        assert_eq!(stepped_scale(0.50, -0.05), 0.50);
+        assert!((stepped_scale(0.85, 0.05) - 0.90).abs() < 1e-9);
+        assert!((stepped_scale(0.95, 0.05) - 1.00).abs() < 1e-9);
+        assert!((stepped_scale(1.00, -0.05) - 0.95).abs() < 1e-9);
     }
 
     #[test]

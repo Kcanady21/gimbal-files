@@ -8,18 +8,18 @@
 pub mod tok {
     pub const GAP_S: f64 = 8.0; pub const GAP_M: f64 = 16.0; pub const GAP_L: f64 = 24.0; pub const GAP_XL: f64 = 32.0; pub const GAP_2XL: f64 = 40.0;
     pub const CONTROL_H: f64 = 50.0; pub const HEADER_H: f64 = 96.0;
-    pub const LINE_HAIR: f64 = 1.0; pub const LINE_THIN: f64 = 3.0; pub const LINE_MID: f64 = 6.0;
+    pub const LINE_HAIR: f64 = 1.0; pub const LINE_THIN: f64 = 2.0; pub const LINE_MID: f64 = 3.0;
     pub const RADIUS: f64 = 12.0; pub const RADIUS_PILL: f64 = 999.0;
-    pub const GRID_MARGIN: f64 = 72.0; pub const SECTION_H: f64 = 40.0;
+    pub const GRID_MARGIN: f64 = 72.0; pub const SECTION_H: f64 = 32.0;
     pub const PIN_ROW_H: f64 = 64.0; pub const DIR_ROW_H: f64 = 32.0; pub const STATUS_H: f64 = 64.0;
     pub const BAR_W: f64 = 209.0; pub const BAR_H: f64 = 18.0; pub const MAIN_BAR_W: f64 = 228.0; pub const MAIN_BAR_H: f64 = 20.0;
     pub const CELL_W: f64 = 97.0; pub const CELL_H: f64 = 144.0;
     pub const SIDEBAR_W: f64 = 348.0; pub const SIDEBAR_MIN: f64 = 300.0;
     pub const PREVIEW_W: f64 = 648.0; pub const PREVIEW_MIN: f64 = 360.0;
     pub const PILL_W: f64 = 270.0;
-    pub const TEXT_TITLE: f64 = 32.0; pub const TEXT_SECTION: f64 = 28.0; pub const TEXT_CONTROL: f64 = 24.0; pub const TEXT_ROW: f64 = 20.0;
+    pub const TEXT_TITLE: f64 = 32.0; pub const TEXT_ITEM: f64 = 22.0; pub const TEXT_CONTROL: f64 = 24.0; pub const TEXT_ROW: f64 = 20.0;
     pub const TEXT_MONO_ISH: f64 = 16.0; pub const TEXT_SMALL: f64 = 14.0; pub const TEXT_TINY: f64 = 12.0;
-    pub const ICON_ROW: f64 = 32.0; pub const ICON_GRID: f64 = 80.0; pub const ICON_TAB_CLOSE: f64 = 28.0;
+    pub const ICON_ROW: f64 = 32.0; pub const ICON_PIN: f64 = 24.0; pub const ICON_GRID: f64 = 80.0; pub const ICON_TAB_CLOSE: f64 = 28.0;
     pub const DEFAULT_W: i32 = 2560; pub const DEFAULT_H: i32 = 1440;
 }
 pub use tok::*;
@@ -29,15 +29,25 @@ pub mod col {
     pub const BG: &str = "@window_bg_color"; pub const FG: &str = "@window_fg_color"; pub const OUTLINE: &str = "@accent_color";
     pub const RAISED: &str = "@card_bg_color"; pub const RAISED_FG: &str = "@card_fg_color";
     pub const RECESSED: &str = "shade(@window_bg_color, 0.8)";
-    pub const SELECTED: &str = "mix(shade(@window_bg_color, 0.8), @accent_color, 0.3)";
-    pub const SELECTED_ACTIVE: &str = "mix(@card_bg_color, @accent_color, 0.3)";
-    pub const FOCUS_RING: &str = "alpha(@accent_color, 0.5)";
+    pub const SELECTED: &str = "mix(shade(@window_bg_color, 0.8), @accent_color, 0.5)";
+    pub const SELECTED_ACTIVE: &str = "mix(@card_bg_color, @accent_color, 0.5)";
+    pub const FOCUS_RING: &str = "@accent_color";
     pub const HOVER: &str = "alpha(@window_fg_color, 0.1)"; pub const HOVER_STRONG: &str = "alpha(@window_fg_color, 0.15)";
     pub const RULE: &str = "alpha(@window_fg_color, 0.3)";
     pub const PINNED_BG: &str = "@sidebar_bg_color"; pub const PINNED_FG: &str = "@sidebar_fg_color";
     pub const PIN_SEL: &str = "mix(@sidebar_bg_color, @sidebar_fg_color, 0.12)";
 }
 pub use col::*;
+
+/// The mockup folder's five symbolic colour slots, in the order the table in
+/// look-style-spec.md gives them. `foreground` (the `color` property) is the
+/// paper tab; the four remappable slots carry the accent-derived faces. GTK
+/// 4.22 includes `accent` in `-gtk-icon-palette`'s lookup (gtk-4.22.4:
+/// gtk/gtkcssstyle.c:883-900, gtk/gtkcsspalettevalue.c:298-312), so the folder
+/// needs no success/warning/error fallback.
+pub const FOLDER_PALETTE: &str = "accent @accent_color, success shade(@accent_color, 0.7), warning shade(@accent_color, 0.6), error shade(@accent_color, 0.45)";
+/// Save As' pencil outline is the window background behind the button.
+pub const SAVE_AS_PALETTE: &str = "error @window_bg_color";
 
 pub const DEFAULT_OPACITY: f64 = 0.85;
 
@@ -119,19 +129,20 @@ pub fn css(scale: f64, font: Option<&str>, opacity: f64) -> String {
         .unwrap_or_default();
     let o = opacity.clamp(0.50, 1.00);
     let fill = |role: &str| format!("alpha({role}, {o:.2})");
-    let (gs, gm, gl, gxl, g2) = (p(GAP_S), p(GAP_M), p(GAP_L), p(GAP_XL), p(GAP_2XL));
+    let (gs, gm, gxl, g2) = (p(GAP_S), p(GAP_M), p(GAP_XL), p(GAP_2XL));
     let (hair, thin, mid) = (p(LINE_HAIR), p(LINE_THIN), p(LINE_MID));
+    let strip_pad = gm + mid;
     let (r, rp) = (p(RADIUS), p(RADIUS_PILL));
-    let (tt, tsec, tc, trow, tmono, tsmall, ttiny) = (
+    let (tt, titem, tc, trow, tmono, tsmall, ttiny) = (
         p(TEXT_TITLE),
-        p(TEXT_SECTION),
+        p(TEXT_ITEM),
         p(TEXT_CONTROL),
         p(TEXT_ROW),
         p(TEXT_MONO_ISH),
         p(TEXT_SMALL),
         p(TEXT_TINY),
     );
-    let (irow, itc) = (p(ICON_ROW), p(ICON_TAB_CLOSE));
+    let (irow, ipin, itc) = (p(ICON_ROW), p(ICON_PIN), p(ICON_TAB_CLOSE));
     // min-width/min-height are content-box: subtract padding and border.
     let pill_w = (p(PILL_W) - 2 * gm - 2 * mid).max(1);
     let pill_h = (p(CONTROL_H) - 2 * mid).max(1);
@@ -161,17 +172,17 @@ window.gimbal-look, window.gimbal-look.background {{ background-color: {window_b
 .gl-pill.selected {{ background-color: {pill_selected}; }} .gl-pill.active.selected {{ background-color: {pill_selected_active}; }}
 .gl-pill-close {{ all: unset; min-width: {close}px; min-height: {close}px; -gtk-icon-size: {close}px; padding: 0; border: {thin}px solid {FG}; border-radius: {rp}px; color: {FG}; margin-left: {gm}px; }}
 .gl-pill-close:hover {{ background-color: {HOVER_STRONG}; }} .gl-pill-close:focus-visible {{ box-shadow: 0 0 0 {thin}px {FOCUS_RING}; }}
-.gl-pill.active .gl-pill-close {{ color: {RAISED_FG}; border-color: {RAISED_FG}; }} .gl-pill.tab {{ margin-bottom: {gl}px; }}
+.gl-pill.active .gl-pill-close {{ color: {RAISED_FG}; border-color: {RAISED_FG}; }} .gl-pill.tab {{ margin-bottom: {gs}px; }}
 .gl-section {{ margin-top: {gxl}px; }}
 .gl-section-pill {{ all: unset; min-height: {sect_h}px; margin: 0 {gm}px {gs}px {gm}px; border: {thin}px solid {OUTLINE}; border-radius: {rp}px; }}
-.gl-section-pill label {{ font-size: {tsec}px; }}
+.gl-section-pill label {{ font-size: {titem}px; }}
 .gl-section-pill:hover {{ background-color: {HOVER}; }} .gl-section-pill:focus-visible {{ box-shadow: 0 0 0 {thin}px {FOCUS_RING}; }}
 .gl-pinned {{ background-color: {pinned}; color: {PINNED_FG}; border-radius: {r}px; margin-top: {gs}px; }}
 .gl-pinned-row {{ all: unset; min-height: {pinrow}px; padding: 0 {gs}px; }}
-.gl-pinned-row image {{ -gtk-icon-size: {irow}px; }} .gl-pinned-row label {{ font-size: {tsec}px; margin-left: {gs}px; }}
+.gl-pinned-row image {{ -gtk-icon-size: {ipin}px; }} .gl-pinned-row label {{ font-size: {titem}px; margin-left: {gs}px; }}
 .gl-pinned-row.sel {{ background-color: {pin_sel}; }}
-.gl-dir-row {{ min-height: {dirrow}px; }} .gl-dir-row label {{ font-size: {trow}px; }}
-.gl-drive-name {{ font-size: {trow}px; }} .gl-drive-block {{ margin-bottom: {gs}px; }}
+.gl-dir-row {{ min-height: {dirrow}px; }} .gl-dir-row label {{ font-size: {titem}px; }}
+.gl-drive-name {{ font-size: {titem}px; }} .gl-drive-block {{ margin-bottom: {gs}px; }}
 .gl-drive-track {{ min-width: {barw}px; min-height: {barh}px; background-color: {track}; }} .gl-drive-track.main {{ min-width: {mbarw}px; min-height: {mbarh}px; }}
 .gl-drive-fill {{ min-height: {barh}px; }} .gl-drive-fill.main {{ min-height: {mbarh}px; }}
 {bars}
@@ -179,16 +190,17 @@ window.gimbal-look, window.gimbal-look.background {{ background-color: {window_b
 .gl-grid {{ border-spacing: {gxl}px; margin: {g2}px {gmar}px 0 {gmar}px; background-color: transparent; }} .gl-grid.tile {{ margin: {gm}px; }}
 gridview > child {{ padding: 0; }}
 .gl-cell {{ min-width: {cellw}px; min-height: {cellh}px; }}
-.gl-cell image {{ -gtk-icon-size: {igrid}px; color: {FG}; }} .gl-cell label {{ font-size: {trow}px; }}
+.gl-cell image {{ -gtk-icon-size: {igrid}px; color: {FG}; -gtk-icon-palette: {folder_palette}; }} .gl-cell label {{ font-size: {trow}px; }}
 .gl-tile {{ background-color: {tile}; border: {thin}px solid {OUTLINE}; border-radius: {r}px; color: {FG}; }}
 .gl-tile.focused {{ box-shadow: 0 0 0 {thin}px {FOCUS_RING}; }}
 .gl-status {{ min-height: {statush}px; font-size: {tc}px; }} .gl-num {{ font-size: {tmono}px; }} .gl-pline {{ font-size: {tmono}px; margin-left: {gm}px; }}
-.gl-collapse-strip {{ min-width: {g2}px; }} .gl-action-row .gl-icon-button {{ margin-left: {gm}px; }}
+.gl-collapse-strip {{ min-width: {g2}px; }} .gl-collapse-strip.left {{ padding: {strip_pad}px 0 0 {strip_pad}px; }} .gl-collapse-strip.right {{ padding: {strip_pad}px {strip_pad}px 0 0; }} .gl-action-row .gl-icon-button {{ margin-left: {gm}px; -gtk-icon-palette: {save_as_palette}; }}
 window.gimbal-look .gl-frame gridview, window.gimbal-look .gl-frame listview, window.gimbal-look .gl-frame textview, window.gimbal-look .gl-frame textview > text, window.gimbal-look .gl-frame scrolledwindow, window.gimbal-look .gl-frame viewport, window.gimbal-look .gl-frame gridview > child, window.gimbal-look windowhandle {{ background-color: transparent; }}",
         hh = p(HEADER_H), pinrow = p(PIN_ROW_H), dirrow = p(DIR_ROW_H),
         barw = p(BAR_W), barh = p(BAR_H), mbarw = p(MAIN_BAR_W), mbarh = p(MAIN_BAR_H),
         cellw = p(CELL_W), cellh = p(CELL_H), igrid = p(ICON_GRID), gmar = p(GRID_MARGIN),
         statush = p(STATUS_H), bars = bar_css(o),
+        folder_palette = FOLDER_PALETTE, save_as_palette = SAVE_AS_PALETTE,
     )
 }
 
@@ -211,6 +223,54 @@ mod tests {
         assert!(plain.contains("alpha(@window_bg_color, 0.85)"));
         assert!(plain.contains("alpha(mix(@card_bg_color, @window_fg_color, 0.2), 0.85)"));
         assert!(!plain.contains(".gl-panel { background-color"));
+    }
+
+    #[test]
+    fn nov_1_outlines_and_contrast() {
+        let plain = css(1.0, None, DEFAULT_OPACITY);
+        // line-mid 3 and line-thin 2 (was 6 and 3).
+        assert!(plain.contains("border: 3px solid @accent_color"));
+        assert!(plain.contains("border: 2px solid @window_fg_color"));
+        // Selection mixes 0.5 accent, and the focus ring is the full accent.
+        assert!(plain.contains("mix(shade(@window_bg_color, 0.8), @accent_color, 0.5)"));
+        assert!(plain.contains("mix(@card_bg_color, @accent_color, 0.5)"));
+        assert!(plain.contains("0 0 0 2px @accent_color"));
+        assert!(!plain.contains("alpha(@accent_color"));
+    }
+
+    #[test]
+    fn icon_palettes_map_the_spec_table() {
+        let plain = css(1.0, None, DEFAULT_OPACITY);
+        // The four remappable slots are set from theme colours, live.
+        for entry in [
+            "accent @accent_color",
+            "success shade(@accent_color, 0.7)",
+            "warning shade(@accent_color, 0.6)",
+            "error shade(@accent_color, 0.45)",
+        ] {
+            assert!(plain.contains(entry), "folder palette lacks {entry:?}");
+        }
+        assert!(plain.contains("-gtk-icon-palette: error @window_bg_color"));
+        // The folder's parts carry slots, not the mockup's grey stand-ins.
+        let folder = include_str!("icons/gimbal-folder-symbolic.svg");
+        for slot in [
+            "gpa:fill=\"accent\"",
+            "gpa:fill=\"success\"",
+            "gpa:fill=\"warning\"",
+            "gpa:fill=\"foreground\"",
+            "gpa:fill=\"error\"",
+        ] {
+            assert!(folder.contains(slot), "folder icon lacks {slot:?}");
+        }
+        for grey in ["#333333", "#656565", "#565656", "#8e8e8e", "#000000"] {
+            assert!(!folder.contains(grey), "fixed colour {grey:?} left behind");
+        }
+        // Save As keeps its pencil fill in the text colour and its outline in
+        // the window background.
+        let save_as = include_str!("icons/gimbal-save-as-symbolic.svg");
+        assert!(save_as.contains("gpa:fill=\"foreground\""));
+        assert!(save_as.contains("gpa:stroke=\"error\""));
+        assert!(!save_as.contains("#000000") && !save_as.contains("#d4d4d4"));
     }
 
     #[test]

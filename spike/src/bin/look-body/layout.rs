@@ -8,7 +8,8 @@
 //! here are visible panel widths and every position helper adds the inset.
 
 use crate::style::{
-    CELL_W, GAP_2XL, GAP_M, GAP_S, GRID_MARGIN, LINE_THIN, PREVIEW_MIN, SIDEBAR_MIN, scaled,
+    CELL_W, GAP_2XL, GAP_M, GAP_S, GRID_MARGIN, ICON_ROW, LINE_MID, LINE_THIN, PREVIEW_MIN,
+    SIDEBAR_MIN, scaled,
 };
 
 /// The 1 px separator Adwaita draws between a paned's children
@@ -46,6 +47,17 @@ pub fn left_from_position(position: i32, scale: f64) -> i32 {
 /// `preview_position`).
 pub fn preview_from_position(inner_w: i32, position: i32, scale: f64) -> i32 {
     (inner_w - HANDLE - inset(scale) - position).max(0)
+}
+
+/// The collapsed sidebar's strip width. The strip carries the same
+/// `icon-row` button (with its `gap-s` padding) as the panel title row, plus
+/// the panel's `gap-m` padding and `line-mid` border on its inner and top
+/// edges. Those paddings put the expand button at exactly the window position
+/// the collapse button had (P1m item 7). The strip is therefore wider than
+/// `gap-2xl`; that is the button's own minimum.
+pub fn strip_width(scale: f64) -> i32 {
+    let button = scaled(ICON_ROW, scale) + 2 * scaled(GAP_S, scale);
+    scaled(GAP_2XL, scale).max(button) + scaled(GAP_M, scale) + scaled(LINE_MID, scale)
 }
 
 /// The narrowest content column that still shows one grid column: the worse
@@ -87,7 +99,7 @@ pub fn body_widths(
     right_collapsed: bool,
 ) -> (BodyWidths, i32) {
     let edge = inset(scale);
-    let strip = scaled(GAP_2XL, scale);
+    let strip = strip_width(scale);
     let (lmin, rmin) = (scaled(SIDEBAR_MIN, scale), scaled(PREVIEW_MIN, scale));
     let min_content = one_column_width(scale);
     let avail = (window_w - 2 * edge).max(0);
@@ -148,10 +160,9 @@ mod tests {
             min,
             2 * inset(1.0) + scaled(SIDEBAR_MIN, 1.0) + 2 * HANDLE + one_column_width(1.0) + 360
         );
-        // The split view's one-column width is now 215 (2 × gap-2xl view
-        // inset + 2 × gap-m tile margin + 2 × line-thin + one cell), so the
-        // single view's 241 dominates and the floor is 919, 22 px below the
-        // old gap-2xl tile margin's 941.
+        // The split view's one-column width is now 213 (2 × gap-2xl view
+        // inset + 2 × gap-m tile margin + 2 × line-thin 2 + one cell), so the
+        // single view's 241 still dominates and the floor stays 919.
         assert_eq!(min, 919);
     }
 
@@ -160,7 +171,7 @@ mod tests {
         let cell = scaled(CELL_W, 1.0);
         let split =
             2 * scaled(GAP_2XL, 1.0) + 2 * scaled(GAP_M, 1.0) + 2 * scaled(LINE_THIN, 1.0) + cell;
-        assert_eq!(split, 215);
+        assert_eq!(split, 213);
         // The single view's 2 × grid-margin + cell (241) still dominates.
         assert_eq!(one_column_width(1.0), 241);
         assert_eq!(one_column_width(0.5), 121);
@@ -220,12 +231,40 @@ mod tests {
     #[test]
     fn collapsed_sidebars_are_strips() {
         let (w, min) = body_widths(2560, 1.0, 348.0, 648.0, true, true);
-        assert_eq!((w.left, w.preview), (40, 40));
+        assert_eq!((w.left, w.preview), (strip_width(1.0), strip_width(1.0)));
+        assert_eq!(w.left, 67);
         assert!(w.content > one_column_width(1.0));
         assert_eq!(
             min,
-            2 * inset(1.0) + 40 + 2 * HANDLE + one_column_width(1.0) + 40
+            2 * inset(1.0)
+                + strip_width(1.0)
+                + 2 * HANDLE
+                + one_column_width(1.0)
+                + strip_width(1.0)
         );
+        assert_eq!(min, 393);
+    }
+
+    #[test]
+    fn the_strip_keeps_the_collapse_button_in_place() {
+        for scale in [1.0, 0.5] {
+            let button = scaled(ICON_ROW, scale) + 2 * scaled(GAP_S, scale);
+            let pad = scaled(GAP_M, scale) + scaled(LINE_MID, scale);
+            // The panel's button starts inset + border + padding from the
+            // window edge; the left strip's button starts inset + pad.
+            let panel_button_left = inset(scale) + scaled(LINE_MID, scale) + scaled(GAP_M, scale);
+            let strip_button_left = inset(scale) + pad;
+            assert_eq!(panel_button_left, strip_button_left);
+            // The strip's content area is exactly the button, so its inner
+            // edge is at the same place as the panel's inner padding edge.
+            let content = strip_width(scale) - pad;
+            assert_eq!(content, button.max(scaled(GAP_2XL, scale)));
+            // On the right, both the button's right edge and the panel's
+            // padding edge are the window's right edge minus inset and pad.
+            let right_panel = 2560 - inset(scale) - pad;
+            let strip_right = (2560 - inset(scale) - strip_width(scale)) + content;
+            assert_eq!(right_panel, strip_right);
+        }
     }
 
     #[test]

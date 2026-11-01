@@ -7,7 +7,7 @@
 //! on the moving pill would see its offsets collapse — see the notes); the
 //! dragged tile follows the pointer and the displaced tiles slide to their
 //! new rects over 150 ms.
-use crate::style::{CONTROL_H, GAP_2XL, PILL_W, scaled};
+use crate::style::{CONTROL_H, GAP_2XL, GAP_L, GAP_S, PILL_W, scaled};
 use adw::prelude::*;
 use gtk::glib;
 use std::cell::{Cell, RefCell};
@@ -27,31 +27,65 @@ impl Rect {
     }
 }
 
-/// Tile layout: always 2 columns, `gap-2xl` apart, inset `gap-2xl` from
-/// every side of the view (the sketch's split panes are centred, so the
-/// inset splits evenly left/right and top/bottom). With exactly 2 tiles
-/// each fills the full inner height; with more, each row is half of it and
-/// further rows scroll. An odd last tile sits in the left column.
+/// The number of tiles in each column, left first. Slots are row-major, so
+/// slot `i` is in column `i % 2` at row `i / 2`: with 3 tiles the order is
+/// top-left, right (full height), bottom-left; with 5, three rows and the last
+/// row left-only. Row-major is the simplest order to drag across: the tile to
+/// the right of a slot is always +1 and the tile below is +2, even where a
+/// column is one shorter. (The earlier "fill the left column first" order
+/// would make a drag across the gutter jump by the taller column's count.)
+pub fn column_counts(n: usize) -> (usize, usize) {
+    (n.div_ceil(2), n / 2)
+}
+
+/// Tile layout: two columns `gap-l` apart, inset `gap-2xl` from the view's
+/// sides and bottom but flush with its top, so the first row of pills has its
+/// top edge level with the side panels. A slot is the tile's pill plus its
+/// frame: the pill is `control-h` tall and sits `gap-s` above the frame. Each
+/// column's slots share the visible height equally (`inner_h`), so a column
+/// with fewer tiles gets taller ones: 3 tiles are 2 left + 1 full-height right,
+/// 5 are 3 + 2. Beyond 4 tiles a slot is never shorter than half the visible
+/// height, so the view scrolls instead of shrinking tiles further.
 pub fn tile_rects(n: usize, view_w: i32, view_h: i32, scale: f64) -> Vec<Rect> {
     if n == 0 || view_w <= 0 || view_h <= 0 {
         return vec![];
     }
-    let m = scaled(GAP_2XL, scale);
-    let inner_w = (view_w - 2 * m).max(1);
-    let inner_h = (view_h - 2 * m).max(1);
-    let w = ((inner_w - m) / 2).max(1);
-    let rows = n.div_ceil(2);
-    let h = if rows == 1 {
-        inner_h
+    let inset = scaled(GAP_2XL, scale);
+    let gap = scaled(GAP_L, scale);
+    let pill = scaled(CONTROL_H, scale);
+    let pill_gap = scaled(GAP_S, scale);
+    let inner_w = (view_w - 2 * inset).max(1);
+    let inner_h = (view_h - inset).max(1);
+    let w = ((inner_w - gap) / 2).max(1);
+    let (left, right) = column_counts(n);
+    // A slot is pill + gap-s + frame; half the visible height is the floor
+    // beyond four tiles (the height a two-tile column would have).
+    let min_slot = if n > 4 {
+        ((inner_h - gap) / 2).max(1)
     } else {
-        ((inner_h - m) / 2).max(1)
+        0
     };
+    let slot_h = |count: usize| -> i32 {
+        if count == 0 {
+            return 0;
+        }
+        let shared = (inner_h - (count as i32 - 1) * gap) / count as i32;
+        shared.max(min_slot).max(pill + pill_gap + 1)
+    };
+    let (left_h, right_h) = (slot_h(left), slot_h(right));
     (0..n)
-        .map(|i| Rect {
-            x: m + (i % 2) as i32 * (w + m),
-            y: m + (i / 2) as i32 * (h + m),
-            w,
-            h,
+        .map(|i| {
+            let (col, h) = if i % 2 == 0 {
+                (0, left_h)
+            } else {
+                (1, right_h)
+            };
+            Rect {
+                x: inset + col * (w + gap),
+                y: (i / 2) as i32 * (h + gap),
+                w,
+                h,
+            }
         })
         .collect()
 }
@@ -450,6 +484,10 @@ impl Inner {
         pill.append(&label);
         let close = gtk::Button::new();
         close.add_css_class("gl-pill-close");
+        // A Box child fills its cross axis by default: without these the ring
+        // stretched to the pill's 44 px content height and drew as an oval.
+        close.set_halign(gtk::Align::Center);
+        close.set_valign(gtk::Align::Center);
         close.set_child(Some(&gtk::Image::from_icon_name("window-close-symbolic")));
         pill.append(&close);
         let frame = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -747,19 +785,66 @@ mod tests {
     fn two_tiles_fill_the_height() {
         let rects = tile_rects(2, 1000, 800, 1.0);
         assert_eq!(rects.len(), 2);
-        assert_eq!(rects[0].h, 720); // 800 − 2 × 40 inset
-        assert_eq!(rects[0].x, 40); // the inset splits evenly
-        assert_eq!(rects[1].x, 520); // 40 + (920 − 40) / 2 + 40
+        assert_eq!(rects[0].y, 0); // the pill tops sit level with the panels
+        assert_eq!(rects[0].h, 760); // 800 − gap-2xl bottom inset
+        assert_eq!(rects[0].x, 40); // the side inset splits evenly
+        assert_eq!(rects[1].x, 512); // 40 + 448 + gap-l 24
+        assert_eq!(rects[1].h, 760);
         assert!(tile_rects(0, 1000, 800, 1.0).is_empty());
         assert!(tile_rects(2, 0, 800, 1.0).is_empty()); // degenerate views
     }
 
     #[test]
-    fn four_tiles_fill_two_rows() {
-        let rects = tile_rects(4, 1000, 800, 1.0);
-        assert_eq!(rects.len(), 4);
-        assert_eq!(rects[0].h, 340); // (800 − 2 × 40 − 40) / 2
-        assert_eq!(rects[2].y + rects[2].h, 760); // rows fill down to the inset
+    fn column_counts_are_row_major() {
+        assert_eq!(column_counts(1), (1, 0));
+        assert_eq!(column_counts(2), (1, 1));
+        assert_eq!(column_counts(3), (2, 1));
+        assert_eq!(column_counts(4), (2, 2));
+        assert_eq!(column_counts(5), (3, 2));
+        assert_eq!(column_counts(6), (3, 3));
+    }
+
+    #[test]
+    fn uneven_columns_make_their_tiles_taller() {
+        let s = |n| tile_rects(n, 1000, 800, 1.0);
+        // 3 tiles: two stacked left, one full-height right.
+        let three = s(3);
+        assert_eq!(three[0].h, 368); // (760 − gap-l) / 2
+        assert_eq!(three[1].h, 760); // the right column's only tile
+        assert_eq!(three[2].x, 40);
+        assert_eq!(three[2].y, 392); // 368 + gap-l
+        assert_eq!(three[2].y + three[2].h, 760); // the left column fills down
+        // 4 tiles: equal 2 + 2 columns.
+        let four = s(4);
+        assert_eq!((four[0].h, four[1].h), (368, 368));
+        assert_eq!((four[2].y, four[3].y), (392, 392));
+        // 5 tiles: 3 left, 2 right; the right column still fits, the left
+        // scrolls at the half-visible-height floor.
+        let five = s(5);
+        assert_eq!((five[0].h, five[1].h), (368, 368));
+        assert_eq!(five[3].y + five[3].h, 760); // right column ends at the inset
+        assert_eq!(five[4].x, 40);
+        assert!(five[4].y + five[4].h > 800); // the third left tile overflows
+        // 6 tiles: 3 + 3, both columns scroll.
+        let six = s(6);
+        assert_eq!((six[4].h, six[5].h), (368, 368));
+        assert!(six[4].y + six[4].h > 800);
+        assert!(six[5].y + six[5].h > 800);
+        // The pill + gap-s leave the frame this much of each slot.
+        let frame = |r: Rect| r.h - scaled(CONTROL_H, 1.0) - scaled(GAP_S, 1.0);
+        assert_eq!(frame(three[0]), 310);
+        assert_eq!(frame(three[1]), 702);
+    }
+
+    #[test]
+    fn five_tiles_never_drop_below_half_the_visible_height() {
+        for n in 5..=6 {
+            for r in tile_rects(n, 1000, 800, 1.0) {
+                // Half of the 800 px viewport, less the half-gap slack the
+                // two-tile column uses.
+                assert!(r.h >= 368, "n={n}: slot {} is too short", r.h);
+            }
+        }
     }
 
     #[test]
@@ -767,7 +852,7 @@ mod tests {
         let rects = tile_rects(3, 1000, 800, 1.0);
         // The odd last tile sits in the left column of the second row.
         assert_eq!(rects[2].x, 40);
-        assert_eq!(rects[2].y, rects[0].h + 80);
+        assert_eq!(rects[2].y, 392);
     }
 
     #[test]
@@ -775,7 +860,7 @@ mod tests {
         let rects = tile_rects(6, 1000, 800, 1.0);
         assert_eq!(rects.len(), 6);
         assert!(rects[4].y + rects[4].h > 800); // last row overflows
-        assert_eq!(rects[5].x, 520);
+        assert_eq!(rects[5].x, 512);
     }
 
     #[test]
@@ -786,9 +871,9 @@ mod tests {
         assert_eq!(tile_at(&rects, 600, 100), Some(1));
         assert_eq!(tile_at(&rects, 100, 500), Some(2));
         assert_eq!(tile_at(&rects, 600, 500), Some(3));
-        // The gap-2xl gutter between the columns and rows holds no tile.
-        assert_eq!(tile_at(&rects, 519, 100), None);
-        assert_eq!(tile_at(&rects, 100, 419), None);
+        // The gap-l gutter between the columns and rows holds no tile.
+        assert_eq!(tile_at(&rects, 500, 100), None);
+        assert_eq!(tile_at(&rects, 100, 380), None);
         // Outside the view entirely.
         assert_eq!(tile_at(&rects, -5, 100), None);
         assert_eq!(tile_at(&rects, 1500, 1500), None);
@@ -806,7 +891,7 @@ mod tests {
         // Below the pill strip too.
         assert_eq!(pill_at(&rects, px + 10, r.y + ph, 1.0), None);
         // The gutter between the columns holds no pill.
-        assert_eq!(pill_at(&rects, 519, r.y + 10, 1.0), None);
+        assert_eq!(pill_at(&rects, 500, r.y + 10, 1.0), None);
         assert_eq!(
             pill_at(&rects, rects[1].x + (rects[1].w - 270) / 2, r.y + 10, 1.0),
             Some(1)

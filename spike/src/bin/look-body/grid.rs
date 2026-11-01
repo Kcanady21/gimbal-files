@@ -13,7 +13,7 @@ pub fn counts(items: u32) -> (u32, u32) {
 
 pub fn item_name(i: u32) -> (String, &'static str) {
     if i < 4 {
-        (format!("Folder {}", i + 1), "folder")
+        (format!("Folder {}", i + 1), "gimbal-folder-symbolic")
     } else {
         (format!("File {}.txt", i + 1), "text-x-generic")
     }
