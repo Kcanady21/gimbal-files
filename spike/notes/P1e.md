@@ -505,3 +505,321 @@ commands pass on the combined tree (21 tests).
    ordinary names at word boundaries instead of mid-word. One word to change; not worth a round.
 3. The 3.6 s didn't reproduce at 0.65 s, and the reasoning about what reuse does and doesn't
    cost is sound. I remeasure it live with the real double-click.
+
+### Live check of P1e-r1 (Claude, Nov 1, 2026): needs fixes (`P1e-r2-fixes.md`)
+
+Same setup as before (1220×1326 floating window, DP-2 only), but **without** `WAYLAND_DEBUG`
+this time: the first live check had it on, which is part of why it saw 3.6 s.
+
+What passed:
+
+- **Correction 1.** The visible 100k tab opens at `sub-00` (screenshot `r1-100k-top`), and `/tmp`
+  opens at `.font-unix`.
+- **Correction 2.** `/tmp` now shows 9 columns at 1220 px, the same as the 100k folder; the log
+  shows `128/128` for the shortest and longest names in both. Phase 2 should still switch to
+  `WordChar`: `Char` breaks ordinary names mid-word (`gimbal-spike-dro-pin`,
+  `gimbal-spike-the-me`).
+
+Corrections:
+
+1. **Crash: the Up button aborts the app.** `navigate_up` (line 150) runs
+   `if let Some(parent) = state.dir.borrow().parent() { navigate(&state, &parent); }`. The
+   `borrow()` lives for the whole `if let` body, `navigate` then calls `state.dir.borrow_mut()`
+   (line 167), and the panic ("RefCell already borrowed") inside a GTK callback can't unwind, so
+   the process aborts. Every click on Up crashes. This came in with P1e (P1b read the folder from
+   `dir_list`), not r1; the first live check navigated only by double-click. Take the parent
+   into a local first. Also look for the same pattern anywhere else in `listing.rs`.
+2. **Navigating is still about 3× slower than opening at startup, and it reproduces.** Launched
+   on `/tmp` alone, double-clicking `gimbal-spike-100k`: **2,149, 2,036, 2,024, 2,016, 2,015 and
+   2,017 ms** over six fresh runs, against **604 ms** for the same folder opened at startup in
+   the same session (and 2,034 ms in a run with a second tab open). Moving the pointer off the
+   window right after the double-click changed nothing (2,024/2,015 ms away, 2,016/2,017 ms
+   over the grid). So your 0.65 s timer navigation misses something a real activation does.
+   The obvious difference: a double-click gives the grid keyboard focus and a focused item
+   (position 6 here), and selects it, while a timer gives neither. `GtkListBase` tracks the
+   focused and selected items through model changes as it does the anchor. Reproduce without
+   input by doing what the click does from your timer: `grid_view.grab_focus()`, select the
+   item, then `grid_view.emit_by_name::<()>("activate", &[&position])`. Find which part costs
+   the 1.4 s and fix it, or say what Phase 2 must do about it. `perf` is not usable on this
+   machine (`perf_event_paranoid` is 2 and even software events are refused); use timestamps.
+
+## P1e-r2 changes (Nov 1, 2026)
+
+Brief: `phase1/P1e-r2-fixes.md`, corrections 1-2 of the live check. Files changed: `src/listing.rs`
+(304 lines) and this section. Nothing else was touched. The two `dnd::` calls are exactly where
+P1e/P1e-r1 left them (`attach_drag_source(cell, item, &selection)` in factory `setup`,
+`attach_drop_target(scrolled, &state.dir)` after the view is created), and no dependency or
+feature changed.
+
+### 1. The Up crash
+
+**Cause [read].** `navigate_up()` was `if let Some(parent) = state.dir.borrow().parent() {
+navigate(&state, &parent); }`. The temporary `Ref` from `borrow()` lives for the whole `if let`
+body, and `navigate()` does `*state.dir.borrow_mut() = target.clone()` on the same cell, so every
+Up click panicked with `BorrowMutError`. The panic crosses a GTK signal callback, which cannot
+unwind, so the process aborted.
+
+**Fix [observed].** `navigate_up()` now takes the parent into a local first (`listing.rs:168-175`):
+the `Ref` is dropped at the end of the `let` statement and `navigate()` borrows mutably afterwards.
+I audited every other borrow in the file:
+
+- `navigate()` used to hold `state.on_navigate.borrow()` across `callback(target)`
+  (`listing.rs:195-200`). The callback is now an `Rc<dyn Fn(&gio::File)>` in `State`, cloned out
+  before the call. The window's callback does not re-enter today, but the pattern is gone.
+- the activate handler's `state.dir.borrow().child(info.name())` was already safe (the temporary
+  `Ref` drops at the end of the `let`), and is now an explicit block so the boundary is visible
+  (`listing.rs:95-99`).
+- `pending.borrow_mut()` is a one-statement `std::mem::take`; `set_on_navigate()` and `dir_of()`
+  only borrow and clone. No other borrow is held across a call.
+
+**Verified [observed].** A temporary 2 s / 4 s timer in `build()` called `navigate_up()` twice
+(removed before delivery, as required). Start folder `/tmp/gimbal-spike-100k/sub-00`: first Up to
+the 100k folder, second Up to `/tmp`. Both `folder load finished` lines appear and the process
+kept running to the kill:
+
+```text
+[gimbal-spike 0.067] listing: folder load started: /tmp/gimbal-spike-100k/sub-00
+[gimbal-spike 0.107] listing: first items in model: +100 (100 so far)
+[gimbal-spike 0.110] listing: folder load finished: /tmp/gimbal-spike-100k/sub-00 (100 items, 43 ms)
+[gimbal-spike 2.733] temp: up #1 from Some("/tmp/gimbal-spike-100k/sub-00")
+[gimbal-spike 2.733] listing: folder load started: /tmp/gimbal-spike-100k
+[gimbal-spike 3.159] listing: folder load finished: /tmp/gimbal-spike-100k (99406 items, 426 ms)
+[gimbal-spike 4.732] temp: up #2 from Some("/tmp/gimbal-spike-100k")
+[gimbal-spike 4.732] listing: folder load started: /tmp
+[gimbal-spike 4.814] listing: folder load finished: /tmp (183 items, 81 ms)
+```
+
+The same two-load sequence also passed on the pre-cap build (685 ms and 122 ms). The temporary
+`temp:` lines are the only lines from the measurement build; the delivered file has no timer.
+
+### 2. Navigating is still about 3x slower than opening at startup
+
+#### Reproduction without input
+
+Temporary env-gated code in `build()` (removed before delivery). Startup on `/tmp`; at 2 s:
+
+1. `view.grab_focus()`,
+2. find `gimbal-spike-100k` in the selection (position 6 in every run),
+3. `selection.select_item(6, false)`,
+4. `view.emit_by_name::<()>("activate", &[&6])`.
+
+That reaches the real `connect_activate` handler, which builds the child `gio::File` and calls
+`navigate()`. Variants measured: `plain` (timer calls `navigate()` directly, the r1 method),
+`focus` (grab_focus only), `cellfocus` (grab_focus on the realised cell at position 6),
+`select` only, `activate` only, `full` (steps 1-4), and `cellfull` (cell focus instead of grid
+focus, then select + activate). Times are the `ms` in `listing: folder load finished`, i.e. from
+`navigate()` to `loading == FALSE`.
+
+#### The three rows, before and after the fix
+
+All runs a11y on (the default), app tiled by niri at 1272x1398 (close to the live 1220x1326),
+run alone, 07:00-07:10. `niri msg --json windows` reports `window_size [1272, 1398]` for the app.
+"before" means the r1 code with `max-columns = 64`; "after" is the delivered file.
+
+| row | before (64-column pool) | after (width-derived cap) |
+|---|---|---|
+| startup load, 100k | 719 / 745 / 757 ms | 438 / 442 / 444 ms |
+| timer navigation `/tmp` -> 100k (r1 style) | 668 / 681 / 665 ms | 433 / 442 / 429 ms |
+| reproduction: focus + select + activate | 2094 / 2083 / 2080 ms | 462 / 468 / 469 ms |
+| reproduction with cell focus (closest to a click) | not run | 456 / 465 / 457 ms |
+| focus only (no selection, no activate) | 2047 / 2085 / 2101 ms | 451 / 452 / 448 ms |
+
+`cellfocus` before the fix was 2099 / 2144 / 2162 ms, so focusing the actual cell behaves like
+focusing the grid. The isolation runs before the fix:
+
+| variant (before, a11y on unless stated) | run 1 / 2 / 3 |
+|---|---|
+| focus only | 2047 / 2085 / 2101 ms |
+| cell focus only | 2099 / 2144 / 2162 ms |
+| select only | 670 / 693 / 656 ms |
+| emit `activate` only | 643 / 663 / 684 ms |
+| focus only, `GTK_A11Y=none` | 641 / 657 / 647 ms |
+
+Selection and `activate` on their own are normal; **focus alone reproduces the whole 1.4 s**, and
+turning a11y off removes it.
+
+#### Cause
+
+`GTK_DEBUG=accessibility` on the pre-cap build counted the AT-SPI contexts created for
+`GtkListItemWidget`:
+
+| run | load | cell AT-SPI contexts |
+|---|---|---|
+| `plain` timer navigation | 670 ms | 0 |
+| `focus` timer navigation | 2005 ms | 2052 |
+| `focus` after the cap (10 columns) | 459-462 ms | 324 |
+
+The batch timestamps show where the time goes. In the focus run the DirectoryList batches are
+~20-30 ms apart except for two blocking gaps, one after the first batch and one after the third;
+the plain run has neither:
+
+```text
+focus, before the cap
+[gimbal-spike 2.093] temp: batch +0 total 0
+[gimbal-spike 2.120] temp: batch +5000 total 5000
+[gimbal-spike 3.226] temp: batch +5000 total 10000      <-- 1.106 s gap
+[gimbal-spike 3.244] temp: batch +5000 total 15000
+[gimbal-spike 3.680] temp: batch +5000 total 20000      <-- 0.436 s gap
+[gimbal-spike 3.698] temp: batch +5000 total 25000
+```
+
+`gtk_directory_list_set_file()` is not the cost: a temporary `Instant` around it logged 11-17 ms
+(`set_file returned in 13.5/16.4/11.1 ms`), and the plain run's total is 0.6-0.7 s. The main loop
+is blocked *after* the first batch, inside GTK's accessibility registration [observed].
+
+Mechanism [read]:
+
+- A widget's AT context is realized lazily, and only if its parent context is realized:
+  `maybe_realize_context()` (`gtkatcontext.c:543-560`). At startup only the toplevel is realized
+  (`gtkwindow.c:4025`); the `GtkGridView`'s context stays unrealized.
+- While the parent context is unrealized, adding or removing a cell is a no-op:
+  `gtk_at_context_child_changed()` returns early on `!self->realized`
+  (`gtkatcontext.c:1699-1707`). That is why startup and the r1 timer (which never focused the
+  grid) pay nothing.
+- Focusing the grid makes the AT-SPI client ask the focused object for its children
+  (`GetChildren`, `gtkatspicontext.c:712-738`), which realizes each child and the grid's context.
+  From then on, parenting a pooled cell fires `gtk_accessible_update_children(parent, cell,
+  ADDED)` (`gtkwidget.c:6363-6366`; `gtkaccessible.c:1445-1473`), the realised grid's
+  `child_change` calls `gtk_at_context_realize(child_context)` (`gtkatspicontext.c:1320-1355`),
+  and realizing an AT-SPI context mints a UUID, builds a D-Bus object path and queues a
+  registration (`gtkatspicontext.c:1574-1633`): one AT-SPI object per pooled cell.
+- The pool is what makes this large. `GtkGridView` passes
+  `gtk_list_base_set_anchor_max_widgets(max_columns * 30, max_columns)` in its constructor and
+  setter (`gtkgridview.c:1236-1238`, `:1401-1403`), and the list base keeps
+  `2 * above_below + center + 1` widgets (`gtklistbase.c:2327-2345`): 2049 cells at the old
+  `max_columns = 64`. Realizing 2052 contexts blocked the main loop for ~1.4 s [observed].
+
+The live double-click reproduced it and the r1 timer did not because a click focuses the row:
+the press handler calls `gtk_widget_grab_focus(widget)` (`gtklistfactorywidget.c:433-434`, via
+`gtkwidget.c:5154-5162`) and the release selects the item (`:459-475`); the double-click press
+then activates it (`:424-430`). The r1 timer went straight to `navigate()` and never focused
+anything. The pointer itself was irrelevant, as the live check found.
+
+#### Fix and rerun
+
+`max-columns` now follows the viewport width instead of being fixed at 64: the h-adjustment's
+`page-size` notify computes `page_size / CELL_WIDTH + 1`, clamped to `1..=64`
+(`listing.rs:105-120`), and the grid starts at 1 until that first allocation (`listing.rs:83-84`)
+so a background tab does not build a 2049-cell pool either. At the measured 1272 px viewport that
+is 10 columns (the grid lays out 9); the live 1220 px window also gives 10 (the grid lays out 9),
+so the cap never binds and the grid's own width-derived column count is still what is shown
+(`gtkgridview.c:620-638`, `:777-783`). The pool drops from 2049 to `2*10 + 30*10 + 1 = 321` cells,
+and the focus run creates 324 AT-SPI contexts instead of 2052. The handler holds the grid weakly
+(`grid_view.downgrade()`): a grid keeps a strong ref to its adjustment (`gtklistbase.c:753-757`),
+so a strong capture here would be the P1b review item 2 cycle again and would leak every closed
+tab's grid.
+
+The three rows rerun on the delivered fix are the "after" column above: startup 438-444 ms,
+timer navigation 429-442 ms, focus + selection + `activate` 462-469 ms. The 2.0 s is now 0.46 s,
+and navigation is no longer slower than startup. `incremental` stays off, as in r1.
+
+**Remaining / what Phase 2 must do.** The width-derived cap is now part of the code and must be
+kept if the grid is rewritten. Even at 10 columns every pooled cell still gets an AT-SPI object
+when the grid is focused; at 324 cells the measured cost is about 10-20 ms (focus-only
+448-452 ms vs plain 429-442 ms), inside the batch noise, so it no longer explains a user-visible
+delay. If a larger pool ever comes back, the real fix is GTK-side lazy realisation of child
+contexts (realize in `GetChildren` instead of on every `child_change`), or a custom accessible
+that presents only the visible range. Disabling a11y (`GTK_A11Y=none`) or setting the grid's role
+to `NONE`/`PRESENTATION` would remove the whole list from screen readers and is not an acceptable
+app-side fix.
+
+### Gate commands (RULES.md "Done means")
+
+```text
+$ PATH="$T:$PATH" cargo fmt --check
+exit=0
+$ PATH="$T:$PATH" cargo clippy --all-targets -- -D warnings
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.04s
+exit=0
+$ cargo test
+     Running unittests src/main.rs (target/debug/deps/gimbal_spike-b2015085d72c48fe)
+running 4 tests
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running unittests src/bin/look-body/main.rs (target/debug/deps/look_body-29a8f160103fcf7b)
+running 12 tests
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running unittests src/bin/look-header/main.rs (target/debug/deps/look_header-f6eea3612da1734e)
+running 5 tests
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+exit=0
+$ cargo build --release
+    Finished `release` profile [optimized] target(s) in 0.02s
+exit=0
+$ wc -l src/listing.rs
+  304 src/listing.rs
+$ grep -nE 'remove|delete|trash' src/listing.rs ; echo $?
+1                                   # no matches
+```
+
+(The 12 `look-body` and 5 `look-header` tests belong to other agents' bins; the 4 in `main.rs`
+include this module's `sorts_folders_first_then_names`.)
+
+A rerun after the session's OS restart also prints rustc's `corrupt incremental compilation
+artifact` warning from `target/debug/incremental/`; all four exits are still 0 and no lint is
+reported. That is host cache damage from the restart, not this module.
+
+### New API citations
+
+Delivered code, gtk4-rs 0.11.5 / glib 0.22.10:
+`auto/scrolled_window.rs:64` `hadjustment() -> Adjustment`; `auto/adjustment.rs:177`
+`page_size()`; `auto/grid_view.rs:89` `max_columns()`, `:164` `set_max_columns(u32)`;
+`glib-0.22.10:src/object.rs:2199` `connect_notify_local` (the `notify::page-size` handler).
+
+Temporary measurement code only (removed): `auto/widget.rs:857` `grab_focus()`;
+`auto/selection_model.rs:70` `select_item(position, unselect_rest)`;
+`glib-0.22.10:src/object.rs:2909` `emit_by_name`;
+`glib-0.22.10:src/source.rs:642` `timeout_add_seconds_local_once`.
+
+GTK source citations are inline above; also checked `gtklistbase.c:2327-2345` (pool formula),
+`gtkgridview.c:1236-1238`/`:1401-1403` (GridView passes `max_columns * 30`, `max_columns`),
+`gtkaccessible.c:1445-1473`, `gtkwidget.c:6363-6366`, `gtkatcontext.c:1699-1707`,
+`gtkatspicontext.c:712-738`, `:1320-1355`, `:1574-1633`.
+
+### Not verified without a live session (Claude)
+
+- The real pointer double-click from `/tmp` to the 100k folder, and the same remeasure at the
+  1220x1326 live window. My runs are tiled at 1272x1398 rather than the live floating geometry;
+  both give cap 10 and nine laid-out columns, but the live numbers are Claude's to retake.
+- Whether the first frame of a newly shown tab can ever draw one column before the
+  `page-size` notify raises `max_columns` (the initial value is 1). It was not visible in the
+  logs, but only a screenshot can settle it.
+- That the focus ring, keyboard navigation (arrows/Tab) and the `--select` scroll still behave
+  after the pool is rebuilt when `max_columns` changes on a resize.
+- The earlier live checks that were already outstanding: drag out of the grid, the closed-tab
+  VmRSS comparison, and narrowing to the 2-column minimum.
+
+**One environment note for the live check:** the host restarted while this round was running and
+its `/tmp` was wiped, so `/tmp/gimbal-spike-100k` (and my run logs) no longer exist. Regenerate
+the folder with `tools/make-big-dir.sh 100000` before the live navigation measurement. This does
+not affect the source changes; the log excerpts above were captured before the restart.
+
+### Anything I'd change outside my files
+
+- `src/bin/look-body/grid.rs` already derives its cap from the viewport
+  (`max_columns()` at `:24-45`, `update_cap()` at `:38-45`, wired at `:121`), so it has the same
+  protection; P1j-r1 must keep it.
+- The remaining per-cell AT-SPI registration is a GTK performance issue, not a listing one: in
+  `gtk_at_spi_context_child_change()` a child context is realized on every add
+  (`gtkatspicontext.c:1350`), while the AT-SPI protocol can fetch children lazily through
+  `GetChildren` (`:712-738`). This is worth an upstream report if Phase 2 keeps large pools.
+- No `Cargo.toml` change and no new feature was needed; all APIs are already behind the pinned
+  `gtk4`/`libadwaita` features.
+
+## Review of P1e-r2 (Claude, Nov 1, 2026)
+
+**Verdict: accepted on code; the live remeasure follows.** Only `listing.rs` (304 lines) and this
+file changed; the dnd hook calls are unchanged; the four RULES commands pass on the combined tree
+(21 tests, clippy clean after clearing the incremental cache the 07:15 reboot left behind).
+
+1. The crash fix is right, and the audit went further than asked: cloning the `on_navigate`
+   callback out before calling it removes the same trap from `navigate()`.
+2. Excellent diagnosis. Isolating focus as the whole 1.4 s, then counting AT-SPI contexts
+   (0, 2,052, 324) is the evidence the brief asked for. Checked: `gtkatcontext.c:1699-1707`
+   (no child change while the parent context is unrealized), `a11y/gtkatspicontext.c:1320-1355`
+   (realize on every added child), `gtklistfactorywidget.c:433-434` (a click grabs focus),
+   `gtkwidget.c:6363-6366` (parenting updates the accessible children). The width-derived cap
+   with a weak grid ref is the right fix, and `page_size / CELL_WIDTH + 1` can't bind below the
+   grid's own column count because a cell is never narrower than `CELL_WIDTH`.
+3. Not dropping a11y to win the number was the right call. Phase 2 note: the plan should keep
+   the width-derived cap as a rule for every list or grid view, and an upstream GTK report on
+   realizing child contexts eagerly is worth filing.

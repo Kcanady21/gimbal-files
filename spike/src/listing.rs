@@ -15,7 +15,7 @@ const CELL_WIDTH: i32 = 128;
 const LABEL_CHARS: i32 = 14;
 // max-columns also sizes the pooled cells (gtkgridview.c:1236-1238, gtklistbase.c:2327); G_MAXUINT is fatal (890 MB), 64 covers 8192 px.
 const MAX_COLUMNS: u32 = 64;
-type NavigateCallback = Box<dyn Fn(&gio::File)>;
+type NavigateCallback = Rc<dyn Fn(&gio::File)>;
 struct State {
     dir: Rc<RefCell<gio::File>>,
     dir_list: WeakRef<gtk::DirectoryList>,
@@ -80,7 +80,8 @@ pub fn build(dir: &gio::File, select: &[String]) -> gtk::ScrolledWindow {
         label.set_label(&info.display_name());
     });
     let grid_view = gtk::GridView::new(Some(selection.clone()), Some(factory));
-    grid_view.set_max_columns(MAX_COLUMNS);
+    // One until the viewport width is known; the page-size handler below raises it.
+    grid_view.set_max_columns(1);
     grid_view.set_min_columns(1);
     {
         let state = Rc::downgrade(&state);
@@ -91,13 +92,32 @@ pub fn build(dir: &gio::File, select: &[String]) -> gtk::ScrolledWindow {
             if info.file_type() != gio::FileType::Directory {
                 return;
             }
-            let target = state.dir.borrow().child(info.name());
+            let target = {
+                let dir = state.dir.borrow();
+                dir.child(info.name())
+            };
             navigate(&state, &target);
         });
     }
     scrolled.set_child(Some(&grid_view));
     scrolled.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
     scrolled.set_vexpand(true);
+    {
+        // max-columns also sizes the pool (gtkgridview.c:1236-1238, gtklistbase.c:2327), and every
+        // pooled cell becomes an AT-SPI object once the grid has focus. Follow the viewport width.
+        // Weak: the grid holds a ref to this adjustment, so a strong capture here would cycle.
+        let view = grid_view.downgrade();
+        scrolled
+            .hadjustment()
+            .connect_notify_local(Some("page-size"), move |adjustment, _| {
+                let Some(view) = view.upgrade() else { return };
+                let columns = adjustment.page_size() as u32 / CELL_WIDTH as u32 + 1;
+                let columns = columns.clamp(1, MAX_COLUMNS);
+                if view.max_columns() != columns {
+                    view.set_max_columns(columns);
+                }
+            });
+    }
     let pending = RefCell::new(select.to_vec());
     // Weak State/selection/view: a strong one cycles with the model chain (P1b review item 2).
     let state = Rc::downgrade(&state);
@@ -147,7 +167,9 @@ pub fn build(dir: &gio::File, select: &[String]) -> gtk::ScrolledWindow {
 }
 pub fn navigate_up(view: &gtk::Widget) {
     let Some(state) = state(view) else { return };
-    if let Some(parent) = state.dir.borrow().parent() {
+    // The borrow ends before navigate(), which borrows the same cell mutably.
+    let parent = state.dir.borrow().parent();
+    if let Some(parent) = parent {
         navigate(&state, &parent);
     }
 }
@@ -160,7 +182,7 @@ pub fn display_path(file: &gio::File) -> String {
 }
 pub fn set_on_navigate(view: &gtk::Widget, callback: impl Fn(&gio::File) + 'static) {
     if let Some(state) = state(view) {
-        *state.on_navigate.borrow_mut() = Some(Box::new(callback));
+        *state.on_navigate.borrow_mut() = Some(Rc::new(callback));
     }
 }
 fn navigate(state: &State, target: &gio::File) {
@@ -170,7 +192,10 @@ fn navigate(state: &State, target: &gio::File) {
     if let Some(dir_list) = state.dir_list.upgrade() {
         dir_list.set_file(Some(target));
     }
-    if let Some(callback) = state.on_navigate.borrow().as_ref() {
+    // Clone the callback out: holding the RefCell borrow across the call would
+    // deadlock if the callback ever navigated again.
+    let callback = state.on_navigate.borrow().as_ref().cloned();
+    if let Some(callback) = callback {
         callback(target);
     }
 }
