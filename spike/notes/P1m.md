@@ -1437,3 +1437,188 @@ The right column, which fits, stays pinned as the left one scrolls.
 Change (Kyle, reproduced): scrolled halfway, Tab 1's contents are still on screen but its pill has
 scrolled off the top. New rule "Sticky pills": a pill stays visible while any of its frame is, and
 its own tile's bottom pushes it up. Brief P1m-r6.
+
+## P1m-r6 changes
+
+Built on P1m-r5 in `spike/src/bin/look-body/`. Only `split.rs` under that folder and this note
+changed. The temporary timer harness was removed before delivery. Below, command output and the
+timer log are **[observed]**, GTK/gtk-rs source citations are **[read]**, and everything that needs a
+real pointer is **[inferred]**.
+
+### Item 1: sticky pills
+
+The tile's widget is now the framed pane only: its clipping scroller holds a vertical box with the
+`gl-tile` frame, whose top margin is the pill band (`control-h` + `gap-s`). The pill is no longer
+inside that box. It lives in `pill_wrap`, a `ScrolledWindow` (EXTERNAL both axes, measure zero)
+containing a horizontal row with the centred pill, and `pill_wrap` is a **sibling of the tile in the
+split's `GtkFixed`**, inserted directly after it so it paints over the frame and is cut to the
+tile's width [read: gtkfixedlayout.c:297-321, gtkscrolledwindow.c:3184].
+
+`relayout` writes the wrap's size and position from the model, outside the slot allocation and from
+the same `scroll` value the pinned column uses:
+
+```text
+x = rect.x
+width = rect.w
+height = band
+y = rect.y + pill_local_top(rect, scroll, view_h, scale)
+```
+
+`pill_local_top` is the pure rule's content-space form. The rule itself is:
+
+```rust
+pub fn sticky_pill_y(slot: Rect, frame: Rect, scroll: i32, visible_h: i32, pill_h: i32) -> i32 {
+    let natural = slot.y - scroll;
+    let frame_top = frame.y - scroll;
+    let frame_bottom = frame.y + frame.h - scroll;
+    if frame_top >= visible_h {
+        return natural;                    // a frame below the view: no push
+    }
+    natural.max(0).min(frame_bottom - pill_h)
+}
+```
+
+- the slot fully visible: `natural` (no change),
+- its top scrolled above the view: `0` (sticks at the top),
+- near its bottom: `frame_bottom - pill_h`, so the pill's bottom rides the frame's bottom and the
+  pill leaves with the frame's last visible pixel,
+- the frame entirely below the view: unchanged.
+
+`frame_rect(slot, scale)` is the slot minus the pill band; `pill_content_rect` gives the pill's rect
+in content coordinates for the hit tests. All hit tests take `(scroll, visible_h)` now:
+`pill_at` (tile drags), `border_at`/`pill_zone` (the strip is never a border where any pill is
+drawn), and the tile click no longer needs a geometric pill test because the pill is its own widget.
+`press_on_pill` stays as a pure test helper only. A tile drag that starts on a stuck pill raises the
+wrap with the tile and carries the pill at the tile's top; a press that is not a drag leaves
+click/Ctrl/Shift, the ✕ and the right-click menu working on the pill where it is drawn.
+
+A pinned column's rects already carry `+scroll`, so `pill_local_top` is 0 and its pills do not move.
+
+### Startup assertion (unrelated to the rule, needed for the new tree)
+
+The pill being a separate Fixed child changes the tile's content box to hold only the frame. With
+the first (0-width) allocation, GTK's box gives that sole expanding child `0 - 0 = 0` height
+[read: gtkboxlayout.c:985-1014], the `GridView` is allocated at 0×0, and GTK aborts in
+`gtk_list_base_update_adjustments` (`bounds.y == 0`, gtklistbase.c:2121-2131). This existed in
+principle before; the r5 tree's overflowing pill happened to give the frame a different path. The
+fix is in the same file: `State.view` starts at `[1200, 1280]` (a provisional layout of a real
+size), and `relayout` skips an all-zero layout until the scroller reports a viewport. The first real
+page size then applies normally.
+
+### Unit tests added (all in the look-body binary)
+
+- `split::tests::a_visible_slot_leaves_its_pill_at_the_slot_top`
+- `split::tests::a_slot_top_above_the_view_sticks_the_pill_at_the_top`
+- `split::tests::the_tiles_own_bottom_pushes_its_pill_up`
+- `split::tests::the_frame_fully_off_leaves_the_pill_with_it`
+- `split::tests::a_pinned_column_never_moves_its_pills`
+
+The existing hit tests were updated for the extra `scroll`/`visible_h` arguments.
+
+### Temporary timer log (harness removed before delivery)
+
+Debug binary, `GIMBAL_R6_TIMER=1 GIMBAL_SPIKE_LOG=1 look-body --tiles 4`, niri-tiled 1272×1398.
+The timer set the left column to the reproduction's hand heights `[1056, 564]`, then drove the outer
+adjustment through five values from 0 to its maximum and logged Tab 1's pill and frame bounds
+relative to the split's Fixed (content y; "view" is content y − scroll). The left column is 97 wide;
+its total is 1056 + 564 + 24 = 1644, the view 1191, so the maximum is 453 — the live check's
+arithmetic. [observed]
+
+```text
+[gimbal-look-body 2.171] temp: r6 scroll 0: pill y 0 (view 0) frame [40, 58] 97x998 (view y 58)
+[gimbal-look-body 2.371] temp: r6 scroll 113: pill y 113 (view 0) frame [40, 58] 97x998 (view y -55)
+[gimbal-look-body 2.571] temp: r6 scroll 227: pill y 227 (view 0) frame [40, 58] 97x998 (view y -169)
+[gimbal-look-body 2.771] temp: r6 scroll 340: pill y 340 (view 0) frame [40, 58] 97x998 (view y -282)
+[gimbal-look-body 2.971] temp: r6 scroll 453: pill y 453 (view 0) frame [40, 58] 97x998 (view y -395)
+```
+
+The pill's view y is 0 at every nonzero scroll while the frame's view y goes negative: it sticks at
+the top of the visible area. (`pill y` in the log is content y, so it equals `scroll` while stuck.)
+The frame's content rect is fixed at `[40, 58] 97×998`; only the view moves. The bottom push is not
+reachable in this layout before the maximum (the frame's last 50 px need scroll > 1006); the unit
+test `the_tiles_own_bottom_pushes_its_pill_up` covers it.
+
+### RULES.md's four commands, from `$SPIKE`
+
+`cargo fmt --check` (through the rustup toolchain):
+
+```text
+(fmt exit 0; no output)
+```
+
+`cargo clippy --all-targets -- -D warnings`:
+
+```text
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.04s
+(clippy exit 0)
+```
+
+`cargo test`:
+
+```text
+     Running unittests src/main.rs (target/debug/deps/gimbal_spike-27f41c3be3242da9)
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running unittests src/bin/look-body/main.rs (target/debug/deps/look_body-0c97cc23f4ccae67)
+test result: ok. 66 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running unittests src/bin/look-header/main.rs (target/debug/deps/look_header-4abd02268319d43d)
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+```
+
+`cargo build --release`:
+
+```text
+    Finished `release` profile [optimized] target(s) in 0.02s
+```
+
+### 10-second release runs (stopped by PID with SIGTERM, from `/tmp/gimbal-spike-p1m-r6`)
+
+Default, `--tiles 5`, and `--tiles 6 --pins 14 --scale 0.5` each ran for 10 s and printed an empty
+log (exit 143 from the SIGTERM). No GTK warnings, no `Gtk-CRITICAL`, no CSS/theme/icon warnings and
+no panics; the intermittent `VK_SUBOPTIMAL_KHR` notice did not appear in these three runs.
+[observed]
+
+### API citations
+
+- `WidgetExt::insert_after`: `gtk4-0.11.5:src/auto/widget.rs:922`.
+- `WidgetExt::set_margin_top` (the frame's pill band): `gtk4-0.11.5:src/auto/widget.rs:1321`.
+- A `GtkFixed` allocates a child its preferred size: `gtk-4.22.4:gtk/gtkfixedlayout.c:297-321`.
+- A scroller's child gets the scroller's full allocation:
+  `gtk-4.22.4:gtk/gtkscrolledwindow.c:3184`; EXTERNAL/measure-zero is the r4 citation,
+  `gtk-4.22.4:gtk/gtkscrolledwindow.c:1847-1851`.
+- The sole-inconstant-child box path that gave the frame 0 height:
+  `gtk-4.22.4:gtk/gtkboxlayout.c:985-1014`.
+- The list-base assertion avoided: `gtk-4.22.4:gtk/gtklistbase.c:2121-2131`.
+- CSS margins applied inside an allocation: `gtk-4.22.4:gtk/gtkwidget.c:4247-4252`.
+
+### Not verified live (Claude's check)
+
+- The visual stick at the top while wheeling: the timer set the adjustment programmatically; no
+  pointer was injected (RULES). [inferred]
+- A drag that starts on a stuck pill, click and Ctrl/Shift selection, the ✕ and the right-click
+  menu at the stuck position. They use the pill widget itself (drag via `pill_at`), but the pointer
+  path was not replayed. [inferred]
+- The pill being pushed out by its tile's bottom in a real scroll to that point. [inferred]
+- The pinned column's pills staying still while the other column wheels. [inferred]
+- The paint order over the frame (the wrap is a later Fixed child, then cut to the tile width); no
+  screenshot was taken. [inferred]
+- The startup guard at window sizes other than this session's 1272×1398 tile. [inferred]
+- Stuck-pill interpretation: the pill sits at view y 0 and overlaps the frame's content, as the
+  "draws over the frame's content while stuck" sentence says. If "the same `gap-s` above the frame's
+  visible top" means a real 8 px gap while stuck, that is not what this code does; the live check
+  should decide. [read/inferred]
+
+### Anything I'd change outside my files
+
+None. `grid.rs`, `style.rs` and `main.rs` are byte-identical to their P1m-r5 state (the extra timer
+harness and its temporary experiments were removed). `look-style-spec.md` already describes the
+rule; it could note that while stuck the pill covers the top `control-h` of the frame content.
+
+## Review of P1m-r6 (Claude, with Kyle's finding, Nov 1, 2026): change of rule (P1m-r7)
+
+RULES.md's four commands pass (82 tests). Kyle: the pill now stays visible, but it draws over the
+tile's contents, and the tile must never go behind its pill. Kyle chose the rule "Stuck tiles":
+- the pill and the frame's top border stay fixed while the tile is stuck;
+- the frame's bottom keeps moving;
+- the contents keep scrolling and disappear under the frame's own top border.
+
+Brief P1m-r7. r6's sticky-pill positioning is committed as the base it builds on.

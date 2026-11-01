@@ -405,6 +405,57 @@ pub fn offset_slots(slots: &mut [Vec<Rect>; 2], view_h: i32, scale: f64, scroll:
     }
 }
 
+/// The tile's frame inside its slot: the slot minus the pill band above it
+/// (`control-h` plus `gap-s`). The frame's bottom is the slot's bottom.
+pub fn frame_rect(slot: Rect, scale: f64) -> Rect {
+    let band = scaled(CONTROL_H, scale) + scaled(GAP_S, scale);
+    Rect {
+        x: slot.x,
+        y: slot.y + band,
+        w: slot.w,
+        h: (slot.h - band).max(0),
+    }
+}
+
+/// The pill's y in the visible area for a slot (P1m-r6). `slot` and `frame`
+/// are in content coordinates; the result is in view coordinates, i.e. the
+/// content y minus `scroll`. The pill sits at the slot's top until that top
+/// has scrolled above the view, then sticks at the top of the visible area
+/// (`0`). Its own tile's bottom pushes it up: it never sits lower than the
+/// frame's bottom minus the pill's height, so it leaves together with the
+/// frame's last visible pixel. A frame entirely below the view leaves the
+/// pill at its natural position (also below).
+pub fn sticky_pill_y(slot: Rect, frame: Rect, scroll: i32, visible_h: i32, pill_h: i32) -> i32 {
+    let natural = slot.y - scroll;
+    let frame_top = frame.y - scroll;
+    let frame_bottom = frame.y + frame.h - scroll;
+    // A frame entirely below the view leaves the pill where the tile is.
+    if frame_top >= visible_h {
+        return natural;
+    }
+    natural.max(0).min(frame_bottom - pill_h)
+}
+
+/// The pill's rect in content coordinates (what the hit tests use): centred
+/// in the slot, `pill_h` tall, at its sticky position. `slot` already carries
+/// its column's scroll offset, like `State.rects`.
+pub fn pill_content_rect(slot: Rect, scroll: i32, visible_h: i32, scale: f64) -> Rect {
+    let pill_h = scaled(CONTROL_H, scale);
+    let top = sticky_pill_y(slot, frame_rect(slot, scale), scroll, visible_h, pill_h) + scroll;
+    let pw = pill_width(slot.w, scale);
+    Rect {
+        x: slot.x + (slot.w - pw) / 2,
+        y: top,
+        w: pw,
+        h: pill_h,
+    }
+}
+
+/// The sticky pill's top in the tile's own space: the click test's `y`.
+pub fn pill_local_top(slot: Rect, scroll: i32, visible_h: i32, scale: f64) -> i32 {
+    pill_content_rect(slot, scroll, visible_h, scale).y - slot.y
+}
+
 /// The rect of every tile, indexed by tile id, from its column and row.
 pub fn rects_by_tile(columns: &[Vec<usize>; 2], slots: &[Vec<Rect>; 2]) -> Vec<Rect> {
     let total = columns[0].len() + columns[1].len();
@@ -705,20 +756,24 @@ pub enum Border {
     Heights { column: usize, row: usize },
 }
 
-/// The pill's own region inside a slot (its top `control-h`, centred and at
+/// The pill's own region inside a slot (its sticky position, centred and at
 /// most the column's width).
-fn pill_zone(r: Rect, x: i32, y: i32, scale: f64) -> bool {
-    let pw = pill_width(r.w, scale);
-    let px = r.x + (r.w - pw) / 2;
-    let ph = scaled(CONTROL_H, scale);
-    x >= px && x < px + pw && y >= r.y && y < r.y + ph
+fn pill_zone(r: Rect, x: i32, y: i32, scroll: i32, visible_h: i32, scale: f64) -> bool {
+    pill_content_rect(r, scroll, visible_h, scale).contains(x, y)
 }
 
 /// A border under the pointer: the gutter between the columns, or the whole
 /// strip between two stacked tiles of one column (item 2). The strip runs
 /// from the upper tile's frame bottom to the lower tile's frame top, and
-/// grabs everywhere except on the lower tile's pill itself.
-pub fn border_at(slots: &[Vec<Rect>; 2], x: i32, y: i32, scale: f64) -> Option<Border> {
+/// grabs everywhere except on a pill (wherever scrolling has drawn it).
+pub fn border_at(
+    slots: &[Vec<Rect>; 2],
+    x: i32,
+    y: i32,
+    scroll: i32,
+    visible_h: i32,
+    scale: f64,
+) -> Option<Border> {
     let (left, right) = (&slots[0], &slots[1]);
     if !left.is_empty() && !right.is_empty() {
         let left_end = left[0].x + left[0].w;
@@ -733,6 +788,14 @@ pub fn border_at(slots: &[Vec<Rect>; 2], x: i32, y: i32, scale: f64) -> Option<B
             return Some(Border::Columns);
         }
     }
+    // A sticky pill can be drawn over a strip; it is never a border.
+    if slots
+        .iter()
+        .flatten()
+        .any(|r| pill_zone(*r, x, y, scroll, visible_h, scale))
+    {
+        return None;
+    }
     let pill_h = scaled(CONTROL_H, scale);
     let gap_s = scaled(GAP_S, scale);
     for (column, s) in slots.iter().enumerate() {
@@ -746,7 +809,7 @@ pub fn border_at(slots: &[Vec<Rect>; 2], x: i32, y: i32, scale: f64) -> Option<B
         for row in 1..s.len() {
             let top = s[row - 1].y + s[row - 1].h;
             let next_frame_top = s[row].y + pill_h + gap_s;
-            if y >= top && y < next_frame_top && !pill_zone(s[row], x, y, scale) {
+            if y >= top && y < next_frame_top {
                 return Some(Border::Heights { column, row });
             }
         }
@@ -818,27 +881,34 @@ fn adjusted(index: usize, removed: usize, length: usize) -> usize {
     }
 }
 
-/// The pill hit test: which tile's pill region holds the point. The pill is
-/// `PILL_W` wide, centred above the tile's frame, starting at the tile rect's
-/// top and `control-h` tall.
-pub fn pill_at(rects: &[Rect], x: i32, y: i32, scale: f64) -> Option<usize> {
-    let ph = scaled(CONTROL_H, scale);
-    rects.iter().position(|r| {
-        let pw = pill_width(r.w, scale);
-        let px = r.x + (r.w - pw) / 2;
-        x >= px.max(r.x) && x < (px + pw).min(r.x + r.w) && y >= r.y && y < r.y + ph
-    })
+/// The pill hit test: which tile's pill region holds the point, in content
+/// coordinates. The pill is centred above the tile's frame and moves with
+/// `scroll` once its slot's top has gone above the view (P1m-r6).
+pub fn pill_at(
+    rects: &[Rect],
+    x: i32,
+    y: i32,
+    scroll: i32,
+    visible_h: i32,
+    scale: f64,
+) -> Option<usize> {
+    rects
+        .iter()
+        .position(|r| pill_content_rect(*r, scroll, visible_h, scale).contains(x, y))
 }
 
-/// Whether a press at (x, y) inside a `tile_w`-wide tile landed on its pill.
-pub fn press_on_pill(x: f64, y: f64, tile_w: i32, scale: f64) -> bool {
+#[cfg(test)]
+#[cfg(test)]
+/// Whether a press at (x, y) inside a `tile_w`-wide tile landed on its pill,
+/// whose top sits `pill_top` down from the tile's top (0 unless it is stuck).
+pub fn press_on_pill(x: f64, y: f64, tile_w: i32, pill_top: i32, scale: f64) -> bool {
     if tile_w <= 0 {
         return false;
     }
     let pw = pill_width(tile_w, scale);
     let px = (tile_w - pw) / 2;
     let ph = scaled(CONTROL_H, scale);
-    x >= px as f64 && x < (px + pw) as f64 && y >= 0.0 && y < ph as f64
+    x >= px as f64 && x < (px + pw) as f64 && y >= pill_top as f64 && y < (pill_top + ph) as f64
 }
 
 /// Which tiles are focused, which is the Shift anchor, and which are
@@ -904,6 +974,9 @@ struct State {
     widgets: Vec<gtk::Box>, // indexed by tile id: the outer pill+frame box
     frames: Vec<gtk::Box>,
     pills: Vec<gtk::Box>,
+    /// The pill clipping scrollers, indexed by tile id: Fixed children that
+    /// follow the tile's slot and the scroll value (P1m-r6).
+    pill_wraps: Vec<gtk::ScrolledWindow>,
     rects: Vec<Rect>, // indexed by tile id
     selection: Selection,
     scale: f64,
@@ -967,6 +1040,18 @@ struct Slot {
     size: Rc<Cell<(i32, i32)>>,
     slide: Option<adw::Animation>,
     generation: Rc<Cell<u64>>,
+}
+
+/// One tile's widget tree (P1m-r6). The tile itself holds only the framed
+/// pane; its pill lives in `pill_wrap`, a clipping scroller that is a sibling
+/// of the tile in the split's Fixed, so the pill can stay at the top of the
+/// view while the tile scrolls and still be cut to the tile's width.
+struct TileWidgets {
+    outer: gtk::Box,
+    frame: gtk::Box,
+    pill: gtk::Box,
+    close: gtk::Button,
+    pill_wrap: gtk::ScrolledWindow,
 }
 
 /// The resize cursor currently set on the view.
@@ -1093,10 +1178,11 @@ impl SplitView {
                     widgets: vec![],
                     frames: vec![],
                     pills: vec![],
+                    pill_wraps: vec![],
                     rects: vec![],
                     selection: Selection::new(0),
                     scale: 1.0,
-                    view: [0, 0],
+                    view: [1200, 1280],
                     next_uid: 0,
                 }),
                 on_exit,
@@ -1201,6 +1287,9 @@ impl Inner {
             for widget in st.widgets.drain(..) {
                 self.fixed.remove(&widget);
             }
+            for wrap in st.pill_wraps.drain(..) {
+                self.fixed.remove(&wrap);
+            }
             st.tiles.clear();
             st.columns = [vec![], vec![]];
             st.heights = [Heights::Default, Heights::Default];
@@ -1233,14 +1322,14 @@ impl Inner {
 
     fn add_one(&self, view: &SplitView, animate: bool) {
         let items = self.items;
-        let (index, name, tile) = {
+        let (index, name, parts) = {
             let mut st = self.state.borrow_mut();
             let index = st.tiles.len();
             let uid = st.next_uid;
             st.next_uid += 1;
             let name = format!("Tab {}", uid + 1);
-            let (tile, frame, pill, close) = Self::tile_widget(&name, items);
-            Self::attach_handlers(view, uid, &tile, &pill, &close);
+            let parts = Self::tile_widget(&name, items, st.scale);
+            Self::attach_handlers(view, uid, &parts.outer, &parts.pill, &parts.close);
             st.tiles.push(Tile {
                 uid,
                 name: name.clone(),
@@ -1248,11 +1337,12 @@ impl Inner {
             let column = add_to_shorter(&mut st.columns, index);
             // A column that gained a tile goes back to the default.
             st.heights[column] = Heights::Default;
-            st.widgets.push(tile.clone());
-            st.frames.push(frame);
-            st.pills.push(pill);
+            st.widgets.push(parts.outer.clone());
+            st.frames.push(parts.frame.clone());
+            st.pills.push(parts.pill.clone());
+            st.pill_wraps.push(parts.pill_wrap.clone());
             st.selection.selected.push(false);
-            (index, name, tile)
+            (index, name, parts)
         };
         let rect = {
             let st = self.state.borrow();
@@ -1263,8 +1353,20 @@ impl Inner {
                 h: 1,
             })
         };
-        self.fixed.put(&tile, rect.x as f64, rect.y as f64);
-        tile.set_size_request(rect.w, rect.h);
+        let band = {
+            let scale = self.state.borrow().scale;
+            scaled(CONTROL_H, scale) + scaled(GAP_S, scale)
+        };
+        self.fixed.put(&parts.outer, rect.x as f64, rect.y as f64);
+        parts.outer.set_size_request(rect.w, rect.h);
+        // The pill's scroller sits right after the tile, so the pill paints
+        // over its frame, and is cut to the tile's width.
+        parts.pill_wrap.set_size_request(rect.w, band);
+        self.fixed
+            .put(&parts.pill_wrap, rect.x as f64, rect.y as f64);
+        parts
+            .pill_wrap
+            .insert_after(&self.fixed, Some(&parts.outer));
         self.slots.borrow_mut().push(Slot {
             pos: Rc::new(Cell::new((rect.x as f64, rect.y as f64))),
             size: Rc::new(Cell::new((rect.w, rect.h))),
@@ -1291,15 +1393,22 @@ impl Inner {
     /// their widgets and animate to the new rects. The columns rebalance and
     /// a column that changed size returns to equal shares.
     fn remove_tile(&self, index: usize) {
-        let (widget, name) = {
+        let (widget, wrap, name) = {
             let st = self.state.borrow();
             let Some(widget) = st.widgets.get(index).cloned() else {
                 return;
             };
-            (widget, st.tiles[index].name.clone())
+            (
+                widget,
+                st.pill_wraps.get(index).cloned(),
+                st.tiles[index].name.clone(),
+            )
         };
         self.bump_gen(index);
         self.fixed.remove(&widget);
+        if let Some(wrap) = wrap {
+            self.fixed.remove(&wrap);
+        }
         {
             let mut st = self.state.borrow_mut();
             let old_columns = st.columns.clone();
@@ -1311,6 +1420,7 @@ impl Inner {
             st.widgets.remove(index);
             st.frames.remove(index);
             st.pills.remove(index);
+            st.pill_wraps.remove(index);
             if index < st.selection.selected.len() {
                 st.selection.selected.remove(index);
             }
@@ -1332,18 +1442,31 @@ impl Inner {
 
     /// Recompute every tile's rect and move it there: immediately for a
     /// viewport/scale/border change, over 200 ms for a close, an add or a drop.
+    /// The pill's sticky position is a view position, not part of the layout:
+    /// it is applied here from the same scroll value the pinned column uses.
     fn relayout(&self, animate: bool) {
-        let (rects, widgets, pills, scale) = {
+        let (rects, widgets, pills, wraps, frames, scale, scroll, view_h) = {
             let mut st = self.state.borrow_mut();
             let rects = st.rects();
+            // Until the scroller has a viewport, keep the provisional layout:
+            // applying an empty one would resize every grid to 0×0 (a GTK
+            // list-base assertion at startup).
+            if !st.tiles.is_empty() && rects.iter().all(|r| r.w <= 0 || r.h <= 0) {
+                return;
+            }
             st.rects = rects;
             (
                 st.rects.clone(),
                 st.widgets.clone(),
                 st.pills.clone(),
+                st.pill_wraps.clone(),
+                st.frames.clone(),
                 st.scale,
+                st.scroll,
+                st.view[1],
             )
         };
+        let band = scaled(CONTROL_H, scale) + scaled(GAP_S, scale);
         for (slot, widget) in widgets.iter().enumerate() {
             if let Some(&rect) = rects.get(slot) {
                 if let Some(pill) = pills.get(slot) {
@@ -1360,6 +1483,20 @@ impl Inner {
                             pill_label_chars(rect.w, scale)
                         });
                     }
+                }
+                // The frame starts under the pill band (its CSS margin, which
+                // has to follow a scale change).
+                if let Some(frame) = frames.get(slot)
+                    && frame.margin_top() != band
+                {
+                    frame.set_margin_top(band);
+                }
+                if let Some(wrap) = wraps.get(slot) {
+                    wrap.set_size_request(rect.w.max(1), band.max(1));
+                    let top = rect.y + pill_local_top(rect, scroll, view_h, scale);
+                    self.fixed.move_(wrap, rect.x as f64, top as f64);
+                    // The pill paints over its own tile.
+                    wrap.insert_after(&self.fixed, Some(widget));
                 }
                 if animate {
                     self.slide_to(slot, widget, rect);
@@ -1412,14 +1549,18 @@ impl Inner {
         }
     }
 
-    /// One tile: the tab pill sits short and centred *above* the framed pane.
-    /// Both live in a clipping scroller whose measure is zero in both axes:
-    /// a `GtkFixed` allocates a child its *preferred* size, not the size it
-    /// was asked for (gtk-4.22.4:gtk/gtkfixedlayout.c:297-322), and a
-    /// ScrolledWindow with an EXTERNAL policy measures zero
-    /// (gtk-4.22.4:gtk/gtkscrolledwindow.c:1847-1851), so the tile can be
-    /// narrower than its pill without drawing over the neighbour (item 4).
-    fn tile_widget(name: &str, items: u32) -> (gtk::Box, gtk::Box, gtk::Box, gtk::Button) {
+    /// One tile: the framed pane in a clipping scroller, with the frame's
+    /// top margin leaving the pill band. The tab pill lives in its own
+    /// clipping scroller (`pill_wrap`), a sibling of the tile in the split's
+    /// Fixed (P1m-r6): a `GtkFixed` allocates a child its *preferred* size,
+    /// not the size it was asked for (gtk-4.22.4:gtk/gtkfixedlayout.c:297-322),
+    /// and a ScrolledWindow with an EXTERNAL policy measures zero
+    /// (gtk-4.22.4:gtk/gtkscrolledwindow.c:1847-1851), so `set_size_request`
+    /// fixes the wrap to the tile's width and the scroller cuts the pill
+    /// before it can draw over the neighbour. `relayout` moves it to the
+    /// sticky y, outside the slot allocation.
+    fn tile_widget(name: &str, items: u32, scale: f64) -> TileWidgets {
+        let band = scaled(CONTROL_H, scale) + scaled(GAP_S, scale);
         let outer = gtk::Box::new(gtk::Orientation::Vertical, 0);
         let clip = gtk::ScrolledWindow::new();
         clip.set_policy(gtk::PolicyType::External, gtk::PolicyType::External);
@@ -1442,15 +1583,28 @@ impl Inner {
         close.set_valign(gtk::Align::Center);
         close.set_child(Some(&gtk::Image::from_icon_name("window-close-symbolic")));
         pill.append(&close);
+        let pill_row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        pill_row.append(&pill);
+        let pill_wrap = gtk::ScrolledWindow::new();
+        pill_wrap.set_policy(gtk::PolicyType::External, gtk::PolicyType::External);
+        pill_wrap.set_propagate_natural_width(false);
+        pill_wrap.set_propagate_natural_height(false);
+        pill_wrap.set_child(Some(&pill_row));
         let frame = gtk::Box::new(gtk::Orientation::Vertical, 0);
         frame.add_css_class("gl-tile");
         frame.set_vexpand(true);
+        frame.set_margin_top(band);
         frame.append(&crate::grid::folder_view(items, true));
-        content.append(&pill);
         content.append(&frame);
         clip.set_child(Some(&content));
         outer.append(&clip);
-        (outer, frame, pill, close)
+        TileWidgets {
+            outer,
+            frame,
+            pill,
+            close,
+            pill_wrap,
+        }
     }
 
     fn attach_handlers(
@@ -1463,13 +1617,7 @@ impl Inner {
         let click = gtk::GestureClick::new();
         click.set_propagation_phase(gtk::PropagationPhase::Capture);
         let click_view = view.clone();
-        let click_tile = tile.clone();
-        click.connect_pressed(move |_, _, x, y| {
-            let scale = click_view.inner.state.borrow().scale;
-            if !press_on_pill(x, y, click_tile.width(), scale) {
-                click_view.inner.focus(id);
-            }
-        });
+        click.connect_pressed(move |_, _, _, _| click_view.inner.focus(id));
         tile.add_controller(click);
         let pill_click = gtk::GestureClick::new();
         pill_click.set_button(0);
@@ -1544,12 +1692,45 @@ impl Inner {
         anim.play();
     }
 
+    /// Put a tile's pill scroller at its slot's sticky position, cut to the
+    /// slot's width, and raise it over the tile (P1m-r6).
+    fn place_pill(&self, slot: usize, rect: Rect) {
+        let (wrap, widget, scale, scroll, view_h) = {
+            let st = self.state.borrow();
+            (
+                st.pill_wraps.get(slot).cloned(),
+                st.widgets.get(slot).cloned(),
+                st.scale,
+                st.scroll,
+                st.view[1],
+            )
+        };
+        let Some(wrap) = wrap else {
+            return;
+        };
+        let band = scaled(CONTROL_H, scale) + scaled(GAP_S, scale);
+        wrap.set_size_request(rect.w.max(1), band.max(1));
+        let top = rect.y + pill_local_top(rect, scroll, view_h, scale);
+        self.fixed.move_(&wrap, rect.x as f64, top as f64);
+        if let Some(widget) = widget {
+            wrap.insert_after(&self.fixed, Some(&widget));
+        }
+    }
+
+    /// While a tile is dragged, its pill rides at the tile's top (P1m-r6).
+    fn drag_pill(&self, slot: usize, rect: Rect) {
+        let wrap = self.state.borrow().pill_wraps.get(slot).cloned();
+        if let Some(wrap) = wrap {
+            self.fixed.move_(&wrap, rect.x as f64, rect.y as f64);
+        }
+    }
+
     /// A press anywhere in the view: a pill starts a tile drag, a border
     /// starts a resize. Nothing moves until the pointer passes the threshold.
     /// The press point, the hit test and every later update are in the
     /// Fixed's content space via `pointer_in_fixed` (item 5).
     fn begin_drag(&self, gesture: &gtk::GestureDrag, sx: f64, sy: f64) {
-        let (rects, slots, scale, width_share, columns, heights, view) = {
+        let (rects, slots, scale, width_share, columns, heights, view, scroll) = {
             let st = self.state.borrow();
             (
                 st.rects.clone(),
@@ -1559,14 +1740,15 @@ impl Inner {
                 st.columns.clone(),
                 st.heights.clone(),
                 st.view,
+                st.scroll,
             )
         };
         let (px, py) = pointer_in_fixed(&self.fixed, gesture.current_event().as_ref())
             .map(|(x, y)| (x.round() as i32, y.round() as i32))
             .unwrap_or((sx.round() as i32, sy.round() as i32));
-        let border = border_at(&slots, px, py, scale);
+        let border = border_at(&slots, px, py, scroll, view[1], scale);
         crate::log!("split", "border press at ({px}, {py}) hit {border:?}");
-        if let Some(slot) = pill_at(&rects, px, py, scale) {
+        if let Some(slot) = pill_at(&rects, px, py, scroll, view[1], scale) {
             let Some(rect) = rects.get(slot).copied() else {
                 return;
             };
@@ -1585,6 +1767,11 @@ impl Inner {
             if self.fixed.last_child().as_ref() != Some(widget.upcast_ref()) {
                 let last = self.fixed.last_child();
                 widget.insert_after(&self.fixed, last.as_ref());
+            }
+            // The pill rides at the tile's top during the drag.
+            self.drag_pill(slot, rect);
+            if let Some(wrap) = self.state.borrow().pill_wraps.get(slot).cloned() {
+                wrap.insert_after(&self.fixed, Some(&widget));
             }
             crate::log!(
                 "split",
@@ -1687,6 +1874,7 @@ impl Inner {
                             size.0,
                             size.1,
                         );
+                        self.drag_pill(slot, *r);
                     } else if *r != targets[slot] {
                         self.slide_to(slot, &widgets[slot], *r);
                     }
@@ -1800,6 +1988,7 @@ impl Inner {
             None => {
                 self.hide_drop_line();
                 self.slide_to(from, &widgets[from], rects[from]);
+                self.place_pill(from, rects[from]);
                 crate::log!("split", "drag ended with no drop; sliding back");
             }
         }
@@ -1817,6 +2006,7 @@ impl Inner {
             };
             if let (Some(rect), Some(widget)) = (rect, widget) {
                 self.slide_to(from, &widget, rect);
+                self.place_pill(from, rect);
             }
         }
         self.hide_drop_line();
@@ -1824,11 +2014,18 @@ impl Inner {
 
     /// A double-click on a border resets it to equal shares, animated.
     fn reset_border(&self, x: f64, y: f64) {
-        let (slots, scale) = {
+        let (slots, scale, scroll, view_h) = {
             let st = self.state.borrow();
-            (st.slots(), st.scale)
+            (st.slots(), st.scale, st.scroll, st.view[1])
         };
-        match border_at(&slots, x.round() as i32, y.round() as i32, scale) {
+        match border_at(
+            &slots,
+            x.round() as i32,
+            y.round() as i32,
+            scroll,
+            view_h,
+            scale,
+        ) {
             Some(Border::Columns) => {
                 self.state.borrow_mut().width_share = 0.5;
                 self.relayout(true);
@@ -1845,11 +2042,18 @@ impl Inner {
 
     /// The hover cursor over a border.
     fn hover(&self, x: f64, y: f64) {
-        let (slots, scale) = {
+        let (slots, scale, scroll, view_h) = {
             let st = self.state.borrow();
-            (st.slots(), st.scale)
+            (st.slots(), st.scale, st.scroll, st.view[1])
         };
-        let cursor = match border_at(&slots, x.round() as i32, y.round() as i32, scale) {
+        let cursor = match border_at(
+            &slots,
+            x.round() as i32,
+            y.round() as i32,
+            scroll,
+            view_h,
+            scale,
+        ) {
             Some(Border::Columns) => Cursor::Width,
             Some(Border::Heights { .. }) => Cursor::Height,
             None => Cursor::None,
@@ -2469,7 +2673,10 @@ mod tests {
         let gap = scaled(GAP_L, 1.0);
         // The column gutter, at any height.
         let x = slots[0][0].x + slots[0][0].w + gap / 2;
-        assert_eq!(border_at(&slots, x, 40, 1.0), Some(Border::Columns));
+        assert_eq!(
+            border_at(&slots, x, 40, 0, VIEW.1, 1.0),
+            Some(Border::Columns)
+        );
         // The left column's strip: frame bottom to the next tile's frame top,
         // every integer y, at an x clear of the pill.
         let edge = slots[0][0].x + 5;
@@ -2477,33 +2684,33 @@ mod tests {
         let bottom = slots[0][1].y + scaled(CONTROL_H, 1.0) + scaled(GAP_S, 1.0);
         for y in top..bottom {
             assert_eq!(
-                border_at(&slots, edge, y, 1.0),
+                border_at(&slots, edge, y, 0, VIEW.1, 1.0),
                 Some(Border::Heights { column: 0, row: 1 }),
                 "y {y} in the strip"
             );
         }
         // The next frame itself is not a border.
-        assert_eq!(border_at(&slots, edge, bottom, 1.0), None);
+        assert_eq!(border_at(&slots, edge, bottom, 0, VIEW.1, 1.0), None);
         // On the lower pill it is not a border either ...
         let lower = slots[0][1];
         let pw = scaled(PILL_W, 1.0).min(lower.w);
         let pill_x = lower.x + (lower.w - pw) / 2 + pw / 2;
         let pill_y = lower.y + scaled(CONTROL_H, 1.0) / 2;
-        assert_eq!(border_at(&slots, pill_x, pill_y, 1.0), None);
+        assert_eq!(border_at(&slots, pill_x, pill_y, 0, VIEW.1, 1.0), None);
         // ... but the gutter band at the same x still is (the pill is only
         // the lower tile's top control-h).
         assert_eq!(
-            border_at(&slots, pill_x, top + 1, 1.0),
+            border_at(&slots, pill_x, top + 1, 0, VIEW.1, 1.0),
             Some(Border::Heights { column: 0, row: 1 })
         );
         // A tile's middle is no border.
-        assert_eq!(border_at(&slots, edge, 100, 1.0), None);
+        assert_eq!(border_at(&slots, edge, 100, 0, VIEW.1, 1.0), None);
         // The right column's own strip is at its own y.
         let top = slots[1][0].y + slots[1][0].h;
         let bottom = slots[1][1].y + scaled(CONTROL_H, 1.0) + scaled(GAP_S, 1.0);
         for y in top..bottom {
             assert_eq!(
-                border_at(&slots, slots[1][0].x + 5, y, 1.0),
+                border_at(&slots, slots[1][0].x + 5, y, 0, VIEW.1, 1.0),
                 Some(Border::Heights { column: 1, row: 1 }),
                 "right y {y}"
             );
@@ -2568,11 +2775,112 @@ mod tests {
         let r = rects[0];
         let px = r.x + (r.w - scaled(PILL_W, 1.0)) / 2;
         let ph = scaled(CONTROL_H, 1.0);
-        assert_eq!(pill_at(&rects, px + 10, r.y + 10, 1.0), Some(0));
-        assert_eq!(pill_at(&rects, r.x + 10, r.y + 10, 1.0), None);
-        assert_eq!(pill_at(&rects, px + 10, r.y + ph, 1.0), None);
-        assert!(!press_on_pill(10.0, 10.0, 500, 1.0));
-        assert!(press_on_pill(240.0, 10.0, 500, 1.0));
+        assert_eq!(pill_at(&rects, px + 10, r.y + 10, 0, VIEW.1, 1.0), Some(0));
+        assert_eq!(pill_at(&rects, r.x + 10, r.y + 10, 0, VIEW.1, 1.0), None);
+        assert_eq!(pill_at(&rects, px + 10, r.y + ph, 0, VIEW.1, 1.0), None);
+        assert!(!press_on_pill(10.0, 10.0, 500, 0, 1.0));
+        assert!(press_on_pill(240.0, 10.0, 500, 0, 1.0));
+    }
+
+    /// A slot 700 tall at y 100: its frame runs from 158 to 800.
+    fn sticky_case() -> (Rect, Rect) {
+        let slot = Rect {
+            x: 40,
+            y: 100,
+            w: 300,
+            h: 700,
+        };
+        (slot, frame_rect(slot, 1.0))
+    }
+
+    #[test]
+    fn a_visible_slot_leaves_its_pill_at_the_slot_top() {
+        let (slot, frame) = sticky_case();
+        let ph = scaled(CONTROL_H, 1.0);
+        // The slot fully visible at the top.
+        assert_eq!(sticky_pill_y(slot, frame, 0, VIEW.1, ph), 100);
+        assert_eq!(frame_rect(slot, 1.0).y, 158);
+        // Still fully visible after a 40 px scroll: no change relative to the
+        // slot, so in the view it simply follows the scroll.
+        assert_eq!(sticky_pill_y(slot, frame, 40, VIEW.1, ph), 60);
+        // In content coordinates the pill is still at the slot's top; the
+        // scroller moves both by 40.
+        assert_eq!(pill_content_rect(slot, 40, VIEW.1, 1.0).y, 100);
+    }
+
+    #[test]
+    fn a_slot_top_above_the_view_sticks_the_pill_at_the_top() {
+        let (slot, frame) = sticky_case();
+        let ph = scaled(CONTROL_H, 1.0);
+        // The slot's top is 100 px above the visible area.
+        assert_eq!(sticky_pill_y(slot, frame, 200, VIEW.1, ph), 0);
+        // The hit test sees it at the top of the view: content y 200.
+        assert_eq!(pill_content_rect(slot, 200, VIEW.1, 1.0).y, 200);
+        // A further scroll keeps it at the top while the frame is visible.
+        assert_eq!(sticky_pill_y(slot, frame, 500, VIEW.1, ph), 0);
+    }
+
+    #[test]
+    fn the_tiles_own_bottom_pushes_its_pill_up() {
+        let (slot, frame) = sticky_case();
+        let ph = scaled(CONTROL_H, 1.0);
+        assert_eq!(frame.y + frame.h, 800);
+        // Ten pixels of the frame are still visible: the pill's bottom rides
+        // the frame's bottom, 40 px above the view's top.
+        let y = sticky_pill_y(slot, frame, 790, VIEW.1, ph);
+        assert_eq!(y, -40);
+        assert_eq!(y + ph, 10);
+        // At the frame's last pixel the pill is exactly off the top.
+        assert_eq!(sticky_pill_y(slot, frame, 800, VIEW.1, ph) + ph, 0);
+    }
+
+    #[test]
+    fn the_frame_fully_off_leaves_the_pill_with_it() {
+        let (slot, frame) = sticky_case();
+        let ph = scaled(CONTROL_H, 1.0);
+        let y = sticky_pill_y(slot, frame, 850, VIEW.1, ph);
+        assert!(y + ph <= 0, "the pill must be above the view: {y}");
+        // The pill's bottom stays on the frame's bottom as it leaves.
+        assert_eq!(y + ph, -50);
+        // A frame entirely below the view has not pushed anything yet.
+        let below = sticky_pill_y(slot, frame, 0, VIEW.1, ph);
+        assert_eq!(below, 100);
+    }
+
+    #[test]
+    fn a_pinned_column_never_moves_its_pills() {
+        // 4 + 1: the lone tile fits, so its column is pinned at the scroll
+        // value and its pill stays at the slot's top.
+        let columns = [vec![0, 1, 2, 3], vec![4]];
+        let board = Board {
+            columns: &columns,
+            heights: &defaults(),
+            width_share: 0.5,
+            view: Viewport {
+                w: VIEW.0,
+                h: VIEW.1,
+                scale: 1.0,
+            },
+            scroll: 300,
+        };
+        let slots = board.slots();
+        assert!(column_fits(
+            &layout(&columns, &defaults(), 0.5, VIEW.0, VIEW.1, 1.0)[1],
+            VIEW.1,
+            1.0
+        ));
+        let pinned = slots[1][0];
+        assert_eq!(
+            pill_content_rect(pinned, 300, VIEW.1, 1.0).y,
+            pinned.y,
+            "a pinned column's pill top is its slot top"
+        );
+        // The tall column's first pill sticks instead.
+        assert_eq!(
+            pill_content_rect(slots[0][0], 300, VIEW.1, 1.0).y,
+            300,
+            "the tall column's pill sits at the view's top"
+        );
     }
 
     #[test]
