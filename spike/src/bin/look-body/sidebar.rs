@@ -168,14 +168,80 @@ pub fn pin_drag_layout(
 }
 
 /// The drag in progress: the row's original slot, its grab offset, the
-/// pointer's local start, the rows container's origin in surface coordinates,
-/// and whether the sequence has been claimed after the threshold.
+/// pointer's local start, the rows container's bounds in the window and the
+/// window's surface transform, and whether the sequence has been claimed.
 struct PinDrag {
     from: usize,
     grab: i32,
     start: (f64, f64),
-    origin: (f64, f64),
+    bounds: (f64, f64),
+    transform: (f64, f64),
     claimed: bool,
+}
+
+/// What releasing a press on a pinned row means. A press that never passed
+/// the drag threshold can only select (or open, on a double-click) — it must
+/// never reorder.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PinRelease {
+    Select { slot: usize },
+    Open { slot: usize },
+    Reorder { from: usize, to: usize },
+}
+
+/// The row a pointer at `y` (in the rows' own space) is over.
+pub fn pin_slot(y: f64, row_h: i32, n: usize) -> usize {
+    if n == 0 || row_h <= 0 {
+        return 0;
+    }
+    ((y as i32).div_euclid(row_h)).clamp(0, (n - 1) as i32) as usize
+}
+
+/// The decision at release, pure: a still pointer selects (and a double-click
+/// opens); only `moved` — the press passed the drag threshold — can reorder.
+pub fn pin_release(
+    n: usize,
+    row_h: i32,
+    from: usize,
+    pointer_y: f64,
+    n_press: i32,
+    moved: bool,
+) -> PinRelease {
+    if n == 0 || row_h <= 0 {
+        return PinRelease::Select { slot: 0 };
+    }
+    let from = from.min(n - 1);
+    if !moved {
+        return if n_press >= 2 {
+            PinRelease::Open { slot: from }
+        } else {
+            PinRelease::Select { slot: from }
+        };
+    }
+    let to = pin_slot(pointer_y, row_h, n);
+    if to == from {
+        PinRelease::Select { slot: from }
+    } else {
+        PinRelease::Reorder { from, to }
+    }
+}
+
+/// The pointer in the rows' own space: the surface position minus the window's
+/// surface transform and the rows' bounds in the window. `GtkGestureDrag`
+/// reports its press point already in that space (GTK itself subtracts the
+/// surface transform, which is the client-side shadow — 25 px here), so a
+/// still pointer yields the press point and never passes the threshold.
+/// Reading the raw surface position without the transform made every click
+/// look like a drag whose drop sat one row lower.
+pub fn pin_local(
+    surface: (f64, f64),
+    surface_transform: (f64, f64),
+    bounds: (f64, f64),
+) -> (f64, f64) {
+    (
+        surface.0 - surface_transform.0 - bounds.0,
+        surface.1 - surface_transform.1 - bounds.1,
+    )
 }
 
 /// The pinned rows' container: a plain widget whose custom `PinnedRowLayout`
@@ -423,9 +489,9 @@ impl PinnedList {
         let weak = Rc::downgrade(&this);
         let click = this.click.clone();
         click.set_button(1);
-        click.connect_released(move |_, _, _, y| {
+        click.connect_released(move |_, n_press, _, y| {
             if let Some(this) = weak.upgrade() {
-                this.clicked(y);
+                this.clicked(n_press, y);
             }
         });
         this.rows.add_controller(click);
@@ -513,13 +579,29 @@ impl PinnedList {
         }
     }
 
-    fn clicked(&self, y: f64) {
+    fn clicked(&self, n_press: i32, y: f64) {
         let n = self.names_len();
         let row_h = self.row_h();
         if n == 0 || y < 0.0 {
             return;
         }
-        let slot = ((y as i32).div_euclid(row_h)).clamp(0, (n - 1) as i32) as usize;
+        let slot = pin_slot(y, row_h, n);
+        match pin_release(n, row_h, slot, y, n_press, false) {
+            PinRelease::Open { slot } => {
+                let name = self.names.borrow()[slot].clone();
+                crate::log!("pins", "open {name}");
+            }
+            _ => self.select(slot),
+        }
+    }
+
+    /// Highlight `slot` as the current folder.
+    fn select(&self, slot: usize) {
+        let n = self.names_len();
+        if n == 0 {
+            return;
+        }
+        let slot = slot.min(n - 1);
         self.selected.set(slot);
         let widgets = self.widgets.borrow();
         for (i, row) in widgets.iter().enumerate() {
@@ -538,40 +620,36 @@ impl PinnedList {
         if n == 0 || row_h <= 0 || y < 0.0 {
             return;
         }
-        let from = ((y as i32).div_euclid(row_h)).clamp(0, (n - 1) as i32) as usize;
-        // The event's position is in surface coordinates; the rows' bounds
-        // in the window (whose widget origin is the surface origin) convert
-        // the pointer into the container's own space. This is the pointer
-        // offset from the surface, not the gesture's widget-relative dx/dy.
-        let origin = self
+        let from = pin_slot(y, row_h, n);
+        // The rows' origin in *surface* coordinates: their bounds in the
+        // window plus the window's surface transform (the client-side shadow,
+        // which GTK subtracts for the gesture's own widget coordinates —
+        // gtk-4.22.4:gtkwidget.c:4958-4966). Without the transform the two
+        // sides of the threshold comparison sat 25 px apart, so every click
+        // claimed and dropped one row lower; see `pin_local`.
+        let transform = self
+            .rows
+            .native()
+            .map(|native| native.surface_transform())
+            .unwrap_or((0.0, 0.0));
+        let bounds = self
             .rows
             .root()
             .and_then(|root| self.rows.compute_bounds(&root))
             .map(|bounds| (bounds.x() as f64, bounds.y() as f64))
             .unwrap_or((0.0, 0.0));
         let grab = y - from as f64 * row_h as f64;
-        // Raise the dragged row to the end of the child order (draws above
-        // the others); this only reorders, it never unparents.
-        let widgets = self.widgets.borrow();
-        let row = widgets[from].clone();
-        drop(widgets);
-        if self.rows.last_child().as_ref() != Some(row.clone().upcast_ref()) {
-            let last = self.rows.last_child();
-            row.insert_after(&self.rows, last.as_ref());
-        }
-        self.bump_gen(from);
+        // Nothing moves on a press: the raise and every layout change wait
+        // for the threshold in `update_drag`. A plain click therefore only
+        // selects.
         *self.drag.borrow_mut() = Some(PinDrag {
             from,
             grab: grab.round() as i32,
             start: (x, y),
-            origin,
+            bounds,
+            transform,
             claimed: false,
         });
-        crate::log!(
-            "pins",
-            "dragging '{}' from slot {from}",
-            self.names.borrow()[from]
-        );
     }
 
     fn update_drag(&self, gesture: &gtk::GestureDrag, dx: f64, dy: f64) {
@@ -579,22 +657,38 @@ impl PinnedList {
             return;
         };
         let local = match gesture.current_event().and_then(|event| event.position()) {
-            Some((sx, sy)) => (sx - drag.origin.0, sy - drag.origin.1),
+            Some((sx, sy)) => pin_local((sx, sy), drag.transform, drag.bounds),
             None => (drag.start.0 + dx, drag.start.1 + dy),
         };
-        if !drag.claimed
-            && self.rows.drag_check_threshold(
-                drag.start.0.round() as i32,
-                drag.start.1.round() as i32,
-                local.0.round() as i32,
-                local.1.round() as i32,
-            )
-            && gesture.set_state(gtk::EventSequenceState::Claimed)
-        {
+        // Everything here is in the rows' own space, so the press point and
+        // the pointer agree and a still click is never a drag.
+        let moved = self.rows.drag_check_threshold(
+            0,
+            0,
+            (local.0 - drag.start.0).round() as i32,
+            (local.1 - drag.start.1).round() as i32,
+        );
+        if !drag.claimed && moved && gesture.set_state(gtk::EventSequenceState::Claimed) {
             drag.claimed = true;
             // The drag owns this sequence: the click gesture must not also
             // select a row when the pointer is released.
             self.click.set_state(gtk::EventSequenceState::Denied);
+            // Raise the dragged row to the end of the child order (draws above
+            // the others). Reordering only; it never unparents.
+            let widgets = self.widgets.borrow();
+            let row = widgets[drag.from].clone();
+            drop(widgets);
+            if self.rows.last_child().as_ref() != Some(row.clone().upcast_ref()) {
+                let last = self.rows.last_child();
+                row.insert_after(&self.rows, last.as_ref());
+            }
+            self.bump_gen(drag.from);
+            crate::log!(
+                "pins",
+                "dragging '{}' from slot {}",
+                self.names.borrow()[drag.from],
+                drag.from
+            );
             crate::log!("pins", "claimed the sequence after the drag threshold");
         }
         if !drag.claimed {
@@ -655,32 +749,29 @@ impl PinnedList {
             return;
         };
         let local = match gesture.current_event().and_then(|event| event.position()) {
-            Some((sx, sy)) => (sx - drag.origin.0, sy - drag.origin.1),
+            Some((sx, sy)) => pin_local((sx, sy), drag.transform, drag.bounds),
             None => (drag.start.0 + dx, drag.start.1 + dy),
         };
         let n = self.names_len();
         let row_h = self.row_h();
-        let (target, _) = pin_drag_layout(n, row_h, drag.from, local.1.round() as i32, drag.grab);
-        if drag.claimed
-            && let Some(to) = target
-            && to != drag.from
-            && to < n
+        if let PinRelease::Reorder { from, to } =
+            pin_release(n, row_h, drag.from, local.1, 1, drag.claimed)
         {
-            let name = self.names.borrow()[drag.from].clone();
-            self.names.borrow_mut().remove(drag.from);
+            let name = self.names.borrow()[from].clone();
+            self.names.borrow_mut().remove(from);
             self.names.borrow_mut().insert(to, name.clone());
             let row = {
                 let mut widgets = self.widgets.borrow_mut();
-                widgets.remove(drag.from)
+                widgets.remove(from)
             };
             self.widgets.borrow_mut().insert(to, row);
             let generation = {
                 let mut gens = self.gens.borrow_mut();
-                gens.remove(drag.from)
+                gens.remove(from)
             };
             self.gens.borrow_mut().insert(to, generation);
             self.selected.set(to);
-            crate::log!("pins", "moved '{name}' from slot {} to {to}", drag.from);
+            crate::log!("pins", "moved '{name}' from slot {from} to {to}");
         }
         self.settle();
     }
@@ -903,5 +994,77 @@ mod tests {
         assert_eq!(pin_drag_layout(0, h, 0, 0, 0), (None, vec![]));
         assert_eq!(pin_drag_layout(2, 0, 0, 0, 0), (None, vec![]));
         assert_eq!(pin_drag_layout(2, h, 5, 0, 0), (None, vec![]));
+    }
+
+    #[test]
+    fn a_click_never_reorders() {
+        // The press point and the pointer are the same for a still click, at
+        // every row and every offset inside it: never a reorder.
+        let h = 64;
+        let surface_transform = (25.0, 25.0); // the window's CSD shadow
+        let bounds = (27.0, 220.0);
+        for from in 0..7usize {
+            for offset in [0.0, 1.0, 31.5, 63.0] {
+                let press = (
+                    bounds.0 + 10.0 + surface_transform.0,
+                    bounds.1 + from as f64 * 64.0 + offset + surface_transform.1,
+                );
+                let start = (
+                    press.0 - surface_transform.0 - bounds.0,
+                    press.1 - surface_transform.1 - bounds.1,
+                );
+                assert_eq!(pin_slot(start.1, h, 7), from, "from={from} offset={offset}");
+                // The release is at the same surface point.
+                let local = pin_local(press, surface_transform, bounds);
+                let moved = (local.0 - start.0).abs() > 0.5 || (local.1 - start.1).abs() > 0.5;
+                assert!(!moved, "still click claimed, from={from} offset={offset}");
+                assert_eq!(
+                    pin_release(7, h, from, local.1, 1, moved),
+                    PinRelease::Select { slot: from },
+                    "from={from} offset={offset}"
+                );
+            }
+        }
+        // Without the surface transform the comparison sat 25 px apart: that
+        // is the bug this test guards.
+        let stale_origin = (bounds.0, bounds.1 + surface_transform.1 * 2.0);
+        let wrong = pin_local(
+            (bounds.0 + 10.0, bounds.1 + 6.0 * 64.0 + 40.0),
+            (0.0, 0.0),
+            stale_origin,
+        );
+        let start = (10.0, 6.0 * 64.0 + 40.0);
+        assert!(
+            (wrong.1 - start.1).abs() > 8.0,
+            "the un-transformed read was a drag"
+        );
+    }
+
+    #[test]
+    fn only_a_past_threshold_press_reorders() {
+        let h = 64;
+        // A real drag down two rows reorders.
+        assert_eq!(
+            pin_release(7, h, 0, 2.0 * h as f64 + 10.0, 1, true),
+            PinRelease::Reorder { from: 0, to: 2 }
+        );
+        // A drag that ends where it started changes nothing.
+        assert_eq!(
+            pin_release(7, h, 3, 3.0 * h as f64 + 10.0, 1, true),
+            PinRelease::Select { slot: 3 }
+        );
+        // A double-click opens, and still never reorders.
+        assert_eq!(
+            pin_release(7, h, 4, 4.0 * h as f64 + 10.0, 2, false),
+            PinRelease::Open { slot: 4 }
+        );
+        assert_eq!(
+            pin_release(0, h, 0, 0.0, 1, true),
+            PinRelease::Select { slot: 0 }
+        );
+        assert_eq!(
+            pin_release(3, 0, 0, 0.0, 1, true),
+            PinRelease::Select { slot: 0 }
+        );
     }
 }

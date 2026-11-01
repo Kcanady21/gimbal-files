@@ -199,6 +199,7 @@ gridview > child {{ padding: 0; }}
 .gl-cell image {{ -gtk-icon-size: {igrid}px; color: {FG}; -gtk-icon-palette: {folder_palette}; }} .gl-cell label {{ font-size: {trow}px; }}
 .gl-tile {{ background-color: {tile}; border: {thin}px solid {OUTLINE}; border-radius: {r}px; color: {FG}; }}
 .gl-tile.focused {{ box-shadow: 0 0 0 {thin}px {FOCUS_RING}; }}
+.gl-drop-line {{ background-color: {OUTLINE}; min-height: {thin}px; border-radius: {rp}px; }}
 .gl-status {{ min-height: {statush}px; font-size: {tc}px; }} .gl-num {{ font-size: {tmono}px; }} .gl-pline {{ font-size: {tmono}px; margin-left: {gm}px; }}
 .gl-collapse-strip {{ min-width: {g2}px; }} .gl-collapse-strip.left {{ padding: {strip_pad}px 0 0 0; }} .gl-collapse-strip.right {{ padding: {strip_pad}px 0 0 0; }} .gl-action-row .gl-icon-button {{ margin-left: {gm}px; }} .gl-action-row image {{ color: {FG}; -gtk-icon-palette: {save_as_palette}; }}
 window.gimbal-look .gl-frame gridview, window.gimbal-look .gl-frame listview, window.gimbal-look .gl-frame textview, window.gimbal-look .gl-frame textview > text, window.gimbal-look .gl-frame scrolledwindow, window.gimbal-look .gl-frame viewport, window.gimbal-look .gl-frame gridview > child, window.gimbal-look windowhandle {{ background-color: transparent; }}",
@@ -242,6 +243,10 @@ mod tests {
         assert!(plain.contains("mix(@card_bg_color, @accent_color, 0.5)"));
         assert!(plain.contains("0 0 0 2px @accent_color"));
         assert!(!plain.contains("alpha(@accent_color"));
+        // The drop line is an accent outline, thin and round-ended.
+        assert!(plain.contains(
+            ".gl-drop-line { background-color: @accent_color; min-height: 2px; border-radius: 999px; }"
+        ));
     }
 
     #[test]

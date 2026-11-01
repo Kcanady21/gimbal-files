@@ -780,3 +780,271 @@ Kyle found the space between the last directory name and the Devices pill too la
 `gap-m − section-gap` (10, plus the next section's 6 px top margin = 16), was `gap-xl − 6` (26),
 and the style test follows. RULES.md's four commands pass (65 tests). Live: the gaps after Recent
 Directories and Devices are 16 px; collapsed pills are unchanged.
+
+## P1m-r3 changes
+
+Built on P1m-r2 in `spike/src/bin/look-body/`. Only `split.rs` (rewritten around a shares
+model), `sidebar.rs` (the pinned click), `style.rs` (the drop line's class) and this note were
+touched; the temporary timer harness was removed before delivery. Below, command output and timer
+logs are **[observed]**, GTK/gtk-rs source citations are **[read]**, and the live look/feel items
+are **[inferred]**.
+
+### Item by item
+
+1. **Rebalance on close.** `split::columns_without` now runs three rules in order after removing
+   the tile: (a) the existing empty-column rule (a column that empties takes the other column's
+   last tile while the other keeps one); (b) then, while the counts differ by two or more, the
+   longer column's **bottom** tile moves across; (c) the surviving ids are renumbered. So 3 + 3
+   closed twice from one column goes 3 + 2 → 3 + 1 → (one move) 2 + 2. A hand-made layout is left
+   alone otherwise: 3 + 1 closed from the long column is 2 + 1 and stays; 3 + 1 with the lone tile
+   closed is 2 + 1 by rule (a). Every close still goes through the per-slot generation slides
+   (`relayout(true)`, 200 ms), so the moved tile animates; no new animation path was added.
+   Timer, below: `columns [[0,2,4],[1,3]]` → `[[0,2],[1,3]]` with a clean 2 + 2 rect set.
+
+2. **Move a tile between tiles.** New pure `Drop::{Swap, Insert}`: a press over a gap band inserts
+   (`insert` makes that column one longer and the other one shorter), a press on a tile swaps
+   across columns or reorders within one. The band is the `gap-l` gutter plus a fifth of the
+   adjacent slot's height on each side, and it wins over the tile under it; the column x range
+   selects the column (`drop_at`). `columns_after_insert` refuses (`None`) a move that would empty a
+   column while two or more tiles exist, and also refuses a no-op; the release path then slides the
+   tile back to its resting rect. The preview (`drag_layout`) recomputes the whole slot layout for
+   an insert, so the other tiles slide into the new (shorter/taller) slots while the dragged tile
+   follows the pointer at its old size. A `gtk::Box` with the new `gl-drop-line` class — `line-thin`
+   tall, `@accent_color`, `radius-pill` — sits in the Fixed and is moved to the gap and shown only
+   for an accepted insert.
+
+3. **Resize tiles by their borders.** `State` now stores **shares**: `heights[column]` is the
+   share of the column's available height (`inner_h − (n−1)·gap`) for each slot, and
+   `width_share` is the left column's share of the width after the gutter. `split::layout` turns
+   them into rects, so a window resize or a scale change keeps the proportions (test). One
+   `GestureDrag` on the Fixed classifies the press: a pill starts a tile drag, the gutter between
+   the columns (`Border::Columns`) or between two stacked tiles (`Border::Heights`) starts a
+   resize. A `EventControllerMotion` sets `ew-resize` / `ns-resize` from the same hit test, so the
+   cursor and the drag can never disagree. The border drag writes the share from the press value
+   plus the pointer delta on every update (`relayout(false)`, direct follow); every reset
+   (double-click) or close/add goes through `relayout(true)`. Minimums: `min_column_width` is one
+   grid column (`CELL_W`) or, when larger, the tab pill's own minimum (`PILL_W`, see the note
+   below); `min_slot_height` is `control-h + gap-s + CELL_H` (the pill plus one grid row), and
+   beyond four tiles `slot_minimum` also applies the existing half-visible-height floor.
+   `heights_after_drag` clamps the pair either side of the dragged border (a pair already below two
+   minimums cannot move). A double-click on a border sets equal shares (heights) or 0.5 (widths).
+   `heights_after_change` resets the shares of any column that gained or lost a tile (add and
+   close), keeps them through a swap or a same-column reorder, and `remove_tile` resets the width
+   share only when a column empties.
+   Timer, below: an equal 2 + 2 column's shares 0.5/0.5 dragged 120 px become 0.6069/0.3940 on a
+   1127 px available height, min 202, and the rects follow (684 / 444).
+
+4. **Pinned rows: click selects, double-click opens, only a drag moves.**
+
+   **The cause of "a plain click moves the row down one."** The pinned list's drag handler read the
+   pointer from `gdk::Event::position()` — **surface** coordinates — and subtracted the rows'
+   `compute_bounds` (window coordinates), then compared that with `GestureDrag`'s press point, which
+   GTK reports in **widget** coordinates. Those differ by the window's surface transform: GTK 4.22
+   draws its client-side shadow inside the surface and offsets the widget by it
+   (`gtk_window_native_get_surface_transform`, `gtk-4.22.4:gtk/gtkwindow.c:2274-2287`), and its own
+   event translation subtracts exactly that offset (`translate_event_coordinates`,
+   `gtk-4.22.4:gtk/gtkwidget.c:4954-4956`). On this machine the transform is 25 px: r2's blur log
+   prints `surface layout changed to 1322×1448` with the visible window `1272×1398 at (25, 25)`, and
+   that 25 px is the same value (`blur.rs::visible_geometry` reads `window.surface_transform()`).
+   So on every press `local − start` was **25 px**, which is past the 8 px `gtk-dnd-drag-threshold`:
+   the first `drag-update` (GTK emits one more on release — `gtkgesture.c:684-690`) claimed the
+   sequence, `drag-end` computed the drop slot from `start.1 + 25`, and a press in the lower ~39 px
+   of a 64 px row landed in the row below → `pin_order(n, from, from+1)`. The same 25 px also made
+   a real drag ride 25 px below the pointer (small enough to pass a live check).
+
+   The fix: `PinDrag` stores the rows' bounds **and** the window's transform; `pin_local` does
+   `surface − transform − bounds` for both the threshold and the drop, so the two are in one space
+   (`NativeExt::surface_transform`, `gtk4-0.11.5:src/auto/native.rs:60-73`). The threshold is now
+   measured as a delta (`drag_check_threshold(0, 0, local − start)`), and nothing is raised or moved
+   on the press: the raise, the claim, the click denial and the log all happen at the threshold.
+   `pin_release(n, row_h, from, pointer_y, n_press, moved)` is the pure decision: `!moved` is
+   `Select` (or `Open` at `n_press ≥ 2`), and only `moved` can produce `Reorder`. The click gesture
+   now passes `n_press`, so a double-click logs `pins: open <name>`; a single click selects the row
+   under the cursor; the same function drives the drag's commit. Tests:
+   `sidebar::tests::a_click_never_reorders` (every row, every offset, with a 25 px transform: the
+   local delta is 0 and the decision is `Select`), `only_a_past_threshold_press_reorders` (a real
+   drag reorders; a drag back to its own row does not; a double-click opens).
+
+### Unit tests added / changed (all in the look-body binary)
+
+- `split::tests::a_close_rebalances_two_or_more_apart` — 6 → 5 → 4 from one column ends 2 + 2, and
+  the tile that moved is the long column's bottom one; the mirror case too.
+- `split::tests::a_hand_made_layout_survives_a_close_that_leaves_one_gap` — hand-made 3 + 1 → 2 + 1.
+- `split::tests::closing_the_lone_tile_rebalances` — 3 + 1 with the lone tile closed → 2 + 1; 3 → 2
+  is one per column, full height.
+- `split::tests::dropping_on_a_tile_swaps_across_and_reorders_within`,
+  `dropping_in_a_gap_inserts_and_the_column_gets_longer` (between two, below the last, and a
+  same-column move), `a_drop_never_empties_a_column` (refused; a no-op drop is refused too),
+  `the_drop_zone_is_the_gap_plus_a_fifth_on_each_side`, `the_drop_line_spans_the_gap`.
+- `split::tests::border_drags_clamp_at_the_minimums` (height pair both ways, width both ways),
+  `a_double_click_resets_a_border_to_equal_shares`, `shares_survive_a_window_resize` (ratios at two
+  window sizes and at scale 0.5), `adding_or_closing_resets_that_column`.
+- Existing geometry tests updated to shares: `tiles_fill_the_height_and_split_the_width`,
+  `uneven_columns_make_their_tiles_taller`, `rects_never_overlap` (now also every insert),
+  `border_hit_test`, `drag_follows_the_pointer_and_previews_the_drop`, `hit_test`, `pill_hit_test`.
+- `sidebar::tests::a_click_never_reorders`, `only_a_past_threshold_press_reorders`.
+- `style::tests::nov_1_outlines_and_contrast` now also checks the `gl-drop-line` rule.
+
+### RULES.md's four commands, from `$SPIKE`
+
+`cargo fmt --check`:
+
+```text
+(no output; exit 0)
+```
+
+`cargo clippy --all-targets -- -D warnings`:
+
+```text
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.04s
+```
+
+`cargo test`:
+
+```text
+     Running unittests src/main.rs (target/debug/deps/gimbal_spike-27f41c3be3242da9)
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running unittests src/bin/look-body/main.rs (target/debug/deps/look_body-0c97cc23f4ccae67)
+test result: ok. 56 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running unittests src/bin/look-header/main.rs (target/debug/deps/look_header-4abd02268319d43d)
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+```
+
+`cargo build --release`:
+
+```text
+    Finished `release` profile [optimized] target(s) in 0.02s
+```
+
+### 10-second runs (release binary, from `/tmp/gimbal-spike-p1m-r3`, stopped with SIGTERM)
+
+Default, `--tiles 3`, and `--tiles 6 --pins 14 --scale 0.5` each produced an empty log:
+
+```text
+(no output)
+```
+
+No GTK warnings, CSS/theme/icon warnings or panics; the intermittent `VK_SUBOPTIMAL_KHR` notice did
+not appear in these runs.
+
+### Temporary timer logs (harness removed before delivery)
+
+Debug binary, `GIMBAL_SPIKE_LOG=1 look-body --tiles 4 --pins 14`, niri-tiled 1272 × 1398 (so the
+content column is narrow and the tiles are 77 px wide; the *model* numbers are what matter). One
+timer at 1.6 s: build six tiles, close two from the right column, then simulate a 120 px drag of
+the left column's first border.
+
+```text
+[gimbal-look-body 1.691] temp: item1 start: columns [[0, 2, 4], [1, 3, 5]] rects [Rect { x: 40, y: 0, w: 77, h: 563 }, Rect { x: 141, y: 0, w: 77, h: 563 }, Rect { x: 40, y: 587, w: 77, h: 563 }, Rect { x: 141, y: 587, w: 77, h: 563 }, Rect { x: 40, y: 1174, w: 77, h: 563 }, Rect { x: 141, y: 1174, w: 77, h: 563 }]
+[gimbal-look-body 1.691] split: closed 'Tab 6' from slot 5
+[gimbal-look-body 1.692] temp: item1 after close 5: columns [[0, 2, 4], [1, 3]] rects [Rect { x: 40, y: 0, w: 77, h: 563 }, Rect { x: 141, y: 0, w: 77, h: 564 }, Rect { x: 40, y: 587, w: 77, h: 563 }, Rect { x: 141, y: 588, w: 77, h: 564 }, Rect { x: 40, y: 1174, w: 77, h: 563 }]
+[gimbal-look-body 1.692] split: closed 'Tab 4' from slot 3
+[gimbal-look-body 1.692] temp: item1 after close 3: columns [[0, 2], [1, 3]] rects [Rect { x: 40, y: 0, w: 77, h: 564 }, Rect { x: 141, y: 0, w: 77, h: 564 }, Rect { x: 40, y: 588, w: 77, h: 564 }, Rect { x: 141, y: 588, w: 77, h: 564 }]
+[gimbal-look-body 1.692] temp: item3 avail 1127 min 202: shares [0.5, 0.5] -> [0.6069210292812778, 0.3939662821650399]; rects [Rect { x: 40, y: 0, w: 77, h: 684 }, Rect { x: 141, y: 0, w: 77, h: 564 }, Rect { x: 40, y: 708, w: 77, h: 444 }, Rect { x: 141, y: 588, w: 77, h: 564 }]
+```
+
+The first close leaves 3 + 2 (one apart, kept); the second leaves 3 + 1, the left column's bottom
+tile (id 4) moves across and the ids renumber, so the model is 2 + 2 and the rects are two equal
+stacks. Item 3: the dragged border's two slots go 563/563 → 684/444 on a 1127 px available
+height, and the untouched right column stays at 564.
+
+### Sizes and model changes (r3)
+
+| Where | Old | New |
+|---|---|---|
+| Column height | equal shares of the visible height, recomputed | stored shares per slot (reset on add/close, clamped to `min_slot_height` / the half floor) |
+| Column width | always 50 / 50 | stored left share, clamped to `min_column_width` |
+| Tile minimum height | `pill + gap + 1` | `control-h + gap-s + CELL_H` (202 at scale 1) during a border drag; the half-visible-height floor stays beyond four tiles |
+| Column minimum width | — | `max(CELL_W, PILL_W)` = 270 at scale 1 (see below) |
+| Drop line | — | new `.gl-drop-line`: `@accent_color`, `line-thin`, `radius-pill` |
+| Pinned pointer | raw surface − bounds | surface − surface transform − bounds |
+| Pinned press | raised + started a drag on press | nothing until the drag threshold; the raise, claim and click denial happen at the threshold |
+
+No colour expression changed (`gl-drop-line` reuses `OUTLINE`). The CSS still contains no
+`#rrggbb`, `rgb()`, `hsl()` or colour keyword other than `transparent`.
+
+### API citations (r3)
+
+- The window's surface transform is its client-side shadow offset:
+  `gtk-4.22.4:gtk/gtkwindow.c:2274-2287` (`get_shadow_width` minus the margin rect), installed as
+  the `GtkNative::get_surface_transform` vfunc at `:2362`; the default returns 0 at
+  `gtk-4.22.4:gtk/gtknative.c:74-92`.
+- Event coordinates are translated by that transform before controllers see them:
+  `gtk-4.22.4:gtk/gtkwidget.c:4936-4966` (the `event_x -= nx; event_y -= ny` at :4954-4956), then
+  `gtk_widget_compute_point` into the controller's widget (:4958-4961).
+- Gesture press points are relative to the widget allocation:
+  `gtk-4.22.4:gtk/gtkgesture.c:1271-1307` (`data->widget_x` from `_gtk_gesture_update_point`,
+  :500-503).
+- `GtkGestureDrag` emits `drag-begin` when the gesture is recognised on the press and one more
+  `drag-update` before `drag-end` on release: `gtk-4.22.4:gtk/gtkgesturedrag.c:83-136` (the
+  `begin`/`update`/`end` vfuncs) and `gtk-4.22.4:gtk/gtkgesture.c:655-700` (recognition and the
+  release path). It claims nothing on its own.
+- `gtk::Fixed` allocates each child its preferred size and honours the child transform in picking:
+  `gtk-4.22.4:gtk/gtkfixedlayout.c:297-322`; child transforms in hit testing
+  `gtk-4.22.4:gtk/gtkwidget.c:10440-10500`, and `gtk_widget_compute_transform` walking them at
+  `:10576-10635`.
+- gtk-rs: `NativeExt::surface_transform` at `gtk4-0.11.5:src/auto/native.rs:60-73`;
+  `WidgetExt::set_cursor_from_name` at `gtk4-0.11.5:src/auto/widget.rs:1168-1176`;
+  `EventControllerMotion::{connect_motion, connect_leave}` at
+  `gtk4-0.11.5:src/auto/event_controller_motion.rs:111` and `:87`;
+  `GestureExt::set_state` / `WidgetExt::drag_check_threshold` as cited in P1m.
+
+### Not verified live (Claude's check)
+
+- **The drop line**: its accent colour, position across the gap, thickness at scale 1.0 and 0.5, and
+  that it appears only for an accepted gap drop (and that the band feels right — the fifth-of-a-tile
+  band overlaps the neighbouring tiles by design, so dropping "on" a tile near a gap inserts
+  instead of swapping). [inferred]
+- **Border hover and drag feel**: the `ew-resize` / `ns-resize` cursor showing only over the
+  gutters, the border following the pointer without lag or jitter, the stop at the minimums, and
+  that a press on a pill still drags the tile (never the border). [inferred]
+- **Double-click on a border** resetting and animating (heights to equal shares, the column border
+  to the middle); the 200 ms reset and the 150/200 ms slides by eye. [inferred]
+- **The pinned click fix**: a single click now selects without moving the row, a double-click logs
+  `pins: open <name>`, and a drag still follows the pointer — now exactly under it instead of 25 px
+  below. The arithmetic and the decision are unit-tested, but no pointer was injected (RULES). The
+  cause's 25 px is read from the r2 blur log on this machine; a window without a client-side shadow
+  (transform 0) would not have shown the bug at all. [read + inferred]
+- The split view at the default 2560-wide window: my timer window was 1272 wide, where two pill-wide
+  columns do not fit and the model falls back to equal halves (77 px tiles, as in r2). [inferred]
+
+### Anything I'd change outside my files
+
+- **The column minimum is 270, not 97.** `look-style-spec.md` says a column never shrinks below one
+  grid column (`CELL_W`, 97). A tile's tab pill is `PILL_W` (270) wide and GTK will not shrink it
+  (`gtk_widget_measure` takes the child's minimum), and `GtkFixed` allocates the tile its preferred
+  size, so a 97 px column would draw a 270 px pill over its neighbour. `min_column_width` therefore
+  uses `max(CELL_W, PILL_W)`; it is *stricter* than the spec's floor. If Kyle wants the border to
+  reach 97, the pill has to be allowed to shrink (or the tile clipped) — one line in
+  `min_column_width`, but the pill's CSS `min-width` is the real limit. This is the only place where
+  I deliberately did not reach the stated number.
+- "One grid row" in the height minimum: I read it as `CELL_H` (144), i.e. `control-h + gap-s +
+  CELL_H` = 202 at scale 1. The tile's grid has a `gap-m` margin on each side that this does not
+  count; if Kyle means "one cell visible including the tile's inner margin", it is 234. One token
+  in `min_slot_height`.
+- `look-style-spec.md`'s shared-components table could gain `gl-drop-line` (accent, `line-thin`,
+  radius-pill) so Phase 2 has the rule in one place; I did not edit the spec.
+- The Phase 2 GResource note for the mockup SVGs from P1m still stands.
+
+## Review and live check of P1m-r3 (Claude, with Kyle's findings, Nov 1, 2026): needs fixes (P1m-r4-fixes.md)
+
+RULES.md's four commands pass (72 tests). The pinned-click cause fits: the handler compared a
+surface-coordinate pointer with a widget-coordinate press point, 25 px apart (GTK's client-side
+shadow), so every click looked like a 25 px drag. Live, release build, DP-3 off:
+
+- **Works:**
+  - 5 tiles start as 3 + 2.
+  - Dragging Tab 2 into the gap between Tab 1 and Tab 3 shows the accent drop line, then moves it
+    (`dropped at Insert { column: 0, row: 1 }`), giving 4 + 1 with Tab 4 alone at full visible
+    height.
+  - In 2 + 2, dragging the border between Tab 1 and Tab 2 down 200 px moves Tab 1's frame bottom
+    from y 742 to 941.
+- **Scrolling (Kyle; reproduced):** with 4 + 1, scrolling the split view down carries the lone tile
+  up and away, leaving the right half empty. Kyle chose: a column that fits in the view stays
+  pinned while the taller one scrolls.
+- **Vertical resize (Kyle: "doesn't work vertically"; explained):**
+  - Only the 24 px gap between a frame and the next slot grabs: a resize cursor at y 750–765, a
+    plain arrow from y 782 (beside the next pill).
+  - In a column of four, every tile is at the half-height floor, so nothing moves.
+  - The fix is to grab the whole strip and let hand drags go below the floor.
+- **Pinned rows (Kyle):** 64 px apart is too much; Kyle chose 44.

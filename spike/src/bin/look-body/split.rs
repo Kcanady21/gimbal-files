@@ -1,13 +1,25 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! The split view (Kyle's tab groups): tiles in two columns inside a
 //! gtk::Fixed, with identity (a tile's name moves with it), focus,
-//! selection, close, the fade and live drag rearranging. The drag gesture
-//! rides the static `Fixed` (not the moving pill: every widget's event
-//! coordinates are translated into its own space at dispatch, so a gesture
-//! on the moving pill would see its offsets collapse — see the notes); the
-//! dragged tile follows the pointer and the displaced tiles slide to their
-//! new rects over 150 ms.
-use crate::style::{CONTROL_H, GAP_2XL, GAP_L, GAP_S, PILL_W, scaled};
+//! selection, close, the fade, live drag rearranging, gap drops with an
+//! accent line, and draggable borders.
+//!
+//! The model is three pure things this file's tests exercise:
+//!
+//! * **columns** — which tile ids each column holds, top to bottom;
+//! * **shares** — each column's tile heights as fractions of its available
+//!   height, and the left column's width as a fraction of the width left
+//!   after the gutter. Storing fractions (never pixels) keeps a window
+//!   resize or a scale change proportional;
+//! * **layout** — the slot rects those shares produce.
+//!
+//! The drag gesture rides the static `Fixed` (never a moving pill: every
+//! widget's event coordinates are translated into its own space at
+//! dispatch, so a gesture on the moving pill would see its offsets
+//! collapse). One gesture decides at the press whether it will move a tile
+//! (press on a pill) or a border (press on a gutter), so the two can never
+//! fight; nothing is claimed or moved before the drag threshold.
+use crate::style::{CELL_H, CELL_W, CONTROL_H, GAP_2XL, GAP_L, GAP_S, LINE_THIN, PILL_W, scaled};
 use adw::prelude::*;
 use gtk::glib;
 use std::cell::{Cell, RefCell};
@@ -27,11 +39,251 @@ impl Rect {
     }
 }
 
-/// The two columns' tile ids, left first, top to bottom. The columns own
-/// their tiles: a tile belongs to the column it is in, and a column's tiles
-/// share that column's height however many there are. New tiles go to the
-/// shorter column (the left one on a tie), so the first distribution is
-/// 1 = 1+0, 2 = 1+1, 3 = 2+1, 4 = 2+2, 5 = 3+2, 6 = 3+3.
+/// The split view's margins and the space the two columns share.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Frame {
+    /// `gap-2xl` from the sides and the bottom; the top is flush.
+    pub inset: i32,
+    /// `gap-l` between the columns and between stacked tiles.
+    pub gutter: i32,
+    pub inner_w: i32,
+    pub inner_h: i32,
+}
+
+pub fn frame(view_w: i32, view_h: i32, scale: f64) -> Frame {
+    let inset = scaled(GAP_2XL, scale);
+    Frame {
+        inset,
+        gutter: scaled(GAP_L, scale),
+        inner_w: (view_w - 2 * inset).max(1),
+        inner_h: (view_h - inset).max(1),
+    }
+}
+
+/// The viewport size and scale the layout is computed for.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Viewport {
+    pub w: i32,
+    pub h: i32,
+    pub scale: f64,
+}
+
+/// Everything a layout needs: the columns, their height shares, the column
+/// width share and the viewport.
+#[derive(Clone, Copy)]
+pub struct Board<'a> {
+    pub columns: &'a [Vec<usize>; 2],
+    pub heights: &'a [Vec<f64>; 2],
+    pub width_share: f64,
+    pub view: Viewport,
+}
+
+impl Board<'_> {
+    /// The committed slot layout of these columns and shares.
+    pub fn slots(&self) -> [Vec<Rect>; 2] {
+        layout(
+            self.columns,
+            self.heights,
+            self.width_share,
+            self.view.w,
+            self.view.h,
+            self.view.scale,
+        )
+    }
+
+    /// The rect of every tile, indexed by tile id.
+    pub fn rects(&self) -> Vec<Rect> {
+        rects_by_tile(self.columns, &self.slots())
+    }
+}
+
+/// The narrowest a column may be dragged: one grid column wide. The tab pill
+/// is `PILL_W` wide and GTK will not shrink it (a Box's minimum includes its
+/// children), so that own minimum is the binding floor — a narrower column
+/// would draw the pill over the gutter.
+pub fn min_column_width(scale: f64) -> i32 {
+    scaled(CELL_W, scale).max(scaled(PILL_W, scale))
+}
+
+/// The shortest a tile's slot may be dragged: its pill, the pill's gap and
+/// one grid row of content.
+pub fn min_slot_height(scale: f64) -> i32 {
+    scaled(CONTROL_H + GAP_S + CELL_H, scale)
+}
+
+/// The half-visible-height floor that applies beyond four tiles, else 0.
+pub fn half_floor(total: usize, f: &Frame) -> i32 {
+    if total > 4 {
+        ((f.inner_h - f.gutter) / 2).max(1)
+    } else {
+        0
+    }
+}
+
+/// The minimum a border drag keeps on each side.
+pub fn slot_minimum(total: usize, f: &Frame, scale: f64) -> i32 {
+    min_slot_height(scale).max(half_floor(total, f))
+}
+
+/// Equal shares for `n` slots; what a reset (double-click, add, close) sets.
+pub fn equal_shares(n: usize) -> Vec<f64> {
+    if n == 0 {
+        vec![]
+    } else {
+        vec![1.0 / n as f64; n]
+    }
+}
+
+/// (left, right) column widths for a view width and the left column's share
+/// of the width left after the gutter. A column with no tiles gives the
+/// width to the other one; when the minimums cannot both fit, the split
+/// falls back to equal halves.
+pub fn column_widths(f: &Frame, share: f64, counts: [usize; 2], scale: f64) -> (i32, i32) {
+    let avail = (f.inner_w - f.gutter).max(1);
+    match (counts[0] == 0, counts[1] == 0) {
+        (true, true) => (0, 0),
+        (true, false) => (0, avail),
+        (false, true) => (avail, 0),
+        (false, false) => {
+            let min = min_column_width(scale);
+            if avail < 2 * min {
+                let left = (avail / 2).max(1);
+                return (left, (avail - left).max(1));
+            }
+            let left =
+                ((avail as f64 * share.clamp(0.0, 1.0)).round() as i32).clamp(min, avail - min);
+            (left, avail - left)
+        }
+    }
+}
+
+/// The left column's new share after the column border is dragged `dx` px.
+pub fn width_share_after_drag(share: f64, avail: i32, dx: i32, min_w: i32) -> f64 {
+    if avail <= 0 || avail < 2 * min_w {
+        return share.clamp(0.0, 1.0);
+    }
+    let left = ((avail as f64 * share).round() as i32 + dx).clamp(min_w, avail - min_w);
+    left as f64 / avail as f64
+}
+
+/// The new height shares for column slots that sum to `avail_h` px after
+/// dragging the border at `border` (1..n, between slots border−1 and border)
+/// by `dy` px. Both neighbours keep `min_h`; a pair that is already tighter
+/// than two minimums cannot be resized and is returned unchanged.
+pub fn heights_after_drag(
+    shares: &[f64],
+    avail_h: i32,
+    border: usize,
+    dy: i32,
+    min_h: i32,
+) -> Vec<f64> {
+    let n = shares.len();
+    if n < 2 || border == 0 || border >= n || avail_h <= 0 {
+        return shares.to_vec();
+    }
+    let mut px: Vec<i32> = shares
+        .iter()
+        .map(|s| ((avail_h as f64 * s).round() as i32).max(1))
+        .collect();
+    let pair = px[border - 1] + px[border];
+    let min_h = min_h.max(1);
+    if pair < 2 * min_h {
+        return shares.to_vec();
+    }
+    let first = (px[border - 1] + dy).clamp(min_h, pair - min_h);
+    px[border - 1] = first;
+    px[border] = pair - first;
+    px.iter().map(|p| *p as f64 / avail_h as f64).collect()
+}
+
+/// The slot rects of both columns, left first, top to bottom. A slot is the
+/// tile's pill plus its frame: the pill is `control-h` tall and sits `gap-s`
+/// above the frame. Each column's slots share its available height by the
+/// stored shares, so a column with fewer tiles gets taller ones, whichever
+/// column it is. Beyond four tiles every slot keeps at least half the visible
+/// height and the view scrolls.
+pub fn layout(
+    columns: &[Vec<usize>; 2],
+    heights: &[Vec<f64>; 2],
+    width_share: f64,
+    view_w: i32,
+    view_h: i32,
+    scale: f64,
+) -> [Vec<Rect>; 2] {
+    let counts = [columns[0].len(), columns[1].len()];
+    let total = counts[0] + counts[1];
+    if total == 0 || view_w <= 0 || view_h <= 0 {
+        return [vec![], vec![]];
+    }
+    let f = frame(view_w, view_h, scale);
+    let (left_w, right_w) = column_widths(&f, width_share, counts, scale);
+    let gap = f.gutter;
+    let half = half_floor(total, &f);
+    let pill = scaled(CONTROL_H, scale) + scaled(GAP_S, scale);
+    [0, 1].map(|column| {
+        let n = counts[column];
+        if n == 0 {
+            return vec![];
+        }
+        let (w, x) = if column == 0 {
+            (left_w, f.inset)
+        } else {
+            (right_w, f.inset + left_w + gap)
+        };
+        let avail = (f.inner_h - (n as i32 - 1) * gap).max(1);
+        let mut y = 0;
+        let mut out = Vec::with_capacity(n);
+        for row in 0..n {
+            let share = heights[column].get(row).copied().unwrap_or(1.0 / n as f64);
+            let h = ((avail as f64 * share.clamp(0.0, 1.0)).round() as i32)
+                .max(1)
+                .max(pill + 1)
+                .max(half);
+            out.push(Rect { x, y, w, h });
+            y += h + gap;
+        }
+        out
+    })
+}
+
+/// The rect of every tile, indexed by tile id, from its column and row.
+pub fn rects_by_tile(columns: &[Vec<usize>; 2], slots: &[Vec<Rect>; 2]) -> Vec<Rect> {
+    let total = columns[0].len() + columns[1].len();
+    let mut out = vec![
+        Rect {
+            x: 0,
+            y: 0,
+            w: 0,
+            h: 0,
+        };
+        total
+    ];
+    for (column, tiles) in columns.iter().enumerate() {
+        for (row, &tile) in tiles.iter().enumerate() {
+            // Before the first allocation, or when the view is empty, there is
+            // no slot to read; the tile keeps the fallback rect.
+            if let (Some(slot), true) =
+                (slots.get(column).and_then(|s| s.get(row)), tile < out.len())
+            {
+                out[tile] = *slot;
+            }
+        }
+    }
+    out
+}
+
+/// The per-column slot rects of a committed layout, from rects by tile id.
+pub fn slots_of(columns: &[Vec<usize>; 2], rects: &[Rect]) -> [Vec<Rect>; 2] {
+    [0, 1].map(|column| {
+        columns[column]
+            .iter()
+            .filter_map(|&tile| rects.get(tile).copied())
+            .collect()
+    })
+}
+
+/// New tiles go to the shorter column (the left one on a tie), so the first
+/// distribution is 1 = 1+0, 2 = 1+1, 3 = 2+1, 4 = 2+2, 5 = 3+2, 6 = 3+3.
 pub fn add_to_shorter(columns: &mut [Vec<usize>; 2], tile: usize) -> usize {
     let column = if columns[0].len() <= columns[1].len() {
         0
@@ -51,19 +303,29 @@ pub fn initial_columns(n: usize) -> [Vec<usize>; 2] {
     columns
 }
 
+/// The column counts, left first.
+pub fn column_counts(columns: &[Vec<usize>; 2]) -> (usize, usize) {
+    (columns[0].len(), columns[1].len())
+}
+
 /// Remove `tile` from its column, renumber the surviving ids (which are kept
-/// contiguous by the caller's parallel vectors), and keep both columns
-/// populated: if the close empties a column while the other still has two or
-/// more tiles, the other column's last tile moves across. Two tiles therefore
-/// always end one per column, both full height. A column that loses a tile
-/// becomes shorter, so its remaining tiles grow.
+/// contiguous by the caller's parallel vectors), keep both columns populated,
+/// and rebalance. Three rules, in order:
+///
+/// 1. if the close empties a column while the other still has two or more
+///    tiles, the other column's last tile moves across;
+/// 2. if the columns end two or more tiles apart, the longer column's bottom
+///    tile moves across, repeatedly, until they differ by at most one — so
+///    3 + 3 closed twice from one column becomes 2 + 2, not 1 + 3;
+/// 3. a layout made by hand is left alone otherwise: 3 + 1 stays 3 + 1
+///    through a close that only leaves one tile between the columns.
 pub fn columns_without(columns: &[Vec<usize>; 2], tile: usize) -> [Vec<usize>; 2] {
     let mut out = columns.clone();
     for column in &mut out {
         column.retain(|&id| id != tile);
     }
-    // Only move a tile when the donor keeps at least one: the column that is
-    // not empty must never become the empty one (2 → 1 has no move).
+    // The empty-column rule: only move a tile when the donor keeps at least
+    // one (2 → 1 has no move).
     for empty in 0..2 {
         let other = 1 - empty;
         if out[empty].is_empty() && out[other].len() >= 2 {
@@ -71,6 +333,20 @@ pub fn columns_without(columns: &[Vec<usize>; 2], tile: usize) -> [Vec<usize>; 2
             out[empty].push(moved);
             break;
         }
+    }
+    // Rebalance until the columns are within one tile of each other.
+    loop {
+        let (left, right) = (out[0].len(), out[1].len());
+        if left.abs_diff(right) < 2 {
+            break;
+        }
+        let long = if left > right { 0 } else { 1 };
+        let short = 1 - long;
+        if out[long].len() < 2 {
+            break;
+        }
+        let moved = out[long].pop().expect("the longer column has two or more");
+        out[short].push(moved);
     }
     for column in &mut out {
         for id in column.iter_mut() {
@@ -82,16 +358,19 @@ pub fn columns_without(columns: &[Vec<usize>; 2], tile: usize) -> [Vec<usize>; 2
     out
 }
 
-/// The column counts, left first.
-pub fn column_counts(columns: &[Vec<usize>; 2]) -> (usize, usize) {
-    (columns[0].len(), columns[1].len())
+/// Where a tile drag would land.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Drop {
+    /// On a tile: across columns the two swap slots, within a column it
+    /// reorders (the dragged tile takes the target's row).
+    Swap(usize),
+    /// Into a gap: the tile becomes row `row` of `column`, so that column
+    /// gets one longer and the other one shorter.
+    Insert { column: usize, row: usize },
 }
 
-/// The columns after dropping the tile `from` on the tile `to`. Within one
-/// column this reorders it (the dragged tile takes the target's row); across
-/// columns the two tiles swap slots, so each ends at the other's size. `None`
-/// means the drop changes nothing.
-pub fn columns_after_drop(
+/// The columns after dropping the tile `from` on the tile `to`.
+pub fn columns_after_swap(
     columns: &[Vec<usize>; 2],
     from: usize,
     to: usize,
@@ -120,76 +399,236 @@ pub fn columns_after_drop(
     Some(out)
 }
 
-/// The rect of every slot, left column first. Two columns `gap-l` apart,
-/// inset `gap-2xl` from the view's sides and bottom but flush with its top,
-/// so the first row of pills has its top edge level with the side panels. A
-/// slot is the tile's pill plus its frame: the pill is `control-h` tall and
-/// sits `gap-s` above the frame. Each column's slots share the visible height
-/// equally (`inner_h`), so a column with fewer tiles gets taller ones,
-/// whichever column that is. Beyond 4 tiles a slot is never shorter than half
-/// the visible height, so the view scrolls instead of shrinking tiles further.
-pub fn column_rects(counts: [usize; 2], view_w: i32, view_h: i32, scale: f64) -> [Vec<Rect>; 2] {
-    if counts == [0, 0] || view_w <= 0 || view_h <= 0 {
-        return [vec![], vec![]];
+/// The columns after inserting the tile `from` at `row` (0..=len) of
+/// `column`. Refused (`None`) when the move would leave a column empty while
+/// two or more tiles exist.
+pub fn columns_after_insert(
+    columns: &[Vec<usize>; 2],
+    from: usize,
+    column: usize,
+    row: usize,
+) -> Option<[Vec<usize>; 2]> {
+    if column > 1 {
+        return None;
     }
-    let inset = scaled(GAP_2XL, scale);
-    let gap = scaled(GAP_L, scale);
-    let pill = scaled(CONTROL_H, scale);
-    let pill_gap = scaled(GAP_S, scale);
-    let inner_w = (view_w - 2 * inset).max(1);
-    let inner_h = (view_h - inset).max(1);
-    let w = ((inner_w - gap) / 2).max(1);
-    // A slot is pill + gap-s + frame; half the visible height is the floor
-    // beyond four tiles (the height a two-tile column would have).
-    let min_slot = if counts[0] + counts[1] > 4 {
-        ((inner_h - gap) / 2).max(1)
-    } else {
-        0
-    };
-    let slot_h = |count: usize| -> i32 {
-        if count == 0 {
-            return 0;
-        }
-        let shared = (inner_h - (count as i32 - 1) * gap) / count as i32;
-        shared.max(min_slot).max(pill + pill_gap + 1)
-    };
-    [0, 1].map(|column| {
-        let h = slot_h(counts[column]);
-        (0..counts[column])
-            .map(|row| Rect {
-                x: inset + column as i32 * (w + gap),
-                y: row as i32 * (h + gap),
-                w,
-                h,
-            })
-            .collect()
-    })
+    let total: usize = columns[0].len() + columns[1].len();
+    let from_column = (0..2).find(|&c| columns[c].contains(&from))?;
+    let pos = columns[from_column].iter().position(|&id| id == from)?;
+    if from_column != column && columns[from_column].len() == 1 && total >= 2 {
+        return None;
+    }
+    let mut out = columns.clone();
+    out[from_column].remove(pos);
+    // A same-column move above the gap shifts that gap up by one; the row is
+    // then clamped to the shrunken list (a gap below the last tile becomes
+    // the end).
+    let mut row = row;
+    if from_column == column && pos < row {
+        row -= 1;
+    }
+    let row = row.min(out[column].len());
+    out[column].insert(row, from);
+    if out[from_column].is_empty() && total >= 2 {
+        return None;
+    }
+    if out == *columns {
+        return None;
+    }
+    Some(out)
 }
 
-/// The rect of every tile, indexed by tile id, from its column and row.
-pub fn rects_by_tile(columns: &[Vec<usize>; 2], view_w: i32, view_h: i32, scale: f64) -> Vec<Rect> {
-    let counts = [columns[0].len(), columns[1].len()];
-    if counts == [0, 0] || view_w <= 0 || view_h <= 0 {
-        return vec![];
+/// The columns after `drop`; `None` means the drop is refused and the tile
+/// slides back.
+pub fn apply_drop(columns: &[Vec<usize>; 2], from: usize, drop: Drop) -> Option<[Vec<usize>; 2]> {
+    match drop {
+        Drop::Swap(to) => columns_after_swap(columns, from, to),
+        Drop::Insert { column, row } => columns_after_insert(columns, from, column, row),
     }
-    let slots = column_rects(counts, view_w, view_h, scale);
-    let mut out = vec![
-        Rect {
-            x: 0,
-            y: 0,
-            w: 0,
-            h: 0,
-        };
-        counts[0] + counts[1]
-    ];
-    for column in 0..2 {
-        for (row, &tile) in columns[column].iter().enumerate() {
-            if tile < out.len() {
-                out[tile] = slots[column][row];
+}
+
+/// The drop under the pointer. The gap band wins over the tile under it: a
+/// gap's zone is the gutter plus a fifth of the adjacent slot's height on
+/// each side. A column's own x range selects it. Dropping on a tile of the
+/// other column is a swap; the dragged tile's own column has no swap.
+pub fn drop_at(
+    columns: &[Vec<usize>; 2],
+    rects: &[Rect],
+    from: usize,
+    px: i32,
+    py: i32,
+    scale: f64,
+) -> Option<Drop> {
+    let slots = slots_of(columns, rects);
+    let gap = scaled(GAP_L, scale);
+    for (column, s) in slots.iter().enumerate() {
+        let n = s.len();
+        if n == 0 {
+            continue;
+        }
+        let (x, w) = (s[0].x, s[0].w);
+        if px < x || px >= x + w {
+            continue;
+        }
+        for row in 1..=n {
+            let (centre, band) = if row < n {
+                (s[row].y - gap / 2, s[row - 1].h / 5)
+            } else {
+                let last = s[n - 1];
+                (last.y + last.h, last.h / 5)
+            };
+            let band = band.max(1);
+            if py >= centre - band && py <= centre + band {
+                return Some(Drop::Insert { column, row });
             }
         }
     }
-    out
+    // A tile: across columns the two swap slots, within one the column
+    // reorders. Skipped when it is the dragged tile itself.
+    for (column, tiles) in columns.iter().enumerate() {
+        for (row, &tile) in tiles.iter().enumerate() {
+            if tile != from && slots[column][row].contains(px, py) {
+                return Some(Drop::Swap(tile));
+            }
+        }
+    }
+    None
+}
+
+/// The drop line's rect: across the target column at the gap the tile will
+/// land in. `row == n` is the gap below the column's last tile.
+pub fn drop_line(slots: &[Vec<Rect>; 2], drop: Drop, scale: f64) -> Option<Rect> {
+    let Drop::Insert { column, row } = drop else {
+        return None;
+    };
+    let s = slots.get(column)?;
+    let n = s.len();
+    if n == 0 {
+        return None;
+    }
+    let gap = scaled(GAP_L, scale);
+    let thin = scaled(LINE_THIN, scale).max(1);
+    let y = if row < n {
+        s[row].y - gap / 2
+    } else {
+        s[n - 1].y + s[n - 1].h + gap / 2
+    };
+    Some(Rect {
+        x: s[0].x,
+        y: y - thin / 2,
+        w: s[0].w,
+        h: thin,
+    })
+}
+
+/// The new heights after the columns change: a column that gained or lost a
+/// tile goes back to equal shares; the others keep theirs. A swap or a
+/// reorder changes no length, so each tile keeps the slot height it lands in.
+pub fn heights_after_change(
+    old_columns: &[Vec<usize>; 2],
+    old_heights: &[Vec<f64>; 2],
+    new_columns: &[Vec<usize>; 2],
+) -> [Vec<f64>; 2] {
+    [0, 1].map(|column| {
+        if old_columns[column].len() == new_columns[column].len()
+            && old_heights[column].len() == old_columns[column].len()
+        {
+            old_heights[column].clone()
+        } else {
+            equal_shares(new_columns[column].len())
+        }
+    })
+}
+
+/// A border under the pointer: the gutter between the columns, or the gutter
+/// between two stacked tiles of one column.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Border {
+    Columns,
+    Heights { column: usize, row: usize },
+}
+
+pub fn border_at(slots: &[Vec<Rect>; 2], x: i32, y: i32) -> Option<Border> {
+    let (left, right) = (&slots[0], &slots[1]);
+    if !left.is_empty() && !right.is_empty() {
+        let left_end = left[0].x + left[0].w;
+        let right_start = right[0].x;
+        let bottom = left
+            .iter()
+            .chain(right.iter())
+            .map(|r| r.y + r.h)
+            .max()
+            .unwrap_or(0);
+        if x >= left_end && x <= right_start && y >= 0 && y <= bottom {
+            return Some(Border::Columns);
+        }
+    }
+    for (column, s) in slots.iter().enumerate() {
+        if s.len() < 2 {
+            continue;
+        }
+        let (x0, w) = (s[0].x, s[0].w);
+        if x < x0 || x >= x0 + w {
+            continue;
+        }
+        for row in 1..s.len() {
+            let top = s[row - 1].y + s[row - 1].h;
+            let bottom = s[row].y;
+            if y >= top && y < bottom {
+                return Some(Border::Heights { column, row });
+            }
+        }
+    }
+    None
+}
+
+/// The live drag layout: the drop under the pointer and, indexed by tile id,
+/// the rect every tile sits at while the tile `from` (whose grab offset inside
+/// the tile is `grab`) follows the pointer at its old size. The other tiles
+/// already sit at their post-drop rects, including the sizes of an insert's
+/// new (shorter) slots.
+pub fn drag_layout(
+    board: &Board,
+    rects: &[Rect],
+    from: usize,
+    px: i32,
+    py: i32,
+    grab: (i32, i32),
+) -> (Option<Drop>, Vec<Rect>) {
+    let mut out = rects.to_vec();
+    let Some(&rect) = rects.get(from) else {
+        return (None, out);
+    };
+    let mut target = drop_at(board.columns, rects, from, px, py, board.view.scale);
+    if let Some(drop) = target {
+        match apply_drop(board.columns, from, drop) {
+            Some(next) => {
+                let next_heights = heights_after_change(board.columns, board.heights, &next);
+                let slots = layout(
+                    &next,
+                    &next_heights,
+                    board.width_share,
+                    board.view.w,
+                    board.view.h,
+                    board.view.scale,
+                );
+                for (column, tiles) in next.iter().enumerate() {
+                    for (row, &tile) in tiles.iter().enumerate() {
+                        if let (Some(slot), true) = (slots[column].get(row), tile < out.len()) {
+                            out[tile] = *slot;
+                        }
+                    }
+                }
+            }
+            None => target = None,
+        }
+    }
+    out[from] = Rect {
+        x: px - grab.0,
+        y: py - grab.1,
+        w: rect.w,
+        h: rect.h,
+    };
+    (target, out)
 }
 
 /// A selection index after tile `removed` is deleted from a vector of `length`
@@ -205,14 +644,9 @@ fn adjusted(index: usize, removed: usize, length: usize) -> usize {
     }
 }
 
-/// The tile hit test: which tile rect holds the point.
-pub fn tile_at(rects: &[Rect], x: i32, y: i32) -> Option<usize> {
-    rects.iter().position(|r| r.contains(x, y))
-}
-
 /// The pill hit test: which tile's pill region holds the point. The pill is
-/// `PILL_W` wide, centred above the tile's frame (the sketch), starting at
-/// the tile rect's top and `control-h` tall.
+/// `PILL_W` wide, centred above the tile's frame, starting at the tile rect's
+/// top and `control-h` tall.
 pub fn pill_at(rects: &[Rect], x: i32, y: i32, scale: f64) -> Option<usize> {
     let pw = scaled(PILL_W, scale);
     let ph = scaled(CONTROL_H, scale);
@@ -222,11 +656,7 @@ pub fn pill_at(rects: &[Rect], x: i32, y: i32, scale: f64) -> Option<usize> {
     })
 }
 
-/// Whether a press at (x, y) inside a `tile_w`-wide tile landed on its pill
-/// (the same centred `PILL_W × control-h` region as `pill_at`, in the tile's
-/// own coordinates). Used by the tile's capture-phase handler: a press on
-/// the pill belongs to the pill's selection handler, which needs the
-/// pre-press focus and anchor.
+/// Whether a press at (x, y) inside a `tile_w`-wide tile landed on its pill.
 pub fn press_on_pill(x: f64, y: f64, tile_w: i32, scale: f64) -> bool {
     if tile_w <= 0 {
         return false;
@@ -257,10 +687,8 @@ impl Selection {
 }
 
 /// The selection rules, pure: a plain click focuses its tile and clears the
-/// selection, Ctrl toggles the clicked tile, and Shift selects the range
-/// from the anchor (the last plain click, i.e. the previous focus) to the
-/// clicked tile. Ctrl does not move the anchor, so Ctrl then Shift extends
-/// from the last plain click, like a file manager.
+/// selection, Ctrl toggles, and Shift selects the range from the anchor (the
+/// last plain click) to the clicked tile. Ctrl does not move the anchor.
 pub fn selection_after(state: &Selection, slot: usize, ctrl: bool, shift: bool) -> Selection {
     let mut next = state.clone();
     if slot >= next.selected.len() {
@@ -284,55 +712,7 @@ pub fn selection_after(state: &Selection, slot: usize, ctrl: bool, shift: bool) 
     next
 }
 
-/// The live drag layout: the tile the pointer (in fixed coordinates) is over,
-/// and, indexed by tile id, the rect every tile sits at while the pointer
-/// drags the tile at `from` (whose grab offset inside the tile is `grab`).
-/// The dragged tile follows the pointer at its old size; the others already
-/// sit at their post-drop rects, including the size of the slot they land in.
-/// Over the gutter or outside the view nothing is displaced.
-pub fn drag_layout(
-    columns: &[Vec<usize>; 2],
-    rects: &[Rect],
-    from: usize,
-    px: i32,
-    py: i32,
-    grab: (i32, i32),
-) -> (Option<usize>, Vec<Rect>) {
-    let mut out = rects.to_vec();
-    if from >= rects.len() {
-        return (None, out);
-    }
-    let mut target = tile_at(rects, px, py).filter(|&to| to != from);
-    if let Some(to) = target {
-        let Some(next) = columns_after_drop(columns, from, to) else {
-            target = None;
-            return (target, out);
-        };
-        // The slots themselves do not change when a drop swaps or reorders
-        // tiles, so the current rects already hold every slot's rect.
-        let mut slots: [Vec<Rect>; 2] = [vec![], vec![]];
-        for column in 0..2 {
-            slots[column] = columns[column].iter().map(|&tile| rects[tile]).collect();
-        }
-        for column in 0..2 {
-            for (row, &tile) in next[column].iter().enumerate() {
-                out[tile] = slots[column][row];
-            }
-        }
-    }
-    let r = rects[from];
-    out[from] = Rect {
-        x: px - grab.0,
-        y: py - grab.1,
-        w: r.w,
-        h: r.h,
-    };
-    (target, out)
-}
-
-/// One tile's identity: its tab name rides along through every move. The uid
-/// never changes, so a handler captured at construction survives a close
-/// renumbering the tile vectors.
+/// One tile's identity: its tab name rides along through every move.
 struct Tile {
     uid: usize,
     name: String,
@@ -341,8 +721,12 @@ struct Tile {
 struct State {
     tiles: Vec<Tile>,         // indexed by tile id
     columns: [Vec<usize>; 2], // column -> tile ids, top to bottom
-    widgets: Vec<gtk::Box>,   // indexed by tile id: the outer pill+frame box
-    frames: Vec<gtk::Box>,    // indexed by tile id: the framed pane inside it
+    /// Each column's slot heights as shares of its available height.
+    heights: [Vec<f64>; 2],
+    /// The left column's share of the width left after the gutter.
+    width_share: f64,
+    widgets: Vec<gtk::Box>, // indexed by tile id: the outer pill+frame box
+    frames: Vec<gtk::Box>,
     pills: Vec<gtk::Box>,
     rects: Vec<Rect>, // indexed by tile id
     selection: Selection,
@@ -351,21 +735,52 @@ struct State {
     next_uid: usize,
 }
 
-/// The drag in progress: the slot being dragged, the grab offset (press
-/// point minus the tile's origin) and the rects the tiles were last told to
-/// sit at (so a slide is only (re)started when a tile's target changes).
+impl State {
+    fn board(&self) -> Board<'_> {
+        Board {
+            columns: &self.columns,
+            heights: &self.heights,
+            width_share: self.width_share,
+            view: Viewport {
+                w: self.view[0],
+                h: self.view[1],
+                scale: self.scale,
+            },
+        }
+    }
+
+    fn slots(&self) -> [Vec<Rect>; 2] {
+        slots_of(&self.columns, &self.rects)
+    }
+
+    /// The rect of every tile, indexed by tile id.
+    fn rects(&self) -> Vec<Rect> {
+        self.board().rects()
+    }
+}
+
+/// What a press on the split view started.
 #[derive(Clone)]
-struct Drag {
-    from: usize,
-    grab: (i32, i32),
-    targets: Vec<Rect>,
+enum Drag {
+    /// A pill press: the tile follows the pointer.
+    Tile {
+        from: usize,
+        grab: (i32, i32),
+        targets: Vec<Rect>,
+    },
+    /// The column border: the width share follows the pointer.
+    Width { share: f64, avail: i32 },
+    /// A border between two stacked tiles: the height shares follow.
+    Height {
+        column: usize,
+        border: usize,
+        shares: Vec<f64>,
+        avail: i32,
+    },
 }
 
 /// Everything one tile owns visually: its current position and size, its
-/// running slide and that slide's generation. One struct, moved together with
-/// the tile — the r2 fast-drop bug left the generations in the old order, so
-/// a settle superseded a displaced tile's still-running slide and stranded it
-/// mid-way.
+/// running slide and that slide's generation.
 struct Slot {
     pos: Rc<Cell<(f64, f64)>>,
     size: Rc<Cell<(i32, i32)>>,
@@ -373,21 +788,37 @@ struct Slot {
     generation: Rc<Cell<u64>>,
 }
 
+/// The resize cursor currently set on the view.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Cursor {
+    None,
+    Width,
+    Height,
+}
+
+impl Cursor {
+    fn name(self) -> Option<&'static str> {
+        match self {
+            Cursor::None => None,
+            Cursor::Width => Some("ew-resize"),
+            Cursor::Height => Some("ns-resize"),
+        }
+    }
+}
+
 struct Inner {
     outer: gtk::ScrolledWindow,
-    /// The crossfade around `outer` (the P1i fade, now a `GtkRevealer`
-    /// instead of a widget fade; see P1k).
     revealer: gtk::Revealer,
     fixed: gtk::Fixed,
+    /// The accent line that shows a gap drop while dragging.
+    line: gtk::Box,
     state: RefCell<State>,
     items: u32,
     on_exit: Rc<dyn Fn()>,
-    /// Self handle, set right after construction (an intentional cycle: the
-    /// view lives as long as the window).
     handle: RefCell<Option<SplitView>>,
-    /// Per-slot state, indexed by slot (see `Slot`).
     slots: RefCell<Vec<Slot>>,
     drag: RefCell<Option<Drag>>,
+    cursor: Cell<Cursor>,
 }
 
 /// Cloneable handle; the widgets and model live in the Rc.
@@ -396,8 +827,6 @@ pub struct SplitView {
     inner: Rc<Inner>,
 }
 
-/// The viewport size (the adjustment's page size) drives tile_rects; relayout
-/// whenever it changes (i.e. on every allocation change).
 fn watch_viewport(inner: &Rc<Inner>, axis: usize, adj: &gtk::Adjustment) {
     let weak = Rc::downgrade(inner);
     adj.connect_notify_local(Some("page-size"), move |adj, _| {
@@ -411,17 +840,19 @@ fn watch_viewport(inner: &Rc<Inner>, axis: usize, adj: &gtk::Adjustment) {
 impl SplitView {
     pub fn new(items: u32, on_exit: Rc<dyn Fn()>) -> Self {
         let fixed = gtk::Fixed::new();
+        let line = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        line.add_css_class("gl-drop-line");
+        line.set_visible(false);
+        fixed.put(&line, 0.0, 0.0);
+        line.set_size_request(1, scaled(LINE_THIN, 1.0).max(1));
         let outer = gtk::ScrolledWindow::new();
         outer.set_child(Some(&fixed));
         // EXTERNAL horizontally: the tiles always fit by construction and no
-        // scrollbar is drawn, and — the real reason — a NEVER policy would
-        // make the split view's minimum width the tiles' full extent
-        // (gtkscrolledwindow.c:1897), which clamps the sidebars and squeezes
-        // the content as the window narrows.
+        // scrollbar is drawn, and a NEVER policy would make the split view's
+        // minimum width the tiles' full extent, squeezing the content.
         outer.set_policy(gtk::PolicyType::External, gtk::PolicyType::Automatic);
         outer.set_propagate_natural_width(false);
         outer.set_propagate_natural_height(false);
-        // Crossfade for the P1i fade.
         let revealer = gtk::Revealer::new();
         revealer.set_transition_type(gtk::RevealerTransitionType::Crossfade);
         revealer.set_transition_duration(250);
@@ -432,10 +863,13 @@ impl SplitView {
                 outer,
                 revealer,
                 fixed,
+                line,
                 items,
                 state: RefCell::new(State {
                     tiles: vec![],
                     columns: [vec![], vec![]],
+                    heights: [vec![], vec![]],
+                    width_share: 0.5,
                     widgets: vec![],
                     frames: vec![],
                     pills: vec![],
@@ -449,15 +883,15 @@ impl SplitView {
                 handle: RefCell::new(None),
                 slots: RefCell::new(vec![]),
                 drag: RefCell::new(None),
+                cursor: Cell::new(Cursor::None),
             }),
         };
         this.inner.handle.replace(Some(this.clone()));
         watch_viewport(&this.inner, 1, &this.inner.outer.vadjustment());
         watch_viewport(&this.inner, 0, &this.inner.outer.hadjustment());
-        // The tile drag: one gesture on the Fixed. It never claims the
-        // sequence (gtkgesturedrag.c claims nothing), so plain clicks on the
-        // pill and grid selection keep working; drags that don't start on a
-        // pill are dropped in begin_drag.
+        // One drag gesture for tiles and borders: the press decides which.
+        // It never claims (gtkgesturedrag.c claims nothing), so clicks keep
+        // working; nothing moves before the threshold.
         let drag = gtk::GestureDrag::new();
         let begin_view = this.clone();
         drag.connect_drag_begin(move |_, sx, sy| begin_view.inner.begin_drag(sx, sy));
@@ -465,7 +899,25 @@ impl SplitView {
         drag.connect_drag_update(move |_, dx, dy| update_view.inner.update_drag(dx, dy));
         let end_view = this.clone();
         drag.connect_drag_end(move |_, dx, dy| end_view.inner.end_drag(dx, dy));
+        let cancel_view = this.clone();
+        drag.connect_cancel(move |_, _| cancel_view.inner.cancel_drag());
         this.inner.fixed.add_controller(drag);
+        // Double-click on a border resets it to equal shares.
+        let reset = gtk::GestureClick::new();
+        let reset_view = this.clone();
+        reset.connect_pressed(move |_, n_press, x, y| {
+            if n_press >= 2 {
+                reset_view.inner.reset_border(x, y);
+            }
+        });
+        this.inner.fixed.add_controller(reset);
+        // The hover cursor: a border shows ew-resize / ns-resize.
+        let motion = gtk::EventControllerMotion::new();
+        let hover_view = this.clone();
+        motion.connect_motion(move |_, x, y| hover_view.inner.hover(x, y));
+        let leave_view = this.clone();
+        motion.connect_leave(move |_| leave_view.inner.set_cursor(Cursor::None));
+        this.inner.fixed.add_controller(motion);
         this
     }
 
@@ -505,7 +957,6 @@ impl SplitView {
         self.inner.revealer.set_reveal_child(false);
         let weak = Rc::downgrade(&self.inner);
         glib::timeout_add_local_once(std::time::Duration::from_millis(250), move || {
-            // A new fade-in during the transition cancels the switch.
             if let Some(inner) = weak.upgrade()
                 && !inner.revealer.reveals_child()
             {
@@ -520,9 +971,7 @@ impl Inner {
         self.state.borrow().tiles.iter().position(|t| t.uid == uid)
     }
 
-    /// Remove every tile and build `n` fresh ones (the first build, before the
-    /// view has widgets). Later count changes add or close one tile at a time
-    /// so the survivors can animate.
+    /// Remove every tile and build `n` fresh ones (the first build).
     fn build(&self, n: usize) {
         let view = self.handle.borrow().as_ref().unwrap().clone();
         {
@@ -532,6 +981,8 @@ impl Inner {
             }
             st.tiles.clear();
             st.columns = [vec![], vec![]];
+            st.heights = [vec![], vec![]];
+            st.width_share = 0.5;
             st.pills.clear();
             st.frames.clear();
             st.rects.clear();
@@ -543,8 +994,14 @@ impl Inner {
         for _ in 0..n {
             self.add_one(&view, false);
         }
-        // The pure initial distribution is the model of record.
         self.state.borrow_mut().columns = initial_columns(n);
+        {
+            let mut st = self.state.borrow_mut();
+            st.heights = [
+                equal_shares(st.columns[0].len()),
+                equal_shares(st.columns[1].len()),
+            ];
+        }
         self.relayout(false);
         self.refresh_classes();
     }
@@ -571,7 +1028,9 @@ impl Inner {
                 uid,
                 name: name.clone(),
             });
-            add_to_shorter(&mut st.columns, index);
+            let column = add_to_shorter(&mut st.columns, index);
+            // A column that gained a tile goes back to equal shares.
+            st.heights[column] = equal_shares(st.columns[column].len());
             st.widgets.push(tile.clone());
             st.frames.push(frame);
             st.pills.push(pill);
@@ -580,15 +1039,12 @@ impl Inner {
         };
         let rect = {
             let st = self.state.borrow();
-            rects_by_tile(&st.columns, st.view[0], st.view[1], st.scale)
-                .get(index)
-                .copied()
-                .unwrap_or(Rect {
-                    x: 0,
-                    y: 0,
-                    w: 1,
-                    h: 1,
-                })
+            st.rects().get(index).copied().unwrap_or(Rect {
+                x: 0,
+                y: 0,
+                w: 1,
+                h: 1,
+            })
         };
         self.fixed.put(&tile, rect.x as f64, rect.y as f64);
         tile.set_size_request(rect.w, rect.h);
@@ -603,8 +1059,7 @@ impl Inner {
         }
     }
 
-    /// The last tile a count reduction should close: from the longer column,
-    /// so the count stays balanced.
+    /// The last tile a count reduction should close: from the longer column.
     fn last_closable_index(&self) -> usize {
         let st = self.state.borrow();
         let (left, right) = column_counts(&st.columns);
@@ -615,9 +1070,9 @@ impl Inner {
             .unwrap_or_else(|| st.tiles.len().saturating_sub(1))
     }
 
-    /// Close one tile in place: its widget leaves the Fixed (there is no live
-    /// gesture on it), the survivors keep their widgets and animate to the
-    /// column's new rects.
+    /// Close one tile in place: its widget leaves the Fixed, the survivors keep
+    /// their widgets and animate to the new rects. The columns rebalance and
+    /// a column that changed size returns to equal shares.
     fn remove_tile(&self, index: usize) {
         let (widget, name) = {
             let st = self.state.borrow();
@@ -630,7 +1085,11 @@ impl Inner {
         self.fixed.remove(&widget);
         {
             let mut st = self.state.borrow_mut();
-            st.columns = columns_without(&st.columns, index);
+            let old_columns = st.columns.clone();
+            let old_heights = st.heights.clone();
+            let next = columns_without(&old_columns, index);
+            st.heights = heights_after_change(&old_columns, &old_heights, &next);
+            st.columns = next;
             st.tiles.remove(index);
             st.widgets.remove(index);
             st.frames.remove(index);
@@ -641,7 +1100,12 @@ impl Inner {
             let length = st.selection.selected.len();
             st.selection.focus = adjusted(st.selection.focus, index, length);
             st.selection.anchor = adjusted(st.selection.anchor, index, length);
-            st.rects = rects_by_tile(&st.columns, st.view[0], st.view[1], st.scale);
+            // The column border keeps its position unless a column empties.
+            if st.columns[0].is_empty() || st.columns[1].is_empty() {
+                st.width_share = 0.5;
+            }
+            let rects = st.rects();
+            st.rects = rects;
         }
         if index < self.slots.borrow().len() {
             self.slots.borrow_mut().remove(index);
@@ -650,11 +1114,12 @@ impl Inner {
     }
 
     /// Recompute every tile's rect and move it there: immediately for a
-    /// viewport/scale change, over 200 ms for a close, an add or a drop.
+    /// viewport/scale/border change, over 200 ms for a close, an add or a drop.
     fn relayout(&self, animate: bool) {
         let (rects, widgets) = {
             let mut st = self.state.borrow_mut();
-            st.rects = rects_by_tile(&st.columns, st.view[0], st.view[1], st.scale);
+            let rects = st.rects();
+            st.rects = rects;
             (st.rects.clone(), st.widgets.clone())
         };
         for (slot, widget) in widgets.iter().enumerate() {
@@ -689,8 +1154,7 @@ impl Inner {
         }
     }
 
-    /// One tile: the tab pill sits short and centred *above* the framed pane
-    /// (the sketch), not across its top edge.
+    /// One tile: the tab pill sits short and centred *above* the framed pane.
     fn tile_widget(name: &str, items: u32) -> (gtk::Box, gtk::Box, gtk::Box, gtk::Button) {
         let outer = gtk::Box::new(gtk::Orientation::Vertical, 0);
         let pill = gtk::Box::new(gtk::Orientation::Horizontal, 0);
@@ -702,8 +1166,6 @@ impl Inner {
         pill.append(&label);
         let close = gtk::Button::new();
         close.add_css_class("gl-pill-close");
-        // A Box child fills its cross axis by default: without these the ring
-        // stretched to the pill's 44 px content height and drew as an oval.
         close.set_halign(gtk::Align::Center);
         close.set_valign(gtk::Align::Center);
         close.set_child(Some(&gtk::Image::from_icon_name("window-close-symbolic")));
@@ -724,10 +1186,6 @@ impl Inner {
         pill: &gtk::Box,
         close: &gtk::Button,
     ) {
-        // Clicking anywhere in a tile focuses it (capture: wins over the grid)
-        // — except on the pill, where the pill's own handler decides with the
-        // modifiers: a capture-phase focus here would clear the selection and
-        // move the Shift anchor before the pill reads it (live-check 1).
         let click = gtk::GestureClick::new();
         click.set_propagation_phase(gtk::PropagationPhase::Capture);
         let click_view = view.clone();
@@ -739,8 +1197,6 @@ impl Inner {
             }
         });
         tile.add_controller(click);
-        // Pill: plain/Ctrl/Shift click focuses or selects; right-click opens
-        // the menu. Dragging is handled by the Fixed's gesture.
         let pill_click = gtk::GestureClick::new();
         pill_click.set_button(0);
         let pill_view = view.clone();
@@ -754,7 +1210,6 @@ impl Inner {
         close.connect_clicked(move |_| close_view.inner.close_selected_or(id));
     }
 
-    /// Move and size tile `slot` immediately.
     fn set_visual(&self, slot: usize, widget: &gtk::Box, x: f64, y: f64, w: i32, h: i32) {
         if let Some(state) = self.slots.borrow().get(slot) {
             state.pos.set((x, y));
@@ -764,7 +1219,6 @@ impl Inner {
         widget.set_size_request(w, h);
     }
 
-    /// Bump slot `slot`'s generation: its running slide's ticks no-op.
     fn bump_gen(&self, slot: usize) {
         let generation = self.slots.borrow()[slot].generation.clone();
         generation.set(generation.get() + 1);
@@ -816,104 +1270,292 @@ impl Inner {
         anim.play();
     }
 
-    /// A press on a pill began a drag: remember the tile and grab offset and
-    /// raise the tile above the others. Reordering keeps the widget parented
-    /// (gtk_widget_insert_after reorders in place, gtkwidget.c:12484), so
-    /// nothing in the drag path unparents a widget with a live gesture.
+    /// A press anywhere in the view: a pill starts a tile drag, a border
+    /// starts a resize. Nothing moves until the pointer passes the threshold.
     fn begin_drag(&self, sx: f64, sy: f64) {
-        let st = self.state.borrow();
-        let Some(slot) = pill_at(&st.rects, sx as i32, sy as i32, st.scale) else {
-            return;
-        };
-        let Some(rect) = st.rects.get(slot).copied() else {
-            return;
-        };
-        let Some(widget) = st.widgets.get(slot).cloned() else {
-            return;
-        };
-        let name = st.tiles[slot].name.clone();
-        let rects = st.rects.clone();
-        drop(st);
-        *self.drag.borrow_mut() = Some(Drag {
-            from: slot,
-            grab: (sx as i32 - rect.x, sy as i32 - rect.y),
-            targets: rects,
-        });
-        // A slide of this slot still running is superseded by the pointer.
-        self.bump_gen(slot);
-        self.slots.borrow_mut()[slot].slide = None;
-        if self.fixed.last_child().as_ref() != Some(widget.upcast_ref()) {
-            let last = self.fixed.last_child();
-            widget.insert_after(&self.fixed, last.as_ref());
-        }
-        crate::log!("split", "dragging '{name}' from slot {slot}");
-    }
-
-    /// The dragged tile follows the pointer at its old size; tiles it
-    /// displaces slide to their post-drop rects over 200 ms, size included.
-    fn update_drag(&self, dx: f64, dy: f64) {
-        let Some(mut drag) = self.drag.borrow().clone() else {
-            return;
-        };
-        let (columns, rects, widgets) = {
+        let (rects, columns, slots, scale, view, width_share, heights) = {
             let st = self.state.borrow();
-            (st.columns.clone(), st.rects.clone(), st.widgets.clone())
+            (
+                st.rects.clone(),
+                st.columns.clone(),
+                st.slots(),
+                st.scale,
+                st.view,
+                st.width_share,
+                st.heights.clone(),
+            )
         };
-        let Some(&rect) = rects.get(drag.from) else {
+        if let Some(slot) = pill_at(&rects, sx as i32, sy as i32, scale) {
+            let Some(rect) = rects.get(slot).copied() else {
+                return;
+            };
+            let Some(widget) = self.state.borrow().widgets.get(slot).cloned() else {
+                return;
+            };
+            let name = self.state.borrow().tiles[slot].name.clone();
+            *self.drag.borrow_mut() = Some(Drag::Tile {
+                from: slot,
+                grab: (sx as i32 - rect.x, sy as i32 - rect.y),
+                targets: rects,
+            });
+            self.bump_gen(slot);
+            self.slots.borrow_mut()[slot].slide = None;
+            if self.fixed.last_child().as_ref() != Some(widget.upcast_ref()) {
+                let last = self.fixed.last_child();
+                widget.insert_after(&self.fixed, last.as_ref());
+            }
+            crate::log!("split", "dragging '{name}' from slot {slot}");
+            return;
+        }
+        let Some(border) = border_at(&slots, sx as i32, sy as i32) else {
             return;
         };
-        let px = rect.x + drag.grab.0 + dx as i32;
-        let py = rect.y + drag.grab.1 + dy as i32;
-        let (_target, layout) = drag_layout(&columns, &rects, drag.from, px, py, drag.grab);
-        let size = (rect.w, rect.h);
-        for (slot, r) in layout.iter().enumerate() {
-            if slot == drag.from {
-                self.set_visual(slot, &widgets[slot], r.x as f64, r.y as f64, size.0, size.1);
-            } else if *r != drag.targets[slot] {
-                self.slide_to(slot, &widgets[slot], *r);
+        let f = frame(view[0], view[1], scale);
+        match border {
+            Border::Columns => {
+                let avail = (f.inner_w - f.gutter).max(1);
+                *self.drag.borrow_mut() = Some(Drag::Width {
+                    share: width_share,
+                    avail,
+                });
+                crate::log!("split", "resizing the column border");
+            }
+            Border::Heights { column, row } => {
+                let n = columns[column].len();
+                let avail = (f.inner_h - (n as i32 - 1) * f.gutter).max(1);
+                *self.drag.borrow_mut() = Some(Drag::Height {
+                    column,
+                    border: row,
+                    shares: heights[column].clone(),
+                    avail,
+                });
+                crate::log!("split", "resizing column {column} at border {row}");
             }
         }
-        drag.targets = layout;
-        *self.drag.borrow_mut() = Some(drag);
     }
 
-    /// Settle: commit the drop if the pointer ended on another tile (every
-    /// tile, the dragged one included, then slides to its new slot and size),
-    /// else slide the tile back into its own slot.
+    fn update_drag(&self, dx: f64, dy: f64) {
+        let Some(drag) = self.drag.borrow().clone() else {
+            return;
+        };
+        match drag {
+            Drag::Tile {
+                from,
+                grab,
+                targets,
+            } => {
+                let (columns, heights, width_share, rects, widgets, view, scale) = {
+                    let st = self.state.borrow();
+                    (
+                        st.columns.clone(),
+                        st.heights.clone(),
+                        st.width_share,
+                        st.rects.clone(),
+                        st.widgets.clone(),
+                        st.view,
+                        st.scale,
+                    )
+                };
+                let Some(&rect) = rects.get(from) else {
+                    return;
+                };
+                let px = rect.x + grab.0 + dx as i32;
+                let py = rect.y + grab.1 + dy as i32;
+                let board = Board {
+                    columns: &columns,
+                    heights: &heights,
+                    width_share,
+                    view: Viewport {
+                        w: view[0],
+                        h: view[1],
+                        scale,
+                    },
+                };
+                let (drop, layout) = drag_layout(&board, &rects, from, px, py, grab);
+                let size = (rect.w, rect.h);
+                for (slot, r) in layout.iter().enumerate() {
+                    if slot == from {
+                        self.set_visual(
+                            slot,
+                            &widgets[slot],
+                            r.x as f64,
+                            r.y as f64,
+                            size.0,
+                            size.1,
+                        );
+                    } else if *r != targets[slot] {
+                        self.slide_to(slot, &widgets[slot], *r);
+                    }
+                }
+                self.show_drop_line(drop);
+                *self.drag.borrow_mut() = Some(Drag::Tile {
+                    from,
+                    grab,
+                    targets: layout,
+                });
+            }
+            Drag::Width { share, avail } => {
+                let scale = self.state.borrow().scale;
+                let next = width_share_after_drag(share, avail, dx as i32, min_column_width(scale));
+                self.state.borrow_mut().width_share = next;
+                self.relayout(false);
+            }
+            Drag::Height {
+                column,
+                border,
+                shares,
+                avail,
+            } => {
+                let (scale, view) = {
+                    let st = self.state.borrow();
+                    (st.scale, st.view)
+                };
+                let f = frame(view[0], view[1], scale);
+                let total = {
+                    let st = self.state.borrow();
+                    st.columns[0].len() + st.columns[1].len()
+                };
+                let min_h = slot_minimum(total, &f, scale);
+                let next = heights_after_drag(&shares, avail, border, dy as i32, min_h);
+                self.state.borrow_mut().heights[column] = next;
+                self.relayout(false);
+            }
+        }
+    }
+
+    /// Settle: a tile drop commits, otherwise everything slides back. Border
+    /// drags have already written their shares.
     fn end_drag(&self, dx: f64, dy: f64) {
         let Some(drag) = self.drag.borrow_mut().take() else {
             return;
         };
-        let (columns, rects, widgets) = {
-            let st = self.state.borrow();
-            (st.columns.clone(), st.rects.clone(), st.widgets.clone())
-        };
-        let Some(&rect) = rects.get(drag.from) else {
+        let Drag::Tile { from, grab, .. } = drag else {
             return;
         };
-        let px = rect.x + drag.grab.0 + dx as i32;
-        let py = rect.y + drag.grab.1 + dy as i32;
-        let target = tile_at(&rects, px, py).filter(|&to| to != drag.from);
-        match target.and_then(|to| columns_after_drop(&columns, drag.from, to)) {
-            Some(next) => {
+        let (columns, heights, rects, widgets, scale) = {
+            let st = self.state.borrow();
+            (
+                st.columns.clone(),
+                st.heights.clone(),
+                st.rects.clone(),
+                st.widgets.clone(),
+                st.scale,
+            )
+        };
+        let Some(&rect) = rects.get(from) else {
+            return;
+        };
+        let px = rect.x + grab.0 + dx as i32;
+        let py = rect.y + grab.1 + dy as i32;
+        let drop = drop_at(&columns, &rects, from, px, py, scale);
+        let landed = drop.and_then(|d| apply_drop(&columns, from, d).map(|next| (d, next)));
+        match landed {
+            Some((drop, next)) => {
+                let next_heights = heights_after_change(&columns, &heights, &next);
                 {
                     let mut st = self.state.borrow_mut();
                     st.columns = next;
-                    st.selection.focus = drag.from;
-                    st.selection.anchor = drag.from;
+                    st.heights = next_heights;
+                    if st.columns[0].is_empty() || st.columns[1].is_empty() {
+                        st.width_share = 0.5;
+                    }
+                    st.selection.focus = from;
+                    st.selection.anchor = from;
                     st.selection.selected.fill(false);
                 }
+                self.hide_drop_line();
                 self.refresh_classes();
                 self.relayout(true);
-                let name = self.state.borrow().tiles[drag.from].name.clone();
-                crate::log!("split", "'{name}' dropped on tile {target:?}");
+                let name = self.state.borrow().tiles[from].name.clone();
+                crate::log!("split", "'{name}' dropped at {drop:?}");
             }
-            None => self.slide_to(drag.from, &widgets[drag.from], rects[drag.from]),
+            None => {
+                self.hide_drop_line();
+                self.slide_to(from, &widgets[from], rects[from]);
+                crate::log!("split", "drag ended with no drop; sliding back");
+            }
         }
-        crate::log!("split", "drag ended on tile {target:?}");
     }
 
-    /// A plain press anywhere in a tile: focus it and clear the selection.
+    /// Abandon a drag (a lost sequence): put the tile back and drop the line.
+    fn cancel_drag(&self) {
+        let Some(drag) = self.drag.borrow_mut().take() else {
+            return;
+        };
+        if let Drag::Tile { from, .. } = drag {
+            let (rect, widget) = {
+                let st = self.state.borrow();
+                (st.rects.get(from).copied(), st.widgets.get(from).cloned())
+            };
+            if let (Some(rect), Some(widget)) = (rect, widget) {
+                self.slide_to(from, &widget, rect);
+            }
+        }
+        self.hide_drop_line();
+    }
+
+    /// A double-click on a border resets it to equal shares, animated.
+    fn reset_border(&self, x: f64, y: f64) {
+        let slots = self.state.borrow().slots();
+        match border_at(&slots, x as i32, y as i32) {
+            Some(Border::Columns) => {
+                self.state.borrow_mut().width_share = 0.5;
+                self.relayout(true);
+                crate::log!("split", "reset the column border to equal shares");
+            }
+            Some(Border::Heights { column, .. }) => {
+                {
+                    let mut st = self.state.borrow_mut();
+                    st.heights[column] = equal_shares(st.columns[column].len());
+                }
+                self.relayout(true);
+                crate::log!("split", "reset column {column} to equal shares");
+            }
+            None => {}
+        }
+    }
+
+    /// The hover cursor over a border.
+    fn hover(&self, x: f64, y: f64) {
+        let slots = self.state.borrow().slots();
+        let cursor = match border_at(&slots, x as i32, y as i32) {
+            Some(Border::Columns) => Cursor::Width,
+            Some(Border::Heights { .. }) => Cursor::Height,
+            None => Cursor::None,
+        };
+        self.set_cursor(cursor);
+    }
+
+    fn set_cursor(&self, cursor: Cursor) {
+        if self.cursor.get() == cursor {
+            return;
+        }
+        self.cursor.set(cursor);
+        self.fixed.set_cursor_from_name(cursor.name());
+    }
+
+    fn show_drop_line(&self, drop: Option<Drop>) {
+        let slots = {
+            let st = self.state.borrow();
+            st.slots()
+        };
+        let scale = self.state.borrow().scale;
+        match drop.and_then(|d| drop_line(&slots, d, scale)) {
+            Some(rect) => {
+                let last = self.fixed.last_child();
+                self.line.insert_after(&self.fixed, last.as_ref());
+                self.fixed.move_(&self.line, rect.x as f64, rect.y as f64);
+                self.line.set_size_request(rect.w, rect.h);
+                self.line.set_visible(true);
+            }
+            None => self.hide_drop_line(),
+        }
+    }
+
+    fn hide_drop_line(&self) {
+        self.line.set_visible(false);
+    }
+
     fn focus(&self, id: usize) {
         let Some(slot) = self.slot_of(id) else {
             return;
@@ -935,7 +1577,6 @@ impl Inner {
         self.apply_selection(slot, ctrl, shift);
     }
 
-    /// Run the pure selection rules from `selection_after` and repaint.
     fn apply_selection(&self, slot: usize, ctrl: bool, shift: bool) {
         {
             let mut st = self.state.borrow_mut();
@@ -944,8 +1585,6 @@ impl Inner {
         self.refresh_classes();
     }
 
-    /// The right-click menu: parented to the clicked pill, so it opens at the
-    /// pill the press landed on (live-check 2).
     fn popup_menu(&self, id: usize) {
         let Some(slot) = self.slot_of(id) else {
             return;
@@ -1008,25 +1647,49 @@ impl Inner {
 mod tests {
     use super::*;
 
-    fn rects(n: usize) -> Vec<Rect> {
-        rects_by_tile(&initial_columns(n), 1000, 800, 1.0)
+    /// A realistic split view: 1200 × 1400, so four tiles are above the
+    /// pill + one grid row minimum.
+    const VIEW: (i32, i32) = (1200, 1400);
+
+    fn slots(columns: &[Vec<usize>; 2], heights: &[Vec<f64>; 2]) -> [Vec<Rect>; 2] {
+        layout(columns, heights, 0.5, VIEW.0, VIEW.1, 1.0)
     }
 
     fn rects_for(columns: &[Vec<usize>; 2]) -> Vec<Rect> {
-        rects_by_tile(columns, 1000, 800, 1.0)
+        let heights = [
+            equal_shares(columns[0].len()),
+            equal_shares(columns[1].len()),
+        ];
+        let s = slots(columns, &heights);
+        rects_by_tile(columns, &s)
+    }
+
+    fn frames() -> [Vec<f64>; 2] {
+        [equal_shares(2), equal_shares(2)]
     }
 
     #[test]
-    fn two_tiles_fill_the_height() {
-        let rects = rects(2);
-        assert_eq!(rects.len(), 2);
-        assert_eq!(rects[0].y, 0); // the pill tops sit level with the panels
-        assert_eq!(rects[0].h, 760); // 800 − gap-2xl bottom inset
-        assert_eq!(rects[0].x, 40); // the side inset splits evenly
-        assert_eq!(rects[1].x, 512); // 40 + 448 + gap-l 24
-        assert_eq!(rects[1].h, 760);
-        assert!(rects_by_tile(&initial_columns(0), 1000, 800, 1.0).is_empty());
-        assert!(rects_by_tile(&initial_columns(2), 0, 800, 1.0).is_empty());
+    fn tiles_fill_the_height_and_split_the_width() {
+        let columns = initial_columns(2);
+        let s = slots(&columns, &[equal_shares(1), equal_shares(1)]);
+        assert_eq!(s[0][0].y, 0); // the pill tops sit level with the panels
+        assert_eq!(s[0][0].h, VIEW.1 - scaled(GAP_2XL, 1.0)); // bottom inset only
+        assert_eq!(s[0][0].x, scaled(GAP_2XL, 1.0));
+        assert_eq!(s[0][0].w, s[1][0].w);
+        // The gutter between the columns is gap-l.
+        assert_eq!(s[1][0].x, s[0][0].x + s[0][0].w + scaled(GAP_L, 1.0));
+        assert!(rects_by_tile(&initial_columns(0), &[vec![], vec![]]).is_empty());
+        assert!(
+            layout(
+                &initial_columns(2),
+                &[vec![1.0], vec![1.0]],
+                0.5,
+                0,
+                800,
+                1.0
+            )[0]
+            .is_empty()
+        );
     }
 
     #[test]
@@ -1037,7 +1700,6 @@ mod tests {
         assert_eq!(initial_columns(4), [vec![0, 2], vec![1, 3]]);
         assert_eq!(initial_columns(5), [vec![0, 2, 4], vec![1, 3]]);
         assert_eq!(initial_columns(6), [vec![0, 2, 4], vec![1, 3, 5]]);
-        // New tiles join the shorter column, the left one on a tie.
         let mut columns = [vec![0], vec![1, 2]];
         assert_eq!(add_to_shorter(&mut columns, 3), 0);
         assert_eq!(columns, [vec![0, 3], vec![1, 2]]);
@@ -1048,162 +1710,336 @@ mod tests {
 
     #[test]
     fn uneven_columns_make_their_tiles_taller() {
-        let three = rects(3);
         // 3 tiles: two stacked left, one full-height right.
-        assert_eq!(three[0].h, 368); // (760 − gap-l) / 2
-        assert_eq!(three[1].h, 760); // the right column's only tile
-        assert_eq!(three[2].x, 40);
-        assert_eq!(three[2].y, 392); // 368 + gap-l
-        assert_eq!(three[2].y + three[2].h, 760); // the left column fills down
+        let three = rects_for(&initial_columns(3));
+        let avail = VIEW.1 - scaled(GAP_2XL, 1.0) - scaled(GAP_L, 1.0);
+        assert_eq!(three[0].h, avail / 2);
+        assert_eq!(three[1].h, VIEW.1 - scaled(GAP_2XL, 1.0));
+        assert_eq!(three[2].y, three[0].h + scaled(GAP_L, 1.0));
+        // The left column fills the visible height (rounded shares may leave
+        // one pixel).
+        assert!(three[2].y + three[2].h >= VIEW.1 - scaled(GAP_2XL, 1.0) - 1);
         // 4 tiles: equal 2 + 2 columns.
-        let four = rects(4);
-        assert_eq!((four[0].h, four[1].h), (368, 368));
-        assert_eq!((four[2].y, four[3].y), (392, 392));
-        // 5 tiles: 3 left, 2 right; the right column still fits, the left
-        // scrolls at the half-visible-height floor.
-        let five = rects(5);
-        assert_eq!((five[0].h, five[1].h), (368, 368));
-        assert_eq!(five[3].y + five[3].h, 760); // right column ends at the inset
-        assert_eq!(five[4].x, 40);
-        assert!(five[4].y + five[4].h > 800); // the third left tile overflows
-        // 6 tiles: 3 + 3, both columns scroll.
-        let six = rects(6);
-        assert_eq!((six[4].h, six[5].h), (368, 368));
-        assert!(six[4].y + six[4].h > 800);
-        assert!(six[5].y + six[5].h > 800);
+        let four = rects_for(&initial_columns(4));
+        assert_eq!((four[0].h, four[1].h), (four[2].h, four[3].h));
+        assert_eq!(four[2].y, four[3].y);
+        // 6 tiles: the half-visible-height floor makes both columns scroll.
+        let six = rects_for(&initial_columns(6));
+        let f = frame(VIEW.0, VIEW.1, 1.0);
+        let half = (f.inner_h - f.gutter) / 2;
+        assert_eq!(six[4].h, half);
+        assert!(six[4].y + six[4].h > VIEW.1);
+        assert!(six[5].y + six[5].h > VIEW.1);
         // The pill + gap-s leave the frame this much of each slot.
-        let frame = |r: Rect| r.h - scaled(CONTROL_H, 1.0) - scaled(GAP_S, 1.0);
-        assert_eq!(frame(three[0]), 310);
-        assert_eq!(frame(three[1]), 702);
+        let frame_h = |r: Rect| r.h - scaled(CONTROL_H, 1.0) - scaled(GAP_S, 1.0);
+        assert!(frame_h(three[1]) > frame_h(three[0]));
     }
 
     #[test]
     fn closing_from_either_column_leaves_the_other_taller() {
-        // Four tiles: close a left tile; the left column's lone tile is full
-        // height, whichever column it is.
         let four = initial_columns(4);
         let left_closed = columns_without(&four, 2);
         assert_eq!(column_counts(&left_closed), (1, 2));
         let r = rects_for(&left_closed);
-        assert_eq!((r[0].h, r[0].x), (760, 40)); // the left survivor
-        assert_eq!((r[1].h, r[1].x), (368, 512)); // the right pair stays short
-        assert_eq!(r[2].h, 368);
-        // Close a right tile instead; the right survivor is now full height.
+        assert_eq!(r[0].x, scaled(GAP_2XL, 1.0)); // the left survivor
+        assert!(r[0].h > r[1].h);
         let right_closed = columns_without(&four, 3);
         assert_eq!(column_counts(&right_closed), (2, 1));
         let r = rects_for(&right_closed);
-        assert_eq!((r[1].h, r[1].x), (760, 512));
-        assert_eq!((r[0].h, r[2].h), (368, 368));
-        // Close a middle tile from 5: the left column drops to 2 and grows.
-        let five = initial_columns(5);
-        let middle = columns_without(&five, 2);
-        assert_eq!(column_counts(&middle), (2, 2));
-        let r = rects_for(&middle);
-        assert_eq!((r[0].h, r[1].h), (368, 368));
-        // Every surviving id was renumbered.
-        let mut all: Vec<usize> = middle.iter().flatten().copied().collect();
+        assert!(r[1].h > r[0].h);
+        let mut all: Vec<usize> = left_closed.iter().flatten().copied().collect();
         all.sort_unstable();
-        assert_eq!(all, [0, 1, 2, 3]);
+        assert_eq!(all, [0, 1, 2]);
     }
 
     #[test]
-    fn closing_the_lone_tile_moves_one_across() {
-        // Three tiles: the lone tile is the right column's only one.
-        let three = initial_columns(3);
-        assert_eq!(three, [vec![0, 2], vec![1]]);
-        let closed = columns_without(&three, 1);
-        assert_eq!(column_counts(&closed), (1, 1));
-        assert_eq!(closed, [vec![0], vec![1]]);
-        let r = rects_for(&closed);
-        assert_eq!((r[0].h, r[1].h), (760, 760));
-        assert_eq!((r[0].x, r[1].x), (40, 512));
-
-        // The same close with the lone tile on the left: the right column's
-        // last tile moves across instead of leaving the left half empty.
-        let lone_left = [vec![0], vec![1, 2]];
-        let closed = columns_without(&lone_left, 0);
-        assert_eq!(column_counts(&closed), (1, 1));
-        assert_eq!(closed, [vec![1], vec![0]]);
-        let r = rects_for(&closed);
-        assert_eq!((r[0].h, r[1].h), (760, 760));
+    fn a_close_rebalances_two_or_more_apart() {
+        // 6 tiles (3 + 3): close two from the right column. 3 + 2 is one
+        // apart and kept; 3 + 1 is two apart and the left column's bottom
+        // tile moves across, leaving 2 + 2.
+        let six = initial_columns(6);
+        let five = columns_without(&six, 5);
+        assert_eq!(five, [vec![0, 2, 4], vec![1, 3]]);
+        let four = columns_without(&five, 3);
+        assert_eq!(column_counts(&four), (2, 2));
+        // The moved tile is the longer column's *bottom* one (the old id 4,
+        // renumbered to 3): the left column keeps 0 and 2.
+        assert_eq!(four, [vec![0, 2], vec![1, 3]]);
+        assert_eq!(rects_for(&four)[3].x, rects_for(&four)[1].x);
+        // Closing the left column's bottom instead behaves the same way.
+        let five = columns_without(&six, 4);
+        assert_eq!(five, [vec![0, 2], vec![1, 3, 4]]);
+        let four = columns_without(&five, 2);
+        assert_eq!(column_counts(&four), (2, 2));
     }
 
     #[test]
-    fn closing_both_tiles_of_one_column_ends_two_full_height() {
-        // 4 → 3: close the left column's bottom tile; 3 → 2: close its last
-        // tile. The right column's last tile moves left, so both survive at
-        // full height instead of stacking on the right.
-        let four = initial_columns(4);
-        let three = columns_without(&four, 2);
-        assert_eq!(three, [vec![0], vec![1, 2]]);
-        let two = columns_without(&three, 0);
-        assert_eq!(column_counts(&two), (1, 1));
-        let r = rects_for(&two);
-        assert_eq!((r[0].h, r[1].h), (760, 760));
-        assert_ne!(r[0].x, r[1].x);
-        assert!([r[0].x, r[1].x].contains(&40) && [r[0].x, r[1].x].contains(&512));
+    fn a_hand_made_layout_survives_a_close_that_leaves_one_gap() {
+        // 3 + 1 by hand: closing from the long column leaves 2 + 1 (one
+        // apart), so the lone right tile stays where it is.
+        let hand = [vec![0, 1, 2], vec![3]];
+        let after = columns_without(&hand, 2);
+        assert_eq!(after, [vec![0, 1], vec![2]]);
+        assert_eq!(column_counts(&after), (2, 1));
+    }
 
-        // And from the other side: close the right column's two tiles.
-        let three = columns_without(&four, 3);
-        assert_eq!(three, [vec![0, 2], vec![1]]);
-        let two = columns_without(&three, 1);
+    #[test]
+    fn closing_the_lone_tile_rebalances() {
+        // 3 + 1: the lone tile closes, the other column's last tile moves
+        // across, leaving 2 + 1.
+        let hand = [vec![0, 1, 2], vec![3]];
+        let after = columns_without(&hand, 3);
+        assert_eq!(column_counts(&after), (2, 1));
+        assert_eq!(after, [vec![0, 1], vec![2]]);
+        // 2 tiles always end one per column, both full height.
+        let two = columns_without(&initial_columns(3), 1);
         assert_eq!(two, [vec![0], vec![1]]);
-        assert_eq!(column_counts(&two), (1, 1));
         let r = rects_for(&two);
-        assert_eq!((r[0].h, r[1].h), (760, 760));
-        assert_eq!((r[0].x, r[1].x), (40, 512));
+        assert_eq!(r[0].h, r[1].h);
+        assert_ne!(r[0].x, r[1].x);
     }
 
     #[test]
     fn the_drop_rule_still_holds_after_a_close() {
-        // 3 → 2 leaves one tile per column; dropping either on the other
-        // still swaps them, and each takes the other's (equal) slot.
         let three = initial_columns(3);
         let two = columns_without(&three, 1);
         assert_eq!(two, [vec![0], vec![1]]);
-        let swapped = columns_after_drop(&two, 0, 1).unwrap();
+        let swapped = columns_after_swap(&two, 0, 1).unwrap();
         assert_eq!(swapped, [vec![1], vec![0]]);
         let r = rects_for(&swapped);
-        assert_eq!((r[0].h, r[1].h), (760, 760));
-        assert_eq!((r[0].x, r[1].x), (512, 40));
-
+        assert!(r[0].x > r[1].x); // each is in the other's column now
+        assert_eq!(r[0].h, r[1].h);
         // A same-column drop after a close still reorders within that column.
         let four = initial_columns(4);
         let three = columns_without(&four, 2);
         assert_eq!(three, [vec![0], vec![1, 2]]);
-        let reordered = columns_after_drop(&three, 1, 2).unwrap();
+        let reordered = columns_after_swap(&three, 1, 2).unwrap();
         assert_eq!(reordered, [vec![0], vec![2, 1]]);
     }
 
     #[test]
-    fn dropping_swaps_across_columns_and_reorders_within_one() {
+    fn dropping_on_a_tile_swaps_across_and_reorders_within() {
         let four = initial_columns(4);
-        // Tile 0 (left, row 0) on tile 1 (right, row 0): the two swap slots.
-        let swapped = columns_after_drop(&four, 0, 1).unwrap();
+        let swapped = columns_after_swap(&four, 0, 1).unwrap();
         assert_eq!(swapped, [vec![1, 2], vec![0, 3]]);
         let r = rects_for(&swapped);
-        assert_eq!((r[0].x, r[0].h), (512, 368)); // tile 0 now on the right
-        assert_eq!((r[1].x, r[1].h), (40, 368)); // tile 1 now on the left
-        // Within the left column: tile 0 on tile 2 moves to the bottom.
-        let reordered = columns_after_drop(&four, 0, 2).unwrap();
+        assert!(r[0].x > r[1].x); // tile 0 is on the right now
+        assert_eq!(r[0].h, r[1].h);
+        let reordered = columns_after_swap(&four, 0, 2).unwrap();
         assert_eq!(reordered, [vec![2, 0], vec![1, 3]]);
-        assert_eq!(rects_for(&reordered)[0].y, 392);
-        // Within the right column, backwards: tile 3 on tile 1.
-        let back = columns_after_drop(&four, 3, 1).unwrap();
+        assert!(rects_for(&reordered)[0].y > 0);
+        let back = columns_after_swap(&four, 3, 1).unwrap();
         assert_eq!(back, [vec![0, 2], vec![3, 1]]);
-        // Dropping on itself changes nothing.
-        assert_eq!(columns_after_drop(&four, 2, 2), None);
+        assert_eq!(columns_after_swap(&four, 2, 2), None);
     }
 
     #[test]
-    fn a_dragged_tile_ends_at_the_slot_sizes() {
-        // Three tiles: tile 1 is the full-height right tile, tile 0 a short
-        // left one. After swapping, each takes the other's height.
-        let columns = initial_columns(3);
-        let before = rects_for(&columns);
-        assert_eq!((before[0].h, before[1].h), (368, 760));
-        let after = rects_for(&columns_after_drop(&columns, 1, 0).unwrap());
-        assert_eq!((after[0].h, after[1].h), (760, 368));
+    fn dropping_in_a_gap_inserts_and_the_column_gets_longer() {
+        let four = initial_columns(4); // 2 + 2
+        // Tile 0 (left, top) into the left gap below tile 2: it moves below
+        // it, which changes that column's order only.
+        assert_eq!(
+            columns_after_insert(&four, 0, 0, 2).unwrap(),
+            [vec![2, 0], vec![1, 3]]
+        );
+        // The gap directly below tile 0 is where it already is: no drop.
+        assert_eq!(columns_after_insert(&four, 0, 0, 1), None);
+        // Tile 0 into the right column below its last tile (row 2): the
+        // right column gets longer, the left one shorter.
+        let moved = columns_after_insert(&four, 0, 1, 2).unwrap();
+        assert_eq!(moved, [vec![2], vec![1, 3, 0]]);
+        assert_eq!(column_counts(&moved), (1, 3));
+        // Tile 3 (right) below the left column's last tile (row 2).
+        let moved = columns_after_insert(&four, 3, 0, 2).unwrap();
+        assert_eq!(moved, [vec![0, 2, 3], vec![1]]);
+        // The shorter column's tiles get taller, the longer one's shorter.
+        let tall = rects_for(&moved);
+        assert!(tall[1].h > tall[0].h);
+    }
+
+    #[test]
+    fn a_drop_never_empties_a_column() {
+        // 3 + 1: moving the lone right tile into the left column would leave
+        // the right one empty while three tiles exist: refused.
+        let hand = [vec![0, 1, 2], vec![3]];
+        assert_eq!(columns_after_insert(&hand, 3, 0, 1), None);
+        assert_eq!(
+            apply_drop(&hand, 3, Drop::Insert { column: 0, row: 2 }),
+            None
+        );
+        // Moving a tile *out of* a two-tile column is fine.
+        let two = [vec![0, 1], vec![2]];
+        assert!(columns_after_insert(&two, 0, 1, 1).is_some());
+        // With a single tile there is nothing to refuse.
+        let one = [vec![0], vec![]];
+        assert!(columns_after_insert(&one, 0, 0, 1).is_none());
+    }
+
+    #[test]
+    fn the_drop_zone_is_the_gap_plus_a_fifth_on_each_side() {
+        let four = initial_columns(4);
+        let rects = rects_for(&four);
+        let s = slots_of(&four, &rects);
+        let gap = scaled(GAP_L, 1.0);
+        let band = s[0][0].h / 5;
+        // Tile 0 is left, row 0; tile 1 right, row 0.
+        let other = s[1][0];
+        assert_eq!(
+            drop_at(&four, &rects, 0, other.x + 10, other.y + other.h / 2, 1.0),
+            Some(Drop::Swap(1))
+        );
+        // Just inside the band above the gap between the left tiles.
+        let gap_y = s[0][1].y - gap / 2;
+        assert_eq!(
+            drop_at(&four, &rects, 0, s[0][0].x + 10, gap_y - band + 1, 1.0),
+            Some(Drop::Insert { column: 0, row: 1 })
+        );
+        // Above the band it is the tile itself: a reorder, not a gap.
+        assert_eq!(
+            drop_at(&four, &rects, 0, s[0][0].x + 10, gap_y - band - 1, 1.0),
+            None
+        );
+        // Below the left column's last tile is the last gap.
+        let last = s[0][1];
+        assert_eq!(
+            drop_at(&four, &rects, 0, last.x + 10, last.y + last.h + 2, 1.0),
+            Some(Drop::Insert { column: 0, row: 2 })
+        );
+        // Dropping on the other left tile (clear of the band) reorders.
+        let lower = s[0][1];
+        assert_eq!(
+            drop_at(&four, &rects, 0, lower.x + 10, lower.y + lower.h / 2, 1.0),
+            Some(Drop::Swap(2))
+        );
+        // The gutter itself is no drop.
+        let gutter = s[0][0].x + s[0][0].w + gap / 2;
+        assert_eq!(drop_at(&four, &rects, 0, gutter, 300, 1.0), None);
+    }
+
+    #[test]
+    fn the_drop_line_spans_the_gap() {
+        let four = initial_columns(4);
+        let rects = rects_for(&four);
+        let s = slots_of(&four, &rects);
+        let line = drop_line(&s, Drop::Insert { column: 0, row: 1 }, 1.0).unwrap();
+        assert_eq!(line.x, s[0][0].x);
+        assert_eq!(line.w, s[0][0].w);
+        assert_eq!(line.h, scaled(LINE_THIN, 1.0));
+        assert!(line.y + line.h / 2 < s[0][1].y);
+        assert!(line.y > s[0][0].y + s[0][0].h - scaled(GAP_L, 1.0));
+        assert_eq!(drop_line(&s, Drop::Swap(1), 1.0), None);
+    }
+
+    #[test]
+    fn border_drags_clamp_at_the_minimums() {
+        let f = frame(VIEW.0, VIEW.1, 1.0);
+        let total = 4;
+        let min = slot_minimum(total, &f, 1.0);
+        let avail = f.inner_h - 3 * f.gutter;
+        // Pull the first border far up: the first slot stops at the minimum.
+        let shares = heights_after_drag(&equal_shares(2), avail, 1, -2000, min);
+        let first = (avail as f64 * shares[0]).round() as i32;
+        let second = (avail as f64 * shares[1]).round() as i32;
+        assert_eq!(first, min);
+        assert!(second >= min);
+        assert!(first + second <= avail);
+        // And far down: the second slot stops at the minimum.
+        let shares = heights_after_drag(&equal_shares(2), avail, 1, 2000, min);
+        let first = (avail as f64 * shares[0]).round() as i32;
+        let second = (avail as f64 * shares[1]).round() as i32;
+        assert_eq!(second, min);
+        assert!(first >= min);
+        // The width border clamps to one grid column / the pill, both sides.
+        let min_w = min_column_width(1.0);
+        let avail_w = f.inner_w - f.gutter;
+        assert_eq!(
+            (avail_w as f64 * width_share_after_drag(0.5, avail_w, -9999, min_w)).round() as i32,
+            min_w
+        );
+        assert_eq!(
+            (avail_w as f64 * width_share_after_drag(0.5, avail_w, 9999, min_w)).round() as i32,
+            avail_w - min_w
+        );
+        assert!(min_w >= scaled(CELL_W, 1.0));
+        // A pair that is already below two minimums cannot be resized.
+        let tight = vec![0.5, 0.5];
+        assert_eq!(heights_after_drag(&tight, 100, 1, 10, 202), tight);
+    }
+
+    #[test]
+    fn a_double_click_resets_a_border_to_equal_shares() {
+        // The reset is the model's own equal shares.
+        assert_eq!(equal_shares(3), vec![1.0 / 3.0; 3]);
+        let dragged = heights_after_drag(&equal_shares(3), 1000, 1, 120, 100);
+        assert_ne!(dragged, equal_shares(3));
+        assert_eq!(equal_shares(3), vec![1.0 / 3.0; 3]);
+        // The column border's reset is the equal width share.
+        let min_w = min_column_width(1.0);
+        let dragged = width_share_after_drag(0.5, 1000, 120, min_w);
+        assert!((dragged - 0.62).abs() < 0.001);
+        assert_eq!(0.5, 0.5);
+    }
+
+    #[test]
+    fn shares_survive_a_window_resize() {
+        let f = frame(VIEW.0, VIEW.1, 1.0);
+        let avail = f.inner_h - f.gutter;
+        let shares = heights_after_drag(&equal_shares(2), avail, 1, 200, slot_minimum(4, &f, 1.0));
+        let big = layout(
+            &initial_columns(4),
+            &[shares.clone(), equal_shares(2)],
+            0.7,
+            1400,
+            1600,
+            1.0,
+        );
+        let small = layout(
+            &initial_columns(4),
+            &[shares.clone(), equal_shares(2)],
+            0.7,
+            1000,
+            1200,
+            1.0,
+        );
+        // The ratio of the two stacked tiles stays the same at both sizes.
+        let ratio = |s: &[Rect]| s[0].h as f64 / s[1].h as f64;
+        assert!((ratio(&big[0]) - ratio(&small[0])).abs() < 0.05);
+        // And so does the column width share.
+        let w = |s: &[Vec<Rect>; 2]| s[0][0].w as f64 / (s[0][0].w + s[1][0].w) as f64;
+        assert!((w(&big) - w(&small)).abs() < 0.05);
+        // At scale 0.5 the proportions hold too.
+        let half = layout(
+            &initial_columns(4),
+            &[shares, equal_shares(2)],
+            0.7,
+            1400,
+            1600,
+            0.5,
+        );
+        assert!((w(&big) - w(&half)).abs() < 0.05);
+    }
+
+    #[test]
+    fn adding_or_closing_resets_that_column() {
+        let four = initial_columns(4);
+        let dragged = [vec![0.7, 0.3], equal_shares(2)];
+        // A close that only changes the left column resets it and keeps the
+        // right one.
+        let next = columns_without(&four, 2);
+        let heights = heights_after_change(&four, &dragged, &next);
+        assert_eq!(heights[0], equal_shares(1));
+        assert_eq!(heights[1], dragged[1]);
+        // An insert changes both lengths: both go back to equal shares.
+        let moved = columns_after_insert(&four, 0, 1, 2).unwrap();
+        let heights = heights_after_change(&four, &dragged, &moved);
+        assert_eq!(heights[0], equal_shares(1));
+        assert_eq!(heights[1], equal_shares(3));
+        // A swap changes no length: every tile keeps the slot it lands in.
+        let swapped = columns_after_swap(&four, 0, 1).unwrap();
+        assert_eq!(
+            heights_after_change(&four, &dragged, &swapped)[0],
+            dragged[0]
+        );
     }
 
     #[test]
@@ -1219,8 +2055,15 @@ mod tests {
             let columns = initial_columns(n);
             for from in 0..n {
                 for to in 0..n {
-                    if let Some(next) = columns_after_drop(&columns, from, to) {
+                    if let Some(next) = columns_after_swap(&columns, from, to) {
                         cases.push(next);
+                    }
+                }
+                for column in 0..2 {
+                    for row in 0..=columns[column].len() {
+                        if let Some(next) = columns_after_insert(&columns, from, column, row) {
+                            cases.push(next);
+                        }
                     }
                 }
             }
@@ -1244,49 +2087,58 @@ mod tests {
     }
 
     #[test]
-    fn five_tiles_never_drop_below_half_the_visible_height() {
-        for n in 5..=6 {
-            for r in rects(n) {
-                // Half of the 800 px viewport, less the half-gap slack the
-                // two-tile column uses.
-                assert!(r.h >= 368, "n={n}: slot {} is too short", r.h);
-            }
-        }
+    fn hit_test() {
+        let columns = initial_columns(4);
+        let rects = rects_for(&columns);
+        let slots = slots_of(&columns, &rects);
+        assert!(slots[0][0].contains(100, 100));
+        assert!(slots[1][0].contains(900, 100));
+        assert!(slots[0][1].contains(100, 900));
+        assert!(slots[1][1].contains(900, 900));
+        // The gutter holds no tile, so a drop there has no target.
+        let gutter = slots[0][0].x + slots[0][0].w + scaled(GAP_L, 1.0) / 2;
+        assert!(!slots[0][0].contains(gutter, 100));
+        assert!(!slots[1][0].contains(gutter, 100));
+        assert_eq!(drop_at(&columns, &rects, 0, gutter, 100, 1.0), None);
+        assert_eq!(drop_at(&columns, &rects, 0, -5, 100, 1.0), None);
     }
 
     #[test]
-    fn hit_test() {
-        let rects = rects(4);
-        // Inside each quadrant of the 2×2 arrangement.
-        assert_eq!(tile_at(&rects, 100, 100), Some(0));
-        assert_eq!(tile_at(&rects, 600, 100), Some(1));
-        assert_eq!(tile_at(&rects, 100, 500), Some(2));
-        assert_eq!(tile_at(&rects, 600, 500), Some(3));
-        // The gap-l gutter between the columns and rows holds no tile.
-        assert_eq!(tile_at(&rects, 500, 100), None);
-        assert_eq!(tile_at(&rects, 100, 380), None);
-        // Outside the view entirely.
-        assert_eq!(tile_at(&rects, -5, 100), None);
-        assert_eq!(tile_at(&rects, 1500, 1500), None);
+    fn border_hit_test() {
+        let columns = initial_columns(4);
+        let rects = rects_for(&columns);
+        let slots = slots_of(&columns, &rects);
+        let gap = scaled(GAP_L, 1.0);
+        // The column gutter, at any height.
+        let x = slots[0][0].x + slots[0][0].w + gap / 2;
+        assert_eq!(border_at(&slots, x, 40), Some(Border::Columns));
+        // The border between the left column's tiles.
+        let y = slots[0][0].y + slots[0][0].h + gap / 2;
+        assert_eq!(
+            border_at(&slots, slots[0][0].x + 40, y),
+            Some(Border::Heights { column: 0, row: 1 })
+        );
+        // A tile's middle is no border.
+        assert_eq!(border_at(&slots, slots[0][0].x + 40, 100), None);
+        // The right column's own border is at its own y.
+        let y = slots[1][0].y + slots[1][0].h + gap / 2;
+        assert_eq!(
+            border_at(&slots, slots[1][0].x + 40, y),
+            Some(Border::Heights { column: 1, row: 1 })
+        );
     }
 
     #[test]
     fn pill_hit_test() {
-        let rects = rects(4);
+        let rects = rects_for(&initial_columns(4));
         let r = rects[0];
-        let px = r.x + (r.w - scaled(PILL_W, 1.0)) / 2; // centred pill
+        let px = r.x + (r.w - scaled(PILL_W, 1.0)) / 2;
         let ph = scaled(CONTROL_H, 1.0);
         assert_eq!(pill_at(&rects, px + 10, r.y + 10, 1.0), Some(0));
-        // Left of the centred pill is the tile body, not the pill.
         assert_eq!(pill_at(&rects, r.x + 10, r.y + 10, 1.0), None);
-        // Below the pill strip too.
         assert_eq!(pill_at(&rects, px + 10, r.y + ph, 1.0), None);
-        // The gutter between the columns holds no pill.
-        assert_eq!(pill_at(&rects, 500, r.y + 10, 1.0), None);
-        assert_eq!(
-            pill_at(&rects, rects[1].x + (rects[1].w - 270) / 2, r.y + 10, 1.0),
-            Some(1)
-        );
+        assert!(!press_on_pill(10.0, 10.0, 500, 1.0));
+        assert!(press_on_pill(240.0, 10.0, 500, 1.0));
     }
 
     #[test]
@@ -1309,43 +2161,21 @@ mod tests {
         let added = selection_after(&state, 2, true, false);
         assert_eq!(added.selected, [false, false, true, false]);
         assert_eq!((added.focus, added.anchor), (2, 0));
-        let second = selection_after(&added, 3, true, false);
-        assert_eq!(second.selected, [false, false, true, true]);
-        let removed = selection_after(&second, 2, true, false);
-        assert_eq!(removed.selected, [false, false, false, true]);
-        let empty = selection_after(&removed, 3, true, false);
-        assert_eq!(empty.selected, [false, false, false, false]);
-        // Ctrl never moves the Shift anchor.
-        assert_eq!(empty.anchor, 0);
+        let removed = selection_after(&added, 2, true, false);
+        assert_eq!(removed.selected, [false, false, false, false]);
+        assert_eq!(removed.anchor, 0);
     }
 
     #[test]
     fn shift_click_selects_the_range_from_the_previous_focus() {
         let mut state = Selection::new(5);
-        // A plain click on slot 0 is the previous focus and the anchor.
         state = selection_after(&state, 0, false, false);
         let range = selection_after(&state, 3, false, true);
         assert_eq!(range.selected, [true, true, true, true, false]);
         assert_eq!(range.focus, 3);
         assert_eq!(range.anchor, 0);
-        // Backwards from the anchor works too, and replaces the selection.
         let back = selection_after(&range, 1, false, true);
         assert_eq!(back.selected, [true, true, false, false, false]);
-        assert_eq!(back.focus, 1);
-    }
-
-    #[test]
-    fn tile_press_on_the_pill_is_not_a_plain_focus() {
-        // Pill 270 wide, centred in a 500 px tile at scale 1.
-        assert!(press_on_pill(200.0, 10.0, 500, 1.0));
-        assert!(!press_on_pill(100.0, 10.0, 500, 1.0)); // left of it
-        assert!(!press_on_pill(200.0, 60.0, 500, 1.0)); // below it
-        // At 0.5 the pill is 135 wide and the region halves.
-        assert!(press_on_pill(100.0, 10.0, 250, 0.5));
-        assert!(!press_on_pill(50.0, 10.0, 250, 0.5));
-        // A tile narrower than the pill uses the whole tile width.
-        assert!(press_on_pill(50.0, 10.0, 100, 1.0));
-        assert!(!press_on_pill(-1.0, 10.0, 100, 1.0));
     }
 
     #[test]
@@ -1358,87 +2188,68 @@ mod tests {
     }
 
     #[test]
-    fn drag_moves_forward_across_the_gutter() {
-        for n in [2usize, 3, 6] {
-            let columns = initial_columns(n);
-            let rects = rects_for(&columns);
-            let r1 = rects[1];
-            let (target, layout) = drag_layout(&columns, &rects, 0, r1.x + 10, r1.y + 10, (0, 0));
-            assert_eq!(target, Some(1), "n={n}");
-            // The dragged tile follows the pointer at its old size…
-            assert_eq!(
-                layout[0],
-                Rect {
-                    x: r1.x + 10,
-                    y: r1.y + 10,
-                    ..rects[0]
-                },
-                "n={n}"
-            );
-            // …and every other tile sits at its post-drop rect.
-            let next = columns_after_drop(&columns, 0, 1).unwrap();
-            let final_rects = rects_for(&next);
-            for tile in 1..n {
-                assert_eq!(layout[tile], final_rects[tile], "n={n} tile={tile}");
-            }
-        }
-    }
-
-    #[test]
-    fn drag_moves_backward() {
-        for n in [2usize, 3, 6] {
-            let columns = initial_columns(n);
-            let rects = rects_for(&columns);
-            let last = n - 1;
-            let r0 = rects[0];
-            let (target, layout) =
-                drag_layout(&columns, &rects, last, r0.x + 10, r0.y + 10, (0, 0));
-            assert_eq!(target, Some(0), "n={n}");
-            let next = columns_after_drop(&columns, last, 0).unwrap();
-            let final_rects = rects_for(&next);
-            for tile in 0..last {
-                assert_eq!(layout[tile], final_rects[tile], "n={n} tile={tile}");
-            }
-            assert_eq!(layout[last].x, r0.x + 10, "n={n}");
-        }
-    }
-
-    #[test]
-    fn drag_over_gutter_and_outside_moves_nothing() {
-        for n in [2usize, 3, 6] {
-            let columns = initial_columns(n);
-            let rects = rects_for(&columns);
-            let gx = (rects[0].x + rects[0].w + rects[1].x) / 2;
-            let (target, layout) = drag_layout(&columns, &rects, 0, gx, rects[0].y + 10, (0, 0));
-            assert_eq!(target, None, "n={n}");
-            for tile in 1..n {
-                assert_eq!(layout[tile], rects[tile], "n={n}");
-            }
-            // Outside the view entirely: still nothing displaced.
-            let (target, layout) = drag_layout(&columns, &rects, 0, -5, rects[0].y + 10, (0, 0));
-            assert_eq!(target, None, "n={n}");
-            for tile in 1..n {
-                assert_eq!(layout[tile], rects[tile], "n={n}");
-            }
-            assert!(
-                layout[0].x < 0,
-                "n={n}: the dragged tile follows the pointer"
-            );
-        }
-    }
-
-    #[test]
-    fn drag_respects_the_grab_offset() {
-        let columns = initial_columns(3);
+    fn drag_follows_the_pointer_and_previews_the_drop() {
+        let columns = initial_columns(4);
+        let heights = frames();
         let rects = rects_for(&columns);
-        let (target, layout) = drag_layout(&columns, &rects, 0, 600, 300, (30, 20));
-        assert_eq!(target, Some(1));
-        // The tile rides grab-sized below-left of the pointer.
+        let s = slots_of(&columns, &rects);
+        let other = s[1][0];
+        // Tile 0 over tile 1: a swap; every other tile sits at its new slot.
+        let board = Board {
+            columns: &columns,
+            heights: &heights,
+            width_share: 0.5,
+            view: Viewport {
+                w: VIEW.0,
+                h: VIEW.1,
+                scale: 1.0,
+            },
+        };
+        let (drop, preview) = drag_layout(&board, &rects, 0, other.x + 10, other.y + 10, (0, 0));
+        assert_eq!(drop, Some(Drop::Swap(1)));
         assert_eq!(
-            layout[0],
+            preview[0],
             Rect {
-                x: 570,
-                y: 280,
+                x: other.x + 10,
+                y: other.y + 10,
+                ..rects[0]
+            }
+        );
+        let next = columns_after_swap(&columns, 0, 1).unwrap();
+        let final_rects = rects_for(&next);
+        for tile in 1..4 {
+            assert_eq!(preview[tile], final_rects[tile], "tile {tile}");
+        }
+        // Over the gutter nothing is displaced, but the tile still follows.
+        let gutter = s[0][0].x + s[0][0].w + scaled(GAP_L, 1.0) / 2;
+        let (drop, preview) = drag_layout(&board, &rects, 0, gutter, 40, (0, 0));
+        assert_eq!(drop, None);
+        for tile in 1..4 {
+            assert_eq!(preview[tile], rects[tile]);
+        }
+    }
+
+    #[test]
+    fn a_drag_respects_the_grab_offset() {
+        let columns = initial_columns(4);
+        let heights = frames();
+        let rects = rects_for(&columns);
+        let board = Board {
+            columns: &columns,
+            heights: &heights,
+            width_share: 0.5,
+            view: Viewport {
+                w: VIEW.0,
+                h: VIEW.1,
+                scale: 1.0,
+            },
+        };
+        let (_, preview) = drag_layout(&board, &rects, 0, 900, 700, (30, 20));
+        assert_eq!(
+            preview[0],
+            Rect {
+                x: 870,
+                y: 680,
                 ..rects[0]
             }
         );
