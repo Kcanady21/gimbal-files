@@ -58,9 +58,9 @@ pub fn scaled(token: f64, scale: f64) -> i32 {
     if token > 0.0 { value.max(1) } else { value }
 }
 
-/// How much room is left for the path bar, and whether every pill still fits. The path
-/// bar takes every free pixel (no upper cap); it shrinks to its `PATH_MIN` first, and
-/// only when even that will not fit do the pills collapse.
+/// Whether every pill still fits, and how much width the free space would give the
+/// path bar. The header applies only `fits`; the path bar itself is `hexpand` with a
+/// constant `PATH_MIN × scale` request, so nothing measured becomes a minimum.
 pub fn header_fits(available: i32, pills: usize, scale: f64) -> Fit {
     let p = |token: f64| scaled(token, scale);
     let insets = 2 * p(HEADER_INSET);

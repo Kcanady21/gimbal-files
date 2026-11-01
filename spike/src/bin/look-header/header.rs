@@ -15,6 +15,7 @@ const FADE_MS: u64 = 200;
 struct DragState {
     index: usize,
     start_x: f64,
+    start_y: f64,
     base: f64,
     to: usize,
 }
@@ -82,7 +83,7 @@ pub fn show(app: &adw::Application, args: &Args) {
     row.append(&menu_button);
     for (icon, name) in [
         ("go-previous-symbolic", "back"),
-        ("go-forward-symbolic", "forward"),
+        ("go-next-symbolic", "forward"),
         ("go-up-symbolic", "up"),
     ] {
         let button = icon_button(icon, "nav");
@@ -139,9 +140,12 @@ pub fn show(app: &adw::Application, args: &Args) {
         win_buttons.push((button, *action));
     }
     // A ScrolledWindow with a zero minimum lets the header shrink while the path and pills
-    // re-flow; the row still receives the viewport's width.
+    // re-flow; the row still receives the viewport's width. `External` takes the branch at
+    // gtkscrolledwindow.c:1848-1850, so the child is not measured for size and the minimum
+    // is just `min_content_width` (1929-1932); it still updates the adjustment's page size
+    // (gtkviewport.c:178-184, 540), which is the width the header lays out to.
     let scroller = gtk::ScrolledWindow::new();
-    scroller.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Never);
+    scroller.set_policy(gtk::PolicyType::External, gtk::PolicyType::Never);
     scroller.set_min_content_width(0);
     scroller.set_propagate_natural_width(false);
     scroller.set_has_frame(false);
@@ -155,6 +159,7 @@ pub fn show(app: &adw::Application, args: &Args) {
         .css_classes(["gl-title"])
         .halign(gtk::Align::Center)
         .valign(gtk::Align::Center)
+        .vexpand(true)
         .build();
     body.append(&body_label);
     let root = vbox(&[]);
@@ -402,10 +407,10 @@ fn open_pill_menu(ui: &Rc<Ui>, index: usize, anchor: &gtk::Widget) {
     popover.popup();
 }
 
-/// The pointer's x on the surface. Not the gesture's own offset: the dragged pill moves
+/// The pointer's surface position. Not the gesture's own offset: the dragged pill moves
 /// under the pointer, which would corrupt widget-relative offsets.
-fn pointer_x(gesture: &gtk::GestureDrag) -> Option<f64> {
-    gesture.last_event(None)?.position().map(|(x, _)| x)
+fn pointer_pos(gesture: &gtk::GestureDrag) -> Option<(f64, f64)> {
+    gesture.last_event(None)?.position()
 }
 
 fn make_pill(
@@ -471,24 +476,38 @@ fn make_pill(
     drag.connect_drag_begin({
         let ui = ui.clone();
         move |gesture, _, _| {
-            if let Some(x) = pointer_x(gesture) {
-                ui.drag_begin(index, x);
+            if let Some((x, y)) = pointer_pos(gesture) {
+                ui.drag_begin(index, x, y);
             }
         }
     });
     drag.connect_drag_update({
         let ui = ui.clone();
-        move |gesture, offset_x, _| {
-            if let Some(x) = pointer_x(gesture) {
-                log!("drag", "update dx {offset_x:.1}");
-                ui.drag_move(x);
+        move |gesture, _, _| {
+            let Some((x, y)) = pointer_pos(gesture) else {
+                return;
+            };
+            let Some(state) = ui.drag.get() else { return };
+            let dx = x - state.start_x;
+            let dy = y - state.start_y;
+            // Claim once the surface distance from the press passes the drag threshold.
+            // Surface, not the gesture's widget-relative offset: the pill follows the
+            // pointer, so widget-relative dx stays near zero. Not in drag-begin: that
+            // would also deny the pill's own click gesture.
+            if let Some(pill) = gesture.widget()
+                && pill.drag_check_threshold(0, 0, dx.round() as i32, dy.round() as i32)
+                && gesture.set_state(gtk::EventSequenceState::Claimed)
+            {
+                log!("drag", "claimed the sequence at dx {dx:.1}");
             }
+            log!("drag", "update dx {dx:.1}");
+            ui.drag_move(x);
         }
     });
     drag.connect_drag_end({
         let ui = ui.clone();
         move |gesture, _, _| {
-            if let Some(x) = pointer_x(gesture) {
+            if let Some((x, _)) = pointer_pos(gesture) {
                 ui.drag_move(x);
             }
             ui.drag_end();
@@ -628,8 +647,7 @@ impl Ui {
         self.animate_group.set(None);
     }
 
-    /// Recompute the path width and the overflow decision. True if the pill display
-    /// has to be rebuilt.
+    /// Recompute the overflow decision. True if the pill display has to be rebuilt.
     fn update_layout(&self) -> bool {
         let scale = self.scale.get();
         let search = if self.search_open.get() {
@@ -644,12 +662,16 @@ impl Ui {
         };
         let count = self.model.borrow().entries.len();
         let fit = style::header_fits(self.available.get() - search - desktop, count, scale);
-        self.path.set_width_request(fit.path_width);
+        // Only a token minimum: the path then takes the free width with hexpand. Never
+        // feed the measured free/allocated width back in as a minimum (P1i-r3, item 2).
+        let path_min = style::scaled(style::PATH_MIN, scale);
+        self.path.set_width_request(path_min);
         log!(
             "layout",
-            "window {}, path {}, overflow {}",
+            "window {}, path min {}, fits {}, overflow {}",
             self.available.get(),
-            fit.path_width,
+            path_min,
+            fit.fits,
             !fit.fits
         );
         let collapsed = !fit.fits;
@@ -851,11 +873,12 @@ impl Ui {
         self.refresh();
     }
 
-    fn drag_begin(self: &Rc<Self>, index: usize, pointer_x: f64) {
+    fn drag_begin(self: &Rc<Self>, index: usize, pointer_x: f64, pointer_y: f64) {
         let base = index as f64 * self.pitch();
         self.drag.set(Some(DragState {
             index,
             start_x: pointer_x,
+            start_y: pointer_y,
             base,
             to: index,
         }));

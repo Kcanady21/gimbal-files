@@ -602,3 +602,336 @@ warnings. Search opens and pushes the pills and path bar right.
    Adwaita (`/usr/share/icons/Adwaita/symbolic/actions/` has `go-next-symbolic`). Use
    `go-next-symbolic`, and check every icon name the prototype uses against the installed theme.
 4. **Minor:** the placeholder title sits at the top of the body; the brief asked for it centred.
+
+## P1i-r3 changes
+
+Four fixes from the live check. Only `spike/src/bin/look-header/` (`header.rs`, `style.rs`) and this
+notes file changed; `Cargo.toml`, the other binaries and the review/live-check sections above are
+untouched, and every feature is kept.
+
+### 1. The pill claims the sequence after the drag threshold
+
+`make_pill`'s `drag_update` measures the **surface-coordinate** distance from the press
+(`gdk::Event::position`, the same source as `pointer_pos`) and, once
+`WidgetExt::drag_check_threshold(0, 0, dx, dy)` is true, calls
+`GestureExt::set_state(gtk::EventSequenceState::Claimed)` and logs
+`drag: claimed the sequence at dx …`. `set_state` returns true only on the state change, so the line
+appears once. `drag_begin` still only raises and moves the pill; it does not claim. The surface
+distance is required: the pill follows the pointer, so the gesture's widget-relative `dx` stays near
+zero and would never cross the threshold. A plain click never crosses the threshold, so the pill's
+click gesture still focuses pills.
+
+Why the claim stops the window move **[read]**:
+
+- `gtk_gesture_set_sequence_state` stores `CLAIMED` and calls
+  `gtk_widget_propagate_event_sequence_state` (`gtk-4.22.4:gtk/gtkgesture.c:1056-1059`).
+- That walk starts at the event widget and climbs the pick stack
+  (`gtk-4.22.4:gtk/gtkwidget.c:11903-11945`). On the claiming widget it only touches gestures that
+  already claimed; on each ancestor it calls `_gtk_widget_cancel_or_deny_sequence`
+  (`gtkwidget.c:11941`, implementation `gtkwidget.c:2382-2410`). That helper denies an ancestor
+  gesture whose phase runs before the claiming gesture and **cancels** one that runs after it
+  (`gtkwidget.c:2401-2408`). The `GtkWindowHandle`'s drag gesture is bubble-phase — gestures default
+  to `GTK_PHASE_BUBBLE` (`gtk-4.22.4:gtk/gtkeventcontroller.c:250`) — so it is cancelled, not merely
+  denied. Either way it is stopped.
+- The pill is a descendant of the handle and its bubble-phase gesture handles the motion event
+  first, so the handle's gesture is cancelled before the event reaches it. The window move starts in
+  `drag_gesture_update_cb`, which checks the threshold, claims, and calls
+  `gdk_toplevel_begin_move` (`gtk-4.22.4:gtk/gtkwindowhandle.c:424-437,458-462`). That gesture is
+  installed on the handle itself (`gtkwindowhandle.c:567-570`). It never reaches that code.
+- gtk-rs bindings used: `WidgetExt::drag_check_threshold`
+  (`gtk4-0.11.5:src/auto/widget.rs:250`), `GestureExt::set_state`
+  (`gtk4-0.11.5:src/auto/gesture.rs:198`), `EventSequenceState::Claimed`
+  (`gtk4-0.11.5:src/auto/enums.rs:4386`), `EventControllerExt::widget`
+  (`gtk4-0.11.5:src/auto/event_controller.rs:97`).
+
+A live drag should log several `drag: update dx …` lines with `dx` growing, one
+`drag: claimed the sequence at dx …`, then on release `tabs: moved pill N to M` if the order
+changed. There must be **no** `drag: cancel`; a cancel at the start of a drag means a regression
+(the unparent/reset one or a lost claim). The claim and update lines can come in either order for
+the same motion event. I could not do this live (no pointer injection), so the claim itself is
+**[inferred]** from the GTK source until Claude's drag.
+
+### 2. No measured width is fed back as a minimum
+
+- `update_layout` sets `path.set_width_request(PATH_MIN × scale)` — 320 px at 1.0, 160 px at 0.5 —
+  and the path keeps `hexpand`, so it takes the free header width by itself. `header_fits` is used
+  only for its `fits` result (the collapse decision). Its `path_width` is still computed because the
+  r1 tests assert it, but nothing applies it to a widget.
+- I chose **`PolicyType::External`** on the scroller's horizontal policy. With `External`,
+  `gtk_scrolled_window_measure` does not take the child-size branch: `need_child_size` is false
+  because the policy is not `NEVER` and `propagate_natural_width` is off
+  (`gtk-4.22.4:gtk/gtkscrolledwindow.c:1850`); the horizontal minimum falls through to
+  `MAX(0, min_content_width)` (`gtkscrolledwindow.c:1931`). The viewport still writes its allocation
+  width into the adjustment's `page-size` (`gtk-4.22.4:gtk/gtkviewport.c:178-184`), so the
+  `page-size` notify and `available` still drive the layout. Vertical policy stays `Never`, which
+  still propagates the header's 96 px height.
+- `grep -nE "set_width_request|set_size_request|set_min_content_width" src/bin/look-header/*.rs`:
+
+  ```text
+  header.rs:149:    scroller.set_min_content_width(0);
+  header.rs:668:        self.path.set_width_request(path_min);
+  ```
+
+  Both arguments are constants: zero and `PATH_MIN × scale`. No measured or allocated value becomes
+  a widget minimum; the only fixed window size is the required 2560×1440 default.
+
+**Test A: resize from a temporary timer.** `GIMBAL_LOOK_TEMP_TEST=resize`, release binary, started
+with `window.set_default_size(2560, 1400)` and later `(1500, 900)` from `timeout_add_local_once`;
+each report logs the scroller's page size, `header_fits(page, count, scale)`, the overflow state,
+the pill count, and the title/body bounds (the tuple is `(x, y, width, height, centre_y,
+centre_x)`). Run in `/tmp/gimbal-spike-p1ir3`, stopped by its own PID with SIGTERM.
+
+`--tabs 3`:
+
+```text
+[gimbal-look-header 0.082] layout: window 2560, path min 320, fits true, overflow false
+[gimbal-look-header 0.842] window: header window shown
+[gimbal-look-header 0.849] layout: window 1272, path min 320, fits false, overflow true
+[gimbal-look-header 2.644] test: set 2560x1400
+[gimbal-look-header 2.644] layout: window 2552, path min 320, fits true, overflow false
+[gimbal-look-header 3.843] test: before: page 2552, fits true, overflow false, pills 3, window h 1398, title Some((1236.0, 721.0, 80.0, 44.0, 743.0, 1276.0)), body Some((8.0, 96.0, 2536.0, 1294.0, 743.0, 1276.0))
+[gimbal-look-header 3.892] test: set 1500x900
+[gimbal-look-header 3.893] layout: window 1500, path min 320, fits false, overflow true
+[gimbal-look-header 5.093] test: narrow: page 1500, fits false, overflow true, pills 1, window h 900, title Some((710.0, 472.0, 80.0, 44.0, 494.0, 750.0)), body Some((8.0, 96.0, 1484.0, 796.0, 494.0, 750.0))
+[gimbal-look-header 6.844] test: narrow: page 1500, fits false, overflow true, pills 1, window h 900, title Some((710.0, 472.0, 80.0, 44.0, 494.0, 750.0)), body Some((8.0, 96.0, 1484.0, 796.0, 494.0, 750.0))
+```
+
+The page size follows the window down (2,552 → 1,500); the same resize flips `header_fits` from true
+to false and the strip from three pills to one. `--tabs 6` at 1,500:
+
+```text
+[gimbal-look-header 0.082] layout: window 2560, path min 320, fits false, overflow true
+[gimbal-look-header 0.122] window: header window shown
+[gimbal-look-header 0.128] layout: window 1272, path min 320, fits false, overflow true
+[gimbal-look-header 1.923] test: set 2560x1400
+[gimbal-look-header 1.924] layout: window 2552, path min 320, fits false, overflow true
+[gimbal-look-header 3.122] test: before: page 2552, fits false, overflow true, pills 1, window h 1398, title Some((1236.0, 721.0, 80.0, 44.0, 743.0, 1276.0)), body Some((8.0, 96.0, 2536.0, 1294.0, 743.0, 1276.0))
+[gimbal-look-header 3.172] test: set 1500x900
+[gimbal-look-header 3.173] layout: window 1500, path min 320, fits false, overflow true
+[gimbal-look-header 4.373] test: narrow: page 1500, fits false, overflow true, pills 1, window h 900, title Some((710.0, 472.0, 80.0, 44.0, 494.0, 750.0)), body Some((8.0, 96.0, 1484.0, 796.0, 494.0, 750.0))
+[gimbal-look-header 6.124] test: narrow: page 1500, fits false, overflow true, pills 1, window h 900, title Some((710.0, 472.0, 80.0, 44.0, 494.0, 750.0)), body Some((8.0, 96.0, 1484.0, 796.0, 494.0, 750.0))
+```
+
+Six pills do not fit at 2,552 either, so this run is collapsed at both widths; at 1,500 the log
+shows `fits false, overflow true, pills 1`, i.e. the six pills have collapsed to the single
+accordion pill. No GTK CSS or layout warning appeared in either run.
+
+**Test B: search open and close from a timer.** Same harness, `GIMBAL_LOOK_TEMP_TEST=search`, at
+2,560 wide (the live check's width): set the size, open search, wait, close search, and report the
+page size each time.
+
+```text
+[gimbal-look-header 0.082] layout: window 2560, path min 320, fits true, overflow false
+[gimbal-look-header 0.121] window: header window shown
+[gimbal-look-header 0.127] layout: window 1272, path min 320, fits false, overflow true
+[gimbal-look-header 1.922] test: set 2560x1400
+[gimbal-look-header 1.923] layout: window 2552, path min 320, fits true, overflow false
+[gimbal-look-header 3.121] test: wide: page 2552, fits true, overflow false, pills 3, window h 1398, title Some((1236.0, 721.0, 80.0, 44.0, 743.0, 1276.0)), body Some((8.0, 96.0, 2536.0, 1294.0, 743.0, 1276.0))
+[gimbal-look-header 3.171] layout: window 2552, path min 320, fits true, overflow false
+[gimbal-look-header 3.171] search: opened
+
+(look-header:36442): Gdk-WARNING **: 07:57:56.432: vkAcquireNextImageKHR(): A swapchain no longer matches the surface properties exactly, but can still be used to present to the surface successfully. (VK_SUBOPTIMAL_KHR) (1000001003)
+[gimbal-look-header 4.371] test: open: page 2552, fits true, overflow false, pills 3, window h 1398, title Some((1236.0, 721.0, 80.0, 44.0, 743.0, 1276.0)), body Some((8.0, 96.0, 2536.0, 1294.0, 743.0, 1276.0))
+[gimbal-look-header 4.371] layout: window 2552, path min 320, fits true, overflow false
+[gimbal-look-header 4.371] search: closed
+[gimbal-look-header 6.122] test: closed: page 2552, fits true, overflow false, pills 3, window h 1398, title Some((1236.0, 721.0, 80.0, 44.0, 743.0, 1276.0)), body Some((8.0, 96.0, 2536.0, 1294.0, 743.0, 1276.0))
+```
+
+Every `layout:` line is 2,552; the page size stays at the window width through open and close, and
+there is no `layout continuously requested` warning. The `Gdk-WARNING … VK_SUBOPTIMAL_KHR` is the
+intermittent Vulkan/niri swapchain notice, not a GTK CSS or layout warning and not produced by this
+code; it did not appear in the two delivery runs below.
+
+The harness (`GIMBAL_LOOK_TEMP_TEST`, `temp_test`, `temp_report`, the timers and the
+`compute_bounds` probe) is removed before delivery:
+`grep -rn "TEMP\|GIMBAL_LOOK_TEMP_TEST\|temp_test\|temp_report\|compute_bounds" src/bin/look-header/`
+prints nothing.
+
+### 3. Every icon name resolves in the installed Adwaita
+
+`go-forward-symbolic` does not exist in this theme; the Forward button now uses `go-next-symbolic`.
+Every icon name the prototype uses, and the file each resolves to under `/usr/share/icons/Adwaita/`
+(checked with `find /usr/share/icons/Adwaita -name '<name>.svg'`; none is a symlink, so `readlink -f`
+gives the same path) **[observed]**:
+
+| icon name | file under `/usr/share/icons/Adwaita/` |
+|---|---|
+| `open-menu-symbolic` | `symbolic/actions/open-menu-symbolic.svg` |
+| `go-previous-symbolic` | `symbolic/actions/go-previous-symbolic.svg` |
+| `go-next-symbolic` | `symbolic/actions/go-next-symbolic.svg` |
+| `go-up-symbolic` | `symbolic/actions/go-up-symbolic.svg` |
+| `system-search-symbolic` | `symbolic/actions/system-search-symbolic.svg` |
+| `view-refresh-symbolic` | `symbolic/actions/view-refresh-symbolic.svg` |
+| `user-trash-symbolic` | `symbolic/places/user-trash-symbolic.svg` |
+| `window-close-symbolic` | `symbolic/ui/window-close-symbolic.svg` |
+| `window-maximize-symbolic` | `symbolic/ui/window-maximize-symbolic.svg` |
+| `window-minimize-symbolic` | `symbolic/ui/window-minimize-symbolic.svg` |
+| `window-restore-symbolic` | `symbolic/ui/window-restore-symbolic.svg` |
+
+`go-forward-symbolic` returns no file, confirming the broken icon in the live check.
+
+### 4. The body title is centred
+
+The body label now has `vexpand(true)` as well as `halign/valign(Center)`. A vertical `GtkBox` gives
+a non-expanding child only its minimum height — the extra `size_given_to_child` is added only when
+`gtk_widget_compute_expand` is true (`gtk-4.22.4:gtk/gtkboxlayout.c:1055-1067`) — so `valign:
+center` had nothing to centre in before. With `vexpand`, the label gets the extra height, and
+`gtk_widget_size_allocate` applies `adjust_for_align` to centre it within that
+(`gtk-4.22.4:gtk/gtkwidget.c:3902-3923,4042-4045`).
+
+**[observed]** in the timer above, using `WidgetExt::compute_bounds` in window coordinates (the
+deprecated `allocation()` returned stale, margin-inclusive bounds and disagreed): at 2,552×1,398 the
+title is `(1236, 721, 80, 44)` with centre `(1276, 743)`, and the body box is `(8, 96, 2536, 1294)`
+with centre `(1276, 743)`. At 1,500×900 the title centre is `(750, 494)` and the body centre is
+`(750, 494)`. The title's centre equals the body's centre at both sizes.
+
+### The four RULES commands (P1i-r3 final run, from `spike/`)
+
+```text
+$ PATH="$HOME/.rustup/toolchains/1.95.0-x86_64-unknown-linux-gnu/bin:$PATH" cargo fmt --check
+(no output, exit 0)
+
+$ PATH="$HOME/.rustup/toolchains/1.95.0-x86_64-unknown-linux-gnu/bin:$PATH" cargo clippy --all-targets -- -D warnings
+    Checking gimbal-spike v0.0.0 (/home/kyle/Documents/03.) Code-Projects/gimbal-files/spike)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.17s
+(exit 0)
+
+$ cargo test
+     Running unittests src/main.rs (target/debug/deps/gimbal_spike-b2015085d72c48fe)
+running 4 tests
+test dnd::tests::extension_edge_cases ... ok
+test dnd::tests::conflicts_get_copies ... ok
+test tests::parses_cli ... ok
+test listing::tests::sorts_folders_first_then_names ... ok
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/look-body/main.rs (target/debug/deps/look_body-29a8f160103fcf7b)
+running 17 tests
+test grid::tests::counts_split ... ok
+test grid::tests::column_cap ... ok
+test split::tests::drag_moves_backward ... ok
+test split::tests::drag_respects_the_grab_offset ... ok
+test split::tests::drag_moves_forward ... ok
+test split::tests::drag_over_gutter_and_outside_moves_nothing ... ok
+test split::tests::four_tiles_fill_two_rows ... ok
+test split::tests::hit_test ... ok
+test split::tests::pill_hit_test ... ok
+test split::tests::six_tiles_scroll ... ok
+test split::tests::three_tiles_odd_left ... ok
+test split::tests::two_tiles_fill_the_height ... ok
+test style::tests::drive_classes ... ok
+test style::tests::scaling ... ok
+test tests::rejects_bad_input ... ok
+test tests::parses_cli ... ok
+test style::tests::spec_rules ... ok
+test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/look-header/main.rs (target/debug/deps/look_header-f6eea3612da1734e)
+running 5 tests
+test style::tests::drag_arithmetic ... ok
+test strip::tests::groups_close_and_move ... ok
+test tests::parses_cli ... ok
+test style::tests::header_fits_stretches_then_collapses ... ok
+test style::tests::spec_rules_and_css_shape ... ok
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+(exit 0)
+
+$ cargo build --release
+   Compiling gimbal-spike v0.0.0 (/home/kyle/Documents/03.) Code-Projects/gimbal-files/spike)
+    Finished `release` profile [optimized] target(s) in 0.85s
+(exit 0)
+```
+
+### 10-second runs (P1i-r3, release, SIGTERM by PID, no warnings)
+
+Both used the delivered binary in `/tmp/gimbal-spike-p1ir3`, run for 9 seconds and stopped by their
+own PID with SIGTERM. Neither printed a CSS, theme-parser, `Gtk-WARNING`, `Gtk-CRITICAL`,
+`Gdk-WARNING` or `layout continuously requested` line.
+
+```text
+$ GIMBAL_SPIKE_LOG=1 ./target/release/look-header --tabs 3
+[gimbal-look-header 0.085] layout: window 2560, path min 320, fits true, overflow false
+[gimbal-look-header 0.845] window: header window shown
+[gimbal-look-header 0.852] layout: window 1272, path min 320, fits false, overflow true
+exit=143
+
+$ GIMBAL_SPIKE_LOG=1 ./target/release/look-header --tabs 30 --scale 0.5
+[gimbal-look-header 0.083] layout: window 2560, path min 160, fits false, overflow true
+[gimbal-look-header 0.122] window: header window shown
+[gimbal-look-header 0.128] layout: window 1272, path min 160, fits false, overflow true
+exit=143
+
+$ grep -nE "Theme parser|Gtk-WARNING|Gtk-CRITICAL|Gdk-WARNING|continuously requested" deliver3.out deliver30.out
+(no output, exit 1)
+```
+
+The 1,272 px `layout:` lines are niri tiling the window to half the output; the page size follows
+it. **[observed]**
+
+### Not verified live (Claude does these)
+
+- The pill drag: that the claim cancels the `GtkWindowHandle`'s gesture before it starts the window
+  move, the pill following the pointer, the 150 ms slide, the release settle, the dragged pill
+  painting on top, and the expected `drag:` lines with no `drag: cancel`.
+- The body title's vertical centring on screen (measured centred in the allocation above).
+- That the path still visibly fills the free space with the constant 320 px minimum (the resize logs
+  show the page size, `fits` and the pill count, not the rendered path pixels).
+
+### Line count and process note
+
+`wc -l src/bin/look-header/*.rs`: `header.rs` 994, `style.rs` 274, `strip.rs` 208, `main.rs` 136
+(1,612). No line budget in this brief; all features kept.
+
+The timer runs and the two delivery runs used the binary's own PID (the working directory was set
+for the command rather than `cd … && binary &`, whose `$!` is the wrapper subshell). `pgrep -x
+look-header` was empty after every run and is empty at delivery. `/tmp/gimbal-spike-p1ir3`, which
+held only these logs, is removed. No pointer or keyboard injection and no `niri msg action` was
+used; the only process run was this binary.
+
+## Review of P1i-r3 (Claude, Nov 1, 2026)
+
+Read the diff (`header.rs`, `style.rs`) against the r3 brief. All four items are done as asked:
+the claim happens in `drag-update` once the surface distance passes `drag_check_threshold`;
+the path's minimum is the constant `PATH_MIN × scale` and the scroller's horizontal policy is
+`External`; the Forward button uses `go-next-symbolic` and the icon table checks out; the title
+has `vexpand`. RULES.md's four commands pass here too (32 tests). Nothing to correct in the code
+as delivered.
+
+## Live check of P1i-r3 (Claude, Nov 1, 2026): r3 items pass, one crash found (P1i-r4-fixes.md)
+
+Release build, floating window on DP-2 (DP-3 off). New for this check: the virtual pointer now
+also has a right button, Ctrl, Shift and Escape (still no typing keys), so menus and modifier
+clicks were tested for the first time.
+
+Passes:
+
+- **Pill drag (item 1).** Tab 1 dragged onto Tab 3's slot: the pill follows the pointer, the
+  others slide, it settles in slot 2 (`tabs: moved pill 0 to 2`). The window did not move (its
+  position is the same before and after) and there is no `drag: cancel`. The log has one
+  `drag: claimed the sequence at dx 9.0` per drag; it prints twice at the same timestamp because
+  the update handler runs twice for that motion. Cosmetic.
+- **Narrowing (item 2).** The window narrows to 1,500 and 1,100 (it couldn't before); the pills
+  collapse to "3 tabs" and the path ellipsizes. Widening restores the three pills. Search opened
+  and closed (Escape) three times at 2,560: the window stays 2,560 and every `layout:` line reads
+  2560.
+- **Icons and title (items 3, 4).** The Forward chevron is drawn; the title is centred.
+- **Menus.** Right-click on a pill opens its menu (Split View greyed with one tab selected,
+  Close, Open in New Window). Ctrl+click on two pills selects both and enables Split View.
+  The group pill's menu adds Rename… and Ungroup; Rename opens its dialog (Escape cancels) and
+  Ungroup restores the tabs. The main menu opens with its two items.
+- No GTK or Gdk warnings in the run.
+
+Needs fixing:
+
+1. **Split View crashes the app.** Choosing Split View with two tabs selected aborts with
+   `RefCell already mutably borrowed` at `header.rs:663` (`update_layout`'s
+   `self.model.borrow()`). Cause: `split_selected`'s timer runs
+   `if let Some(first) = ui.model.borrow_mut().group_selected() { …; ui.refresh(); }`, and the
+   `borrow_mut()` temporary in an `if let` scrutinee lives to the end of the block, so it is
+   still held when `refresh()` borrows the model. The panic is inside a GLib callback, which
+   cannot unwind, so the process aborts. This has been in the code since r1; no earlier live check
+   could reach it because Split View needs Ctrl+click. With the borrow taken into a `let` first
+   (tested locally, then reverted), grouping works: "Group 1 · 2 tabs" appears and its menu works.
+2. **Minor: clicking a pill doesn't end search.** With search open and empty, clicking a pill
+   makes that tab active, but the entry keeps focus and search stays open; only Escape closes it.
+   The pill doesn't take keyboard focus, so the entry's focus-leave never fires.
