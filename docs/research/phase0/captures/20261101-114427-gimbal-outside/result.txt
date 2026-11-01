@@ -1,0 +1,14 @@
+zen_opened_file: aborted
+note: stopped after select (intentional --stop-after)
+auto: true
+source: gimbal
+location: outside
+file: sample.png
+selection: selected
+click_at: (377, 167)
+drop_at: None
+title_before: Zen Browser
+raw_title: None
+matched_name: None
+aborted: stop-after select
+source_intact: yes

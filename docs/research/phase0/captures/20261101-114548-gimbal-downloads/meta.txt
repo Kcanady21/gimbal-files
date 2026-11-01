@@ -1,0 +1,9 @@
+date: 2026-11-01T11:45:57-05:00
+source: gimbal
+location: downloads
+source_version: gimbal-spike sha256:d690f6bc0a88
+zen_version: 1.24b
+zen_profile: gimbal-dnd (throwaway)
+moz_log_module: WidgetDrag
+niri_version: Compositor version: 26.04 (unknown commit)
+folder: /home/kyle/Downloads/gimbal-dnd-test-gimbal

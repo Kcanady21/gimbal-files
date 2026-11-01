@@ -1,0 +1,13 @@
+zen_opened_file: other
+note: auto:true source=thunar location=outside file=sample.png folder=/home/kyle/gimbal-dnd-test
+auto: true
+source: thunar
+location: outside
+file: sample.png
+selection: unverified
+click_at: (278, 220)
+drop_at: (1910, 803)
+title_before: Zen Browser
+raw_title: Problem loading page — Zen Browser
+matched_name: None
+source_intact: yes

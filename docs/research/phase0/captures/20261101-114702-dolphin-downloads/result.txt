@@ -1,0 +1,13 @@
+zen_opened_file: y
+note: auto:true source=dolphin location=downloads file=sample.png folder=/home/kyle/Downloads/gimbal-dnd-test
+auto: true
+source: dolphin
+location: downloads
+file: sample.png
+selection: selected
+click_at: (440, 224)
+drop_at: (1910, 803)
+title_before: Zen Browser
+raw_title: sample.png (PNG Image, 16 × 16 pixels) — Zen Browser
+matched_name: sample.png
+source_intact: yes
