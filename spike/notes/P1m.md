@@ -772,3 +772,11 @@ independent of its allocation, as asked. Live, release build, DP-3 off:
 - No GTK warnings, no panics.
 
 Every item from Kyle's P1m notes and the three reviews has now been seen working live.
+
+## Follow-up (Claude, Nov 1, 2026): 16 px after an open section
+
+Kyle found the space between the last directory name and the Devices pill too large and chose
+16 px. Claude changed it directly (one value): `section_tail` in `style.rs` is now
+`gap-m − section-gap` (10, plus the next section's 6 px top margin = 16), was `gap-xl − 6` (26),
+and the style test follows. RULES.md's four commands pass (65 tests). Live: the gaps after Recent
+Directories and Devices are 16 px; collapsed pills are unchanged.

@@ -133,7 +133,8 @@ pub fn css(scale: f64, font: Option<&str>, opacity: f64) -> String {
     let section_gap = p(SECTION_GAP);
     // The gap after an expanded section's content. The next section adds its
     // own 6 px top margin, so the content's bottom margin carries the rest.
-    let section_tail = (p(GAP_XL) - section_gap).max(0);
+    // Kyle, Nov 1: 16 px (gap-m) between an open section's content and the next pill.
+    let section_tail = (p(GAP_M) - section_gap).max(0);
     let (hair, thin, mid) = (p(LINE_HAIR), p(LINE_THIN), p(LINE_MID));
     let strip_pad = gm + mid;
     let (r, rp) = (p(RADIUS), p(RADIUS_PILL));
@@ -251,10 +252,10 @@ mod tests {
         assert!(!plain.contains(".gl-pinned { background-color"));
         assert!(plain.contains(".gl-pinned-row.sel { background-color:"));
         // Collapsed section pills are 6 apart; an expanded section's content
-        // sits 8 below its pill and 32 before the next pill (26 + the next
+        // sits 8 below its pill and 16 before the next pill (10 + the next
         // section's 6 px top margin).
         assert!(plain.contains(".gl-section { margin-top: 6px; }"));
-        assert!(plain.contains(".gl-section-content { margin: 8px 0 26px 0; }"));
+        assert!(plain.contains(".gl-section-content { margin: 8px 0 10px 0; }"));
         // The last section has no next pill, so it keeps no bottom gap.
         assert!(plain.contains(".gl-section:last-child .gl-section-content { margin-bottom: 0; }"));
         assert!(plain.contains(".gl-section-pill { all: unset; min-height: 28px; margin: 0 16px;"));
