@@ -4,8 +4,8 @@
 # Every value below was calibrated in Claude's live check on Oct 31, 2026
 # (NOTES-autodrag.md, "Live check").  The offsets assume DP-2 at 2560x1440
 # with the 34 px Noctalia bar; re-measure if either changes.  An app with
-# no AT-SPI item and no first_item_offset aborts with "unconfigured"
-# instead of clicking blind.
+# no AT-SPI item and no first_item_offset/item_offsets aborts with
+# "unconfigured" instead of clicking blind.
 
 [workspace]
 # Calibrated live, Oct 31 (Claude): `move-floating-window -x 40 -y 40` puts
@@ -100,6 +100,28 @@ window_offset_correction = [0, 0]
 # The name is historical: this points at sample.png, not at whichever
 # item is first.  Re-measure if the window size changes.
 first_item_offset = [335, 141]
+
+[app.gimbal]
+# AT-SPI (P1g probe, Oct 31, 2026): the GTK4 GridView DOES expose its rows.
+# Launched `gimbal-spike /tmp/gimbal-spike-p1g-probe`; the AT-SPI app named
+# "gimbal-spike" (matched by pid) had 50 nodes and one role "table cell" per
+# row, named sample-dir / sample-link.png / sample.png / sample.txt, all
+# SELECTABLE, with window-relative extents (0/141/282/423, 46, 141x94) at the
+# default 900x600 window.  Launching with `--select sample.png,sample.txt`
+# showed both cells STATE_SELECTED.  So the runner clicks via AT-SPI; the
+# offsets below are only the fallback for a future GTK that stops exposing
+# the cells.
+atspi_items = true
+# GTK4 frame == niri tile in the Phase 0 probes (nautilus); the spike is the
+# same toolkit.  Calibrate live with --stop-after select if the click misses.
+window_offset_correction = [0, 0]
+# Per-file fallback offsets, window-relative, ONLY used when AT-SPI exposes
+# no row.  TOML has no null, so [] is the unset marker: every value stays []
+# until Claude calibrates it live (a missing/empty value aborts with
+# "unconfigured" rather than clicking blind).
+# The spike's sort order is folders first, then display name (case-
+# insensitive): sample-dir, sample-link.png, sample.png, sample.txt.
+item_offsets = { "sample.png" = [], "sample.txt" = [], "sample-dir" = [], "sample-link.png" = [] }
 
 [app.zen]
 # Drop point inside Zen's window, as fractions of the window size

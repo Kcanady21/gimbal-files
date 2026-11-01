@@ -2,11 +2,18 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Record one Wayland drag-and-drop run: <source app> -> Zen browser tab.
 #
-#   usage: run.sh [--auto] <dolphin|thunar|nautilus|cosmic> <outside|downloads>
+#   usage: run.sh [--auto] <dolphin|thunar|nautilus|cosmic|gimbal> <outside|downloads>
 #
 # With --auto, the drag itself is performed by autodrag/autodrag.py (P0a2):
 # the launch, capture and cleanup below are unchanged, only the "press
 # Enter" step and the y/n question are replaced.
+#
+# `gimbal` is the Phase 1 GTK4 spike (P1g): the binary at
+# $PROJ/spike/target/release/gimbal-spike, the test folders
+# ~/gimbal-dnd-test-gimbal and ~/Downloads/gimbal-dnd-test-gimbal, and
+# GIMBAL_AUTODRAG_SELECT passed through as --select.  Every source gets a
+# source-integrity check: the dragged files are hashed before the drag and
+# again after cleanup, and result.txt gets `source_intact: yes|no`.
 #
 # Captures three streams into a run directory under $CAPS:
 #   source.log  - WAYLAND_DEBUG=1 stderr of the source file manager
@@ -19,7 +26,10 @@
 #   GIMBAL_MOZ_LOG_MODULE  MOZ_LOG module for GTK drag logging (default
 #                          WidgetDrag; P0g confirms the exact name from
 #                          Firefox source)
-#   GIMBAL_AUTODRAG_FILE  (--auto) file to drag (default sample.png)
+#   GIMBAL_AUTODRAG_FILE  (--auto) file or comma-separated list to drag
+#                          (default sample.png)
+#   GIMBAL_AUTODRAG_SELECT  (gimbal) comma-separated names passed to
+#                          `gimbal-spike --select` (multi-file rows)
 #   GIMBAL_AUTODRAG_STOP_AFTER  (--auto) passed to autodrag.py
 #                          --stop-after <placement|select>
 #   GIMBAL_AUTODRAG_HOLD_S  (--auto) passed to autodrag.py --hold-s: seconds
@@ -40,29 +50,42 @@ fi
 SOURCE_APP="${1:-}"
 LOCATION="${2:-}"
 case "$SOURCE_APP" in
-  dolphin|thunar|nautilus|cosmic) ;;
-  *) echo "usage: $0 [--auto] <dolphin|thunar|nautilus|cosmic> <outside|downloads>" >&2; exit 2 ;;
+  dolphin|thunar|nautilus|cosmic|gimbal) ;;
+  *) echo "usage: $0 [--auto] <dolphin|thunar|nautilus|cosmic|gimbal> <outside|downloads>" >&2; exit 2 ;;
 esac
 case "$LOCATION" in
   outside|downloads) ;;
-  *) echo "usage: $0 [--auto] <dolphin|thunar|nautilus|cosmic> <outside|downloads>" >&2; exit 2 ;;
+  *) echo "usage: $0 [--auto] <dolphin|thunar|nautilus|cosmic|gimbal> <outside|downloads>" >&2; exit 2 ;;
 esac
 
 die() { echo "run.sh: $*" >&2; exit 1; }
 
 # ---------------------------------------------------------------- prechecks
-for tool in dbus-monitor busctl flatpak python3 gzip; do
+for tool in dbus-monitor busctl flatpak python3 gzip sha256sum; do
   command -v "$tool" >/dev/null || die "$tool not found"
 done
 [ -n "${WAYLAND_DISPLAY:-}" ] || die "WAYLAND_DISPLAY is not set; run from inside the niri session"
 
-case "$LOCATION" in
-  outside)  FOLDER="$HOME/gimbal-dnd-test" ;;
-  downloads) FOLDER="$HOME/Downloads/gimbal-dnd-test" ;;
-esac
-for f in "$FOLDER/sample.png" "$FOLDER/sample.txt"; do
-  [ -e "$f" ] || die "missing test file $f — run tools/dnd-capture/make-test-files.sh first"
-done
+if [ "$SOURCE_APP" = gimbal ]; then
+  SOURCE_BIN="$PROJ/spike/target/release/gimbal-spike"
+  [ -x "$SOURCE_BIN" ] \
+    || die "gimbal-spike not found at $SOURCE_BIN — build it with cargo build --release in spike/"
+  case "$LOCATION" in
+    outside)  FOLDER="$HOME/gimbal-dnd-test-gimbal" ;;
+    downloads) FOLDER="$HOME/Downloads/gimbal-dnd-test-gimbal" ;;
+  esac
+  for f in "$FOLDER/sample.png" "$FOLDER/sample.txt"; do
+    [ -e "$f" ] || die "missing test file $f — run tools/dnd-capture/make-test-files-gimbal.sh first"
+  done
+else
+  case "$LOCATION" in
+    outside)  FOLDER="$HOME/gimbal-dnd-test" ;;
+    downloads) FOLDER="$HOME/Downloads/gimbal-dnd-test" ;;
+  esac
+  for f in "$FOLDER/sample.png" "$FOLDER/sample.txt"; do
+    [ -e "$f" ] || die "missing test file $f — run tools/dnd-capture/make-test-files.sh first"
+  done
+fi
 
 # Thunar and Nautilus hand drags off to an already-running instance, which
 # would leave source.log empty.  Both are verified to do this; neither has a
@@ -275,6 +298,13 @@ case "$SOURCE_APP" in
             # cosmic-files daemonizes when stdin is a terminal (src/lib.rs),
             # which would orphan the real process and break PID cleanup.
             SOURCE_ARGS=(--no-daemon) ;;
+  gimbal)   SOURCE_BIN="$PROJ/spike/target/release/gimbal-spike"
+            SOURCE_ARGS=()
+            # the multi-file rows preselect their names in the spike; a click
+            # from the runner would reset the selection to one item
+            if [ -n "${GIMBAL_AUTODRAG_SELECT:-}" ]; then
+              SOURCE_ARGS=(--select "$GIMBAL_AUTODRAG_SELECT")
+            fi ;;
 esac
 WAYLAND_DEBUG=1 "$SOURCE_BIN" "${SOURCE_ARGS[@]}" "$FOLDER" > "$RUNDIR/source.log" 2>&1 &
 SRC_PID=$!
@@ -284,6 +314,43 @@ if ! kill -0 "$SRC_PID" 2>/dev/null; then
 else
   echo "$SOURCE_BIN running: PID $SRC_PID"
 fi
+
+# ---------------------------------------------------------------- source integrity
+# P1g, every source: hash each dragged item before the drag and again after
+# cleanup.  A symlink is recorded by its link target (readlink), not by the
+# target's bytes; a folder is recorded as every file under it.  This checks
+# the "never delete on drag-end" rule directly: Phase 0 saw every drop into
+# Zen report MOVE, so a vanished source would show up here.
+SOURCE_ITEMS_RAW="${GIMBAL_AUTODRAG_FILE:-sample.png}"
+IFS=',' read -r -a INTEGRITY_ITEMS <<< "$SOURCE_ITEMS_RAW"
+SOURCE_SNAP_BEFORE="$RUNDIR/.source-before"
+source_snapshot() {
+  local out="$1" item path rel f hash
+  : > "$out"
+  for item in "${INTEGRITY_ITEMS[@]}"; do
+    path="$FOLDER/$item"
+    if [ -L "$path" ]; then
+      printf '%s\tlink:%s\n' "$item" "$(readlink "$path")" >> "$out"
+    elif [ -d "$path" ]; then
+      while IFS= read -r -d '' f; do
+        rel="${f#"$FOLDER"/}"
+        if [ -L "$f" ]; then
+          printf '%s\tlink:%s\n' "$rel" "$(readlink "$f")" >> "$out"
+        else
+          hash="$(sha256sum "$f" | awk '{print $1}')"
+          printf '%s\t%s\n' "$rel" "$hash" >> "$out"
+        fi
+      done < <(find "$path" \( -type f -o -type l \) -print0 2>/dev/null)
+    elif [ -f "$path" ]; then
+      hash="$(sha256sum "$path" | awk '{print $1}')"
+      printf '%s\t%s\n' "$item" "$hash" >> "$out"
+    else
+      printf '%s\tmissing\n' "$item" >> "$out"
+    fi
+  done
+  sort -o "$out" "$out"
+}
+source_snapshot "$SOURCE_SNAP_BEFORE"
 
 # ---------------------------------------------------------------- 4. the drag
 AUTO_RC=0
@@ -333,10 +400,29 @@ fi
 cleanup
 trap - EXIT
 
+# source integrity, after cleanup and before summarize.py (P1g)
+SOURCE_SNAP_AFTER="$RUNDIR/.source-after"
+source_snapshot "$SOURCE_SNAP_AFTER"
+touch "$RUNDIR/result.txt"
+{
+  if cmp -s "$SOURCE_SNAP_BEFORE" "$SOURCE_SNAP_AFTER"; then
+    echo "source_intact: yes"
+  else
+    echo "source_intact: no"
+    echo "source_diff:"
+    diff -u "$SOURCE_SNAP_BEFORE" "$SOURCE_SNAP_AFTER" \
+      | sed -n 's/^\([+-][^+-].*\)$/  \1/p' || true
+  fi
+} >> "$RUNDIR/result.txt"
+rm -f "$SOURCE_SNAP_BEFORE" "$SOURCE_SNAP_AFTER"
+
 # meta.txt before summarize.py so summary.json can embed it
 SOURCE_VERSION=""
 COSMIC_COMMIT=""
-if [ "$SOURCE_APP" = cosmic ]; then
+if [ "$SOURCE_APP" = gimbal ]; then
+  # P1b treats --version as an unknown flag (exit 2): never run it.
+  SOURCE_VERSION="gimbal-spike sha256:$(sha256sum "$SOURCE_BIN" | cut -c1-12)"
+elif [ "$SOURCE_APP" = cosmic ]; then
   # cosmic-files has no --version (it parses every flag as a path); use the
   # git commit of Kyle's build in ~/cosmic-files
   COSMIC_COMMIT="$(git -C "$HOME/cosmic-files" rev-parse --short=12 HEAD 2>/dev/null || echo unknown)"

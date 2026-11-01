@@ -166,3 +166,65 @@ calibration knobs and the live-check TODOs: `NOTES-autodrag.md`.
   would also stop your own Zen). If the throwaway instance somehow survives
   cleanup, run.sh says so loudly, prints the exact `flatpak kill` command,
   and exits non-zero.
+
+## The gimbal source (Phase 1)
+
+`run.sh --auto gimbal <outside|downloads>` drives the Phase 1 GTK4 spike
+instead of a file manager. It needs the reviewed release build:
+
+```bash
+cd "/home/kyle/Documents/03.) Code-Projects/gimbal-files/spike"
+cargo build --release          # -> target/release/gimbal-spike
+```
+
+`run.sh` dies with that instruction if the binary is missing. It never runs
+`gimbal-spike --version` (P1b treats it as an unknown flag); `meta.txt`'s
+`source_version` is `gimbal-spike sha256:<first 12 hex>` of the binary.
+
+The gimbal source has its own test folders, so Phase 0's calibrated folders
+stay byte-for-byte unchanged:
+
+```bash
+./make-test-files-gimbal.sh    # ~/gimbal-dnd-test-gimbal and
+                               # ~/Downloads/gimbal-dnd-test-gimbal
+```
+
+Each folder holds `sample.png`, `sample.txt`, `sample-dir/inside.txt` and
+`sample-link.png` (a relative symlink to `sample.png`). The script never
+overwrites anything and prints what already existed.
+
+Rows:
+
+```bash
+./run.sh --auto gimbal outside
+GIMBAL_AUTODRAG_FILE=sample-dir ./run.sh --auto gimbal outside
+GIMBAL_AUTODRAG_FILE=sample-link.png ./run.sh --auto gimbal downloads
+GIMBAL_AUTODRAG_FILE=sample.png,sample.txt \
+  GIMBAL_AUTODRAG_SELECT=sample.png,sample.txt \
+  ./run.sh --auto gimbal outside
+./run-matrix-gimbal.sh          # all 8 rows: outside then downloads,
+                               # file / folder / symlink / two files
+```
+
+`GIMBAL_AUTODRAG_SELECT` is passed to the spike as `--select` (comma-separated
+names, the spike's test hook). The multi-file row relies on it: the runner
+**skips its selection click** (a click would reset the selection to one item),
+presses on the first name's row and records `selection: preselected`. A
+single-name row still clicks and verifies `STATE_SELECTED` as in Phase 0.
+
+Classification is `y` when Zen's title contains any dragged name, or a
+symlink's target name (`sample.png` for `sample-link.png`); `result.txt`
+records which one in `matched_name:`. A folder drop shows a directory listing
+whose title contains the folder name, which also classifies `y`.
+
+The spike's GTK4 GridView **does** expose its rows through AT-SPI (probe
+recorded in `NOTES-autodrag.md`, "P1g changes"), so `[app.gimbal]` uses
+`atspi_items = true`. Its `item_offsets` are an unset fallback; a null/empty
+offset still aborts with `unconfigured` rather than clicking blind.
+
+Every source now gets a source-integrity check. Before the drag `run.sh`
+records a sha256 per dragged file (or the link target for a symlink, or every
+file under a folder); after cleanup it checks again and appends
+`source_intact: yes|no` to `result.txt`, with `source_diff:` lines on a
+mismatch. `run-matrix-gimbal.sh` stops on the first `source_intact: no` as
+well as on the first `aborted` row.

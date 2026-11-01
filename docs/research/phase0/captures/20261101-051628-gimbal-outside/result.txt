@@ -1,0 +1,13 @@
+zen_opened_file: y
+note: auto:true source=gimbal location=outside file=sample-dir folder=/home/kyle/gimbal-dnd-test-gimbal
+auto: true
+source: gimbal
+location: outside
+file: sample-dir
+selection: selected
+click_at: (107, 167)
+drop_at: (1910, 803)
+title_before: Zen Browser
+raw_title: Index of file:///run/user/1000/doc/1fc391a7/sample-dir — Zen Browser
+matched_name: sample-dir
+source_intact: yes

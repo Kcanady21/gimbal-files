@@ -1059,3 +1059,414 @@ calibration runs. Their result.txt says `aborted`, so P0b should ignore them.
 **Status: the runner is calibrated. Kyle can run `./run-matrix.sh`**
 with DP-3 off, Nautilus not running, and hands off the mouse for about
 4 minutes.
+
+## P1g changes
+
+P1g adds a fifth source, `gimbal` (the Phase 1 GTK4 spike), the extra drag
+cases for the acceptance run (folder, symlink, several files), and a
+source-integrity check for **every** source. Only the P1g Output files were
+written: `run.sh`, `make-test-files-gimbal.sh`,
+`run-matrix-gimbal.sh`, `autodrag/autodrag.py`, `autodrag/apps.toml`,
+`autodrag/test_autodrag.py`, `README.md` and this section. No Phase 0 test
+folder was touched; the two new folders were created by the new script and
+their contents reported below. Tags as in the earlier notes.
+
+### The spike's AT-SPI tree — **[observed]**
+
+The brief's question was whether the spike's GTK4 list exposes its rows.
+It does (GridView, not a ListView in the current P1c/P1e code). Probe:
+copy the test folder to `/tmp/gimbal-spike-p1g-probe`, launch the release
+binary at it, match the AT-SPI application by pid, walk the tree, then
+`SIGTERM` the pid and wait for it to disappear. No click, no pointer.
+
+```
+$ "$PROJ/spike/target/release/gimbal-spike" /tmp/gimbal-spike-p1g-probe &
+$ python3 -I ... (Atspi.get_desktop(0), app.get_process_id() == pid, BFS)
+desktop children: 8
+app[7] name='gimbal-spike' pid=1746385
+sample* hits (8):
+  ('sample-dir',       'table cell', (0,   46, 141, 94), selected=False, selectable=True)
+  ('sample-link.png',  'table cell', (141, 46, 141, 94), selected=False, selectable=True)
+  ('sample.png',       'table cell', (282, 46, 141, 94), selected=False, selectable=True)
+  ('sample.txt',       'table cell', (423, 46, 141, 94), selected=False, selectable=True)
+```
+
+Each row also has a child `label` with the display name. The app had 50
+nodes. A second probe launched with `--select sample.png,sample.txt`: both
+`table cell`s reported `SELECTED=True`, confirming the multi-file hook
+before any pointer event. Sort order is folders first, then display name
+(case-insensitive): `sample-dir`, `sample-link.png`, `sample.png`,
+`sample.txt` — matching `listing.rs`'s sorter.
+
+Consequence for `apps.toml`: `[app.gimbal] atspi_items = true`, so the
+runner clicks via AT-SPI and `item_offsets` stays an unset fallback
+(`[]`, because TOML has no `null`; a missing/empty value still aborts with
+`unconfigured`). `window_offset_correction` is `[0, 0]` as for the other
+GTK4 app (Nautilus); the live check confirms it.
+
+One unrelated process was already running before the probe:
+`gimbal-spike --select a.txt /tmp/gimbal-spike-p1c` (pid 1728629, P1c's
+work). It was left alone; the probes are `pgrep -af gimbal-spike`-checked
+afterwards and no probe process remained.
+
+### Test files of its own — **[observed]**
+
+```
+$ ./make-test-files-gimbal.sh
+folder: /home/kyle/gimbal-dnd-test-gimbal
+created: .../sample.png (92 bytes)
+created: .../sample.txt (31 bytes)
+created: .../sample-dir/
+created: .../sample-dir/inside.txt (47 bytes)
+created: .../sample-link.png -> sample.png (relative symlink)
+folder: /home/kyle/Downloads/gimbal-dnd-test-gimbal
+... same five entries ...
+```
+
+Running it again prints `exists, left untouched:` for every entry; nothing
+is overwritten. `sample.png`/`sample.txt` use the same generator bytes as
+`make-test-files.sh` (copied PNG code, same text).
+
+### `run.sh` — the complete diff
+
+No separate copy was saved before editing (the brief reached me after the
+file had been read); this diff is against the pre-edit 372-line file
+reconstructed verbatim from that read, and `bash -n` passes on both sides.
+The only changes for the four Phase 0 sources are the new
+`source_intact` block and `sha256sum` in the precheck tool list.
+
+```diff
+--- run.sh (before P1g)
++++ run.sh (P1g)
+@@ -2,12 +2,19 @@
+ # SPDX-License-Identifier: GPL-3.0-or-later
+ # Record one Wayland drag-and-drop run: <source app> -> Zen browser tab.
+ #
+-#   usage: run.sh [--auto] <dolphin|thunar|nautilus|cosmic> <outside|downloads>
++#   usage: run.sh [--auto] <dolphin|thunar|nautilus|cosmic|gimbal> <outside|downloads>
+ #
+ # With --auto, the drag itself is performed by autodrag/autodrag.py (P0a2):
+ # the launch, capture and cleanup below are unchanged, only the "press
+ # Enter" step and the y/n question are replaced.
+ #
++# `gimbal` is the Phase 1 GTK4 spike (P1g): the binary at
++# $PROJ/spike/target/release/gimbal-spike, the test folders
++# ~/gimbal-dnd-test-gimbal and ~/Downloads/gimbal-dnd-test-gimbal, and
++# GIMBAL_AUTODRAG_SELECT passed through as --select.  Every source gets a
++# source-integrity check: the dragged files are hashed before the drag and
++# again after cleanup, and result.txt gets `source_intact: yes|no`.
++#
+ # Captures three streams into a run directory under $CAPS:
+ #   source.log  - WAYLAND_DEBUG=1 stderr of the source file manager
+ #   zen.log     - WAYLAND_DEBUG=1 (and MOZ_LOG) stderr of a throwaway-profile Zen
+@@ -19,7 +26,10 @@
+ #   GIMBAL_MOZ_LOG_MODULE  MOZ_LOG module for GTK drag logging (default
+ #                          WidgetDrag; P0g confirms the exact name from
+ #                          Firefox source)
+-#   GIMBAL_AUTODRAG_FILE  (--auto) file to drag (default sample.png)
++#   GIMBAL_AUTODRAG_FILE  (--auto) file or comma-separated list to drag
++#                          (default sample.png)
++#   GIMBAL_AUTODRAG_SELECT  (gimbal) comma-separated names passed to
++#                          `gimbal-spike --select` (multi-file rows)
+ #   GIMBAL_AUTODRAG_STOP_AFTER  (--auto) passed to autodrag.py
+ #                          --stop-after <placement|select>
+ #   GIMBAL_AUTODRAG_HOLD_S  (--auto) passed to autodrag.py --hold-s: seconds
+@@ -40,29 +50,42 @@
+ SOURCE_APP="${1:-}"
+ LOCATION="${2:-}"
+ case "$SOURCE_APP" in
+-  dolphin|thunar|nautilus|cosmic) ;;
+-  *) echo "usage: $0 [--auto] <dolphin|thunar|nautilus|cosmic> <outside|downloads>" >&2; exit 2 ;;
++  dolphin|thunar|nautilus|cosmic|gimbal) ;;
++  *) echo "usage: $0 [--auto] <dolphin|thunar|nautilus|cosmic|gimbal> <outside|downloads>" >&2; exit 2 ;;
+ esac
+ case "$LOCATION" in
+   outside|downloads) ;;
+-  *) echo "usage: $0 [--auto] <dolphin|thunar|nautilus|cosmic> <outside|downloads>" >&2; exit 2 ;;
++  *) echo "usage: $0 [--auto] <dolphin|thunar|nautilus|cosmic|gimbal> <outside|downloads>" >&2; exit 2 ;;
+ esac
+ 
+ die() { echo "run.sh: $*" >&2; exit 1; }
+ 
+ # ---------------------------------------------------------------- prechecks
+-for tool in dbus-monitor busctl flatpak python3 gzip; do
++for tool in dbus-monitor busctl flatpak python3 gzip sha256sum; do
+   command -v "$tool" >/dev/null || die "$tool not found"
+ done
+ [ -n "${WAYLAND_DISPLAY:-}" ] || die "WAYLAND_DISPLAY is not set; run from inside the niri session"
+ 
+-case "$LOCATION" in
+-  outside)  FOLDER="$HOME/gimbal-dnd-test" ;;
+-  downloads) FOLDER="$HOME/Downloads/gimbal-dnd-test" ;;
+-esac
+-for f in "$FOLDER/sample.png" "$FOLDER/sample.txt"; do
+-  [ -e "$f" ] || die "missing test file $f — run tools/dnd-capture/make-test-files.sh first"
+-done
++if [ "$SOURCE_APP" = gimbal ]; then
++  SOURCE_BIN="$PROJ/spike/target/release/gimbal-spike"
++  [ -x "$SOURCE_BIN" ] \
++    || die "gimbal-spike not found at $SOURCE_BIN — build it with cargo build --release in spike/"
++  case "$LOCATION" in
++    outside)  FOLDER="$HOME/gimbal-dnd-test-gimbal" ;;
++    downloads) FOLDER="$HOME/Downloads/gimbal-dnd-test-gimbal" ;;
++  esac
++  for f in "$FOLDER/sample.png" "$FOLDER/sample.txt"; do
++    [ -e "$f" ] || die "missing test file $f — run tools/dnd-capture/make-test-files-gimbal.sh first"
++  done
++else
++  case "$LOCATION" in
++    outside)  FOLDER="$HOME/gimbal-dnd-test" ;;
++    downloads) FOLDER="$HOME/Downloads/gimbal-dnd-test" ;;
++  esac
++  for f in "$FOLDER/sample.png" "$FOLDER/sample.txt"; do
++    [ -e "$f" ] || die "missing test file $f — run tools/dnd-capture/make-test-files.sh first"
++  done
++fi
+ 
+ # Thunar and Nautilus hand drags off to an already-running instance, which
+ # would leave source.log empty.  Both are verified to do this; neither has a
+@@ -275,6 +298,13 @@
+             # cosmic-files daemonizes when stdin is a terminal (src/lib.rs),
+             # which would orphan the real process and break PID cleanup.
+             SOURCE_ARGS=(--no-daemon) ;;
++  gimbal)   SOURCE_BIN="$PROJ/spike/target/release/gimbal-spike"
++            SOURCE_ARGS=()
++            # the multi-file rows preselect their names in the spike; a click
++            # from the runner would reset the selection to one item
++            if [ -n "${GIMBAL_AUTODRAG_SELECT:-}" ]; then
++              SOURCE_ARGS=(--select "$GIMBAL_AUTODRAG_SELECT")
++            fi ;;
+ esac
+ WAYLAND_DEBUG=1 "$SOURCE_BIN" "${SOURCE_ARGS[@]}" "$FOLDER" > "$RUNDIR/source.log" 2>&1 &
+ SRC_PID=$!
+@@ -285,6 +315,43 @@
+   echo "$SOURCE_BIN running: PID $SRC_PID"
+ fi
+ 
++# ---------------------------------------------------------------- source integrity
++# P1g, every source: hash each dragged item before the drag and again after
++# cleanup.  A symlink is recorded by its link target (readlink), not by the
++# target's bytes; a folder is recorded as every file under it.  This checks
++# the "never delete on drag-end" rule directly: Phase 0 saw every drop into
++# Zen report MOVE, so a vanished source would show up here.
++SOURCE_ITEMS_RAW="${GIMBAL_AUTODRAG_FILE:-sample.png}"
++IFS=',' read -r -a INTEGRITY_ITEMS <<< "$SOURCE_ITEMS_RAW"
++SOURCE_SNAP_BEFORE="$RUNDIR/.source-before"
++source_snapshot() {
++  local out="$1" item path rel f hash
++  : > "$out"
++  for item in "${INTEGRITY_ITEMS[@]}"; do
++    path="$FOLDER/$item"
++    if [ -L "$path" ]; then
++      printf '%s\tlink:%s\n' "$item" "$(readlink "$path")" >> "$out"
++    elif [ -d "$path" ]; then
++      while IFS= read -r -d '' f; do
++        rel="${f#"$FOLDER"/}"
++        if [ -L "$f" ]; then
++          printf '%s\tlink:%s\n' "$rel" "$(readlink "$f")" >> "$out"
++        else
++          hash="$(sha256sum "$f" | awk '{print $1}')"
++          printf '%s\t%s\n' "$rel" "$hash" >> "$out"
++        fi
++      done < <(find "$path" \( -type f -o -type l \) -print0 2>/dev/null)
++    elif [ -f "$path" ]; then
++      hash="$(sha256sum "$path" | awk '{print $1}')"
++      printf '%s\t%s\n' "$item" "$hash" >> "$out"
++    else
++      printf '%s\tmissing\n' "$item" >> "$out"
++    fi
++  done
++  sort -o "$out" "$out"
++}
++source_snapshot "$SOURCE_SNAP_BEFORE"
++
+ # ---------------------------------------------------------------- 4. the drag
+ AUTO_RC=0
+ if [ -n "$AUTO" ]; then
+@@ -333,10 +400,29 @@
+ cleanup
+ trap - EXIT
+ 
++# source integrity, after cleanup and before summarize.py (P1g)
++SOURCE_SNAP_AFTER="$RUNDIR/.source-after"
++source_snapshot "$SOURCE_SNAP_AFTER"
++touch "$RUNDIR/result.txt"
++{
++  if cmp -s "$SOURCE_SNAP_BEFORE" "$SOURCE_SNAP_AFTER"; then
++    echo "source_intact: yes"
++  else
++    echo "source_intact: no"
++    echo "source_diff:"
++    diff -u "$SOURCE_SNAP_BEFORE" "$SOURCE_SNAP_AFTER" \
++      | sed -n 's/^\([+-][^+-].*\)$/  \1/p' || true
++  fi
++} >> "$RUNDIR/result.txt"
++rm -f "$SOURCE_SNAP_BEFORE" "$SOURCE_SNAP_AFTER"
++
+ # meta.txt before summarize.py so summary.json can embed it
+ SOURCE_VERSION=""
+ COSMIC_COMMIT=""
+-if [ "$SOURCE_APP" = cosmic ]; then
++if [ "$SOURCE_APP" = gimbal ]; then
++  # P1b treats --version as an unknown flag (exit 2): never run it.
++  SOURCE_VERSION="gimbal-spike sha256:$(sha256sum "$SOURCE_BIN" | cut -c1-12)"
++elif [ "$SOURCE_APP" = cosmic ]; then
+   # cosmic-files has no --version (it parses every flag as a path); use the
+   # git commit of Kyle's build in ~/cosmic-files
+   COSMIC_COMMIT="$(git -C "$HOME/cosmic-files" rev-parse --short=12 HEAD 2>/dev/null || echo unknown)"
+```
+
+`summarize.py`'s `read_result` only looks at `zen_opened_file:` and `note:`
+(read of `summarize.py:211-229`), so the appended `source_intact:` /
+`source_diff:` lines do not change `summary.json` **[read]**.
+
+### `autodrag.py` — multi-file and classification
+
+- `split_files()` turns `--file` into names; `--file a,b` is a multi-file
+  drag. Each name must exist under the folder.
+- Multi-file path: locate the first name's row (AT-SPI, or `item_offsets`
+  for that exact name), **do not click**, and press there. If AT-SPI exposes
+  the row, each name is re-read first and a missing `STATE_SELECTED` aborts
+  as `preselection check failed`; the run records `selection: preselected`.
+  There is no click -> no `click_to_drag_gap_ms` wait.
+- `title_candidates()` adds a symlink's target basename (via `realpath`,
+  falling back to `readlink`) to the names that count. `classify_title_any()`
+  returns `(verdict, matched)`; `result.txt` now carries
+  `matched_name: <name or None>`. A folder's listing title contains the
+  folder name, itself a candidate, so a folder drop classifies `y`.
+- `fallback_item_point()` reads `item_offsets[name]`; `None`, `[]`, a short
+  list or a missing key means unconfigured -> the existing `unconfigured`
+  abort, never a blind click. Apps without `item_offsets` keep the old
+  `first_item_offset` path.
+- `parse_source_intact()` reads the line `run.sh` appends (last one wins,
+  only `yes`/`no` accepted); `run-matrix-gimbal.sh` uses it for its stop
+  rule, so the matrix and the unit tests share one parser.
+- Standalone `autodrag.py run … --file a,b` also sets
+  `GIMBAL_AUTODRAG_SELECT=a,b` before exec'ing `run.sh`, so a multi-file run
+  works without exporting the variable by hand.
+- `--dry-run` now prints the files, whether the row is preselected, the
+  `item_offsets` table and the any-name classification. It still reads
+  nothing.
+
+### `apps.toml`
+
+New `[app.gimbal]` with the probe evidence, `atspi_items = true`,
+`window_offset_correction = [0, 0]`, and
+`item_offsets = { "sample.png" = [], "sample.txt" = [], "sample-dir" = [], "sample-link.png" = [] }`.
+TOML has no `null`; `[]` is the unset marker and `fallback_item_point`
+treats it exactly like a null. The sort order (folders first, then display
+name) is recorded in the section comment. No value for the four existing
+apps changed.
+
+### `run-matrix-gimbal.sh`
+
+Eight rows in the brief's order: `outside` then `downloads`, each with
+`sample.png`, `sample-dir`, `sample-link.png`, `sample.png,sample.txt`.
+The last row exports both `GIMBAL_AUTODRAG_FILE` and
+`GIMBAL_AUTODRAG_SELECT`. Like `run-matrix.sh`, it snapshots matching run
+directories before a row and only accepts a new one (`comm -13`), sleeps
+2 s between rows, and stops at the first `aborted:` or a run.sh exit code
+other than 0/3. It also stops on `source_intact: no` and prints the
+`source_diff:` lines.
+
+### Tests and checks — **[observed]**
+
+```
+$ python3 -I -B test_autodrag.py
+Ran 60 tests in 0.006s
+OK
+$ python3 -I -B test_vmouse.py   -> Ran 18 tests, OK
+$ python3 -I -B test_niri.py     -> Ran 16 tests, OK
+$ python3 -I -B test_locate.py   -> Ran 10 tests, OK
+$ python3 -I -B ../test_summarize.py -> Ran 42 tests, OK
+$ bash -n run.sh make-test-files-gimbal.sh run-matrix-gimbal.sh
+bash -n: all OK
+```
+
+New tests: the multi-file path never clicks and its first move starts on
+the first row (one press, 4+30 moves, no click move); classification for a
+regular file, folder, symlink target and multi-file (matched name
+recorded); `source_intact` parsing (yes/no/missing/malformed/last line);
+a null/empty gimbal `item_offsets` entry aborts `unconfigured` without a
+pointer device; a configured one is window-relative. All 49 previous
+autodrag tests still pass.
+
+### TODOs for Claude's live calibration
+
+1. **Placement and AT-SPI.** Build the reviewed spike, run
+   `GIMBAL_AUTODRAG_STOP_AFTER=placement ./run.sh --auto gimbal outside`
+   with DP-3 off, then `GIMBAL_AUTODRAG_STOP_AFTER=select …` and take
+   screenshots. Confirm `window_offset_correction = [0, 0]` (the AT-SPI
+   `table cell` center should land on `sample.png`). If it misses, only
+   that correction changes; no offsets are needed while AT-SPI works
+   **[inferred]**.
+2. **Confirm the probe's rects at the runner's 1220x1326 floating size.**
+   The probe measured at the default 900x600; the selection check and the
+   screenshot are the guard.
+3. **One full row** (`sample.png`, outside): expect `zen_opened_file: y`,
+   `selection: selected`, `source_intact: yes`, and a raw title naming
+   `sample.png`.
+4. **`run-matrix-gimbal.sh`**: 8 rows. Watch the folder row's title
+   (directory listing contains `sample-dir`), the symlink row (title may
+   name `sample.png`, the target; `matched_name` says which), and the
+   two-file row (`selection: preselected`, no click, both sources still
+   present).
+5. **`source_intact` on the Phase 0 sources.** Rerun `run-matrix.sh` once
+   and check every row reports `source_intact: yes`; the four old sources
+   should otherwise behave exactly as in the Phase 0 live check.
+6. **If AT-SPI ever stops exposing the rows,** fill the four
+   `item_offsets` values live and re-run the select-stop screenshots;
+   until then they stay `[]` and the runner aborts with `unconfigured`
+   rather than clicking blind.
+
+Not run here, per the hard limits: no `run.sh`, no `run-matrix*.sh`, no
+`/dev/uinput`, no pointer/keyboard injection, no niri action. The only
+spike launches were the two `/tmp/gimbal-spike-p1g-probe*` probes above,
+both closed by PID.
+
+## Review of P1g (Claude, Nov 1, 2026)
+
+**Verdict: accepted on the code. Live calibration still to run** (the six TODOs above).
+
+Checked: only the Output files changed; no new `niri msg action` call; nothing deletes, moves or
+renames a file; `bash -n` passes; all 104 Python tests pass (`python3 -I -m unittest`). The
+AT-SPI probe was taken on P1e's grid, so it already reflects the `GridView`.
+
+1. Before TODO 5: the Phase 0 folder `~/gimbal-dnd-test` has no `sample.txt` (only `sample.png`;
+   the folder hasn't changed since Oct 30 21:09, so this predates P1g). `run.sh` dies on that
+   folder until `make-test-files.sh` is run again. `~/Downloads/gimbal-dnd-test` is complete.
+
+## Live calibration of P1g (Claude, Nov 1, 2026)
+
+Setup: DP-3 turned off by Kyle; DP-2 2560×1440, Noctalia bar 34 px. The spike was the
+reviewed release build. After every run only Kyle's Zen and Mission Center were left in
+`flatpak ps`, and no `gimbal-spike` process.
+
+1. **Placement and AT-SPI.** `--stop-after placement`, then `select` with `--hold-s 8`: the
+   AT-SPI `table cell` click at (377, 167) selected `sample.png` (screenshot), and no viewer
+   opened. `window_offset_correction = [0, 0]` is right; `item_offsets` stay `[]`.
+2. **The probe's rects at 1220×1326** hold: every click in the matrix landed on its file.
+3. **One full row** (`sample.png`, outside), capture `20261101-051557-gimbal-outside`:
+   `zen_opened_file: y`, `source_intact: yes`. The spike offered `x-gtk-local-dnd`,
+   `text/plain;charset=utf-8`, `text/uri-list`, `vnd.portal.filetransfer` and
+   `vnd.portal.files` (nothing added by hand); Zen read `vnd.portal.files` and called
+   `RetrieveFiles` → `/run/user/1000/doc/9e1f8e71/sample.png`. Zen reported MOVE and the
+   source survived.
+4. **`run-matrix-gimbal.sh`**: 6 of 8 rows passed on the first run. Both two-file rows
+   (`051650`, `051736`) gave `zen_opened_file: n`: the spike never called `start_drag` and saw
+   no button event. **Found and fixed live:** `perform_drag` presses wherever the pointer is.
+   The single-file path's selection click had already moved it onto the file; the multi-file
+   path had no click, so the press missed. `autodrag.py` now moves onto the first row and
+   waits `select_settle_ms` before the drag; `test_multi_file_path_never_clicks_and_presses_first_row`
+   now expects that move first (104 tests OK). Rerun: `051846` (outside) and `051857`
+   (downloads) both `zen_opened_file: y`, `selection: preselected`, `source_intact: yes`;
+   `RetrieveFiles` returned both files. The folder and symlink rows passed (`matched_name`
+   recorded). Runs `051501` and `051530` are calibration runs (`aborted`/stopped early);
+   `051650` and `051736` are the pre-fix multi-file runs. P1h should ignore all four.
+5. **`source_intact` on the Phase 0 sources: not run.** `~/gimbal-dnd-test` has no
+   `sample.txt`, so `run.sh` stops for those sources until `make-test-files.sh` is rerun. Not
+   needed for Phase 1's verdict, which depends on the gimbal source.
+6. AT-SPI exposes every row, so the `item_offsets` fallback wasn't needed.
+
+**Status: P1g accepted. The gimbal source is calibrated** and `run-matrix-gimbal.sh` passes
+all 8 rows.

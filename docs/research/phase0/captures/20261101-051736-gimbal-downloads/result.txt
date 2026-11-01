@@ -1,0 +1,13 @@
+zen_opened_file: n
+note: auto:true source=gimbal location=downloads file=sample.png,sample.txt folder=/home/kyle/Downloads/gimbal-dnd-test-gimbal
+auto: true
+source: gimbal
+location: downloads
+file: sample.png,sample.txt
+selection: preselected
+click_at: (377, 167)
+drop_at: (1910, 803)
+title_before: Zen Browser
+raw_title: Zen Browser
+matched_name: None
+source_intact: yes

@@ -2,7 +2,14 @@
 """Automated drag runner (P0a2): one file-manager -> Zen drag, no human.
 
     python3 -I autodrag/autodrag.py run --source <app> --location <outside|downloads>
-                [--file <name>] [--stop-after <placement|select>] [--dry-run]
+                [--file <name>[,<name>...]] [--stop-after <placement|select>]
+                [--dry-run]
+
+P1g adds the `gimbal` source (the GTK4 spike).  `--file` now takes one name
+or a comma-separated list; with several names the app has already selected
+them (`gimbal-spike --select`, passed by run.sh from GIMBAL_AUTODRAG_SELECT),
+so the runner presses on the first name's row and never clicks — a click
+would reset the selection to one item.
 
 Real runs are attached to run.sh, which does the launching (P0a's launch
 code, reused — not copied): run.sh --auto starts the D-Bus monitor, the
@@ -20,7 +27,9 @@ steps, button released in a finally and on SIGINT/SIGTERM/any exception):
   2. place both on niri's empty end workspace — source left half, Zen right
      half, 40 px margin — floating at exact positions; verify against niri.
   3. locate the file item (AT-SPI by PID, fallback offset from apps.toml),
-     click once, verify STATE_SELECTED ("unverified" without AT-SPI).
+     click once, verify STATE_SELECTED ("unverified" without AT-SPI).  With
+     several names the app preselects them, so there is no click: press on
+     the first name's row and record selection: preselected.
   4. press, 12 px in 4 steps, travel to the center of Zen's content area in
      30 steps over ~600 ms, hold 400 ms, release.
   5. wait up to 3 s for Zen's title; classify y/n/other; write result.txt
@@ -55,7 +64,7 @@ OK_EXIT, USAGE_EXIT, ABORT_EXIT = 0, 2, 3
 ATTACH_ENV_VARS = ("GIMBAL_SRC_PID", "GIMBAL_ZEN_INSTANCE", "GIMBAL_RUNDIR",
                    "GIMBAL_FOLDER")
 
-APPS = ("dolphin", "thunar", "nautilus", "cosmic")
+APPS = ("dolphin", "thunar", "nautilus", "cosmic", "gimbal")
 LOCATIONS = ("outside", "downloads")
 
 DEFAULT_DRYRUN_SIZE = (2560, 1440)  # observed 2026-10-31 (DP-2 logical)
@@ -95,14 +104,58 @@ def geometry(out_w, out_h, margin):
             (2 * margin + w, margin, w, h))
 
 
+def split_files(value):
+    """`--file` is one name or a comma-separated list (P1g).  Pure."""
+    return [name.strip() for name in (value or "").split(",") if name.strip()]
+
+
 def classify_title(before, after, file_name):
     """y if the title names the file, n if it did not change, other with
-    the raw title otherwise."""
+    the raw title otherwise.  Kept for the single-name callers/tests."""
+    return classify_title_any(before, after, [file_name])[0]
+
+
+def title_candidates(names, folder):
+    """Every name whose presence in Zen's title counts as a successful drop:
+    the given names, plus a symlink's target name (P1g).  A folder dropped
+    on Zen shows a directory listing whose title contains the folder name —
+    that is the folder name itself, so it is already covered here.  Pure
+    apart from reading the symlink in `folder`."""
+    candidates = []
+    for name in names:
+        if name not in candidates:
+            candidates.append(name)
+        path = os.path.join(folder, name)
+        if os.path.islink(path):
+            target = os.path.basename(os.path.realpath(path))
+            if not target:
+                target = os.path.basename(os.readlink(path).rstrip("/"))
+            if target and target not in candidates:
+                candidates.append(target)
+    return candidates
+
+
+def classify_title_any(before, after, candidates):
+    """(verdict, matched name): y if the title contains any candidate, n if
+    the title did not change, other otherwise.  `matched` is the first
+    candidate found (recorded in result.txt), or None."""
     if after == before:
-        return "n"
-    if file_name in (after or ""):
-        return "y"
-    return "other"
+        return "n", None
+    for name in candidates:
+        if name in (after or ""):
+            return "y", name
+    return "other", None
+
+
+def parse_source_intact(result_text):
+    """The value of the `source_intact:` line run.sh appends after cleanup
+    (P1g), or None when the line is missing or malformed.  The last such
+    line wins.  Used by run-matrix-gimbal.sh's stop rule and unit-tested."""
+    value = None
+    for line in (result_text or "").splitlines():
+        if line.startswith("source_intact:"):
+            value = line.split(":", 1)[1].strip()
+    return value if value in ("yes", "no") else None
 
 
 def drop_point(zen_box, fraction):
@@ -312,16 +365,30 @@ def verify_layout(n, state, note):
         raise Abort("layout mismatch: " + "; ".join(problems))
 
 
-def selection_point(cfg, app, item, window_pos, window_size):
-    """The click point for the file item: AT-SPI window-relative center
-    converted to screen coordinates, or the apps.toml fallback offset, or
-    None (-> abort rather than click blind)."""
+def fallback_item_point(app_cfg, item_name, window_pos, window_size):
+    """The fallback point for one item when AT-SPI exposes no row.
+    `item_offsets` is the per-file table (P1g, gimbal): a missing name or an
+    unset value ([] or None) is unconfigured, not a click at (0, 0).  Apps
+    without `item_offsets` keep the old `first_item_offset` behaviour."""
+    offsets = app_cfg.get("item_offsets")
+    if isinstance(offsets, dict):
+        off = offsets.get(item_name)
+        if not off or len(off) < 2 or off[0] is None or off[1] is None:
+            return None
+        return (window_pos[0] + int(off[0]), window_pos[1] + int(off[1]))
+    return locate.fallback_point(app_cfg, window_pos, window_size)
+
+
+def selection_point(cfg, app, item, item_name, window_pos, window_size):
+    """The press/click point for the file item: AT-SPI window-relative
+    center converted to screen coordinates, or the apps.toml fallback offset
+    for that exact item, or None (-> abort rather than click blind)."""
     app_cfg = cfg.get("app", {}).get(app, {})
     if item is not None:
         corr = app_cfg.get("window_offset_correction") or [0, 0]
         rect = locate.item_screen_rect(item, window_pos, tuple(corr))
         return (rect[0] + rect[2] // 2, rect[1] + rect[3] // 2)
-    return locate.fallback_point(app_cfg, window_pos, window_size)
+    return fallback_item_point(app_cfg, item_name, window_pos, window_size)
 
 
 def perform_click(vm, point, settle_s, sleep, clock):
@@ -428,9 +495,16 @@ def run_real(args, cfg, env=None, niri=None, vm_factory=None,
     before_ids = {int(x) for x in (env.get("GIMBAL_ZEN_WIN_BEFORE") or "").split(",")
                   if x.strip().isdigit()}
 
-    file_name = args.file
-    if not os.path.exists(os.path.join(folder, file_name)):
-        raise Abort("test file %s not found in %s" % (file_name, folder))
+    file_names = split_files(args.file)
+    if not file_names:
+        raise Abort("--file needs at least one name")
+    multi = len(file_names) > 1
+    first_name = file_names[0]
+    for name in file_names:
+        if not os.path.exists(os.path.join(folder, name)):
+            raise Abort("test file %s not found in %s" % (name, folder))
+    # read symlink targets before the drag: a MOVE drop could remove the link
+    title_names = title_candidates(file_names, folder)
 
     t0 = clock()
     state = RunState()
@@ -438,7 +512,9 @@ def run_real(args, cfg, env=None, niri=None, vm_factory=None,
     opened = "aborted"
     selection = "n/a"
     title_before = title_after = None
+    matched_name = None
     click_at = drop_at = None
+    t_release = None
     aborted = None
     stopped = None
 
@@ -505,46 +581,78 @@ def run_real(args, cfg, env=None, niri=None, vm_factory=None,
         if args.stop_after == "placement":
             raise StoppedEarly("placement")
 
-        # -- 3. locate + click + selection check -----------------------------
-        item, app_found = locate_fn(src_pid, file_name)
+        # -- 3. locate + click/selection check --------------------------------
+        item, app_found = locate_fn(src_pid, first_name)
         if item is None:
-            log("AT-SPI: %s" % ("app found, item %r not exposed" % file_name
+            log("AT-SPI: %s" % ("app found, item %r not exposed" % first_name
                                 if app_found else "no application for pid %d" % src_pid))
-        click_at = selection_point(cfg, args.source, item, window_pos, src_box[2:])
+        click_at = selection_point(cfg, args.source, item, first_name,
+                                   window_pos, src_box[2:])
         if click_at is None:
-            raise Abort("unconfigured: no AT-SPI item and no first_item_offset "
-                        "for %s (apps.toml TODO(live))" % args.source)
+            raise Abort("unconfigured: no AT-SPI item and no item_offsets/"
+                        "first_item_offset for %s (%s) (apps.toml TODO(live))"
+                        % (args.source, first_name))
         # the item math yields workspace-view coordinates (the window
         # position niri works with); the pointer needs output coordinates
         click_at = view_to_screen(click_at, cfg)
-        log("clicking %r at %s (selection check follows)" % (file_name, click_at))
 
-        vm = vm_factory(out_w, out_h)
-        t_release = perform_click(vm, click_at,
-                                  cfg.get("drag", {}).get("select_settle_ms", 300) / 1000.0,
-                                  sleep, clock)
-
-        if item is not None:
-            recheck, _ = locate_fn(src_pid, file_name)
-            if recheck is None or not recheck.selected:
-                raise Abort("selection check failed: %r did not report STATE_SELECTED"
-                            % file_name)
-            selection = "selected"
+        if multi:
+            # Several names: the app already selected them (gimbal-spike
+            # --select, passed by run.sh).  A click would reset the selection
+            # to one item, so skip it and just press on the first name's row.
+            log("preselected %r; no selection click (press on %r at %s)"
+                % (file_names, first_name, click_at))
+            if item is not None:
+                for name in file_names:
+                    preset, _ = locate_fn(src_pid, name)
+                    if preset is None or not preset.selected:
+                        raise Abort("preselection check failed: %r did not report "
+                                    "STATE_SELECTED" % name)
+            selection = "preselected"
+            log("selection: %s" % selection)
+            reason = abort_reason(niri, state, t0, clock)
+            if reason:
+                raise Abort(reason)
+            if args.stop_after == "select":
+                raise StoppedEarly("select")
         else:
-            selection = "unverified"
-        log("selection: %s" % selection)
-        reason = abort_reason(niri, state, t0, clock)
-        if reason:
-            raise Abort(reason)
+            log("clicking %r at %s (selection check follows)" % (first_name, click_at))
+            vm = vm_factory(out_w, out_h)
+            t_release = perform_click(vm, click_at,
+                                      cfg.get("drag", {}).get("select_settle_ms", 300) / 1000.0,
+                                      sleep, clock)
 
-        if args.stop_after == "select":
-            raise StoppedEarly("select")
+            if item is not None:
+                recheck, _ = locate_fn(src_pid, first_name)
+                if recheck is None or not recheck.selected:
+                    raise Abort("selection check failed: %r did not report "
+                                "STATE_SELECTED" % first_name)
+                selection = "selected"
+            else:
+                selection = "unverified"
+            log("selection: %s" % selection)
+            reason = abort_reason(niri, state, t0, clock)
+            if reason:
+                raise Abort(reason)
+
+            if args.stop_after == "select":
+                raise StoppedEarly("select")
 
         # -- 4. the drag ------------------------------------------------------
-        # correction 2: the selection click and the drag press must not
-        # register as a double-click, which would open the file in an
-        # external viewer — a window the runner did not start
-        wait_click_gap(clock, sleep, t_release, cfg)
+        if multi:
+            # no selection click happened, so there is no click/press gap to
+            # keep (click_to_drag_gap_ms exists to stop a double-click).
+            # perform_drag presses wherever the pointer is: move it onto the
+            # first row and let the app see the motion first (live check,
+            # Nov 1: without this the press never reached the spike).
+            vm = vm_factory(out_w, out_h)
+            vm.move_to(*click_at)
+            sleep(cfg.get("drag", {}).get("select_settle_ms", 300) / 1000.0)
+        else:
+            # correction 2: the selection click and the drag press must not
+            # register as a double-click, which would open the file in an
+            # external viewer — a window the runner did not start
+            wait_click_gap(clock, sleep, t_release, cfg)
         # correction 5: the title seen at window-appearance is stale (Zen is
         # still starting up); read it again right before the press
         zen_now = niri_mod.window_by_id(niri.windows(), zen_win["id"])
@@ -563,7 +671,10 @@ def run_real(args, cfg, env=None, niri=None, vm_factory=None,
         title_after = wait_for_title(niri, zen_win["id"], title_before,
                                      cfg.get("drag", {}).get("title_wait_ms", 3000),
                                      t0, clock, sleep)
-        opened = classify_title(title_before, title_after, file_name)
+        # y if the title names ANY given file, or a symlink's target; a
+        # folder drop's listing title contains the folder name (title_candidates)
+        opened, matched_name = classify_title_any(
+            title_before, title_after, title_names)
 
     except Abort as a:
         aborted = a.reason
@@ -599,7 +710,7 @@ def run_real(args, cfg, env=None, niri=None, vm_factory=None,
         write_result(rundir, "aborted",
                      "stopped after %s (intentional --stop-after)" % stopped,
                      result_extra(args, selection, click_at, drop_at,
-                                  title_before, title_after,
+                                  title_before, title_after, matched_name,
                                   "aborted: stop-after %s" % stopped))
         log("stopped after %s" % stopped)
         return ABORT_EXIT
@@ -608,9 +719,9 @@ def run_real(args, cfg, env=None, niri=None, vm_factory=None,
         opened = "aborted"
     write_result(rundir, opened,
                  "auto:true source=%s location=%s file=%s folder=%s" %
-                 (args.source, args.location, file_name, folder),
+                 (args.source, args.location, args.file, folder),
                  result_extra(args, selection, click_at, drop_at,
-                              title_before, title_after,
+                              title_before, title_after, matched_name,
                               "aborted: %s" % aborted if aborted else None))
     log("result: zen_opened_file=%s selection=%s" % (opened, selection))
     return ABORT_EXIT if aborted is not None else OK_EXIT
@@ -662,7 +773,7 @@ def cleanup_workspace(n, state, log):
 
 
 def result_extra(args, selection, click_at, drop_at, title_before, title_after,
-                 aborted_line):
+                 matched_name, aborted_line):
     lines = ["auto: true",
              "source: %s" % args.source,
              "location: %s" % args.location,
@@ -671,7 +782,8 @@ def result_extra(args, selection, click_at, drop_at, title_before, title_after,
              "click_at: %s" % (click_at,),
              "drop_at: %s" % (drop_at,),
              "title_before: %s" % title_before,
-             "raw_title: %s" % title_after]
+             "raw_title: %s" % title_after,
+             "matched_name: %s" % matched_name]
     if aborted_line:
         lines.append(aborted_line)
     return lines
@@ -694,8 +806,11 @@ def run_dry(args, cfg, log=None):
         drop_point(output_box(zen_box, wa),
                    zen_cfg.get("drop_point_fraction", [0.5, 0.55])), cfg)
 
+    files = split_files(args.file)
     log("autodrag --dry-run: nothing is run, launched or moved")
     log("plan: source=%s location=%s file=%s" % (args.source, args.location, args.file))
+    log("files: %r (%s)" % (files, "preselected, no selection click"
+                            if len(files) > 1 else "one click, then drag"))
     log("output: %dx%d, margin %d, working area offset %s" % (out_w, out_h, margin, list(wa)))
     log("boxes (working-area coordinates, as commanded): source=(%d, %d, %d, %d) zen=(%d, %d, %d, %d)" %
         (src_box + zen_box))
@@ -710,18 +825,29 @@ def run_dry(args, cfg, log=None):
     log("planned pointer events (logical px -> ABS):")
     app_cfg = cfg.get("app", {}).get(args.source, {})
     fallback = app_cfg.get("first_item_offset")
+    offsets = app_cfg.get("item_offsets")
     origin = (cfg.get("workspace", {}) or {}).get("view_origin_in_output") or [0, 0]
-    log("  item point: located at runtime via AT-SPI (%s); fallback offset: %s"
-        % ("apps.toml atspi_items=%s" % app_cfg.get("atspi_items"), fallback))
+    log("  item point: located at runtime via AT-SPI (%s); first_item_offset: %s; "
+        "item_offsets: %s"
+        % ("apps.toml atspi_items=%s" % app_cfg.get("atspi_items"), fallback, offsets))
     log("  view->screen: + %s (view_origin_in_output, applied to click and drop)"
         % (origin,))
     log("  drop point: %s (zen box + fraction %s)" % (drop_at, zen_cfg.get("drop_point_fraction")))
-    log("  click:  move_to <item point>; press (EV_KEY BTN_LEFT 1 + SYN); "
-        "release (EV_KEY BTN_LEFT 0 + SYN)")
-    log("  verify: STATE_SELECTED via AT-SPI (unverified when no AT-SPI)")
-    log("  gap:    >= %s ms since the click release before the drag press "
-        "(click_to_drag_gap_ms; no double-click)"
-        % cfg.get("drag", {}).get("click_to_drag_gap_ms", 1000))
+    if len(files) > 1:
+        log("  press:  move_to first name's row (%r); no selection click "
+            "(a click would reset the selection)" % files[0])
+    else:
+        log("  click:  move_to <item point>; press (EV_KEY BTN_LEFT 1 + SYN); "
+            "release (EV_KEY BTN_LEFT 0 + SYN)")
+    log("  verify: %s" % ("each name already STATE_SELECTED via AT-SPI"
+                          if len(files) > 1 else
+                          "STATE_SELECTED via AT-SPI (unverified when no AT-SPI)"))
+    if len(files) > 1:
+        log("  gap:    none (no selection click, so no double-click risk)")
+    else:
+        log("  gap:    >= %s ms since the click release before the drag press "
+            "(click_to_drag_gap_ms; no double-click)"
+            % cfg.get("drag", {}).get("click_to_drag_gap_ms", 1000))
     log("  drag:   press (BTN_LEFT 1 + SYN)")
     for i in range(1, drag_cfg.get("threshold_steps", 4) + 1):
         d = drag_cfg.get("threshold_px", 12) * i // drag_cfg.get("threshold_steps", 4)
@@ -733,7 +859,8 @@ def run_dry(args, cfg, log=None):
             (i, steps, drag_cfg.get("step_interval_ms", 20)))
     log("  hold %d ms, then release (EV_KEY BTN_LEFT 0 + SYN)" % drag_cfg.get("hold_ms", 400))
     log("")
-    log("classify: title unchanged -> n; contains %r -> y; else other" % args.file)
+    log("classify: title unchanged -> n; contains any of %r -> y "
+        "(plus a symlink's target name); else other" % (files,))
     log("abort rules: focused window not ours | window moved/resized | "
         ">1 enabled output | run > %.0f s" % TIME_LIMIT_S)
     if args.stop_after:
@@ -788,6 +915,8 @@ def parse_args(argv):
         raise SystemExit("--source must be one of %s" % (APPS,))
     if a.location not in LOCATIONS:
         raise SystemExit("--location must be one of %s" % (LOCATIONS,))
+    if not split_files(a.file):
+        raise SystemExit("--file must name at least one file")
     if a.stop_after is not None and a.stop_after not in ("placement", "select"):
         raise SystemExit("--stop-after must be placement or select")
     if a.hold_s < 0:
@@ -808,6 +937,10 @@ def main(argv):
             os.path.dirname(os.path.abspath(__file__)), "..", "run.sh"))
         env = dict(os.environ)
         env["GIMBAL_AUTODRAG_FILE"] = args.file
+        # a multi-file run needs the spike's --select hook; set it from the
+        # same list unless the caller already chose a different selection
+        if len(split_files(args.file)) > 1 and not env.get("GIMBAL_AUTODRAG_SELECT"):
+            env["GIMBAL_AUTODRAG_SELECT"] = args.file
         if args.stop_after:
             env["GIMBAL_AUTODRAG_STOP_AFTER"] = args.stop_after
         if args.hold_s:

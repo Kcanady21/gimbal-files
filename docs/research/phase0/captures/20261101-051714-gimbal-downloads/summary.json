@@ -1,0 +1,494 @@
+{
+  "attempts_match": true,
+  "dbus": {
+    "portal_calls": [
+      {
+        "destination": "org.freedesktop.portal.Documents",
+        "interface": "org.freedesktop.portal.Documents",
+        "kind": "method_call",
+        "member": "GetMountPoint",
+        "returned": [
+          "/run/user/1000/doc"
+        ],
+        "sender": ":1.2072",
+        "strings": []
+      },
+      {
+        "destination": ":1.261",
+        "interface": "org.freedesktop.portal.FileTransfer",
+        "kind": "method_call",
+        "member": "StartTransfer",
+        "returned": [
+          "13701123455817094269599862346262005534"
+        ],
+        "sender": ":1.2075",
+        "strings": [
+          "writable",
+          "autostop"
+        ]
+      },
+      {
+        "destination": ":1.261",
+        "interface": "org.freedesktop.portal.FileTransfer",
+        "kind": "method_call",
+        "member": "AddFiles",
+        "returned": [],
+        "sender": ":1.2075",
+        "strings": [
+          "13701123455817094269599862346262005534"
+        ]
+      },
+      {
+        "destination": ":1.261",
+        "interface": "org.freedesktop.portal.FileTransfer",
+        "kind": "method_call",
+        "member": "RetrieveFiles",
+        "returned": [
+          "/home/kyle/Downloads/gimbal-dnd-test-gimbal/sample-dir"
+        ],
+        "sender": ":1.2074",
+        "strings": [
+          "13701123455817094269599862346262005534"
+        ]
+      },
+      {
+        "destination": ":1.2075",
+        "interface": "org.freedesktop.portal.FileTransfer",
+        "kind": "signal",
+        "member": "TransferClosed",
+        "returned": null,
+        "sender": ":1.261",
+        "strings": [
+          "13701123455817094269599862346262005534"
+        ]
+      }
+    ]
+  },
+  "drag_seen": true,
+  "location": "downloads",
+  "meta": {
+    "date": "2026-11-01T05:17:23-05:00",
+    "folder": "/home/kyle/Downloads/gimbal-dnd-test-gimbal",
+    "location": "downloads",
+    "moz_log_module": "WidgetDrag",
+    "niri_version": "Compositor version: 26.04 (unknown commit)",
+    "source": "gimbal",
+    "source_version": "gimbal-spike sha256:d7ebebc0e431",
+    "zen_profile": "gimbal-dnd (throwaway)",
+    "zen_version": "1.24b"
+  },
+  "parsing_notes": {
+    "dbus_log_present": true,
+    "source_log_present": true,
+    "source_messages": 2760,
+    "zen_log_present": true,
+    "zen_messages": 3743
+  },
+  "result": {
+    "note": "auto:true source=gimbal location=downloads file=sample-dir folder=/home/kyle/Downloads/gimbal-dnd-test-gimbal",
+    "raw_answer": "y",
+    "zen_opened_file": true
+  },
+  "run": "20261101-051714-gimbal-downloads",
+  "source_app": "gimbal",
+  "source_side": {
+    "action": [
+      1,
+      0,
+      2
+    ],
+    "all_data_sources": [
+      "wl_data_source#53 (lines 1457\u20132410)"
+    ],
+    "attempt": "attempt 1 of 1",
+    "cancelled": false,
+    "dnd_drop_performed": true,
+    "dnd_finished": true,
+    "drag_seen": true,
+    "drag_source_object": "wl_data_source#53",
+    "ending": "dnd_drop_performed+dnd_finished",
+    "offers": [
+      "application/x-gtk-local-dnd",
+      "text/plain;charset=utf-8",
+      "text/uri-list",
+      "application/vnd.portal.filetransfer",
+      "application/vnd.portal.files"
+    ],
+    "other_sources_excluded": [],
+    "send": [
+      {
+        "fd": "23",
+        "mime": "text/uri-list"
+      },
+      {
+        "fd": "23",
+        "mime": "application/vnd.portal.files"
+      }
+    ],
+    "set_actions": [
+      {
+        "args": [
+          3
+        ],
+        "decoded": [
+          [
+            "copy",
+            "move"
+          ]
+        ]
+      }
+    ],
+    "start_drag": {
+      "icon": "wl_surface#77",
+      "origin_surface": "wl_surface#38",
+      "serial": "2571639",
+      "source": "wl_data_source#53"
+    },
+    "start_drag_count": 1,
+    "target": []
+  },
+  "zen_side": {
+    "accept": [
+      {
+        "mime": null,
+        "serial": "2571663"
+      },
+      {
+        "mime": "text/uri-list",
+        "serial": "2571636"
+      },
+      {
+        "mime": null,
+        "serial": "2571663"
+      },
+      {
+        "mime": "application/vnd.portal.files",
+        "serial": "2571636"
+      },
+      {
+        "mime": null,
+        "serial": "2571663"
+      },
+      {
+        "mime": "application/vnd.portal.files",
+        "serial": "2571663"
+      },
+      {
+        "mime": "application/vnd.portal.files",
+        "serial": "2571663"
+      },
+      {
+        "mime": "application/vnd.portal.files",
+        "serial": "2571663"
+      },
+      {
+        "mime": "application/vnd.portal.files",
+        "serial": "2571663"
+      },
+      {
+        "mime": "application/vnd.portal.files",
+        "serial": "2571663"
+      },
+      {
+        "mime": "application/vnd.portal.files",
+        "serial": "2571663"
+      },
+      {
+        "mime": "application/vnd.portal.files",
+        "serial": "2571663"
+      },
+      {
+        "mime": "application/vnd.portal.files",
+        "serial": "2571663"
+      },
+      {
+        "mime": "application/vnd.portal.files",
+        "serial": "2571663"
+      },
+      {
+        "mime": "application/vnd.portal.files",
+        "serial": "2571663"
+      }
+    ],
+    "action": [
+      {
+        "decoded": [
+          "move"
+        ],
+        "mask": 2
+      }
+    ],
+    "attempt_count": 1,
+    "drag_offer_object": "wl_data_offer#4278190082",
+    "drop": [
+      {
+        "serial": null
+      }
+    ],
+    "drop_count": 1,
+    "dropped": true,
+    "enter": [
+      {
+        "offer": "wl_data_offer#4278190082",
+        "serial": "2571663",
+        "surface": "wl_surface#66"
+      }
+    ],
+    "finish": true,
+    "leave": [
+      {
+        "serial": null
+      }
+    ],
+    "offers": [
+      "application/x-gtk-local-dnd",
+      "text/plain;charset=utf-8",
+      "text/uri-list",
+      "application/vnd.portal.filetransfer",
+      "application/vnd.portal.files"
+    ],
+    "receive": [
+      {
+        "fd": "144",
+        "mime": "text/uri-list"
+      },
+      {
+        "fd": "144",
+        "mime": "application/vnd.portal.files"
+      }
+    ],
+    "set_actions": [
+      {
+        "args": [
+          0,
+          0
+        ],
+        "decoded": [
+          [],
+          []
+        ]
+      },
+      {
+        "args": [
+          0,
+          0
+        ],
+        "decoded": [
+          [],
+          []
+        ]
+      },
+      {
+        "args": [
+          0,
+          0
+        ],
+        "decoded": [
+          [],
+          []
+        ]
+      },
+      {
+        "args": [
+          7,
+          2
+        ],
+        "decoded": [
+          [
+            "copy",
+            "move",
+            "ask"
+          ],
+          [
+            "move"
+          ]
+        ]
+      },
+      {
+        "args": [
+          7,
+          2
+        ],
+        "decoded": [
+          [
+            "copy",
+            "move",
+            "ask"
+          ],
+          [
+            "move"
+          ]
+        ]
+      },
+      {
+        "args": [
+          7,
+          2
+        ],
+        "decoded": [
+          [
+            "copy",
+            "move",
+            "ask"
+          ],
+          [
+            "move"
+          ]
+        ]
+      },
+      {
+        "args": [
+          7,
+          2
+        ],
+        "decoded": [
+          [
+            "copy",
+            "move",
+            "ask"
+          ],
+          [
+            "move"
+          ]
+        ]
+      },
+      {
+        "args": [
+          7,
+          2
+        ],
+        "decoded": [
+          [
+            "copy",
+            "move",
+            "ask"
+          ],
+          [
+            "move"
+          ]
+        ]
+      },
+      {
+        "args": [
+          7,
+          2
+        ],
+        "decoded": [
+          [
+            "copy",
+            "move",
+            "ask"
+          ],
+          [
+            "move"
+          ]
+        ]
+      },
+      {
+        "args": [
+          7,
+          2
+        ],
+        "decoded": [
+          [
+            "copy",
+            "move",
+            "ask"
+          ],
+          [
+            "move"
+          ]
+        ]
+      },
+      {
+        "args": [
+          7,
+          2
+        ],
+        "decoded": [
+          [
+            "copy",
+            "move",
+            "ask"
+          ],
+          [
+            "move"
+          ]
+        ]
+      },
+      {
+        "args": [
+          7,
+          2
+        ],
+        "decoded": [
+          [
+            "copy",
+            "move",
+            "ask"
+          ],
+          [
+            "move"
+          ]
+        ]
+      },
+      {
+        "args": [
+          7,
+          2
+        ],
+        "decoded": [
+          [
+            "copy",
+            "move",
+            "ask"
+          ],
+          [
+            "move"
+          ]
+        ]
+      },
+      {
+        "args": [
+          7,
+          2
+        ],
+        "decoded": [
+          [
+            "copy",
+            "move",
+            "ask"
+          ],
+          [
+            "move"
+          ]
+        ]
+      },
+      {
+        "args": [
+          7,
+          2
+        ],
+        "decoded": [
+          [
+            "copy",
+            "move",
+            "ask"
+          ],
+          [
+            "move"
+          ]
+        ]
+      }
+    ],
+    "source_actions": [
+      {
+        "decoded": [
+          "copy",
+          "move"
+        ],
+        "mask": 3
+      }
+    ]
+  }
+}

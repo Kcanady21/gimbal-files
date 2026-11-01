@@ -19,8 +19,10 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import autodrag
 from autodrag import (ABORT_EXIT, OK_EXIT, Args, RunState, abort_reason,
-                      classify_title, drop_point, find_zen_window, geometry,
-                      perform_drag, run_dry, run_real)
+                      classify_title, classify_title_any, drop_point,
+                      fallback_item_point, find_zen_window, geometry,
+                      parse_source_intact, perform_drag, run_dry, run_real,
+                      split_files, title_candidates)
 from locate import SpiItem
 
 
@@ -275,6 +277,22 @@ class Locater(object):
                        selectable=True, selected=self.selected), True
 
 
+class MultiLocater(object):
+    """Fake locate for the multi-file path: a distinct rect per name, so a
+    test can prove the press lands on the FIRST name's row."""
+
+    def __init__(self, rects, selected=True):
+        self.rects = rects
+        self.selected = selected
+        self.queries = 0
+
+    def __call__(self, pid, name):
+        self.queries += 1
+        rect = self.rects.get(name, (0, 0, 1, 1))
+        return SpiItem(name, "table cell", rect,
+                       selectable=True, selected=self.selected), True
+
+
 CFG = autodrag.load_config()
 # The coordinate assertions below were written for a zero working-area
 # offset; the live offset (apps.toml, [0, 34]) has its own test.
@@ -310,6 +328,79 @@ class TestTitleClassification(unittest.TestCase):
 
     def test_txt_file(self):
         self.assertEqual(classify_title("a", "sample.txt — Zen", "sample.txt"), "y")
+
+    def test_split_files_accepts_one_name_or_a_list(self):
+        self.assertEqual(split_files("sample.png"), ["sample.png"])
+        self.assertEqual(split_files("sample.png, sample.txt"),
+                         ["sample.png", "sample.txt"])
+        self.assertEqual(split_files(""), [])
+
+    def test_folder_drop_is_y_when_the_listing_title_names_it(self):
+        # a folder dropped on Zen shows a directory listing whose title
+        # contains the folder name (P1g); that is the given name itself
+        self.assertEqual(classify_title_any("a", "sample-dir — Zen",
+                                            ["sample-dir"]),
+                         ("y", "sample-dir"))
+
+    def test_symlink_matches_its_target_name(self):
+        with tempfile.TemporaryDirectory() as folder:
+            os.symlink("sample.png", os.path.join(folder, "sample-link.png"))
+            candidates = title_candidates(["sample-link.png"], folder)
+        self.assertEqual(candidates, ["sample-link.png", "sample.png"])
+        self.assertEqual(classify_title_any(
+            "a", "sample.png (PNG Image, 16x16) — Zen", candidates),
+            ("y", "sample.png"))
+
+    def test_multi_file_matches_any_given_name_and_records_it(self):
+        self.assertEqual(
+            classify_title_any("a", "sample.txt — Zen",
+                               ["sample.png", "sample.txt"]),
+            ("y", "sample.txt"))
+        self.assertEqual(
+            classify_title_any("a", "sample.png — Zen",
+                               ["sample.png", "sample.txt"]),
+            ("y", "sample.png"))
+
+
+class TestSourceIntactParsing(unittest.TestCase):
+    """run.sh appends `source_intact: yes|no` after cleanup (P1g);
+    run-matrix-gimbal.sh reads it through this helper."""
+
+    def test_yes_and_no(self):
+        self.assertEqual(parse_source_intact(
+            "zen_opened_file: y\nsource_intact: yes\n"), "yes")
+        self.assertEqual(parse_source_intact(
+            "zen_opened_file: y\nsource_intact: no\nsource_diff:\n  -x\n"),
+            "no")
+
+    def test_missing_or_malformed_is_none(self):
+        self.assertIsNone(parse_source_intact("zen_opened_file: y\n"))
+        self.assertIsNone(parse_source_intact("source_intact: maybe\n"))
+        self.assertIsNone(parse_source_intact(None))
+
+    def test_last_line_wins(self):
+        self.assertEqual(parse_source_intact(
+            "source_intact: no\nsource_intact: yes\n"), "yes")
+
+
+class TestGimbalOffsets(unittest.TestCase):
+    """The gimbal fallback table (P1g): TOML has no null, so []/None mean
+    unset and the runner aborts with "unconfigured" rather than clicking."""
+
+    def test_null_or_empty_offset_is_unconfigured(self):
+        self.assertIsNone(fallback_item_point(
+            {"item_offsets": {"sample.png": None}}, "sample.png",
+            (40, 40), (1220, 1326)))
+        self.assertIsNone(fallback_item_point(
+            {"item_offsets": {"sample.png": []}}, "sample.png",
+            (40, 40), (1220, 1326)))
+        self.assertIsNone(fallback_item_point(
+            {"item_offsets": {}}, "sample.png", (40, 40), (1220, 1326)))
+
+    def test_configured_offset_is_relative_to_the_window(self):
+        self.assertEqual(fallback_item_point(
+            {"item_offsets": {"sample.png": [333, 117]}}, "sample.png",
+            (40, 40), (1220, 1326)), (373, 157))
 
 
 class TestZenWindowDiscovery(unittest.TestCase):
@@ -450,6 +541,7 @@ class RunHarness(object):
         self.folder = os.path.join(self.tmp.name, "folder")
         os.makedirs(self.folder)
         open(os.path.join(self.folder, "sample.png"), "w").close()
+        open(os.path.join(self.folder, "sample.txt"), "w").close()
         self.clock = FakeClock(step=clock_step)
         self.niri = FakeNiri(std_windows(), std_outputs(), std_workspaces(),
                              focused_id=100, clock=self.clock)
@@ -514,6 +606,44 @@ class TestRunReal(unittest.TestCase):
         self.assertIn(("move-window-to-workspace", 200, 2, False), self.h.niri.actions)
         self.assertEqual(self.h.niri._win(100)["is_floating"], True)
 
+    def test_multi_file_path_never_clicks_and_presses_first_row(self):
+        # P1g: the app already selected both names (--select), so there is
+        # no selection click at all; the drag presses on the FIRST row
+        self.h.locater = MultiLocater({
+            "sample.png": (100, 50, 40, 40),
+            "sample.txt": (300, 50, 40, 40),
+        })
+        self.h.niri.zen_title_static = "Zen Browser"
+        self.h.niri.title_timeline = [(2.0, "sample.txt — Zen")]
+        rc = self.h.run(file="sample.png,sample.txt")
+        self.assertEqual(rc, OK_EXIT)
+        res = self.h.result()
+        self.assertIn("zen_opened_file: y", res)
+        self.assertIn("selection: preselected", res)
+        self.assertIn("matched_name: sample.txt", res)
+        self.assertIn("file: sample.png,sample.txt", res)
+        vm = self.h.vms[0]
+        self.assertEqual(vm.presses, 1)    # the drag press only, no click
+        self.assertEqual(vm.releases, 1)
+        # one move onto the row before the press (no click), then the drag
+        self.assertEqual(len(vm.moves), 1 + 4 + 30)
+        # first row center: window (40,40) + item (100,50,40,40) -> (160,110)
+        self.assertEqual(vm.moves[0], (160, 110))
+        self.assertEqual(vm.moves[1], (163, 113))
+
+    def test_gimbal_null_item_offset_aborts_unconfigured(self):
+        # apps.toml's gimbal item_offsets start unset ([] is TOML's null);
+        # that must abort with "unconfigured" rather than click at (0, 0)
+        h = RunHarness(found=False)
+        self.addCleanup(h.cleanup)
+        cfg = copy.deepcopy(CFG)
+        rc = run_real(make_args(source="gimbal"), cfg,
+                      env=attach_env(h.rundir, h.folder), niri=h.niri,
+                      vm_factory=h.vm_factory, locate_fn=h.locater,
+                      clock=h.clock, sleep=h.clock.sleep, log=lambda m: None)
+        self.assertEqual(rc, ABORT_EXIT)
+        self.assertIn("unconfigured", h.result())
+        self.assertEqual(h.vms, [])
 
     def test_working_area_offset_live_calibration(self):
         # live check, Oct 31: commands are relative to the working area
