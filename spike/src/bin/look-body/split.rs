@@ -7,12 +7,13 @@
 //! The model is three pure things this file's tests exercise:
 //!
 //! * **columns** — which tile ids each column holds, top to bottom;
-//! * **shares** — each column's tile heights as fractions of its available
-//!   height, and the left column's width as a fraction of the width left
-//!   after the gutter. Storing fractions (never pixels) keeps a window
-//!   resize or a scale change proportional; a hand-dragged column that came
-//!   from the half-height floor may sum above one and keep scrolling;
-//! * **layout** — the slot rects those shares produce.
+//! * **heights** — either the default (equal shares of the visible height,
+//!   with the half-height floor beyond four tiles) or hand-set heights in
+//!   unscaled design pixels, and the left column's width as a fraction of the
+//!   width left after the gutter. Storing hand heights in design pixels keeps
+//!   a hand-sized tile's size through a window resize or a scale change; the
+//!   last tile of a short column stretches to fill it;
+//! * **layout** — the slot rects those heights produce.
 //!
 //! The drag gesture rides the static `Fixed` (never a moving pill: every
 //! widget's event coordinates are translated into its own space at
@@ -72,32 +73,30 @@ pub struct Viewport {
     pub scale: f64,
 }
 
-/// Everything a layout needs: the columns, their height shares, the column
-/// width share, the viewport, the scroll offset and whether each column is
-/// still on its default layout (and so keeps the half-height floor).
+/// Everything a layout needs: the columns, their heights, the column width
+/// share, the viewport and the scroll offset. A `Default` column uses the
+/// half-height floor beyond four tiles; a `Hand` one has no floor.
 #[derive(Clone, Copy)]
 pub struct Board<'a> {
     pub columns: &'a [Vec<usize>; 2],
-    pub heights: &'a [Vec<f64>; 2],
+    pub heights: &'a [Heights; 2],
     pub width_share: f64,
     pub view: Viewport,
     pub scroll: i32,
-    pub floored: [bool; 2],
 }
 
 impl Board<'_> {
-    /// The committed slot layout of these columns and shares, with each
+    /// The committed slot layout of these columns and heights, with each
     /// column's scroll offset applied: a column that fits in the viewport
     /// stays pinned at the scroll position while the taller one scrolls.
     pub fn slots(&self) -> [Vec<Rect>; 2] {
-        let mut slots = layout_floored(
+        let mut slots = layout(
             self.columns,
             self.heights,
             self.width_share,
             self.view.w,
             self.view.h,
             self.view.scale,
-            self.floored,
         );
         offset_slots(&mut slots, self.view.h, self.view.scale, self.scroll);
         slots
@@ -179,13 +178,97 @@ pub fn half_floor(total: usize, f: &Frame) -> i32 {
     }
 }
 
-/// Equal shares for `n` slots; what a reset (double-click, add, close) sets.
-pub fn equal_shares(n: usize) -> Vec<f64> {
+/// One column's slot heights.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Heights {
+    /// Equal shares of the visible height, with the half-height floor beyond
+    /// four tiles. What a reset (double-click, add, close) sets.
+    Default,
+    /// Hand-set heights in unscaled design pixels, one per slot, top to
+    /// bottom. Only the tile above a dragged border changes; everything below
+    /// keeps its height. The last tile's fill is not stored here.
+    Hand(Vec<i32>),
+}
+
+/// Equal heights for `n` slots in design pixels; the stored form of a
+/// default layout in a column of `n` tiles whose visible inner height is
+/// `inner_h` device px, with `floor` already in device px.
+pub fn default_heights(n: usize, inner_h: i32, gap: i32, floor: i32, scale: f64) -> Vec<i32> {
     if n == 0 {
-        vec![]
-    } else {
-        vec![1.0 / n as f64; n]
+        return vec![];
     }
+    let avail = (inner_h - (n as i32 - 1) * gap).max(1);
+    let each = (avail / n as i32).max(1).max(floor);
+    vec![(each as f64 / scale).round().max(1.0) as i32; n]
+}
+
+/// The heights a column's slots remember, before the last tile's fill: the
+/// equal default or the hand-set design pixels (padded from the default when
+/// a hand vector is short).
+pub fn stored_heights(
+    heights: &Heights,
+    n: usize,
+    inner_h: i32,
+    gap: i32,
+    floor: i32,
+    scale: f64,
+) -> Vec<i32> {
+    let default = default_heights(n, inner_h, gap, floor, scale);
+    match heights {
+        Heights::Default => default,
+        Heights::Hand(v) => (0..n)
+            .map(|row| v.get(row).copied().unwrap_or(default[row]))
+            .collect(),
+    }
+}
+
+/// The heights actually drawn for a column ending above the visible height:
+/// the last tile stretches to fill what is left, the others keep their
+/// heights. `visible` and `gap` are unscaled design pixels.
+pub fn fill_last(heights: &[i32], visible: i32, gap: i32) -> Vec<i32> {
+    let n = heights.len();
+    if n == 0 {
+        return vec![];
+    }
+    let mut out = heights.to_vec();
+    let used: i32 = out.iter().sum::<i32>() + (n as i32 - 1) * gap;
+    if used < visible
+        && let Some(last) = out.last_mut()
+    {
+        *last += visible - used;
+    }
+    out
+}
+
+/// The result of dragging a stacked border: the heights to remember (the last
+/// tile's fill excluded, so it can change on the next resize) and the heights
+/// to draw (the last tile filled).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Pushed {
+    pub stored: Vec<i32>,
+    pub shown: Vec<i32>,
+}
+
+/// Push the border at `border` (1..n, between slots border−1 and border) down
+/// by `dy` unscaled design pixels. Only the tile above the border changes: it
+/// grows by `dy` or shrinks, but never below `min_h`. Every tile below keeps
+/// its height and moves with the border, so the stored column total grows or
+/// shrinks by exactly `dy`; a column that ends short of `visible` has its last
+/// tile filled.
+pub fn heights_after_push(
+    heights: &[i32],
+    border: usize,
+    dy: i32,
+    min_h: i32,
+    visible: i32,
+    gap: i32,
+) -> Pushed {
+    let mut stored = heights.to_vec();
+    if stored.len() >= 2 && border > 0 && border < stored.len() {
+        stored[border - 1] = (stored[border - 1] + dy).max(min_h.max(1));
+    }
+    let shown = fill_last(&stored, visible, gap);
+    Pushed { stored, shown }
 }
 
 /// (left, right) column widths for a view width and the left column's share
@@ -220,67 +303,20 @@ pub fn width_share_after_drag(share: f64, avail: i32, dx: i32, min_w: i32) -> f6
     left as f64 / avail as f64
 }
 
-/// The new pixel sizes for column slots after dragging the border at
-/// `border` (1..n, between slots border−1 and border) by `dy` px. Both
-/// neighbours keep `min_h`; a pair that is already tighter than two
-/// minimums cannot be resized and is returned unchanged. Working in pixels
-/// (the slot heights the pointer saw, floor or no floor) keeps the pointer
-/// delta exact and lets a hand drag go below the default half-height floor.
-pub fn sizes_after_drag(sizes: &[i32], border: usize, dy: i32, min_h: i32) -> Vec<i32> {
-    let n = sizes.len();
-    if n < 2 || border == 0 || border >= n {
-        return sizes.to_vec();
-    }
-    let pair = sizes[border - 1].saturating_add(sizes[border]);
-    let min_h = min_h.max(1);
-    if pair < 2 * min_h {
-        return sizes.to_vec();
-    }
-    let mut out = sizes.to_vec();
-    let first = (sizes[border - 1] + dy).clamp(min_h, pair - min_h);
-    out[border - 1] = first;
-    out[border] = pair - first;
-    out
-}
-
 /// The slot rects of both columns, left first, top to bottom. A slot is the
 /// tile's pill plus its frame: the pill is `control-h` tall and sits `gap-s`
-/// above the frame. Each column's slots share its available height by the
-/// stored shares, so a column with fewer tiles gets taller ones, whichever
-/// column it is. A default layout beyond four tiles keeps every slot at least
-/// half the visible height and the view scrolls; a hand drag clears that
-/// column's floor and may shrink a tile to `min_slot_height`.
-/// Default-floor convenience wrapper over `layout_floored` (tests and the
-/// default model path).
-#[cfg(test)]
+/// above the frame. A default column shares its available height equally, so
+/// a column with fewer tiles gets taller ones, whichever column it is; beyond
+/// four tiles the default keeps every slot at least half the visible height
+/// and the view scrolls. A hand-set column draws its stored design heights
+/// (scaled), with no floor, and its last tile fills any space left under it.
 pub fn layout(
     columns: &[Vec<usize>; 2],
-    heights: &[Vec<f64>; 2],
+    heights: &[Heights; 2],
     width_share: f64,
     view_w: i32,
     view_h: i32,
     scale: f64,
-) -> [Vec<Rect>; 2] {
-    layout_floored(
-        columns,
-        heights,
-        width_share,
-        view_w,
-        view_h,
-        scale,
-        [true, true],
-    )
-}
-
-/// `layout` with each column's half-height floor selectable (item 2).
-pub fn layout_floored(
-    columns: &[Vec<usize>; 2],
-    heights: &[Vec<f64>; 2],
-    width_share: f64,
-    view_w: i32,
-    view_h: i32,
-    scale: f64,
-    floored: [bool; 2],
 ) -> [Vec<Rect>; 2] {
     let counts = [columns[0].len(), columns[1].len()];
     let total = counts[0] + counts[1];
@@ -302,16 +338,33 @@ pub fn layout_floored(
         } else {
             (right_w, f.inset + left_w + gap)
         };
-        let avail = (f.inner_h - (n as i32 - 1) * gap).max(1);
-        let floor = if floored[column] { half } else { 0 };
+        // The drawn heights in device pixels: the default's equal share or
+        // the scaled hand heights, then the last tile fills a column that
+        // ends short of the visible height.
+        let mut shown: Vec<i32> = match &heights[column] {
+            Heights::Default => {
+                let avail = (f.inner_h - (n as i32 - 1) * gap).max(1);
+                vec![(avail / n as i32).max(pill + 1).max(half); n]
+            }
+            Heights::Hand(v) => {
+                let default = default_heights(n, f.inner_h, gap, half, scale);
+                (0..n)
+                    .map(|row| {
+                        let design = v.get(row).copied().unwrap_or(default[row]);
+                        scaled(design as f64, scale).max(pill + 1).max(1)
+                    })
+                    .collect()
+            }
+        };
+        let used: i32 = shown.iter().sum::<i32>() + (n as i32 - 1) * gap;
+        if used < f.inner_h
+            && let Some(last) = shown.last_mut()
+        {
+            *last += f.inner_h - used;
+        }
         let mut y = 0;
         let mut out = Vec::with_capacity(n);
-        for row in 0..n {
-            let share = heights[column].get(row).copied().unwrap_or(1.0 / n as f64);
-            let h = ((avail as f64 * share.clamp(0.0, 1.0)).round() as i32)
-                .max(1)
-                .max(pill + 1)
-                .max(floor);
+        for h in shown {
             out.push(Rect { x, y, w, h });
             y += h + gap;
         }
@@ -627,20 +680,19 @@ pub fn drop_line(slots: &[Vec<Rect>; 2], drop: Drop, scale: f64) -> Option<Rect>
 }
 
 /// The new heights after the columns change: a column that gained or lost a
-/// tile goes back to equal shares; the others keep theirs. A swap or a
-/// reorder changes no length, so each tile keeps the slot height it lands in.
+/// tile goes back to the default; the others keep theirs. A swap or a reorder
+/// changes no length, so each column keeps its heights and a tile takes the
+/// slot height it lands in.
 pub fn heights_after_change(
     old_columns: &[Vec<usize>; 2],
-    old_heights: &[Vec<f64>; 2],
+    old_heights: &[Heights; 2],
     new_columns: &[Vec<usize>; 2],
-) -> [Vec<f64>; 2] {
+) -> [Heights; 2] {
     [0, 1].map(|column| {
-        if old_columns[column].len() == new_columns[column].len()
-            && old_heights[column].len() == old_columns[column].len()
-        {
+        if old_columns[column].len() == new_columns[column].len() {
             old_heights[column].clone()
         } else {
-            equal_shares(new_columns[column].len())
+            Heights::Default
         }
     })
 }
@@ -724,14 +776,13 @@ pub fn drag_layout(
         match apply_drop(board.columns, from, drop) {
             Some(next) => {
                 let next_heights = heights_after_change(board.columns, board.heights, &next);
-                let mut slots = layout_floored(
+                let mut slots = layout(
                     &next,
                     &next_heights,
                     board.width_share,
                     board.view.w,
                     board.view.h,
                     board.view.scale,
-                    board.floored,
                 );
                 offset_slots(&mut slots, board.view.h, board.view.scale, board.scroll);
                 for (column, tiles) in next.iter().enumerate() {
@@ -844,10 +895,8 @@ struct Tile {
 struct State {
     tiles: Vec<Tile>,         // indexed by tile id
     columns: [Vec<usize>; 2], // column -> tile ids, top to bottom
-    /// Each column's slot heights as shares of its available height.
-    heights: [Vec<f64>; 2],
-    /// Whether each column still uses the default layout's half-height floor.
-    floored: [bool; 2],
+    /// Each column's slot heights: the default or hand-set design pixels.
+    heights: [Heights; 2],
     /// The left column's share of the width left after the gutter.
     width_share: f64,
     /// The outer scroller's vertical value: a fitting column is pinned there.
@@ -874,7 +923,6 @@ impl State {
                 scale: self.scale,
             },
             scroll: self.scroll,
-            floored: self.floored,
         }
     }
 
@@ -900,13 +948,14 @@ enum Drag {
     },
     /// The column border: the width share follows the pointer.
     Width { share: f64, press_x: i32 },
-    /// A border between two stacked tiles: the height shares follow. `sizes`
-    /// are the pixel heights the pointer saw at the press, so the delta is
-    /// applied once, in the same space (item 5).
+    /// A border between two stacked tiles: the height of the tile above
+    /// follows the pointer, pushing the tiles below. `heights` are the column's
+    /// design-pixel heights at the press, so every update applies the whole
+    /// pointer delta to the same starting sizes.
     Height {
         column: usize,
         border: usize,
-        sizes: Vec<i32>,
+        heights: Vec<i32>,
         press_y: i32,
     },
 }
@@ -1038,8 +1087,7 @@ impl SplitView {
                 state: RefCell::new(State {
                     tiles: vec![],
                     columns: [vec![], vec![]],
-                    heights: [vec![], vec![]],
-                    floored: [true, true],
+                    heights: [Heights::Default, Heights::Default],
                     width_share: 0.5,
                     scroll: 0,
                     widgets: vec![],
@@ -1155,8 +1203,7 @@ impl Inner {
             }
             st.tiles.clear();
             st.columns = [vec![], vec![]];
-            st.heights = [vec![], vec![]];
-            st.floored = [true, true];
+            st.heights = [Heights::Default, Heights::Default];
             st.width_share = 0.5;
             st.scroll = 0;
             st.pills.clear();
@@ -1171,13 +1218,7 @@ impl Inner {
             self.add_one(&view, false);
         }
         self.state.borrow_mut().columns = initial_columns(n);
-        {
-            let mut st = self.state.borrow_mut();
-            st.heights = [
-                equal_shares(st.columns[0].len()),
-                equal_shares(st.columns[1].len()),
-            ];
-        }
+        self.state.borrow_mut().heights = [Heights::Default, Heights::Default];
         self.relayout(false);
         self.refresh_classes();
     }
@@ -1205,9 +1246,8 @@ impl Inner {
                 name: name.clone(),
             });
             let column = add_to_shorter(&mut st.columns, index);
-            // A column that gained a tile goes back to equal shares.
-            st.heights[column] = equal_shares(st.columns[column].len());
-            st.floored[column] = true;
+            // A column that gained a tile goes back to the default.
+            st.heights[column] = Heights::Default;
             st.widgets.push(tile.clone());
             st.frames.push(frame);
             st.pills.push(pill);
@@ -1266,11 +1306,6 @@ impl Inner {
             let old_heights = st.heights.clone();
             let next = columns_without(&old_columns, index);
             st.heights = heights_after_change(&old_columns, &old_heights, &next);
-            for column in 0..2 {
-                if old_columns[column].len() != next[column].len() {
-                    st.floored[column] = true;
-                }
-            }
             st.columns = next;
             st.tiles.remove(index);
             st.widgets.remove(index);
@@ -1514,9 +1549,17 @@ impl Inner {
     /// The press point, the hit test and every later update are in the
     /// Fixed's content space via `pointer_in_fixed` (item 5).
     fn begin_drag(&self, gesture: &gtk::GestureDrag, sx: f64, sy: f64) {
-        let (rects, slots, scale, width_share) = {
+        let (rects, slots, scale, width_share, columns, heights, view) = {
             let st = self.state.borrow();
-            (st.rects.clone(), st.slots(), st.scale, st.width_share)
+            (
+                st.rects.clone(),
+                st.slots(),
+                st.scale,
+                st.width_share,
+                st.columns.clone(),
+                st.heights.clone(),
+                st.view,
+            )
         };
         let (px, py) = pointer_in_fixed(&self.fixed, gesture.current_event().as_ref())
             .map(|(x, y)| (x.round() as i32, y.round() as i32))
@@ -1561,11 +1604,29 @@ impl Inner {
                 crate::log!("split", "resizing the column border from x {px}");
             }
             Border::Heights { column, row } => {
-                let sizes: Vec<i32> = slots[column].iter().map(|r| r.h).collect();
+                let f = frame(view[0], view[1], scale);
+                let total = columns[0].len() + columns[1].len();
+                let heights = match &heights[column] {
+                    // A default column starts its hand layout at the heights the
+                    // pointer sees, so the tiles below keep them exactly. Its
+                    // last slot's fill is at most a rounding pixel here.
+                    Heights::Default => slots[column]
+                        .iter()
+                        .map(|r| (r.h as f64 / scale).round() as i32)
+                        .collect(),
+                    Heights::Hand(_) => stored_heights(
+                        &heights[column],
+                        columns[column].len(),
+                        f.inner_h,
+                        f.gutter,
+                        half_floor(total, &f),
+                        scale,
+                    ),
+                };
                 *self.drag.borrow_mut() = Some(Drag::Height {
                     column,
                     border: row,
-                    sizes,
+                    heights,
                     press_y: py,
                 });
                 crate::log!("split", "resizing column {column} at border {row}");
@@ -1584,7 +1645,7 @@ impl Inner {
                 press,
                 targets,
             } => {
-                let (columns, heights, width_share, rects, widgets, view, scale, scroll, floored) = {
+                let (columns, heights, width_share, rects, widgets, view, scale, scroll) = {
                     let st = self.state.borrow();
                     (
                         st.columns.clone(),
@@ -1595,7 +1656,6 @@ impl Inner {
                         st.view,
                         st.scale,
                         st.scroll,
-                        st.floored,
                     )
                 };
                 let Some(&rect) = rects.get(from) else {
@@ -1614,7 +1674,6 @@ impl Inner {
                         scale,
                     },
                     scroll,
-                    floored,
                 };
                 let (drop, layout) = drag_layout(&board, &rects, from, px, py, grab);
                 let size = (rect.w, rect.h);
@@ -1658,7 +1717,7 @@ impl Inner {
             Drag::Height {
                 column,
                 border,
-                sizes,
+                heights,
                 press_y,
             } => {
                 let (scale, view) = {
@@ -1668,29 +1727,34 @@ impl Inner {
                 let (_, py) = pointer_in_fixed(&self.fixed, gesture.current_event().as_ref())
                     .map(|(_, y)| (0, y.round() as i32))
                     .unwrap_or((0, press_y + dy.round() as i32));
-                let dy = py - press_y;
+                let dragged = py - press_y;
                 let f = frame(view[0], view[1], scale);
-                let n = {
-                    let st = self.state.borrow();
-                    st.columns[column].len()
-                };
-                let avail = (f.inner_h - (n as i32 - 1) * f.gutter).max(1);
-                let next_px = sizes_after_drag(&sizes, border, dy, min_slot_height(scale));
-                let next: Vec<f64> = next_px.iter().map(|px| *px as f64 / avail as f64).collect();
+                // The gesture is in device pixels; the model is in design
+                // pixels, so a scale change keeps a hand size.
+                let dy = (dragged as f64 / scale).round() as i32;
+                let visible = (f.inner_h as f64 / scale).round() as i32;
+                let gap = (f.gutter as f64 / scale).round() as i32;
+                let pushed =
+                    heights_after_push(&heights, border, dy, min_slot_height(1.0), visible, gap);
                 {
                     let mut st = self.state.borrow_mut();
-                    st.heights[column] = next.clone();
-                    // A hand drag owns this column's heights: no half floor.
-                    st.floored[column] = false;
+                    // A hand drag owns this column's heights: no half floor,
+                    // and only the tile above the border changed size.
+                    st.heights[column] = Heights::Hand(pushed.stored.clone());
                 }
-                crate::log!("split", "border drag dy {dy} shares {next:?}");
+                let shown: Vec<i32> = pushed
+                    .shown
+                    .iter()
+                    .map(|h| scaled(*h as f64, scale))
+                    .collect();
+                crate::log!("split", "border drag dy {dragged} heights {shown:?}");
                 self.relayout(false);
             }
         }
     }
 
     /// Settle: a tile drop commits, otherwise everything slides back. Border
-    /// drags have already written their shares.
+    /// drags have already written their heights.
     fn end_drag(&self, gesture: &gtk::GestureDrag, dx: f64, dy: f64) {
         let Some(drag) = self.drag.borrow_mut().take() else {
             return;
@@ -1771,11 +1835,7 @@ impl Inner {
                 crate::log!("split", "reset the column border to equal shares");
             }
             Some(Border::Heights { column, .. }) => {
-                {
-                    let mut st = self.state.borrow_mut();
-                    st.heights[column] = equal_shares(st.columns[column].len());
-                    st.floored[column] = true;
-                }
+                self.state.borrow_mut().heights[column] = Heights::Default;
                 self.relayout(true);
                 crate::log!("split", "reset column {column} to equal shares");
             }
@@ -1922,27 +1982,23 @@ mod tests {
     /// pill + one grid row minimum.
     const VIEW: (i32, i32) = (1200, 1400);
 
-    fn slots(columns: &[Vec<usize>; 2], heights: &[Vec<f64>; 2]) -> [Vec<Rect>; 2] {
+    fn slots(columns: &[Vec<usize>; 2], heights: &[Heights; 2]) -> [Vec<Rect>; 2] {
         layout(columns, heights, 0.5, VIEW.0, VIEW.1, 1.0)
     }
 
     fn rects_for(columns: &[Vec<usize>; 2]) -> Vec<Rect> {
-        let heights = [
-            equal_shares(columns[0].len()),
-            equal_shares(columns[1].len()),
-        ];
-        let s = slots(columns, &heights);
+        let s = slots(columns, &[Heights::Default, Heights::Default]);
         rects_by_tile(columns, &s)
     }
 
-    fn frames() -> [Vec<f64>; 2] {
-        [equal_shares(2), equal_shares(2)]
+    fn defaults() -> [Heights; 2] {
+        [Heights::Default, Heights::Default]
     }
 
     #[test]
     fn tiles_fill_the_height_and_split_the_width() {
         let columns = initial_columns(2);
-        let s = slots(&columns, &[equal_shares(1), equal_shares(1)]);
+        let s = slots(&columns, &defaults());
         assert_eq!(s[0][0].y, 0); // the pill tops sit level with the panels
         assert_eq!(s[0][0].h, VIEW.1 - scaled(GAP_2XL, 1.0)); // bottom inset only
         assert_eq!(s[0][0].x, scaled(GAP_2XL, 1.0));
@@ -1950,17 +2006,7 @@ mod tests {
         // The gutter between the columns is gap-l.
         assert_eq!(s[1][0].x, s[0][0].x + s[0][0].w + scaled(GAP_L, 1.0));
         assert!(rects_by_tile(&initial_columns(0), &[vec![], vec![]]).is_empty());
-        assert!(
-            layout(
-                &initial_columns(2),
-                &[vec![1.0], vec![1.0]],
-                0.5,
-                0,
-                800,
-                1.0
-            )[0]
-            .is_empty()
-        );
+        assert!(layout(&initial_columns(2), &defaults(), 0.5, 0, 800, 1.0)[0].is_empty());
     }
 
     #[test]
@@ -1987,8 +2033,8 @@ mod tests {
         assert_eq!(three[0].h, avail / 2);
         assert_eq!(three[1].h, VIEW.1 - scaled(GAP_2XL, 1.0));
         assert_eq!(three[2].y, three[0].h + scaled(GAP_L, 1.0));
-        // The left column fills the visible height (rounded shares may leave
-        // one pixel).
+        // The left column fills the visible height (integer division may leave
+        // one pixel, which the last tile's fill takes).
         assert!(three[2].y + three[2].h >= VIEW.1 - scaled(GAP_2XL, 1.0) - 1);
         // 4 tiles: equal 2 + 2 columns.
         let four = rects_for(&initial_columns(4));
@@ -2202,21 +2248,143 @@ mod tests {
     }
 
     #[test]
-    fn border_drags_clamp_at_the_minimums() {
+    fn dragging_down_grows_the_tile_above_and_moves_the_rest_down() {
+        let columns = initial_columns(4); // 2 + 2
+        let before = slots(&columns, &defaults());
+        let above = before[0][0].h;
+        let below = before[0][1].h;
         let f = frame(VIEW.0, VIEW.1, 1.0);
-        let min = min_slot_height(1.0);
-        let avail = f.inner_h - 3 * f.gutter;
-        let sizes = vec![avail / 2, avail / 2];
-        // Pull the first border far up: the first slot stops at the minimum.
-        let next = sizes_after_drag(&sizes, 1, -2000, min);
-        assert_eq!(next[0], min);
-        assert!(next[1] >= min);
-        assert_eq!(next[0] + next[1], sizes[0] + sizes[1]);
-        // And far down: the second slot stops at the minimum.
-        let next = sizes_after_drag(&sizes, 1, 2000, min);
-        assert_eq!(next[1], min);
-        assert!(next[0] >= min);
-        // The width border clamps to one grid column, both sides.
+        let pushed = heights_after_push(
+            &[above, below],
+            1,
+            200,
+            min_slot_height(1.0),
+            f.inner_h,
+            f.gutter,
+        );
+        assert_eq!(pushed.stored, vec![above + 200, below]);
+        assert_eq!(pushed.shown, pushed.stored);
+        // Only the tile above changed; the one below keeps its height and
+        // moves down, so the column is 200 px taller.
+        let after = slots(&columns, &[Heights::Hand(pushed.stored), Heights::Default]);
+        assert_eq!(after[0][0].h, above + 200);
+        assert_eq!(after[0][1].h, below);
+        assert_eq!(after[0][1].y, before[0][1].y + 200);
+        assert_eq!(
+            after[0][1].y + after[0][1].h,
+            before[0][1].y + before[0][1].h + 200
+        );
+    }
+
+    #[test]
+    fn dragging_up_shrinks_to_the_minimum_and_moves_the_rest_up() {
+        // A three-tile left column beside a lone right tile.
+        let columns = [vec![0, 1, 2], vec![3]];
+        let before = slots(&columns, &defaults());
+        let f = frame(VIEW.0, VIEW.1, 1.0);
+        let heights = default_heights(3, f.inner_h, f.gutter, 0, 1.0);
+        let pushed = heights_after_push(
+            &heights,
+            1,
+            -10_000,
+            min_slot_height(1.0),
+            f.inner_h,
+            f.gutter,
+        );
+        // The tile above stops at its minimum; the two below keep theirs.
+        assert_eq!(pushed.stored[0], min_slot_height(1.0));
+        assert_eq!(&pushed.stored[1..], &heights[1..]);
+        // The column now ends short, so the last tile fills the rest.
+        let filled = f.inner_h - (pushed.stored[0] + heights[1]) - 2 * f.gutter;
+        assert_eq!(pushed.shown[2], filled.max(heights[2]));
+        let after = slots(&columns, &[Heights::Hand(pushed.stored), Heights::Default]);
+        // The middle tile moved up by the amount the first one shrank and
+        // kept its height.
+        let shrink = heights[0] - min_slot_height(1.0);
+        assert_eq!(after[0][1].y, before[0][1].y - shrink);
+        assert_eq!(after[0][1].h, before[0][1].h);
+        assert_eq!(after[0][2].y + after[0][2].h, f.inner_h);
+    }
+
+    #[test]
+    fn the_last_tile_fills_a_column_shorter_than_the_view() {
+        let columns = [vec![0, 1], vec![2]];
+        let heights = [Heights::Hand(vec![300, 300]), Heights::Default];
+        let s = slots(&columns, &heights);
+        let f = frame(VIEW.0, VIEW.1, 1.0);
+        assert_eq!(s[0][0].h, 300);
+        assert_eq!(s[0][1].h, f.inner_h - f.gutter - 300);
+        assert_eq!(s[0][1].y + s[0][1].h, f.inner_h);
+        // The pure fill matches, and it never shrinks a column that is
+        // already taller than the view.
+        assert_eq!(
+            fill_last(&[300, 300], f.inner_h, f.gutter),
+            vec![300, f.inner_h - f.gutter - 300]
+        );
+        assert_eq!(fill_last(&[900, 900], f.inner_h, f.gutter), vec![900, 900]);
+    }
+
+    #[test]
+    fn hand_heights_keep_their_design_px_through_resizes_and_scale_changes() {
+        // A hand-sized column taller than the view at 800, so no fill can mask
+        // a size change.
+        let columns = [vec![0, 1, 2], vec![3]];
+        let heights = [Heights::Hand(vec![500, 300, 200]), Heights::Default];
+        let at = |view_h: i32, scale: f64| layout(&columns, &heights, 0.5, 1200, view_h, scale);
+        let short = at(800, 1.0);
+        let tall = at(1200, 1.0);
+        for s in [&short, &tall] {
+            assert_eq!((s[0][0].h, s[0][1].h), (500, 300));
+        }
+        // Scale 0.5 halves every hand height; the column is now shorter than
+        // the view, so only the last tile's fill grows.
+        let half = at(800, 0.5);
+        assert_eq!((half[0][0].h, half[0][1].h), (250, 150));
+        let f = frame(1200, 800, 0.5);
+        assert_eq!(half[0][2].h, f.inner_h - 2 * f.gutter - 250 - 150);
+    }
+
+    #[test]
+    fn a_reset_returns_to_the_equal_default() {
+        let columns = [vec![0, 1], vec![2, 3]];
+        let hand = [Heights::Hand(vec![700, 200]), Heights::Default];
+        let dragged = layout(&columns, &hand, 0.5, VIEW.0, VIEW.1, 1.0);
+        assert_ne!(dragged[0][0].h, dragged[0][1].h);
+        // The double-click reset writes `Default`, whose layout is equal.
+        let reset = layout(&columns, &defaults(), 0.5, VIEW.0, VIEW.1, 1.0);
+        assert_eq!(reset[0][0].h, reset[0][1].h);
+        // A swap keeps both columns' heights ...
+        let four = initial_columns(4);
+        let swapped = columns_after_swap(&four, 0, 1).unwrap();
+        assert_eq!(heights_after_change(&four, &hand, &swapped)[0], hand[0]);
+        // ... while an insert (both lengths change) resets both columns.
+        let moved = columns_after_insert(&four, 0, 1, 2).unwrap();
+        let after = heights_after_change(&four, &hand, &moved);
+        assert_eq!(after[0], Heights::Default);
+        assert_eq!(after[1], Heights::Default);
+    }
+
+    #[test]
+    fn a_column_that_grows_past_the_view_stops_being_pinned() {
+        let columns = initial_columns(4); // 2 + 2, both default and fitting
+        let before = slots(&columns, &defaults());
+        assert!(column_fits(&before[0], VIEW.1, 1.0));
+        assert!(column_fits(&before[1], VIEW.1, 1.0));
+        let f = frame(VIEW.0, VIEW.1, 1.0);
+        let heights = default_heights(2, f.inner_h, f.gutter, 0, 1.0);
+        let pushed =
+            heights_after_push(&heights, 1, 800, min_slot_height(1.0), f.inner_h, f.gutter);
+        let after = slots(&columns, &[Heights::Hand(pushed.stored), Heights::Default]);
+        assert!(!column_fits(&after[0], VIEW.1, 1.0));
+        assert!(column_fits(&after[1], VIEW.1, 1.0));
+        // The grown column scrolls (offset 0); the other stays pinned at the
+        // scroll value.
+        assert_eq!(column_offsets(&after, VIEW.1, 1.0, 90), [0, 90]);
+    }
+
+    #[test]
+    fn the_column_border_still_trades_width() {
+        let f = frame(VIEW.0, VIEW.1, 1.0);
         let min_w = min_column_width(1.0);
         let avail_w = f.inner_w - f.gutter;
         assert_eq!(min_w, scaled(CELL_W, 1.0));
@@ -2228,90 +2396,8 @@ mod tests {
             (avail_w as f64 * width_share_after_drag(0.5, avail_w, 9999, min_w)).round() as i32,
             avail_w - min_w
         );
-        assert!(min_w >= scaled(CELL_W, 1.0));
-        // A pair that is already below two minimums cannot be resized.
-        let tight = vec![100, 100];
-        assert_eq!(sizes_after_drag(&tight, 1, 10, 202), tight);
-    }
-
-    #[test]
-    fn a_double_click_resets_a_border_to_equal_shares() {
-        // The reset is the model's own equal shares.
-        assert_eq!(equal_shares(3), vec![1.0 / 3.0; 3]);
-        let dragged = sizes_after_drag(&[500, 500, 500], 1, 120, 100);
-        assert_ne!(dragged, vec![500, 500, 500]);
-        assert_eq!(equal_shares(3), vec![1.0 / 3.0; 3]);
-        // The column border's reset is the equal width share.
-        let min_w = min_column_width(1.0);
         let dragged = width_share_after_drag(0.5, 1000, 120, min_w);
         assert!((dragged - 0.62).abs() < 0.001);
-        assert_eq!(0.5, 0.5);
-    }
-
-    #[test]
-    fn shares_survive_a_window_resize() {
-        let f = frame(VIEW.0, VIEW.1, 1.0);
-        let avail = f.inner_h - f.gutter;
-        let sizes = sizes_after_drag(&[avail / 2, avail / 2], 1, 200, min_slot_height(1.0));
-        let shares: Vec<f64> = sizes.iter().map(|px| *px as f64 / avail as f64).collect();
-        let big = layout_floored(
-            &initial_columns(4),
-            &[shares.clone(), equal_shares(2)],
-            0.7,
-            1400,
-            1600,
-            1.0,
-            [false, true],
-        );
-        let small = layout_floored(
-            &initial_columns(4),
-            &[shares.clone(), equal_shares(2)],
-            0.7,
-            1000,
-            1200,
-            1.0,
-            [false, true],
-        );
-        // The ratio of the two stacked tiles stays the same at both sizes.
-        let ratio = |s: &[Rect]| s[0].h as f64 / s[1].h as f64;
-        assert!((ratio(&big[0]) - ratio(&small[0])).abs() < 0.05);
-        // And so does the column width share.
-        let w = |s: &[Vec<Rect>; 2]| s[0][0].w as f64 / (s[0][0].w + s[1][0].w) as f64;
-        assert!((w(&big) - w(&small)).abs() < 0.05);
-        // At scale 0.5 the proportions hold too.
-        let half = layout_floored(
-            &initial_columns(4),
-            &[shares, equal_shares(2)],
-            0.7,
-            1400,
-            1600,
-            0.5,
-            [false, true],
-        );
-        assert!((w(&big) - w(&half)).abs() < 0.05);
-    }
-
-    #[test]
-    fn adding_or_closing_resets_that_column() {
-        let four = initial_columns(4);
-        let dragged = [vec![0.7, 0.3], equal_shares(2)];
-        // A close that only changes the left column resets it and keeps the
-        // right one.
-        let next = columns_without(&four, 2);
-        let heights = heights_after_change(&four, &dragged, &next);
-        assert_eq!(heights[0], equal_shares(1));
-        assert_eq!(heights[1], dragged[1]);
-        // An insert changes both lengths: both go back to equal shares.
-        let moved = columns_after_insert(&four, 0, 1, 2).unwrap();
-        let heights = heights_after_change(&four, &dragged, &moved);
-        assert_eq!(heights[0], equal_shares(1));
-        assert_eq!(heights[1], equal_shares(3));
-        // A swap changes no length: every tile keeps the slot it lands in.
-        let swapped = columns_after_swap(&four, 0, 1).unwrap();
-        assert_eq!(
-            heights_after_change(&four, &dragged, &swapped)[0],
-            dragged[0]
-        );
     }
 
     #[test]
@@ -2426,86 +2512,54 @@ mod tests {
 
     #[test]
     fn a_short_column_is_pinned_and_a_tall_one_scrolls() {
-        let heights = |columns: &[Vec<usize>; 2]| {
-            [
-                equal_shares(columns[0].len()),
-                equal_shares(columns[1].len()),
-            ]
-        };
         // 4 + 1: the lone tile fits; four floored tiles do not.
         let four_one = [vec![0, 1, 2, 3], vec![4]];
-        let s = layout(&four_one, &heights(&four_one), 0.5, VIEW.0, VIEW.1, 1.0);
+        let s = layout(&four_one, &defaults(), 0.5, VIEW.0, VIEW.1, 1.0);
         assert_eq!(column_offsets(&s, VIEW.1, 1.0, 90), [0, 90]);
         assert!(!column_fits(&s[0], VIEW.1, 1.0));
         assert!(column_fits(&s[1], VIEW.1, 1.0));
         // 3 + 3: both columns are floored past the view, so both scroll.
         let three_three = initial_columns(6);
-        let s = layout(
-            &three_three,
-            &heights(&three_three),
-            0.5,
-            VIEW.0,
-            VIEW.1,
-            1.0,
-        );
+        let s = layout(&three_three, &defaults(), 0.5, VIEW.0, VIEW.1, 1.0);
         assert_eq!(column_offsets(&s, VIEW.1, 1.0, 90), [0, 0]);
         // 2 + 1: both fit, so both stay pinned (and the scroller has no range).
         let two_one = [vec![0, 1], vec![2]];
-        let s = layout(&two_one, &heights(&two_one), 0.5, VIEW.0, VIEW.1, 1.0);
+        let s = layout(&two_one, &defaults(), 0.5, VIEW.0, VIEW.1, 1.0);
         assert_eq!(column_offsets(&s, VIEW.1, 1.0, 0), [0, 0]);
         assert!(column_fits(&s[0], VIEW.1, 1.0));
         // A 2 + 2 column that fits at 1400 stops fitting at 100: the pill plus
         // one grid row is now taller than half the view.
         let four = initial_columns(4);
-        let tall = layout(&four, &heights(&four), 0.5, VIEW.0, 1400, 1.0);
-        let short = layout(&four, &heights(&four), 0.5, VIEW.0, 100, 1.0);
+        let tall = layout(&four, &defaults(), 0.5, VIEW.0, 1400, 1.0);
+        let short = layout(&four, &defaults(), 0.5, VIEW.0, 100, 1.0);
         assert!(column_fits(&tall[0], 1400, 1.0));
         assert!(!column_fits(&short[0], 100, 1.0));
         assert_eq!(column_offsets(&short, 100, 1.0, 30), [0, 0]);
     }
 
     #[test]
-    fn a_hand_drag_reaches_the_minimum_not_the_half_floor() {
+    fn a_hand_drag_reaches_the_minimum_below_the_half_floor() {
         // 4 + 1: the default layout floors the four-tile column at half the
         // view. A hand drag may take one of its tiles down to pill + one grid
-        // row, below that floor.
+        // row, below that floor, and the tiles below keep theirs.
         let four_one = [vec![0, 1, 2, 3], vec![4]];
-        let heights = [equal_shares(4), equal_shares(1)];
-        let s = layout(&four_one, &heights, 0.5, VIEW.0, VIEW.1, 1.0);
+        let s = slots(&four_one, &defaults());
         let f = frame(VIEW.0, VIEW.1, 1.0);
         let half = half_floor(5, &f);
         assert_eq!(s[0][0].h, half);
         let min = min_slot_height(1.0);
         assert!(min < half);
-        let sizes: Vec<i32> = s[0].iter().map(|r| r.h).collect();
-        let next = sizes_after_drag(&sizes, 1, -10_000, min);
-        assert_eq!(next[0], min);
-        // The pair keeps its sum, so the neighbour grows; the floor is gone.
-        assert_eq!(next[1], 2 * half - min);
-        assert!(next[1] > half);
-        // The hand-drag layout drops the floor and renders the minimum.
-        let avail = f.inner_h - 3 * f.gutter;
-        let shares: Vec<f64> = next.iter().map(|px| *px as f64 / avail as f64).collect();
-        let hand = layout_floored(
-            &four_one,
-            &[shares, equal_shares(1)],
-            0.5,
-            VIEW.0,
-            VIEW.1,
-            1.0,
-            [false, true],
-        );
+        let heights = default_heights(4, f.inner_h, f.gutter, half, 1.0);
+        let pushed = heights_after_push(&heights, 1, -10_000, min, f.inner_h, f.gutter);
+        assert_eq!(pushed.stored[0], min);
+        assert_eq!(&pushed.stored[1..], &[half, half, half]);
+        // The hand layout drops the floor and renders the minimum; the next
+        // tile keeps its half-height.
+        let hand = slots(&four_one, &[Heights::Hand(pushed.stored), Heights::Default]);
         assert_eq!(hand[0][0].h, min);
-        // The default layout still floors it.
-        let floored = layout(
-            &four_one,
-            &[equal_shares(4), equal_shares(1)],
-            0.5,
-            VIEW.0,
-            VIEW.1,
-            1.0,
-        );
-        assert_eq!(floored[0][0].h, half);
+        assert_eq!(hand[0][1].h, half);
+        // The default layout still floors every slot.
+        assert_eq!(slots(&four_one, &defaults())[0][0].h, half);
     }
 
     #[test]
@@ -2570,7 +2624,7 @@ mod tests {
     #[test]
     fn drag_follows_the_pointer_and_previews_the_drop() {
         let columns = initial_columns(4);
-        let heights = frames();
+        let heights = defaults();
         let rects = rects_for(&columns);
         let s = slots_of(&columns, &rects);
         let other = s[1][0];
@@ -2585,7 +2639,6 @@ mod tests {
                 scale: 1.0,
             },
             scroll: 0,
-            floored: [true, true],
         };
         let (drop, preview) = drag_layout(&board, &rects, 0, other.x + 10, other.y + 10, (0, 0));
         assert_eq!(drop, Some(Drop::Swap(1)));
@@ -2614,7 +2667,7 @@ mod tests {
     #[test]
     fn a_drag_respects_the_grab_offset() {
         let columns = initial_columns(4);
-        let heights = frames();
+        let heights = defaults();
         let rects = rects_for(&columns);
         let board = Board {
             columns: &columns,
@@ -2626,7 +2679,6 @@ mod tests {
                 scale: 1.0,
             },
             scroll: 0,
-            floored: [true, true],
         };
         let (_, preview) = drag_layout(&board, &rects, 0, 900, 700, (30, 20));
         assert_eq!(

@@ -1265,3 +1265,175 @@ and the border drag is close. Live, release build, tiled window, DP-3 off:
 - **Change (Kyle):** dragging a vertical border should push the tiles below instead of shrinking
   the one below. Dragging up mirrors that, and the last tile fills a column shorter than the view.
   Rule in the spec; brief P1m-r5.
+
+## P1m-r5 changes
+
+Built on P1m-r4 in `spike/src/bin/look-body/`. Only `split.rs` under that folder and this note
+changed; the temporary timer harness was removed before delivery. Below, command output and timer
+logs are **[observed]**, GTK/gtk-rs source citations are **[read]**, and the live look/feel items are
+**[inferred]**.
+
+### Item 1: vertical borders push, not trade
+
+The height model is no longer a vector of shares. `State.heights` is now `[Heights; 2]`:
+
+```rust
+pub enum Heights {
+    Default,          // equal shares, half-height floor beyond four tiles
+    Hand(Vec<i32>),   // hand-set heights, unscaled design px, top to bottom
+}
+```
+
+and the pure model is:
+
+```rust
+heights_after_push(heights, border, dy, min_h, visible, gap) -> Pushed { stored, shown }
+fill_last(heights, visible, gap) -> Vec<i32>
+```
+
+- **Down** changes only `heights[border - 1]`: it grows by `dy`. Every tile below keeps its stored
+  height and moves down by `dy`, so the column's total grows by `dy` and scrolls. `shown` equals
+  `stored` once the column is taller than the view.
+- **Up** changes only the same tile: it shrinks by `dy`, clamped at `min_slot_height` (202 design px
+  at scale 1). Every tile below keeps its stored height and moves up. If the column now ends short,
+  `fill_last` stretches its last tile to the visible height; that fill is *not* stored, so a later
+  resize/scale change only changes the fill.
+- **Layout** (`layout`) computes a `Default` column as `avail / n` device px with the old half-height
+  floor, and a `Hand` column as `scaled(design, scale)` with no floor. Both then fill the last tile
+  in device pixels if the column ends short, so there is never empty space under it. Doing the fill
+  after scaling means the bottom edge is exact at 0.5 and other scales.
+- **Drag start.** For a `Hand` column the press heights are the stored design heights (not the
+  displayed last fill), so a large fill is never baked into the model. For a `Default` column they
+  are the slot heights the pointer sees, converted to design px (its last fill is at most a rounding
+  pixel). Every update applies the whole pointer delta to those press heights, converted with
+  `dy / scale`, so the pointer delta is in one space (r4's fix kept).
+- **Log.** `split: border drag dy <device dy> heights [<device heights>]` (was `… shares […]`).
+
+A hand-sized tile now keeps its exact design-px height through a window resize and a scale change;
+only the last tile's fill changes. A reset (double-click), an add, a close, or a drop that changes a
+column's length writes `Heights::Default` for that column (`heights_after_change`), which is the old
+equal-share/floor layout. The column border still trades width (`width_share_after_drag` unchanged).
+
+The old `floored: [bool; 2]` is gone: a `Default` column is floored, a `Hand` column is not. Pinned
+columns, scroll offsets, drop zones, the drop line and the border hit test all keep using the same
+slot rects, which now include the pushed heights.
+
+### Unit tests added / changed (all in the look-body binary)
+
+Added:
+
+- `split::tests::dragging_down_grows_the_tile_above_and_moves_the_rest_down`
+- `split::tests::dragging_up_shrinks_to_the_minimum_and_moves_the_rest_up`
+- `split::tests::the_last_tile_fills_a_column_shorter_than_the_view`
+- `split::tests::hand_heights_keep_their_design_px_through_resizes_and_scale_changes`
+- `split::tests::a_reset_returns_to_the_equal_default`
+- `split::tests::a_column_that_grows_past_the_view_stops_being_pinned`
+- `split::tests::the_column_border_still_trades_width`
+
+Changed to the new model: `tiles_fill_the_height_and_split_the_width`, `rects_for`/`slots` helpers,
+`a_short_column_is_pinned_and_a_tall_one_scrolls`, `a_hand_drag_reaches_the_minimum_below_the_half_floor`,
+`drag_follows_the_pointer_and_previews_the_drop`, `a_drag_respects_the_grab_offset`. The old
+`sizes_after_drag` trade tests and the share-reset tests were replaced by the push tests above.
+`rects_never_overlap` still covers 2–6 tiles, every swap, insert and close.
+
+### Temporary timer log (harness removed before delivery)
+
+Debug binary, `GIMBAL_SPIKE_LOG=1 look-body --tiles 4`, niri-tiled 1272 × 1398, so the split view is
+298 × 1191 and each left column is 97 wide. The timer at 1.5 s computed a 2 + 2 left column's model
+rects with the same `layout` + `offset_slots` that `relayout` uses, before and after a +200 and a
+−150 drag of its first border. [observed, model]
+
+```text
+[gimbal-look-body 1.577] temp: r5 view [298, 1191] scale 1: before [Rect { x: 40, y: 0, w: 97, h: 563 }, Rect { x: 40, y: 587, w: 97, h: 564 }]
+[gimbal-look-body 1.577] temp: r5 +200: left rects [Rect { x: 40, y: 0, w: 97, h: 763 }, Rect { x: 40, y: 787, w: 97, h: 564 }]
+[gimbal-look-body 1.577] temp: r5 -150: left rects [Rect { x: 40, y: 0, w: 97, h: 413 }, Rect { x: 40, y: 437, w: 97, h: 714 }]
+```
+
+The +200 drag grows the top tile 563 → 763, leaves the bottom at 564 and moves it 587 → 787 (the
+column is 200 px taller). The −150 drag shrinks the top tile to 413, moves the bottom 587 → 437,
+and the last tile's fill grows 564 → 714, so the column still ends at the view (y 437 + 714 =
+1151 = `inner_h`). The 1 px difference between the two default slots (563/564) is the default
+layout's last-tile fill before the drag.
+
+### RULES.md's four commands, from `$SPIKE`
+
+`cargo fmt --check`:
+
+```text
+(fmt exit 0; no output)
+```
+
+`cargo clippy --all-targets -- -D warnings`:
+
+```text
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.04s
+(clippy exit 0)
+```
+
+`cargo test`:
+
+```text
+     Running unittests src/main.rs (target/debug/deps/gimbal_spike-27f41c3be3242da9)
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running unittests src/bin/look-body/main.rs (target/debug/deps/look_body-0c97cc23f4ccae67)
+test result: ok. 61 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running unittests src/bin/look-header/main.rs (target/debug/deps/look_header-4abd02268319d43d)
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+```
+
+`cargo build --release`:
+
+```text
+   Compiling gimbal-spike v0.0.0 (/home/kyle/Documents/03.) Code-Projects/gimbal-files/spike)
+    Finished `release` profile [optimized] target(s) in 1.49s
+```
+
+### 10-second release runs (stopped by PID with SIGTERM, from `/tmp/gimbal-spike-p1m-r5`)
+
+Default, `--tiles 5`, and `--tiles 6 --pins 14 --scale 0.5` each printed an empty log:
+
+```text
+(no output)
+```
+
+No GTK warnings, CSS/theme/icon warnings or panics; the intermittent `VK_SUBOPTIMAL_KHR` notice did
+not appear. [observed]
+
+### API citations
+
+No new gtk-rs or GTK API was added; the change is the pure height model. The drag callbacks are the
+same as r4: `GestureDrag::connect_drag_begin` / `connect_drag_update` / `connect_drag_end` at
+`gtk4-0.11.5:src/auto/gesture_drag.rs:158`, `:224`, `:191`; the gesture's current event is read with
+`Gesture::current_event` (same file). `scaled` is `style.rs:86-89`. The timer used
+`glib::timeout_add_local_once` only while it existed and was removed. [read]
+
+### Not verified live (Claude's check)
+
+- The real-mouse push feel: that dragging down moves the border exactly with the pointer and grows
+  the column, dragging up stops at 202 design px, and the tiles below move without changing height.
+  No pointer was injected (RULES); the pure function and the timer's model rects are tested, the
+  interaction is not. [inferred]
+- The last tile's fill at window sizes and scales other than the 298 × 1191, scale 1 timer window;
+  the fill is applied after scaling in device pixels, but the pixels were not seen. [inferred]
+- That the pinned column switches correctly while wheeling after a hand push grows one column past
+  the view (the test checks `column_offsets`, not a live scroll). [inferred]
+- That the drop zones and accent drop line follow the pushed tiles in a real tile drag (they read
+  the same committed rects, but the pointer interaction was not replayed). [inferred]
+- The new `split: border drag dy … heights …` line through a real drag. [inferred]
+
+### Anything I'd change outside my files
+
+None. No file outside the brief's Output list was edited. The five `look-body` processes from the
+P1m-r4 session (PIDs 83235, 83650, 85626, 85704, 85773) were already running when this round began; I
+left them alone. [observed]
+
+## Review and live check of P1m-r5 (Claude, with Kyle's findings, Nov 1, 2026): passes; one change (P1m-r6)
+
+RULES.md's four commands pass (77 tests). Kyle: scrolling behaves as he wants. Live, release build,
+tiled at full width: in 2 + 2, dragging the left border down 493 px logs
+`border drag dy 493 heights [1056, 564]`. Tab 1 grows, and Tab 3 keeps its height and moves down.
+The right column, which fits, stays pinned as the left one scrolls.
+
+Change (Kyle, reproduced): scrolled halfway, Tab 1's contents are still on screen but its pill has
+scrolled off the top. New rule "Sticky pills": a pill stays visible while any of its frame is, and
+its own tile's bottom pushes it up. Brief P1m-r6.
