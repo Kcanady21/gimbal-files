@@ -10,6 +10,8 @@
 
 pub mod command;
 pub mod config;
+pub(crate) mod fsutil;
+pub mod session;
 pub mod workspace;
 
 /// The application ID used by the UI and, later, the agent socket.

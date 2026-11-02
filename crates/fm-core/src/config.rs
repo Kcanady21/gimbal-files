@@ -7,18 +7,15 @@
 //! comments, key order and formatting, so a save rewrites only the changed
 //! key. A file that does not parse is never written.
 //!
-//! `home` and `current_folder` on [`Config`] are runtime context, not settings:
-//! they are used to expand `~` and to resolve commands that need the focused
-//! folder. They are never written to the file.
+//! `home` on [`Config`] is runtime context, not a setting: it is used to
+//! expand `~`. It is never written to the file.
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::fs;
+use std::io;
 use std::ops::Range;
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use toml_edit::{
     Array, ArrayOfTables, Document, DocumentMut, InlineTable, Item, Table, TableLike, Value,
@@ -475,9 +472,6 @@ pub struct Config {
     pub hotkeys: BTreeMap<String, Hotkey>,
     /// Runtime context: home for `~` expansion. Not written to the file.
     pub home: PathBuf,
-    /// Runtime context: the focused folder, for commands that need one. Not
-    /// written to the file.
-    pub current_folder: Option<PathBuf>,
 }
 
 impl Default for Config {
@@ -498,7 +492,6 @@ impl Config {
             pins: default_pins(&home, special),
             sort: Sort::default(),
             hotkeys: default_hotkeys(),
-            current_folder: Some(home.clone()),
             home,
         }
     }
@@ -830,7 +823,7 @@ impl ConfigFile {
 
         apply_to_document(document, &change, config);
         let text = document.to_string();
-        save_atomic(path, &text).map_err(ApplyError::Io)
+        crate::fsutil::save_atomic(path, &text).map_err(ApplyError::Io)
     }
 }
 
@@ -866,8 +859,12 @@ impl fmt::Display for ApplyError {
 impl std::error::Error for ApplyError {}
 
 /// Turn every `Settings` command into the change it writes. Commands that need
-/// the focused folder use `config.current_folder`.
-pub fn change_for(command: &CheckedCommand, config: &Config) -> Option<Change> {
+/// the focused folder use `current_folder`.
+pub fn change_for(
+    command: &CheckedCommand,
+    config: &Config,
+    current_folder: &Path,
+) -> Option<Change> {
     match command.name() {
         "view.set-scale" => number_argument(command, "scale").map(Change::SetScale),
         "view.zoom-in" => stepped_scale(config.look.scale, 5).map(Change::SetScale),
@@ -897,8 +894,8 @@ pub fn change_for(command: &CheckedCommand, config: &Config) -> Option<Change> {
                     by,
                     order,
                 }),
-                "folder" => config.current_folder.clone().map(|folder| Change::SetSort {
-                    folder: Some(folder),
+                "folder" => Some(Change::SetSort {
+                    folder: Some(current_folder.to_path_buf()),
                     by,
                     order,
                 }),
@@ -908,7 +905,7 @@ pub fn change_for(command: &CheckedCommand, config: &Config) -> Option<Change> {
         "pins.add" => command
             .get("path")
             .and_then(path_argument)
-            .or_else(|| config.current_folder.clone())
+            .or_else(|| Some(current_folder.to_path_buf()))
             .map(Change::AddPin),
         "pins.remove" => command
             .get("path")
@@ -2016,77 +2013,11 @@ fn path_string(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
 
-/// Write a file atomically: a temp file in the same folder, fsync, then rename
-/// over the original. The original permissions are kept, and the folder is
-/// created when missing.
-fn save_atomic(path: &Path, contents: &str) -> io::Result<()> {
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-    let parent = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    fs::create_dir_all(parent)?;
-
-    let permissions = fs::metadata(path)
-        .ok()
-        .map(|metadata| metadata.permissions());
-    let sequence = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or(0);
-    let name = path
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| CONFIG_FILE.to_string());
-    let temp_path = parent.join(format!(
-        ".{name}.tmp-{}-{nanos}-{sequence}",
-        std::process::id()
-    ));
-
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temp_path)?;
-
-    if let Err(error) = file
-        .write_all(contents.as_bytes())
-        .and_then(|_| file.sync_all())
-    {
-        drop(file);
-        let _ = fs::remove_file(&temp_path);
-        return Err(error);
-    }
-
-    if let Some(permissions) = permissions
-        && let Err(error) = fs::set_permissions(&temp_path, permissions)
-    {
-        drop(file);
-        let _ = fs::remove_file(&temp_path);
-        return Err(error);
-    }
-
-    drop(file);
-
-    if let Err(error) = fs::rename(&temp_path, path) {
-        let _ = fs::remove_file(&temp_path);
-        return Err(error);
-    }
-
-    // Make the rename itself durable where the platform allows opening a
-    // directory for fsync. Failure here does not invalidate the save.
-    if let Ok(directory) = File::open(parent) {
-        let _ = directory.sync_all();
-    }
-
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -2194,7 +2125,6 @@ mod tests {
         assert!(config.sort.folders.is_empty());
         assert_eq!(config.hotkeys.len(), 15);
         assert_eq!(config.home, PathBuf::from("/home/kyle"));
-        assert_eq!(config.current_folder, Some(PathBuf::from("/home/kyle")));
 
         let expected = [
             ("<Control>t", "tab.new"),
@@ -2771,7 +2701,7 @@ folders-first = true
     fn every_settings_command_has_a_change_for() {
         let mut config = default_config(Path::new("/home/kyle"));
         config.look.scale = 0.9;
-        config.current_folder = Some(PathBuf::from("/home/kyle/Documents"));
+        let current_folder = Path::new("/home/kyle/Documents");
         config.pins = vec![PathBuf::from("/home/kyle"), PathBuf::from("/tmp")];
 
         let samples: &[(&str, &[&str])] = &[
@@ -2807,7 +2737,7 @@ folders-first = true
             };
             let command = check(command_name, tokens);
             assert!(
-                change_for(&command, &config).is_some(),
+                change_for(&command, &config, current_folder).is_some(),
                 "Settings command `{command_name}` has no change"
             );
         }
@@ -2816,16 +2746,20 @@ folders-first = true
     #[test]
     fn zoom_stops_at_the_scale_limits_and_toggles_flip() {
         let mut config = default_config(Path::new("/home/kyle"));
+        let current_folder = Path::new("/home/kyle");
         config.look.scale = 0.95;
         let zoom_in = check("view.zoom-in", &["view.zoom-in"]);
-        assert_eq!(change_for(&zoom_in, &config), Some(Change::SetScale(1.0)));
+        assert_eq!(
+            change_for(&zoom_in, &config, current_folder),
+            Some(Change::SetScale(1.0))
+        );
 
         config.look.scale = 1.0;
-        assert_eq!(change_for(&zoom_in, &config), None);
+        assert_eq!(change_for(&zoom_in, &config, current_folder), None);
 
         config.look.scale = 0.5;
         let zoom_out = check("view.zoom-out", &["view.zoom-out"]);
-        assert_eq!(change_for(&zoom_out, &config), None);
+        assert_eq!(change_for(&zoom_out, &config, current_folder), None);
 
         config.sections.devices = SectionState::Expanded;
         let toggle = check(
@@ -2833,7 +2767,7 @@ folders-first = true
             &["view.toggle-section", "section=devices"],
         );
         assert_eq!(
-            change_for(&toggle, &config),
+            change_for(&toggle, &config, current_folder),
             Some(Change::SetSection {
                 section: Section::Devices,
                 state: SectionState::Collapsed
@@ -2844,9 +2778,13 @@ folders-first = true
     #[test]
     fn set_scale_and_sort_map_to_the_expected_changes() {
         let config = default_config(Path::new("/home/kyle"));
+        let current_folder = Path::new("/home/kyle/Documents");
 
         let scale = check("view.set-scale", &["view.set-scale", "scale=0.85"]);
-        assert_eq!(change_for(&scale, &config), Some(Change::SetScale(0.85)));
+        assert_eq!(
+            change_for(&scale, &config, current_folder),
+            Some(Change::SetScale(0.85))
+        );
 
         let sort = check(
             "view.set-sort",
@@ -2858,12 +2796,43 @@ folders-first = true
             ],
         );
         assert_eq!(
-            change_for(&sort, &config),
+            change_for(&sort, &config, current_folder),
             Some(Change::SetSort {
                 folder: None,
                 by: SortBy::Size,
                 order: SortOrder::Descending
             })
+        );
+    }
+
+    #[test]
+    fn commands_that_need_the_current_folder_use_the_argument() {
+        let config = default_config(Path::new("/home/kyle"));
+        let current_folder = Path::new("/tmp/gimbal-p2e-current");
+
+        let sort = check(
+            "view.set-sort",
+            &["view.set-sort", "by=modified", "order=descending"],
+        );
+        assert_eq!(
+            change_for(&sort, &config, current_folder),
+            Some(Change::SetSort {
+                folder: Some(current_folder.to_path_buf()),
+                by: SortBy::Modified,
+                order: SortOrder::Descending
+            })
+        );
+
+        let add = check("pins.add", &["pins.add"]);
+        assert_eq!(
+            change_for(&add, &config, current_folder),
+            Some(Change::AddPin(current_folder.to_path_buf()))
+        );
+
+        let explicit = check("pins.add", &["pins.add", "path=/tmp/explicit"]);
+        assert_eq!(
+            change_for(&explicit, &config, current_folder),
+            Some(Change::AddPin(PathBuf::from("/tmp/explicit")))
         );
     }
 

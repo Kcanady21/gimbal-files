@@ -427,6 +427,175 @@ pub struct Workspace {
     ids: IdSource,
 }
 
+/// The parsed contents of a session file, before fresh ids are assigned.
+///
+/// Positions are zero-based: a window's `pills` index its `groups`, a group's
+/// `columns` index its `tabs`, and a window's `focused_tab` is a flat index
+/// over its tabs in pill order, each group's tabs in column order.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RestoreData {
+    pub focused_window: usize,
+    pub windows: Vec<RestoreWindow>,
+}
+
+/// One stored window.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RestoreWindow {
+    pub pills: Vec<usize>,
+    pub groups: Vec<RestoreGroup>,
+    pub focused_tab: usize,
+}
+
+/// One stored group.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RestoreGroup {
+    pub name: Option<String>,
+    pub number: u32,
+    pub width_permille: u16,
+    /// `None` is the default, equal-share heights. `Some` is a hand-set list
+    /// in design px, which restore checks against the column's tile count.
+    pub heights: [Option<Vec<i32>>; 2],
+    pub columns: [Vec<usize>; 2],
+    pub tabs: Vec<RestoreTab>,
+}
+
+/// One stored tab.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RestoreTab {
+    pub folder: PathBuf,
+    pub back: Vec<PathBuf>,
+    pub forward: Vec<PathBuf>,
+    pub selection: FileSelection,
+    pub scroll_anchor: Option<OsString>,
+}
+
+/// A repair the restore made so the result holds the model invariants.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RestoreProblem {
+    /// The stored columns did not hold exactly the group's tabs; the initial
+    /// distribution replaced them.
+    Columns { window: usize, group: usize },
+    /// A hand heights list did not have one entry per tile; the column became
+    /// `Heights::Default`.
+    Heights {
+        window: usize,
+        group: usize,
+        column: usize,
+    },
+    /// A width share above 1000 permille became 500.
+    WidthShare {
+        window: usize,
+        group: usize,
+        value: u16,
+    },
+    /// A focused tab index past the window's tabs became the first tab.
+    FocusedTab { window: usize, index: usize },
+    /// A history stack over the cap lost its oldest entries.
+    HistoryTrimmed {
+        window: usize,
+        group: usize,
+        tab: usize,
+        dropped: usize,
+    },
+    /// A group with no tabs was dropped.
+    EmptyGroup { window: usize, group: usize },
+    /// A window with no groups left was dropped.
+    EmptyWindow { window: usize },
+    /// A pill index did not name a stored group; the pill was dropped.
+    PillOutOfRange { window: usize, index: usize },
+    /// A pill named a group twice; the repeat was dropped.
+    DuplicatePill { window: usize, index: usize },
+    /// Two groups in one window had the same number; the later one took the
+    /// lowest free number.
+    DuplicateNumber {
+        window: usize,
+        group: usize,
+        number: u32,
+    },
+}
+
+impl fmt::Display for RestoreProblem {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Columns { window, group } => write!(
+                f,
+                "window {} group {}: columns did not match its tabs; used the initial columns",
+                window + 1,
+                group + 1
+            ),
+            Self::Heights {
+                window,
+                group,
+                column,
+            } => write!(
+                f,
+                "window {} group {} column {}: heights did not match its tiles; used the default",
+                window + 1,
+                group + 1,
+                column + 1
+            ),
+            Self::WidthShare {
+                window,
+                group,
+                value,
+            } => write!(
+                f,
+                "window {} group {}: width share {value} is over 1000 permille; used 500",
+                window + 1,
+                group + 1
+            ),
+            Self::FocusedTab { window, index } => write!(
+                f,
+                "window {}: focused tab {index} is out of range; used the first tab",
+                window + 1
+            ),
+            Self::HistoryTrimmed {
+                window,
+                group,
+                tab,
+                dropped,
+            } => write!(
+                f,
+                "window {} group {} tab {}: dropped {dropped} oldest history entries",
+                window + 1,
+                group + 1,
+                tab + 1
+            ),
+            Self::EmptyGroup { window, group } => write!(
+                f,
+                "window {} group {}: empty group dropped",
+                window + 1,
+                group + 1
+            ),
+            Self::EmptyWindow { window } => {
+                write!(f, "window {}: empty window dropped", window + 1)
+            }
+            Self::PillOutOfRange { window, index } => write!(
+                f,
+                "window {}: pill {index} names no stored group; dropped",
+                window + 1
+            ),
+            Self::DuplicatePill { window, index } => write!(
+                f,
+                "window {}: pill {index} names a group twice; dropped",
+                window + 1
+            ),
+            Self::DuplicateNumber {
+                window,
+                group,
+                number,
+            } => write!(
+                f,
+                "window {} group {}: number {number} is already used; took the lowest free number",
+                window + 1,
+                group + 1
+            ),
+        }
+    }
+}
+
+impl std::error::Error for RestoreProblem {}
+
 impl Default for Workspace {
     fn default() -> Self {
         Self::new()
@@ -451,6 +620,218 @@ impl Workspace {
             home,
             ids: IdSource::default(),
         }
+    }
+
+    /// Rebuild a workspace from stored data with fresh ids. Broken stored
+    /// values are repaired, one [`RestoreProblem`] each, so the result always
+    /// passes [`Workspace::check_invariants`].
+    pub fn restore(home: PathBuf, data: RestoreData) -> (Self, Vec<RestoreProblem>) {
+        let mut workspace = Self::with_home(home);
+        let mut problems = Vec::new();
+        let mut focused_id = None;
+
+        for (window_index, source) in data.windows.iter().enumerate() {
+            let mut pill_indices = Vec::new();
+            let mut seen_pills = BTreeSet::new();
+            for (index, group_index) in source.pills.iter().enumerate() {
+                if *group_index >= source.groups.len() {
+                    problems.push(RestoreProblem::PillOutOfRange {
+                        window: window_index,
+                        index,
+                    });
+                    continue;
+                }
+                if !seen_pills.insert(*group_index) {
+                    problems.push(RestoreProblem::DuplicatePill {
+                        window: window_index,
+                        index,
+                    });
+                    continue;
+                }
+                pill_indices.push(*group_index);
+            }
+            if pill_indices.is_empty() {
+                problems.push(RestoreProblem::EmptyWindow {
+                    window: window_index,
+                });
+                continue;
+            }
+
+            let window_id = workspace.ids.window();
+            let mut groups = BTreeMap::new();
+            let mut pills = Vec::new();
+            let mut flat_tabs = Vec::new();
+            let mut numbers = BTreeSet::new();
+            let mut kept_group = false;
+
+            for group_index in pill_indices {
+                let source_group = &source.groups[group_index];
+                if source_group.tabs.is_empty() {
+                    problems.push(RestoreProblem::EmptyGroup {
+                        window: window_index,
+                        group: group_index,
+                    });
+                    continue;
+                }
+                kept_group = true;
+
+                let mut tab_ids = Vec::with_capacity(source_group.tabs.len());
+                let mut tabs = Vec::with_capacity(source_group.tabs.len());
+                for (tab_index, source_tab) in source_group.tabs.iter().enumerate() {
+                    let tab_id = workspace.ids.tab();
+
+                    let mut back = source_tab.back.clone();
+                    if back.len() > HISTORY_LIMIT {
+                        let dropped = back.len() - HISTORY_LIMIT;
+                        back.drain(..dropped);
+                        problems.push(RestoreProblem::HistoryTrimmed {
+                            window: window_index,
+                            group: group_index,
+                            tab: tab_index,
+                            dropped,
+                        });
+                    }
+                    let mut forward = source_tab.forward.clone();
+                    if forward.len() > HISTORY_LIMIT {
+                        let dropped = forward.len() - HISTORY_LIMIT;
+                        forward.drain(..dropped);
+                        problems.push(RestoreProblem::HistoryTrimmed {
+                            window: window_index,
+                            group: group_index,
+                            tab: tab_index,
+                            dropped,
+                        });
+                    }
+
+                    tab_ids.push(tab_id);
+                    tabs.push(Tab {
+                        id: tab_id,
+                        folder: source_tab.folder.clone(),
+                        back,
+                        forward,
+                        selection: source_tab.selection.clone(),
+                        scroll_anchor: source_tab.scroll_anchor.clone(),
+                    });
+                }
+
+                let columns = if columns_match(&source_group.columns, tab_ids.len()) {
+                    [
+                        source_group.columns[0]
+                            .iter()
+                            .map(|index| tab_ids[*index])
+                            .collect(),
+                        source_group.columns[1]
+                            .iter()
+                            .map(|index| tab_ids[*index])
+                            .collect(),
+                    ]
+                } else {
+                    problems.push(RestoreProblem::Columns {
+                        window: window_index,
+                        group: group_index,
+                    });
+                    initial_columns(&tab_ids)
+                };
+
+                let mut heights = [Heights::Default, Heights::Default];
+                for column in 0..2 {
+                    let Some(values) = &source_group.heights[column] else {
+                        continue;
+                    };
+                    if values.len() == columns[column].len() {
+                        heights[column] = Heights::Hand(values.clone());
+                    } else {
+                        problems.push(RestoreProblem::Heights {
+                            window: window_index,
+                            group: group_index,
+                            column,
+                        });
+                    }
+                }
+
+                let width_permille = if source_group.width_permille > 1000 {
+                    problems.push(RestoreProblem::WidthShare {
+                        window: window_index,
+                        group: group_index,
+                        value: source_group.width_permille,
+                    });
+                    DEFAULT_WIDTH_PERMILLE
+                } else {
+                    source_group.width_permille
+                };
+
+                let mut number = source_group.number;
+                if !numbers.insert(number) {
+                    let duplicate = number;
+                    number = first_free_number(&numbers);
+                    numbers.insert(number);
+                    problems.push(RestoreProblem::DuplicateNumber {
+                        window: window_index,
+                        group: group_index,
+                        number: duplicate,
+                    });
+                }
+
+                let group_id = workspace.ids.group();
+                let mut group = Group {
+                    id: group_id,
+                    tabs,
+                    layout: SplitLayout {
+                        columns,
+                        heights,
+                        width_permille,
+                    },
+                    name: source_group.name.clone(),
+                    number,
+                };
+                reorder_tabs(&mut group);
+                flat_tabs.extend(
+                    group.layout.columns[0]
+                        .iter()
+                        .chain(group.layout.columns[1].iter())
+                        .copied(),
+                );
+                groups.insert(group_id, group);
+                pills.push(group_id);
+            }
+
+            if !kept_group {
+                problems.push(RestoreProblem::EmptyWindow {
+                    window: window_index,
+                });
+                continue;
+            }
+
+            let focused_tab = if source.focused_tab < flat_tabs.len() {
+                flat_tabs[source.focused_tab]
+            } else {
+                problems.push(RestoreProblem::FocusedTab {
+                    window: window_index,
+                    index: source.focused_tab,
+                });
+                flat_tabs[0]
+            };
+
+            let window = Window {
+                id: window_id,
+                selection: Selection::new(pills.len()),
+                pills,
+                groups,
+                focused_tab,
+            };
+            if window_index == data.focused_window {
+                focused_id = Some(window_id);
+            }
+            workspace.windows.push(window);
+        }
+
+        workspace.focused_window = if workspace.windows.is_empty() {
+            None
+        } else {
+            focused_id.or_else(|| workspace.windows.first().map(|window| window.id))
+        };
+
+        (workspace, problems)
     }
 
     pub fn home(&self) -> &Path {
@@ -1850,6 +2231,40 @@ impl Window {
     fn focused_tab_ref(&self) -> Option<&Tab> {
         self.tab(self.focused_tab)
     }
+}
+
+/// Whether a stored column list holds every tab exactly once and leaves no
+/// column empty when there are two or more tabs.
+fn columns_match(columns: &[Vec<usize>; 2], tab_count: usize) -> bool {
+    if tab_count == 0 {
+        return false;
+    }
+
+    let mut seen = BTreeSet::new();
+    for column in columns {
+        for index in column {
+            if *index >= tab_count || !seen.insert(*index) {
+                return false;
+            }
+        }
+    }
+
+    if seen.len() != tab_count {
+        return false;
+    }
+    if tab_count >= 2 && (columns[0].is_empty() || columns[1].is_empty()) {
+        return false;
+    }
+    true
+}
+
+/// The lowest positive group number not already used in a window.
+fn first_free_number(used: &BTreeSet<u32>) -> u32 {
+    let mut number = 1;
+    while used.contains(&number) {
+        number += 1;
+    }
+    number
 }
 
 fn flatten(columns: &Columns) -> Vec<TabId> {

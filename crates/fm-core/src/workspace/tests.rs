@@ -1090,6 +1090,240 @@ fn a_failed_operation_changes_nothing() {
     assert_eq!(workspace, before);
 }
 
+fn restore_tab(folder_name: &str) -> RestoreTab {
+    RestoreTab {
+        folder: folder(folder_name),
+        ..RestoreTab::default()
+    }
+}
+
+fn restore_group(tabs: Vec<RestoreTab>, columns: [Vec<usize>; 2]) -> RestoreGroup {
+    RestoreGroup {
+        name: None,
+        number: 1,
+        width_permille: DEFAULT_WIDTH_PERMILLE,
+        heights: [None, None],
+        columns,
+        tabs,
+    }
+}
+
+fn restore_window(groups: Vec<RestoreGroup>, pills: Vec<usize>) -> RestoreWindow {
+    RestoreWindow {
+        pills,
+        groups,
+        focused_tab: 0,
+    }
+}
+
+#[test]
+fn restore_replaces_a_column_list_that_does_not_match_its_tabs() {
+    let data = RestoreData {
+        focused_window: 0,
+        windows: vec![restore_window(
+            vec![restore_group(
+                vec![restore_tab("/tmp/a"), restore_tab("/tmp/b")],
+                [vec![0, 1], Vec::new()],
+            )],
+            vec![0],
+        )],
+    };
+
+    let (workspace, problems) = Workspace::restore(home(), data);
+    assert_eq!(
+        problems,
+        vec![RestoreProblem::Columns {
+            window: 0,
+            group: 0
+        }]
+    );
+    workspace.check_invariants().unwrap();
+
+    let window = &workspace.windows[0];
+    let group = &window.groups[&window.pills[0]];
+    let ids: Vec<TabId> = group.tabs.iter().map(|tab| tab.id).collect();
+    assert_eq!(group.layout.columns, initial_columns(&ids));
+}
+
+#[test]
+fn restore_repairs_hand_heights_of_the_wrong_length() {
+    let mut group = restore_group(
+        vec![
+            restore_tab("/tmp/a"),
+            restore_tab("/tmp/b"),
+            restore_tab("/tmp/c"),
+        ],
+        [vec![0, 1], vec![2]],
+    );
+    group.heights = [Some(vec![420, 260]), Some(vec![300, 400])];
+
+    let data = RestoreData {
+        focused_window: 0,
+        windows: vec![restore_window(vec![group], vec![0])],
+    };
+
+    let (workspace, problems) = Workspace::restore(home(), data);
+    assert_eq!(
+        problems,
+        vec![RestoreProblem::Heights {
+            window: 0,
+            group: 0,
+            column: 1
+        }]
+    );
+    workspace.check_invariants().unwrap();
+
+    let window = &workspace.windows[0];
+    let group = &window.groups[&window.pills[0]];
+    assert_eq!(group.layout.heights[0], Heights::Hand(vec![420, 260]));
+    assert_eq!(group.layout.heights[1], Heights::Default);
+}
+
+#[test]
+fn restore_repairs_a_width_share_over_1000() {
+    let mut group = restore_group(vec![restore_tab("/tmp/a")], [vec![0], Vec::new()]);
+    group.width_permille = 1500;
+
+    let data = RestoreData {
+        focused_window: 0,
+        windows: vec![restore_window(vec![group], vec![0])],
+    };
+
+    let (workspace, problems) = Workspace::restore(home(), data);
+    assert_eq!(
+        problems,
+        vec![RestoreProblem::WidthShare {
+            window: 0,
+            group: 0,
+            value: 1500
+        }]
+    );
+    workspace.check_invariants().unwrap();
+
+    let window = &workspace.windows[0];
+    assert_eq!(
+        window.groups[&window.pills[0]].layout.width_permille,
+        DEFAULT_WIDTH_PERMILLE
+    );
+}
+
+#[test]
+fn restore_repairs_a_focused_tab_out_of_range() {
+    let mut window = restore_window(
+        vec![restore_group(
+            vec![restore_tab("/tmp/a"), restore_tab("/tmp/b")],
+            [vec![0], vec![1]],
+        )],
+        vec![0],
+    );
+    window.focused_tab = 9;
+
+    let data = RestoreData {
+        focused_window: 0,
+        windows: vec![window],
+    };
+
+    let (workspace, problems) = Workspace::restore(home(), data);
+    assert_eq!(
+        problems,
+        vec![RestoreProblem::FocusedTab {
+            window: 0,
+            index: 9
+        }]
+    );
+    workspace.check_invariants().unwrap();
+
+    let window = &workspace.windows[0];
+    let group = &window.groups[&window.pills[0]];
+    assert_eq!(window.focused_tab, group.tabs[0].id);
+}
+
+#[test]
+fn restore_trims_history_from_the_oldest_end() {
+    let mut tab = restore_tab("/tmp/now");
+    tab.back = (0..105)
+        .map(|index| folder(&format!("/tmp/{index}")))
+        .collect();
+    tab.forward = (0..101)
+        .map(|index| folder(&format!("/tmp/forward-{index}")))
+        .collect();
+
+    let data = RestoreData {
+        focused_window: 0,
+        windows: vec![restore_window(
+            vec![restore_group(vec![tab], [vec![0], Vec::new()])],
+            vec![0],
+        )],
+    };
+
+    let (workspace, problems) = Workspace::restore(home(), data);
+    assert_eq!(
+        problems,
+        vec![
+            RestoreProblem::HistoryTrimmed {
+                window: 0,
+                group: 0,
+                tab: 0,
+                dropped: 5
+            },
+            RestoreProblem::HistoryTrimmed {
+                window: 0,
+                group: 0,
+                tab: 0,
+                dropped: 1
+            }
+        ]
+    );
+    workspace.check_invariants().unwrap();
+
+    let window = &workspace.windows[0];
+    let tab = &window.groups[&window.pills[0]].tabs[0];
+    assert_eq!(tab.back.len(), HISTORY_LIMIT);
+    assert_eq!(tab.back.first(), Some(&folder("/tmp/5")));
+    assert_eq!(tab.forward.len(), HISTORY_LIMIT);
+    assert_eq!(tab.forward.first(), Some(&folder("/tmp/forward-1")));
+}
+
+#[test]
+fn restore_drops_an_empty_group_and_an_empty_window() {
+    let data = RestoreData {
+        focused_window: 1,
+        windows: vec![
+            restore_window(
+                vec![
+                    restore_group(vec![restore_tab("/tmp/kept")], [vec![0], Vec::new()]),
+                    restore_group(Vec::new(), [Vec::new(), Vec::new()]),
+                ],
+                vec![0, 1],
+            ),
+            restore_window(
+                vec![restore_group(Vec::new(), [Vec::new(), Vec::new()])],
+                vec![0],
+            ),
+        ],
+    };
+
+    let (workspace, problems) = Workspace::restore(home(), data);
+    assert_eq!(
+        problems,
+        vec![
+            RestoreProblem::EmptyGroup {
+                window: 0,
+                group: 1
+            },
+            RestoreProblem::EmptyGroup {
+                window: 1,
+                group: 0
+            },
+            RestoreProblem::EmptyWindow { window: 1 }
+        ]
+    );
+    workspace.check_invariants().unwrap();
+    assert_eq!(workspace.windows.len(), 1);
+    assert_eq!(workspace.windows[0].pills.len(), 1);
+    assert_eq!(workspace.focused_window, Some(workspace.windows[0].id));
+}
+
 struct Lcg(u64);
 
 impl Lcg {
