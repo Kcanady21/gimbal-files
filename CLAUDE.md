@@ -65,6 +65,11 @@ PATH="$T:$PATH" cargo deny check
 - No `niri msg action …`, no changes to `~/.config` (Noctalia, GTK, niri), and no `gsettings set`.
 - **Never delete, move or trash a user file.** Tests use scratch folders under `/tmp/gimbal-*`
   that they create and remove themselves. In the app, deletes go to the trash by default.
+- **Trash tests are the one exception to `/tmp`.** GIO refuses to trash anything on `/tmp`
+  ("Trashing on system internal mounts is not supported"). A trash test works under
+  `~/.cache/gimbal-tests/<test>-*`, which it creates and removes. It runs in a child process with
+  `XDG_DATA_HOME` pointed inside that folder, so the trash it uses is the scratch folder's, never
+  Kyle's real `~/.local/share/Trash`.
 - Don't edit a file your brief doesn't list under Output, and never edit `spike/`. If something
   outside your files needs a change, say so in your notes.
 
