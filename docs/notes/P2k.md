@@ -878,3 +878,14 @@ Also from this check:
   tab for `/tmp/gimbal-p2x/top`. `CLAUDE.md` now says to run test copies under `dbus-run-session`
   when Kyle's instance is running, which is how the rest of this check ran.
 - Kyle's WD-Blue-SSD, now mounted, shows under Devices with its bar at 68% of 1.0 TB.
+
+**Selection, revised (Kyle, Nov 2):** Kyle didn't want the folder icons recoloured. A selected
+cell is now `alpha(@accent_bg_color, 0.45)`, and the icon and the name keep their normal colours.
+`SELECTED_FOLDER_PALETTE` and the label and icon overrides are gone. Measured in a split tile:
+selected (90, 50, 154) against unselected (44, 13, 87).
+
+Claude's mistake during this check: the relaunch helper picked Gimbal windows by excluding Kyle's
+*old* process ID. Kyle had restarted the app, so the helper moved and resized his window (to
+workspace 5) and two test clicks selected items in it. Nothing was opened or changed on disk, and
+the screenshot of his window was deleted. The helper now records every window before launching
+and only takes the one new window, aborting otherwise.

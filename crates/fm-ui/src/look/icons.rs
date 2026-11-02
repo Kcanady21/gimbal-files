@@ -21,10 +21,6 @@ use std::cell::RefCell;
 /// gtk/gtkcsspalettevalue.c:298-312).
 pub const FOLDER_PALETTE: &str = "accent @accent_color, success shade(@accent_color, 0.7), warning shade(@accent_color, 0.6), error shade(@accent_color, 0.45)";
 
-/// The folder on a selected cell's accent block: drawn in the accent's
-/// contrasting colour, its shading mixed back toward the block, so it stays
-/// readable instead of vanishing into the accent (Kyle, Nov 2).
-pub const SELECTED_FOLDER_PALETTE: &str = "accent @accent_fg_color, success mix(@accent_fg_color, @accent_bg_color, 0.3), warning mix(@accent_fg_color, @accent_bg_color, 0.45), error mix(@accent_fg_color, @accent_bg_color, 0.6)";
 /// Save As' pencil outline is the window background behind the button.
 pub const SAVE_AS_PALETTE: &str = "error @window_bg_color";
 /// The float icon's front-window fill hides the window behind it.
