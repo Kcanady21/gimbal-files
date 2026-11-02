@@ -10,6 +10,7 @@
 
 pub mod command;
 pub mod config;
+pub mod workspace;
 
 /// The application ID used by the UI and, later, the agent socket.
 ///
