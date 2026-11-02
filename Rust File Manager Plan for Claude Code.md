@@ -152,7 +152,7 @@ Kyle's requested features, with where each lives and any known approach. Build o
 
 ## Rules for agents
 
-Put these in the repo's `CLAUDE.md`.
+These are in the repo's `CLAUDE.md` (Nov 2), with the Phase 1 agent rules and GTK lessons. `CLAUDE.md` is the version agents follow.
 
 - **Verify, don't recall.** GTK4, libadwaita and Wayland APIs change. Check current docs (gtk-rs.org, docs.rs, GNOME developer docs) and pin crate versions; note the version you read.
 - **Small changes.** One feature or fix per change, with a short description Kyle can review in minutes.
