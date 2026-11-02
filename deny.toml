@@ -1,0 +1,59 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# cargo-deny 0.20.2 configuration for Gimbal Files.
+
+[graph]
+targets = []
+
+[advisories]
+# On by default: check the RustSec database for every crate in Cargo.lock.
+
+[licenses]
+# Every license below is compatible with GPL-3.0-or-later. The list is the
+# complete set the dependency tree actually uses (`cargo deny list`).
+allow = [
+    # Our own workspace crates, and GPLv3-or-later itself.
+    "GPL-3.0-or-later",
+    # gtk4-rs, glib-rs and most of the Rust ecosystem: permissive, and the FSF
+    # considers Apache-2.0 compatible with GPLv3.
+    "Apache-2.0",
+    # target-lexicon (build dependency of the GTK stack): Apache-2.0 plus the
+    # LLVM exception, which only loosens the Apache terms.
+    "Apache-2.0 WITH LLVM-exception",
+    # gtk4-rs, glib-rs, cairo-rs, pango-rs and their helpers: permissive.
+    "MIT",
+    # unicode-ident: the Unicode License v3, a permissive MIT-style license.
+    "Unicode-3.0",
+    # memchr: effectively public domain (Unlicense), compatible with GPLv3.
+    "Unlicense",
+]
+confidence-threshold = 0.8
+
+[bans]
+# Duplicate versions are common in the GTK stack; warn but do not fail.
+multiple-versions = "warn"
+wildcards = "allow"
+highlight = "all"
+# Only fm-ui may touch the GTK toolkit. fm-core stays UI-agnostic, and
+# fm-agent/fm-cli must not pull GTK in through their dependencies.
+#
+# cargo-deny checks wrappers against direct parents, so each GTK crate lists
+# the toolkit crates that sit directly above it in the graph. The roots,
+# gtk4 and libadwaita, list only fm-ui: any non-fm-ui crate that adds GTK,
+# directly or through the GTK crates, is then rejected.
+deny = [
+    { crate = "gtk4", wrappers = ["fm-ui", "libadwaita"], reason = "only fm-ui may use GTK" },
+    { crate = "gtk4-sys", wrappers = ["gtk4", "libadwaita-sys"], reason = "only fm-ui may use GTK" },
+    { crate = "gdk4", wrappers = ["gsk4", "gtk4", "libadwaita"], reason = "only fm-ui may use GDK" },
+    { crate = "gdk4-sys", wrappers = ["gdk4", "gsk4-sys", "gtk4-sys", "libadwaita-sys"], reason = "only fm-ui may use GDK" },
+    { crate = "gsk4", wrappers = ["gtk4"], reason = "only fm-ui may use GSK" },
+    { crate = "gsk4-sys", wrappers = ["gsk4", "gtk4-sys"], reason = "only fm-ui may use GSK" },
+    { crate = "libadwaita", wrappers = ["fm-ui"], reason = "only fm-ui may use libadwaita" },
+    { crate = "libadwaita-sys", wrappers = ["libadwaita"], reason = "only fm-ui may use libadwaita" },
+]
+
+[sources]
+# crates.io only: no git or other registry sources.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
