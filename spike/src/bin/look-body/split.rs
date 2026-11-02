@@ -512,11 +512,24 @@ pub fn stuck_geometry(
     }
 }
 
-/// The pill's rect in content coordinates (what the hit tests use): centred
-/// in the slot, `pill_h` tall, at its stuck position. `slot` already carries
-/// its column's scroll offset, like `State.rects`.
-pub fn pill_content_rect(slot: Rect, scroll: i32, visible_h: i32, scale: f64) -> Rect {
+/// Where a tile's pill wrap sits and how its frame content is offset, for a
+/// given tile rect (P1m-r8). `wrap` is in content coordinates: the tile's x
+/// and width, the pill's stuck y, and the pill band's height. The static
+/// layout and every slide frame both use this, so the pill can never end up
+/// somewhere its tile is not.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PillLayout {
+    /// The pill's clipping scroller, a Fixed child beside the tile.
+    pub wrap: Rect,
+    /// The frame's top margin inside the slot.
+    pub frame_top: i32,
+    /// How far the grid moves up inside the frame.
+    pub content_offset: i32,
+}
+
+pub fn pill_layout(slot: Rect, scroll: i32, visible_h: i32, scale: f64) -> PillLayout {
     let pill_h = scaled(CONTROL_H, scale);
+    let band = pill_h + scaled(GAP_S, scale);
     let stuck = stuck_geometry(
         slot,
         frame_rect(slot, scale),
@@ -525,10 +538,44 @@ pub fn pill_content_rect(slot: Rect, scroll: i32, visible_h: i32, scale: f64) ->
         pill_h,
         min_frame_height(scale),
     );
+    PillLayout {
+        wrap: Rect {
+            x: slot.x,
+            y: stuck.pill_y,
+            w: slot.w.max(1),
+            h: band.max(1),
+        },
+        frame_top: stuck.frame.y - slot.y,
+        content_offset: stuck.content_offset,
+    }
+}
+
+/// The dragged tile's pill layout: its natural geometry, with the pill at the
+/// tile's own top and no sticky offset, even when its slot has scrolled out of
+/// view (P1m-r6/r7).
+pub fn dragged_pill_layout(slot: Rect, scale: f64) -> PillLayout {
+    let band = scaled(CONTROL_H, scale) + scaled(GAP_S, scale);
+    PillLayout {
+        wrap: Rect {
+            x: slot.x,
+            y: slot.y,
+            w: slot.w.max(1),
+            h: band.max(1),
+        },
+        frame_top: band,
+        content_offset: 0,
+    }
+}
+
+/// The pill's rect in content coordinates (what the hit tests use): centred
+/// in the slot, `pill_h` tall, at its stuck position. `slot` already carries
+/// its column's scroll offset, like `State.rects`.
+pub fn pill_content_rect(slot: Rect, scroll: i32, visible_h: i32, scale: f64) -> Rect {
+    let pill_h = scaled(CONTROL_H, scale);
     let pw = pill_width(slot.w, scale);
     Rect {
         x: slot.x + (slot.w - pw) / 2,
-        y: stuck.pill_y,
+        y: pill_layout(slot, scroll, visible_h, scale).wrap.y,
         w: pw,
         h: pill_h,
     }
@@ -1184,6 +1231,10 @@ struct Inner {
     handle: RefCell<Option<SplitView>>,
     slots: RefCell<Vec<Slot>>,
     drag: RefCell<Option<Drag>>,
+    /// Set when a tile drag is cancelled, so the right press that cancelled it
+    /// cannot also open the pill's context menu, even if GTK delivered the
+    /// cancel before the pill's click handler (P1m-r8).
+    menu_blocked: Rc<Cell<bool>>,
     cursor: Cell<Cursor>,
     scroll_pending: Cell<bool>,
 }
@@ -1291,6 +1342,7 @@ impl SplitView {
                 handle: RefCell::new(None),
                 slots: RefCell::new(vec![]),
                 drag: RefCell::new(None),
+                menu_blocked: Rc::new(Cell::new(false)),
                 cursor: Cell::new(Cursor::None),
                 scroll_pending: Cell::new(false),
             }),
@@ -1310,7 +1362,9 @@ impl SplitView {
         let end_view = this.clone();
         drag.connect_drag_end(move |g, dx, dy| end_view.inner.end_drag(g, dx, dy));
         let cancel_view = this.clone();
-        drag.connect_cancel(move |_, _| cancel_view.inner.cancel_drag());
+        drag.connect_cancel(move |_, _| {
+            cancel_view.inner.cancel_drag();
+        });
         this.inner.fixed.add_controller(drag);
         // Double-click on a border resets it to equal shares.
         let reset = gtk::GestureClick::new();
@@ -1356,6 +1410,13 @@ impl SplitView {
     pub fn set_scale(&self, scale: f64) {
         self.inner.state.borrow_mut().scale = scale;
         self.inner.relayout(false);
+    }
+
+    /// Cancel an active drag (Esc, a lost grab, or the window losing focus).
+    /// A tile drag puts every tile back; a border drag keeps its sizes.
+    /// Returns whether a drag was active.
+    pub fn cancel_drag(&self) -> bool {
+        self.inner.cancel_drag()
     }
 
     pub fn fade_in(&self) {
@@ -1550,11 +1611,11 @@ impl Inner {
 
     /// Recompute every tile's rect and move it there: immediately for a
     /// viewport/scale/border change, over 200 ms for a close, an add or a drop.
-    /// The stuck geometry is a view position, not part of the layout: the
-    /// pill's wrap, the frame's top margin and the grid's content offset are
-    /// applied here from the same scroll value the pinned column uses.
+    /// Every move goes through `set_rect` or `slide_to`, which place the tile,
+    /// its pill, the frame's top margin and the grid's content offset from the
+    /// same rect (P1m-r8), so an animation never moves one without the other.
     fn relayout(&self, animate: bool) {
-        let (rects, widgets, pills, wraps, frames, planes, grids, scale, scroll, view_h) = {
+        let (rects, widgets, pills, scale) = {
             let mut st = self.state.borrow_mut();
             let rects = st.rects();
             // Until the scroller has a viewport, keep the provisional layout:
@@ -1568,18 +1629,9 @@ impl Inner {
                 st.rects.clone(),
                 st.widgets.clone(),
                 st.pills.clone(),
-                st.pill_wraps.clone(),
-                st.frames.clone(),
-                st.grid_planes.clone(),
-                st.grids.clone(),
                 st.scale,
-                st.scroll,
-                st.view[1],
             )
         };
-        let band = scaled(CONTROL_H, scale) + scaled(GAP_S, scale);
-        let pill_h = scaled(CONTROL_H, scale);
-        let minimum = min_frame_height(scale);
         for (slot, widget) in widgets.iter().enumerate() {
             if let Some(&rect) = rects.get(slot) {
                 if let Some(pill) = pills.get(slot) {
@@ -1597,34 +1649,9 @@ impl Inner {
                         });
                     }
                 }
-                let stuck = stuck_geometry(
-                    rect,
-                    frame_rect(rect, scale),
-                    scroll,
-                    view_h,
-                    pill_h,
-                    minimum,
-                );
-                // The frame's top margin keeps its border `gap-s` under the
-                // pill while stuck; its bottom keeps the slot's bottom.
-                if let Some(frame) = frames.get(slot) {
-                    let top = stuck.frame.y - rect.y;
-                    if frame.margin_top() != top {
-                        frame.set_margin_top(top);
-                    }
-                }
-                // The grid moves up with the page inside the clipping frame.
-                if let (Some(plane), Some(grid)) = (planes.get(slot), grids.get(slot)) {
-                    let (w, h) = grid_size(rect, scale);
-                    grid.set_size_request(w, h);
-                    plane.move_(grid, 0.0, -(stuck.content_offset as f64));
-                }
-                if let Some(wrap) = wraps.get(slot) {
-                    wrap.set_size_request(rect.w.max(1), band.max(1));
-                    self.fixed.move_(wrap, rect.x as f64, stuck.pill_y as f64);
-                    // The pill paints over its own tile.
-                    wrap.insert_after(&self.fixed, Some(widget));
-                }
+                // The tile and its pill are placed together: at once for a
+                // viewport/scale/border change, frame by frame for an
+                // animation (P1m-r8).
                 if animate {
                     self.slide_to(slot, widget, rect);
                 } else {
@@ -1761,7 +1788,10 @@ impl Inner {
         pill_click.set_button(0);
         let pill_view = view.clone();
         pill_click.connect_pressed(move |g, _, _, _| match g.current_button() {
-            3 => pill_view.inner.popup_menu(id),
+            // The right press that cancels a drag must not open the menu.
+            3 if pill_view.inner.drag.borrow().is_none() && !pill_view.inner.menu_blocked.get() => {
+                pill_view.inner.popup_menu(id)
+            }
             1 => pill_view.inner.pill_pressed(g, id),
             _ => {}
         });
@@ -1788,10 +1818,15 @@ impl Inner {
         self.bump_gen(slot);
         self.slots.borrow_mut()[slot].slide = None;
         self.set_visual(slot, widget, rect.x as f64, rect.y as f64, rect.w, rect.h);
+        self.place_parts(slot, rect);
     }
 
     /// Slide tile `slot` to `end` over 200 ms, from wherever it is now; the
     /// size travels with the position, so a close's growth is smooth too.
+    /// Every frame moves the tile and its pill together: both come from the
+    /// same interpolated rect through `place_parts` (P1m-r8). The generation
+    /// check runs first, so a newer slide or `set_rect` stops this one from
+    /// touching either the tile or its pill.
     fn slide_to(&self, slot: usize, widget: &gtk::Box, end: Rect) {
         let (start, size) = {
             let slots = self.slots.borrow();
@@ -1809,6 +1844,11 @@ impl Inner {
             let slots = self.slots.borrow();
             (slots[slot].pos.clone(), slots[slot].size.clone())
         };
+        let weak = self
+            .handle
+            .borrow()
+            .as_ref()
+            .map(|view| Rc::downgrade(&view.inner));
         let fixed = self.fixed.clone();
         let w = widget.clone();
         let (start_w, start_h) = size;
@@ -1824,77 +1864,74 @@ impl Inner {
             size_cell.set((width.max(1), height.max(1)));
             fixed.move_(&w, x, y);
             w.set_size_request(width.max(1), height.max(1));
+            if let Some(inner) = weak.as_ref().and_then(|weak| weak.upgrade()) {
+                inner.place_parts(
+                    slot,
+                    Rect {
+                        x: x.round() as i32,
+                        y: y.round() as i32,
+                        w: width.max(1),
+                        h: height.max(1),
+                    },
+                );
+            }
         });
         let anim = adw::TimedAnimation::new(widget, 0.0, 1.0, 200, target);
         self.slots.borrow_mut()[slot].slide = Some(anim.clone().upcast());
         anim.play();
     }
 
-    /// Put one tile back at its stuck geometry: the pill's wrap, the frame's
-    /// top margin and the grid's content offset (P1m-r7).
-    fn place_stuck(&self, slot: usize, rect: Rect) {
-        let (wrap, widget, frame, plane, grid, scale, scroll, view_h) = {
+    /// Place the pill, the frame's top margin and the grid's offset for a tile
+    /// whose box already sits at `rect`. The static layout and every slide
+    /// frame call this one function, from `pill_layout` (P1m-r8).
+    fn place_parts(&self, slot: usize, rect: Rect) {
+        let (scale, scroll, view_h) = {
+            let st = self.state.borrow();
+            (st.scale, st.scroll, st.view[1])
+        };
+        self.apply_parts(slot, rect, pill_layout(rect, scroll, view_h, scale));
+    }
+
+    fn apply_parts(&self, slot: usize, rect: Rect, layout: PillLayout) {
+        let (widget, wrap, frame, plane, grid, scale) = {
             let st = self.state.borrow();
             (
-                st.pill_wraps.get(slot).cloned(),
                 st.widgets.get(slot).cloned(),
+                st.pill_wraps.get(slot).cloned(),
                 st.frames.get(slot).cloned(),
                 st.grid_planes.get(slot).cloned(),
                 st.grids.get(slot).cloned(),
                 st.scale,
-                st.scroll,
-                st.view[1],
             )
         };
-        let Some(wrap) = wrap else {
-            return;
-        };
-        let band = scaled(CONTROL_H, scale) + scaled(GAP_S, scale);
-        let stuck = stuck_geometry(
-            rect,
-            frame_rect(rect, scale),
-            scroll,
-            view_h,
-            scaled(CONTROL_H, scale),
-            min_frame_height(scale),
-        );
-        wrap.set_size_request(rect.w.max(1), band.max(1));
-        self.fixed.move_(&wrap, rect.x as f64, stuck.pill_y as f64);
-        if let Some(frame) = frame {
-            frame.set_margin_top(stuck.frame.y - rect.y);
+        if let Some(wrap) = wrap {
+            wrap.set_size_request(layout.wrap.w, layout.wrap.h);
+            self.fixed
+                .move_(&wrap, layout.wrap.x as f64, layout.wrap.y as f64);
+            // The pill paints over its own tile.
+            if let Some(widget) = widget {
+                wrap.insert_after(&self.fixed, Some(&widget));
+            }
+        }
+        if let Some(frame) = frame
+            && frame.margin_top() != layout.frame_top
+        {
+            frame.set_margin_top(layout.frame_top);
         }
         if let (Some(plane), Some(grid)) = (plane, grid) {
             let (w, h) = grid_size(rect, scale);
             grid.set_size_request(w, h);
-            plane.move_(&grid, 0.0, -(stuck.content_offset as f64));
-        }
-        if let Some(widget) = widget {
-            wrap.insert_after(&self.fixed, Some(&widget));
+            plane.move_(&grid, 0.0, -(layout.content_offset as f64));
         }
     }
 
-    /// While a tile is dragged, its pill rides at the tile's top and the tile
-    /// shows its natural geometry, not its stuck one (P1m-r6/r7).
-    fn drag_pill(&self, slot: usize, rect: Rect) {
-        let (wrap, frame, plane, grid, band) = {
-            let st = self.state.borrow();
-            (
-                st.pill_wraps.get(slot).cloned(),
-                st.frames.get(slot).cloned(),
-                st.grid_planes.get(slot).cloned(),
-                st.grids.get(slot).cloned(),
-                scaled(CONTROL_H, st.scale) + scaled(GAP_S, st.scale),
-            )
-        };
-        if let Some(wrap) = wrap {
-            self.fixed.move_(&wrap, rect.x as f64, rect.y as f64);
-        }
-        if let Some(frame) = frame {
-            frame.set_margin_top(band);
-        }
-        if let (Some(plane), Some(grid)) = (plane, grid) {
-            plane.move_(&grid, 0.0, 0.0);
-        }
+    /// While a tile is dragged it shows its natural geometry, not its stuck
+    /// one, and its pill rides at its top: the box and the pill move in this
+    /// one call (P1m-r6/r7/r8).
+    fn place_dragged(&self, slot: usize, widget: &gtk::Box, rect: Rect) {
+        self.set_visual(slot, widget, rect.x as f64, rect.y as f64, rect.w, rect.h);
+        let scale = self.state.borrow().scale;
+        self.apply_parts(slot, rect, dragged_pill_layout(rect, scale));
     }
 
     /// A press anywhere in the view: a pill starts a tile drag, a border
@@ -1902,6 +1939,12 @@ impl Inner {
     /// The press point, the hit test and every later update are in the
     /// Fixed's content space via `pointer_in_fixed` (item 5).
     fn begin_drag(&self, gesture: &gtk::GestureDrag, sx: f64, sy: f64) {
+        // Only a left-button press starts a gesture: the right button that
+        // cancels a drag (gtkgesturesingle.c:206-214) must not start a new one.
+        let button = gesture.current_button();
+        if button != 0 && button != 1 {
+            return;
+        }
         let (rects, slots, scale, width_share, columns, heights, view, scroll) = {
             let st = self.state.borrow();
             (
@@ -1924,31 +1967,12 @@ impl Inner {
             let Some(rect) = rects.get(slot).copied() else {
                 return;
             };
-            let Some(widget) = self.state.borrow().widgets.get(slot).cloned() else {
-                return;
-            };
-            let name = self.state.borrow().tiles[slot].name.clone();
-            *self.drag.borrow_mut() = Some(Drag::Tile {
-                from: slot,
-                grab: (px - rect.x, py - rect.y),
-                press: (px, py),
-                targets: rects,
-            });
-            self.bump_gen(slot);
-            self.slots.borrow_mut()[slot].slide = None;
-            if self.fixed.last_child().as_ref() != Some(widget.upcast_ref()) {
-                let last = self.fixed.last_child();
-                widget.insert_after(&self.fixed, last.as_ref());
+            if let Some(name) = self.start_tile_drag(slot, rect, px, py, rects) {
+                crate::log!(
+                    "split",
+                    "tile press at ({px}, {py}) on '{name}' slot {slot}"
+                );
             }
-            // The pill rides at the tile's top during the drag.
-            self.drag_pill(slot, rect);
-            if let Some(wrap) = self.state.borrow().pill_wraps.get(slot).cloned() {
-                wrap.insert_after(&self.fixed, Some(&widget));
-            }
-            crate::log!(
-                "split",
-                "tile press at ({px}, {py}) on '{name}' slot {slot}"
-            );
             return;
         }
         let Some(border) = border else {
@@ -1993,6 +2017,40 @@ impl Inner {
         }
     }
 
+    /// Start dragging a tile from a press at (`px`, `py`): the drag follows
+    /// the pointer from its grab offset, and the tile is raised so it paints
+    /// over the others. The box and its pill start together (P1m-r8).
+    fn start_tile_drag(
+        &self,
+        slot: usize,
+        rect: Rect,
+        px: i32,
+        py: i32,
+        rects: Vec<Rect>,
+    ) -> Option<String> {
+        let (widget, name) = {
+            let st = self.state.borrow();
+            (
+                st.widgets.get(slot).cloned()?,
+                st.tiles.get(slot)?.name.clone(),
+            )
+        };
+        *self.drag.borrow_mut() = Some(Drag::Tile {
+            from: slot,
+            grab: (px - rect.x, py - rect.y),
+            press: (px, py),
+            targets: rects,
+        });
+        self.bump_gen(slot);
+        self.slots.borrow_mut()[slot].slide = None;
+        if self.fixed.last_child().as_ref() != Some(widget.upcast_ref()) {
+            let last = self.fixed.last_child();
+            widget.insert_after(&self.fixed, last.as_ref());
+        }
+        self.place_dragged(slot, &widget, rect);
+        Some(name)
+    }
+
     fn update_drag(&self, gesture: &gtk::GestureDrag, dx: f64, dy: f64) {
         let Some(drag) = self.drag.borrow().clone() else {
             return;
@@ -2004,60 +2062,10 @@ impl Inner {
                 press,
                 targets,
             } => {
-                let (columns, heights, width_share, rects, widgets, view, scale, scroll) = {
-                    let st = self.state.borrow();
-                    (
-                        st.columns.clone(),
-                        st.heights.clone(),
-                        st.width_share,
-                        st.rects.clone(),
-                        st.widgets.clone(),
-                        st.view,
-                        st.scale,
-                        st.scroll,
-                    )
-                };
-                let Some(&rect) = rects.get(from) else {
-                    return;
-                };
                 let (px, py) = pointer_in_fixed(&self.fixed, gesture.current_event().as_ref())
                     .map(|(x, y)| (x.round() as i32, y.round() as i32))
                     .unwrap_or((press.0 + dx.round() as i32, press.1 + dy.round() as i32));
-                let board = Board {
-                    columns: &columns,
-                    heights: &heights,
-                    width_share,
-                    view: Viewport {
-                        w: view[0],
-                        h: view[1],
-                        scale,
-                    },
-                    scroll,
-                };
-                let (drop, layout) = drag_layout(&board, &rects, from, px, py, grab);
-                let size = (rect.w, rect.h);
-                for (slot, r) in layout.iter().enumerate() {
-                    if slot == from {
-                        self.set_visual(
-                            slot,
-                            &widgets[slot],
-                            r.x as f64,
-                            r.y as f64,
-                            size.0,
-                            size.1,
-                        );
-                        self.drag_pill(slot, *r);
-                    } else if *r != targets[slot] {
-                        self.slide_to(slot, &widgets[slot], *r);
-                    }
-                }
-                self.show_drop_line(drop);
-                *self.drag.borrow_mut() = Some(Drag::Tile {
-                    from,
-                    grab,
-                    press,
-                    targets: layout,
-                });
+                self.update_tile_drag(from, grab, press, targets, px, py);
             }
             Drag::Width { share, press_x } => {
                 let (scale, view) = {
@@ -2113,8 +2121,77 @@ impl Inner {
         }
     }
 
+    /// Apply a tile drag update at (`px`, `py`) in content coordinates: the
+    /// dragged tile follows the pointer at its old size while every other
+    /// tile previews its post-drop slot (P1m-r8). `targets` are the preview
+    /// rects shown by the previous update.
+    fn update_tile_drag(
+        &self,
+        from: usize,
+        grab: (i32, i32),
+        press: (i32, i32),
+        targets: Vec<Rect>,
+        px: i32,
+        py: i32,
+    ) {
+        let (columns, heights, width_share, rects, widgets, view, scale, scroll) = {
+            let st = self.state.borrow();
+            (
+                st.columns.clone(),
+                st.heights.clone(),
+                st.width_share,
+                st.rects.clone(),
+                st.widgets.clone(),
+                st.view,
+                st.scale,
+                st.scroll,
+            )
+        };
+        let Some(&rect) = rects.get(from) else {
+            return;
+        };
+        let board = Board {
+            columns: &columns,
+            heights: &heights,
+            width_share,
+            view: Viewport {
+                w: view[0],
+                h: view[1],
+                scale,
+            },
+            scroll,
+        };
+        let (drop, layout) = drag_layout(&board, &rects, from, px, py, grab);
+        let size = (rect.w, rect.h);
+        for (slot, r) in layout.iter().enumerate() {
+            if slot == from {
+                // The dragged tile's box and pill follow the pointer
+                // together, at its own size.
+                self.place_dragged(
+                    slot,
+                    &widgets[slot],
+                    Rect {
+                        x: r.x,
+                        y: r.y,
+                        w: size.0,
+                        h: size.1,
+                    },
+                );
+            } else if *r != targets[slot] {
+                self.slide_to(slot, &widgets[slot], *r);
+            }
+        }
+        self.show_drop_line(drop);
+        *self.drag.borrow_mut() = Some(Drag::Tile {
+            from,
+            grab,
+            press,
+            targets: layout,
+        });
+    }
+
     /// Settle: a tile drop commits, otherwise everything slides back. Border
-    /// drags have already written their heights.
+    /// drags have already written their heights and are simply dropped.
     fn end_drag(&self, gesture: &gtk::GestureDrag, dx: f64, dy: f64) {
         let Some(drag) = self.drag.borrow_mut().take() else {
             return;
@@ -2122,19 +2199,23 @@ impl Inner {
         let Drag::Tile { from, press, .. } = drag else {
             return;
         };
-        let (columns, heights, rects, widgets, scale) = {
+        let (px, py) = pointer_in_fixed(&self.fixed, gesture.current_event().as_ref())
+            .map(|(x, y)| (x.round() as i32, y.round() as i32))
+            .unwrap_or((press.0 + dx.round() as i32, press.1 + dy.round() as i32));
+        self.finish_tile_drag(from, px, py);
+    }
+
+    /// Commit the tile drag's drop at (`px`, `py`) or slide everything back.
+    fn finish_tile_drag(&self, from: usize, px: i32, py: i32) {
+        let (columns, heights, rects, scale) = {
             let st = self.state.borrow();
             (
                 st.columns.clone(),
                 st.heights.clone(),
                 st.rects.clone(),
-                st.widgets.clone(),
                 st.scale,
             )
         };
-        let (px, py) = pointer_in_fixed(&self.fixed, gesture.current_event().as_ref())
-            .map(|(x, y)| (x.round() as i32, y.round() as i32))
-            .unwrap_or((press.0 + dx.round() as i32, press.1 + dy.round() as i32));
         let drop = drop_at(&columns, &rects, from, px, py, scale);
         let landed = drop.and_then(|d| apply_drop(&columns, from, d).map(|next| (d, next)));
         match landed {
@@ -2158,30 +2239,49 @@ impl Inner {
                 crate::log!("split", "'{name}' dropped at {drop:?}");
             }
             None => {
-                self.hide_drop_line();
-                self.slide_to(from, &widgets[from], rects[from]);
-                self.place_stuck(from, rects[from]);
-                crate::log!("split", "drag ended with no drop; sliding back");
+                self.restore_tiles();
+                crate::log!("split", "drag ended with no drop; sliding everything back");
             }
         }
     }
 
-    /// Abandon a drag (a lost sequence): put the tile back and drop the line.
-    fn cancel_drag(&self) {
-        let Some(drag) = self.drag.borrow_mut().take() else {
-            return;
+    /// Undo every preview: slide every tile, pill included, back to the
+    /// model's rects and hide the drop line. A tile drag changes only preview
+    /// rects until it commits, so this is the one restore for a no-drop
+    /// release, Esc, a right-button cancel, a lost grab or a lost focus
+    /// (P1m-r8).
+    fn restore_tiles(&self) {
+        let (rects, widgets) = {
+            let st = self.state.borrow();
+            (st.rects.clone(), st.widgets.clone())
         };
-        if let Drag::Tile { from, .. } = drag {
-            let (rect, widget) = {
-                let st = self.state.borrow();
-                (st.rects.get(from).copied(), st.widgets.get(from).cloned())
-            };
-            if let (Some(rect), Some(widget)) = (rect, widget) {
-                self.slide_to(from, &widget, rect);
-                self.place_stuck(from, rect);
+        for (slot, rect) in rects.iter().enumerate() {
+            if let Some(widget) = widgets.get(slot) {
+                self.slide_to(slot, widget, *rect);
             }
         }
         self.hide_drop_line();
+    }
+
+    /// Abandon a drag. A tile drag slides every tile back to the model; a
+    /// border drag keeps the sizes it has already written (P1m-r8). Returns
+    /// whether a drag was active.
+    fn cancel_drag(&self) -> bool {
+        let Some(drag) = self.drag.borrow_mut().take() else {
+            return false;
+        };
+        if matches!(drag, Drag::Tile { .. }) {
+            self.restore_tiles();
+            // The same right press must not open the context menu. The idle
+            // clears the block after this event has been dispatched.
+            self.menu_blocked.set(true);
+            let blocked = self.menu_blocked.clone();
+            glib::idle_add_local_once(move || blocked.set(false));
+            crate::log!("split", "tile drag cancelled; sliding everything back");
+        } else {
+            crate::log!("split", "border drag cancelled; its sizes stay");
+        }
+        true
     }
 
     /// A double-click on a border resets it to equal shares, animated.
@@ -3016,6 +3116,69 @@ mod tests {
             scaled(CONTROL_H, 1.0),
             min_frame_height(1.0),
         )
+    }
+
+    #[test]
+    fn a_pills_wrap_sits_with_its_tile_when_not_stuck() {
+        let (slot, _) = sticky_case();
+        let p = pill_layout(slot, 0, VIEW.1, 1.0);
+        assert_eq!(
+            p.wrap,
+            Rect {
+                x: 40,
+                y: 100,
+                w: 300,
+                h: 58
+            }
+        );
+        assert_eq!(p.frame_top, 58);
+        assert_eq!(p.content_offset, 0);
+        // After a 40 px scroll the slot is still in view: the wrap travels
+        // with it in content coordinates, so the view y follows the scroll.
+        let after = pill_layout(slot, 40, VIEW.1, 1.0);
+        assert_eq!(after, p);
+        assert_eq!(after.wrap.y - 40, 60);
+    }
+
+    #[test]
+    fn a_stuck_pills_wrap_holds_the_view_top_with_its_frame() {
+        let (slot, _) = sticky_case();
+        let p = pill_layout(slot, 200, VIEW.1, 1.0);
+        assert_eq!(
+            p.wrap,
+            Rect {
+                x: 40,
+                y: 200,
+                w: 300,
+                h: 58
+            }
+        );
+        // The pill is at the view's top and its frame's border 58 px lower.
+        assert_eq!(p.wrap.y - 200, 0);
+        assert_eq!(p.frame_top, 158);
+        assert_eq!(p.content_offset, 100);
+        // The hit test uses the same pill y.
+        assert_eq!(pill_content_rect(slot, 200, VIEW.1, 1.0).y, p.wrap.y);
+    }
+
+    #[test]
+    fn a_dragged_tile_keeps_its_pill_at_its_own_top() {
+        let (slot, _) = sticky_case();
+        let p = dragged_pill_layout(slot, 1.0);
+        assert_eq!(
+            p.wrap,
+            Rect {
+                x: 40,
+                y: 100,
+                w: 300,
+                h: 58
+            }
+        );
+        assert_eq!(p.frame_top, 58);
+        assert_eq!(p.content_offset, 0);
+        // The slot's scroll position would pin the pill to the view top in the
+        // static layout; a dragged tile ignores that and keeps its own top.
+        assert_eq!(pill_layout(slot, 200, VIEW.1, 1.0).wrap.y, 200);
     }
 
     #[test]

@@ -604,10 +604,20 @@ fn show(app: &adw::Application, args: &Args) {
         ui.split.fade_in();
     }
     // Ctrl+= / Ctrl+- step the same slider the dev bar uses (±0.05), so the
-    // scale setting and the whole stylesheet move together.
+    // scale setting and the whole stylesheet move together. Esc cancels an
+    // active split drag, and losing the window's focus does the same, so no
+    // preview rects are left behind (P1m-r8).
     let keys = gtk::EventControllerKey::new();
     let scale_keys = scale_ctl.clone();
+    let esc_split = ui.split.clone();
     keys.connect_key_pressed(move |_, key, _, modifiers| {
+        if key == gtk::gdk::Key::Escape {
+            if esc_split.cancel_drag() {
+                crate::log!("split", "Escape cancelled the drag");
+                return glib::Propagation::Stop;
+            }
+            return glib::Propagation::Proceed;
+        }
         if !modifiers.contains(gtk::gdk::ModifierType::CONTROL_MASK) {
             return glib::Propagation::Proceed;
         }
@@ -622,6 +632,12 @@ fn show(app: &adw::Application, args: &Args) {
         glib::Propagation::Stop
     });
     window.add_controller(keys);
+    let focus_split = ui.split.clone();
+    window.connect_notify_local(Some("is-active"), move |window, _| {
+        if !window.is_active() {
+            focus_split.cancel_drag();
+        }
+    });
     ui.apply_scale();
     window.present();
 }

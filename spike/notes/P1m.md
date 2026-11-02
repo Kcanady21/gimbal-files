@@ -1851,3 +1851,228 @@ cover.
 - Claude's live reproduction stopped early: with DP-3 enabled, the virtual pointer's absolute range
   covers both outputs, so its coordinates no longer land on DP-2. Live checks need DP-3 off, or the
   helper has to map coordinates across both outputs.
+
+## P1m-r8 changes
+
+Built on P1m-r7. Only `spike/src/bin/look-body/split.rs` and `main.rs` changed under that folder,
+plus this note. Below, command output and the timer log are **[observed]**, GTK/gtk-rs source
+citations are **[read]**, and everything that needs a real pointer or a screenshot is **[inferred]**.
+
+### Item 1: a cancelled tile drag restores every tile
+
+Kyle's cause is confirmed **[read]**:
+
+- a second button pressed during a drag resets the single-button `GestureDrag`
+  (`gtk-4.22.4:gtk/gtkgesturesingle.c:206-214`, through `gtk_gesture_reset` at
+  `gtk-4.22.4:gtk/gtkgesture.c:748-750`), so the split's gesture emits `cancel`;
+- r7's `cancel_drag` slid back only `from`; every other tile stayed at its preview rect from
+  `Drag::Tile.targets`, because a preview never changes `state.columns`.
+
+The timer log shows exactly that preview state at the cancel point, before the restore starts (the
+cancel log line is emitted immediately before `restore_tiles`):
+
+```text
+[1.834] temp: r8 at cancel: Tab 1 rect [161,256] ...; Tab 2 rect [40,0] ...; Tab 3 rect
+        [40,587] ...; Tab 4 rect [161,587] ...
+[1.834] temp: r8 at cancel model: Tab 1 model [40,0] ...; Tab 2 model [161,0] ...
+```
+
+Tab 2 was at its preview slot (40,0), not its model slot (161,0). The fix is one restore path,
+`restore_tiles`: every tile is slid to `state.rects()` through the same `slide_to`/`place_parts`
+pair as any other animation, with its pill, and the drop line is hidden. It serves:
+
+- a gesture `cancel` (the right-button case and any lost grab);
+- Esc (a new `EventControllerKey` on the window);
+- the window losing focus mid-drag (`notify::is-active` → `cancel_drag`);
+- a release with no drop, including a release outside the window (`end_drag` now restores all,
+  not only the dragged tile).
+
+A border drag that is cancelled is still taken and dropped without touching the model, so its
+already-written heights stay. `begin_drag` now ignores non-left buttons
+(`GestureSingleExt::current_button`), so the right press cannot start a new drag after the reset.
+The pill's menu is suppressed while a drag is active, and for the one event in which the cancel
+may arrive before the pill's click handler, a `menu_blocked` flag set by `cancel_drag` and cleared
+by an idle blocks it as well.
+
+### Item 2: the pill is part of every slide
+
+r7's cause is confirmed **[read]**: `slide_to` moved only the tile's outer box, while `relayout`
+moved each `pill_wrap` straight to the final position, and `drag_layout` moved only tiles, never
+wraps. The frame margin and the grid's content offset had the same split.
+
+The fix is a pure `pill_layout(slot, scroll, visible_h, scale) -> PillLayout` plus
+`dragged_pill_layout` in `split.rs`. `PillLayout` carries the wrap rect (tile x and width, the
+`stuck_geometry` pill y, the pill band tall), the frame's top margin and the grid's content
+offset. `Inner::place_parts` applies it; `set_rect` (static layout), every `slide_to` frame and
+`restore_tiles` all go through `place_parts` with the same rect. The dragged tile uses
+`place_dragged`, which sets its box and its natural-geometry pill in one call. `pill_content_rect`
+(hit tests) now takes the pill y from the same `pill_layout`, so hit tests and drawing agree.
+The generation check in `slide_to` runs before `place_parts`, so a newer slide or `set_rect` stops
+an older animation from moving either the tile or its pill.
+
+### Unit tests
+
+Added to the look-body binary:
+
+- `split::tests::a_pills_wrap_sits_with_its_tile_when_not_stuck` — not stuck: wrap = slot x/y/w,
+  band height, frame margin band, offset 0; the wrap travels with the slot after a scroll.
+- `split::tests::a_stuck_pills_wrap_holds_the_view_top_with_its_frame` — stuck at scroll 200:
+  wrap y = 200 (view 0), frame margin 158, offset 100, and `pill_content_rect` uses the same y.
+- `split::tests::a_dragged_tile_keeps_its_pill_at_its_own_top` — the dragged layout ignores the
+  stuck position and puts the pill at the tile's own top.
+
+### Temporary timer log (harness removed before delivery)
+
+Debug binary, `GIMBAL_R8_TIMER=1 GIMBAL_SPIKE_LOG=1 look-body --tiles 4`, niri-tiled (the split
+content was narrow in this session, so the tile rects are 97 px wide; the positions are what
+matter). The timer simulated the same states the gesture drives: `start_tile_drag` at Tab 1's pill,
+`update_tile_drag` over Tab 2's slot, then `cancel_drag`; afterwards a second drag, a preview over
+Tab 3 and a drop over Tab 2 through the drop path (the temporary `end_drag_at`, now
+`finish_tile_drag`). It read each tile's Fixed position/size and each `pill_wrap`'s Fixed
+position. [observed]
+
+```text
+[1.445] temp: r8 before: Tab 1 rect [40,0] 97x563 pill y 0; Tab 2 rect [161,0] 97x563 pill y 0;
+        Tab 3 rect [40,587] 97x564 pill y 587; Tab 4 rect [161,587] 97x564 pill y 587
+[1.534] temp: r8 preview frame 1: Tab 2 tile [93.11609649658203,0] pill [93,0] pill y == tile y true
+[1.584] temp: r8 preview frame 2: Tab 2 tile [56.527496337890625,0] pill [57,0] pill y == tile y true
+[1.634] temp: r8 preview frame 3: Tab 2 tile [42.516422271728516,0] pill [43,0] pill y == tile y true
+[1.834] temp: r8 at cancel: Tab 1 rect [161,256] 97x563 pill y 256; Tab 2 rect [40,0] 97x563 pill y 0;
+        Tab 3 rect [40,587] 97x564 pill y 587; Tab 4 rect [161,587] 97x564 pill y 587
+[1.834] temp: r8 at cancel model: Tab 1 model [40,0] 97x563; Tab 2 model [161,0] 97x563;
+        Tab 3 model [40,587] 97x564; Tab 4 model [161,587] 97x564
+[1.845] split: tile drag cancelled; sliding everything back
+[2.134] temp: r8 after the 200 ms slide-back: Tab 1 rect [40,0] 97x563 pill y 0;
+        Tab 2 rect [161,0] 97x563 pill y 0; Tab 3 rect [40,587] 97x564 pill y 587;
+        Tab 4 rect [161,587] 97x564 pill y 587
+[2.134] temp: r8 cancel check: every tile rect equals before true; every pill y equals its tile y true
+[2.634] split: 'Tab 1' dropped at Swap(1)
+[2.664] temp: r8 settle frame 1: Tab 2 tile [107.94338989257813,0] pill [108,0] pill y == tile y true
+[2.714] temp: r8 settle frame 2: Tab 2 tile [63.608551025390625,0] pill [64,0] pill y == tile y true
+[2.764] temp: r8 settle frame 3: Tab 2 tile [44.75578308105469,0] pill [45,0] pill y == tile y true
+[2.984] temp: r8 after the settle: Tab 1 rect [161,0] 97x563 pill y 0;
+        Tab 2 rect [40,0] 97x563 pill y 0; Tab 3 rect [40,587] 97x564 pill y 587;
+        Tab 4 rect [161,587] 97x564 pill y 587
+```
+
+Every tile's rect at the cancel is its preview rect; 200 ms later all four equal the "before" rows,
+and the check line says so. During both the preview slide and the settle, Tab 2's pill wrap x is
+the tile x rounded to a whole pixel (the wrap moves in integers; the tile's position is kept as a
+float), and its pill y equals its tile y at every frame. The harness methods and the timer call
+were then removed; a grep for `r8_`, `end_drag_at` and `TEMPORARY` in `src/bin/look-body/` finds
+nothing. [observed]
+
+### RULES.md's four commands, from `$SPIKE`
+
+`cargo fmt --check` (rustup 1.95.0 toolchain):
+
+```text
+(fmt exit 0; no output)
+```
+
+`cargo clippy --all-targets -- -D warnings`:
+
+```text
+    Checking gimbal-spike v0.0.0 (/home/kyle/Documents/03.) Code-Projects/gimbal-files/spike)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.45s
+```
+
+`cargo test`:
+
+```text
+     Running unittests src/main.rs (target/debug/deps/gimbal_spike-27f41c3be3242da9)
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running unittests src/bin/look-body/main.rs (target/debug/deps/look_body-0c97cc23f4ccae67)
+test result: ok. 70 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running unittests src/bin/look-header/main.rs (target/debug/deps/look_header-4abd02268319d43d)
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+```
+
+`cargo build --release`:
+
+```text
+   Compiling gimbal-spike v0.0.0 (/home/kyle/Documents/03.) Code-Projects/gimbal-files/spike)
+    Finished `release` profile [optimized] target(s) in 1.63s
+```
+
+### 10-second release runs (stopped by PID with SIGTERM, from `/tmp/gimbal-spike-p1m-r8`)
+
+Default, `--tiles 5`, and `--tiles 6 --pins 14 --scale 0.5` each ran for 10 s: exit 143, 0 lines
+on stderr and 0 on stdout. No GTK warnings, no `Gtk-CRITICAL`, no CSS/theme/icon warnings and no
+panics. [observed]
+
+### API citations
+
+- A different button resets an active single-button gesture:
+  `gtk-4.22.4:gtk/gtkgesturesingle.c:206-214`; `gtk_gesture_reset` cancels every sequence:
+  `gtk-4.22.4:gtk/gtkgesture.c:748-750`.
+- Touch is mapped to button 1, so `current_button() != 0 && != 1` only rejects extra mouse
+  buttons: `gtk-4.22.4:gtk/gtkgesturesingle.c:151-155`.
+- `GestureSingleExt::current_button`: `gtk4-0.11.5:src/auto/gesture_single.rs:35`.
+- `Window::is_active` (the `is-active` notify): `gtk4-0.11.5:src/auto/window.rs:728`.
+- `EventControllerKey::connect_key_pressed`: `gtk4-0.11.5:src/event_controller_key.rs:11`.
+- `gdk::Key::Escape`: `gdk4-0.11.5:src/keys.rs:1068`.
+- `glib::idle_add_local_once`: `glib-0.22.10:src/source.rs:353`.
+- `GtkFixed::child_position` (used only by the removed timer harness):
+  `gtk4-0.11.5:src/auto/fixed.rs:278`.
+- The `GtkFixed` allocation behaviour behind the separate pill wrap is unchanged from r6/r7.
+
+### Not verified live (Claude's check)
+
+- The right button mid-drag with a real pointer: that the fixed's `GestureDrag` cancels, that no
+  context menu opens, and that the second button does not start a new drag. The timer log calls
+  `cancel_drag` directly. [inferred]
+- Esc with a real keyboard, and the window losing focus mid-drag: the key and `is-active` wiring
+  is read from the pinned crate sources, but no key or focus event was injected (RULES). [inferred]
+- A release outside the window: `end_drag`'s no-drop path now restores every tile, but the real
+  grab/lost-grab sequence was not replayed. [inferred]
+- The pill following its tile visually: the timer reads the Fixed positions of the tile and its
+  wrap, which are what is moved, but no screenshot was taken. [inferred]
+- The right press's event order (pill click handler before or after the fixed's gesture reset)
+  under a real pointer; both orders are handled by the drag check and the one-idle block. [inferred]
+
+### Anything I'd change outside my files
+
+None. `grid.rs`, `style.rs` and the rest of `look-body` are unchanged apart from the Esc/focus
+wiring in `main.rs` and the new code in `split.rs`. The spec's two new rules already say what this
+implements; it could add that a cancelled border drag keeps its written sizes (the current code
+already does that).
+
+## Review and live check of P1m-r8 (Claude, with Kyle's look, Nov 2, 2026): passes
+
+Kyle: "aesthetically it's pretty much there"; he'd like the animations a little slower overall
+(separate change, below). Reviewed the diff (`split.rs`, `main.rs`). The model is only written on
+a drop, so `restore_tiles` sliding every tile to `state.rects` is the right single restore.
+`place_parts` / `apply_parts` is now the one place a pill, frame margin and grid offset are set,
+for the static layout and every slide frame, and the generation guard runs before it.
+`begin_drag` ignores non-left buttons, and the menu is blocked while a drag is active and for one
+idle after a cancel.
+
+Gates, from `spike/` (rustup 1.95.0): fmt clean; clippy `-D warnings` clean; tests 4 + 70 + 12
+pass; release build ok. The three 10-second runs printed nothing. No temporary logs left.
+
+Live, release build, niri-tiled on DP-2 (DP-3 off), 4 tiles. Tab 1 was dragged by its pill over
+Tab 2 and held:
+
+- **Mid-drag:** Tab 2 had slid into Tab 1's place **with its pill**, and the dragged Tab 1 carried
+  its own pill.
+- **Right button pressed, then left released:** log `tile drag cancelled; sliding everything back`.
+  All four tiles and pills were back in their starting places, nothing overlapped, and no context
+  menu opened.
+- **Esc instead:** the same result; the log also has `Escape cancelled the drag`.
+
+Not replayed: a release outside the window and a focus loss mid-drag (both go through the same
+restore), and a frame-by-frame look at the pill during a slide (the agent's timer log covers it).
+
+### Animation durations today (for Kyle's "a little bit slower")
+
+| Where | What | ms |
+|---|---|---|
+| look-header `style.rs` | pill hover background | 120 |
+| look-header `style.rs` | tab pill reorder slide (`.gl-pill-wrap`) | 150 |
+| look-header `header.rs` | search open/close crossfade | 200 |
+| look-header `header.rs` | accordion / pill fade (`FADE_MS`, plus timers at `FADE_MS` and 210) | 200 |
+| look-body `sidebar.rs` | pinned row slide | 150 |
+| look-body `sidebar.rs` | section expand/collapse | 200 |
+| look-body `split.rs` | tile move/resize, drop settle, slide back | 200 |
+| look-body `split.rs` | split view fade in/out (plus a 250 ms timer) | 250 |
