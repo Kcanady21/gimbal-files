@@ -1788,6 +1788,18 @@ fn apply_to_document(document: &mut DocumentMut, change: &Change, config: &Confi
                 Value::from(state.as_str()),
             );
         }
+        // With no pin list in the file yet, the in-memory list (the defaults
+        // plus this change, already applied) is written whole. Writing only
+        // the one change would replace the defaults with a single pin on the
+        // next load (found in P2i).
+        Change::AddPin(_) | Change::RemovePin(_) | Change::MovePin { .. }
+            if !has_pins_array(document) =>
+        {
+            let array = pins_array(document);
+            for pin in &config.pins {
+                array.push(Value::from(path_string(pin)));
+            }
+        }
         Change::AddPin(path) => {
             let target = normalize_path(&expand_home(path, &config.home));
             let array = pins_array(document);
@@ -1975,6 +1987,14 @@ fn set_side_value(document: &mut DocumentMut, side: Side, key: &str, value: Valu
         }
         _ => {}
     }
+}
+
+fn has_pins_array(document: &DocumentMut) -> bool {
+    document
+        .get("pins")
+        .and_then(|pins| pins.get("folders"))
+        .and_then(Item::as_value)
+        .is_some_and(toml_edit::Value::is_array)
 }
 
 fn pins_array(document: &mut DocumentMut) -> &mut Array {
@@ -2637,6 +2657,40 @@ remote = "expanded"
                 normalize_path(&home.join("Documents")),
                 normalize_path(home),
             ]
+        );
+    }
+
+    #[test]
+    fn pin_changes_without_a_pin_list_keep_the_defaults() {
+        // P2i found this: with no [pins] table, AddPin wrote only the new pin,
+        // so the defaults were lost on the next load and a MovePin was ignored.
+        let temp = TempDir::new("pins-default");
+        let home = temp.path();
+        let path = temp.write("config.toml", "[look]\nscale = 1.0 # keep\n");
+        let (mut file, problems) = ConfigFile::load_with(&path, home, &SpecialFolders::default());
+        assert!(problems.is_empty());
+        let defaults = file.config().pins.clone();
+        assert!(!defaults.is_empty());
+
+        let added = PathBuf::from("/tmp/gimbal-p2c-extra-pin");
+        file.apply(Change::AddPin(added.clone())).unwrap();
+        let mut expected = defaults.clone();
+        expected.push(added.clone());
+        assert_eq!(file.config().pins, expected);
+        let (reloaded, _) = ConfigFile::load_with(&path, home, &SpecialFolders::default());
+        assert_eq!(reloaded.config().pins, expected);
+
+        let last = expected.len() - 1;
+        file.apply(Change::MovePin { from: last, to: 0 }).unwrap();
+        let moved = expected.remove(last);
+        expected.insert(0, moved);
+        assert_eq!(file.config().pins, expected);
+        let (reloaded, _) = ConfigFile::load_with(&path, home, &SpecialFolders::default());
+        assert_eq!(reloaded.config().pins, expected);
+        assert!(
+            fs::read_to_string(&path)
+                .unwrap()
+                .contains("scale = 1.0 # keep")
         );
     }
 

@@ -7,14 +7,18 @@
 
 mod app;
 mod commands;
+mod content;
 mod events;
+mod folder;
 mod frame;
 mod header;
 mod layout;
 mod log;
 mod look;
+mod open;
 mod platform;
 mod save;
+mod sidebar;
 
 use std::cell::RefCell;
 use std::path::PathBuf;

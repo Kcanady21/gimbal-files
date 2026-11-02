@@ -9,16 +9,18 @@ use std::rc::{Rc, Weak};
 
 use adw::prelude::*;
 use fm_core::command::{Caller, Invocation};
-use fm_core::config::{Change, Side};
+use fm_core::config::{Change, Section, SectionState, Side};
 use fm_core::workspace::{Window, WindowId};
 
 use crate::app::Process;
 use crate::commands;
+use crate::content::Content;
 use crate::header::Header;
 use crate::layout;
 use crate::look::blur::Blur;
 use crate::look::motion;
 use crate::look::tokens::*;
+use crate::sidebar::Sidebar;
 
 pub struct WindowUi {
     pub id: WindowId,
@@ -27,7 +29,8 @@ pub struct WindowUi {
     header: Rc<Header>,
     blur: RefCell<Blur>,
     content_frame: gtk::Box,
-    content_label: gtk::Label,
+    content: Rc<Content>,
+    sidebar: Rc<Sidebar>,
 
     /// Left sidebar | (content | preview): two nested horizontal Paneds.
     outer: gtk::Paned,
@@ -112,36 +115,20 @@ impl WindowUi {
         inner.set_shrink_start_child(true);
         inner.set_shrink_end_child(false);
 
-        // The content placeholder until P2i: the focused folder, centred.
-        let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        let content_label = gtk::Label::builder()
-            .label("")
-            .css_classes(["gl-title"])
-            .halign(gtk::Align::Center)
-            .valign(gtk::Align::Center)
-            .justify(gtk::Justification::Center)
-            .wrap(true)
-            .vexpand(true)
-            .build();
-        content.append(&content_label);
-        let status_rule = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-        status_rule.add_css_class("gl-rule");
-        status_rule.add_css_class("inset");
-        content.append(&status_rule);
-        let status = gtk::Label::new(Some("Files: 0, Folders: 0"));
-        status.add_css_class("gl-status");
-        status.set_hexpand(true);
-        status.set_xalign(0.5);
-        content.append(&status);
+        // The focused tab's folder in the spike's grid; a split group keeps
+        // P2h's placeholder until P2j.
+        let content = Content::new(process, id, scale);
 
         let (left_root, left_button) = panel("Pinned Folders", "sidebar-show-symbolic", true);
+        let sidebar = Sidebar::new(process, id, scale);
+        left_root.append(sidebar.widget());
         let (left_host, left_clip, left_outline) = sidebar_host(&left_root, &left_button, true);
         let (right_root, right_button) = panel("File Name", "sidebar-show-right-symbolic", false);
         let (right_host, right_clip, right_outline) =
             sidebar_host(&right_root, &right_button, false);
 
         outer.set_start_child(Some(&left_host));
-        inner.set_start_child(Some(&content));
+        inner.set_start_child(Some(content.widget()));
         inner.set_end_child(Some(&right_host));
 
         let blur = Blur::attach(window.upcast_ref::<gtk::Window>(), scale, opacity);
@@ -153,7 +140,8 @@ impl WindowUi {
             header: header.clone(),
             blur: RefCell::new(blur),
             content_frame: frame,
-            content_label,
+            content,
+            sidebar,
             outer: outer.clone(),
             inner: inner.clone(),
             left_root,
@@ -288,31 +276,55 @@ impl WindowUi {
 
     pub fn update_content(&self) {
         let Some(window) = self.workspace_window() else {
-            self.content_label.set_text("No window");
+            self.content.show_placeholder("No window");
+            self.sidebar.set_current_folder(None);
             return;
         };
-        let Some(group) = window.focused_group() else {
-            self.content_label.set_text("No tabs");
+        let folder = window.tab(window.focused_tab).map(|tab| tab.folder.clone());
+        self.sidebar.set_current_folder(folder.as_deref());
+        self.content.show(&window);
+    }
+
+    pub fn arm_anchor_restore(&self) {
+        self.content.arm_anchor_restore();
+    }
+
+    pub fn clear_anchor_restore(&self) {
+        self.content.clear_anchor_restore();
+    }
+
+    pub fn listed_names(&self) -> Vec<std::ffi::OsString> {
+        self.content.listed_names()
+    }
+
+    pub fn reload_folder(&self) {
+        self.content.reload();
+    }
+
+    pub fn reload_sidebar(&self) {
+        self.sidebar.reload_from_config();
+    }
+
+    pub fn set_section(&self, section: Section, state: SectionState) {
+        self.sidebar.set_section(section, state);
+    }
+
+    pub fn sort_changed(&self) {
+        let Some(window) = self.workspace_window() else {
             return;
         };
-        let text = if group.is_split() {
-            let folders: Vec<String> = group
-                .layout
-                .columns
-                .iter()
-                .flat_map(|column| column.iter())
-                .filter_map(|id| group.tab(*id))
-                .map(|tab| tab.folder.display().to_string())
-                .collect();
-            folders.join("\n")
-        } else {
-            group
-                .tabs
-                .first()
-                .map(|tab| tab.folder.display().to_string())
-                .unwrap_or_default()
+        let Some(tab) = window.tab(window.focused_tab) else {
+            return;
         };
-        self.content_label.set_text(&text);
+        let Some(process) = self.process.upgrade() else {
+            return;
+        };
+        let rule = process.config.borrow().config().sort_for(&tab.folder);
+        self.content.refresh_sort(rule);
+    }
+
+    pub fn push_recent(&self, folder: &std::path::Path) {
+        self.sidebar.push_recent(folder);
     }
 
     fn scale(&self) -> f64 {
@@ -330,6 +342,8 @@ impl WindowUi {
         let scale = self.scale();
         self.blur.borrow_mut().set_scale(scale);
         self.header.set_scale(self, scale);
+        self.content.apply_scale(scale);
+        self.sidebar.set_scale(scale);
         let px = |token: f64| scaled(token, scale);
         if !self.animating(true) {
             self.left_root.set_width_request(px(SIDEBAR_MIN));

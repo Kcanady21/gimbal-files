@@ -12,15 +12,19 @@ use fm_core::command::{Caller, CheckedCommand, Effect, Invocation, Outcome, Regi
 use fm_core::config::{self, Change, ConfigFile};
 use fm_core::session::{self, SessionProblem};
 use fm_core::workspace::{Event, WindowId, Workspace};
+use gtk::gio;
 use gtk::glib;
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use crate::commands;
+use crate::folder::ClickRequest;
 use crate::frame::WindowUi;
 use crate::look::Look;
+use crate::open::{OpenDecision, decision};
 use crate::save::{Debounce, SAVE_DELAY_MS, Saver};
 
 pub struct Process {
@@ -307,6 +311,104 @@ impl Process {
         self.finish(result);
     }
 
+    /// A grid click, after the view has collected the visible order.
+    pub fn file_click(self: &Rc<Self>, window: WindowId, request: ClickRequest) {
+        self.focus_model_window(window);
+        let result = {
+            let mut workspace = self.workspace.borrow_mut();
+            match request {
+                ClickRequest::Plain(name) => workspace.file_click(name),
+                ClickRequest::Ctrl(name) => workspace.file_ctrl_click(name),
+                ClickRequest::Shift { name, order } => workspace.file_shift_click(name, &order),
+            }
+        };
+        self.finish(result);
+    }
+
+    pub fn selection_all(self: &Rc<Self>, window: WindowId, names: &[OsString]) {
+        self.focus_model_window(window);
+        let result = self.workspace.borrow_mut().selection_all(names);
+        self.finish(result);
+    }
+
+    pub fn selection_none(self: &Rc<Self>, window: WindowId) {
+        self.focus_model_window(window);
+        let result = self.workspace.borrow_mut().selection_none();
+        self.finish(result);
+    }
+
+    pub fn record_scroll_anchor(self: &Rc<Self>, window: WindowId, name: OsString) {
+        self.focus_model_window(window);
+        let result = self.workspace.borrow_mut().record_scroll_anchor(Some(name));
+        self.finish(result);
+    }
+
+    /// Navigate the focused tab to `path` without going through a string
+    /// command, so a non-UTF-8 folder name survives.
+    pub fn nav_go_path(self: &Rc<Self>, window: WindowId, path: PathBuf) {
+        self.focus_model_window(window);
+        let result = self.workspace.borrow_mut().nav_go(path, None);
+        self.finish(result);
+    }
+
+    /// Open a grid item: a folder navigates, a file launches. The decision is
+    /// pure; the only filesystem calls are `is_dir`/`is_file`, which follow a
+    /// symlink to its target. A UTF-8 path goes through the named commands;
+    /// a non-UTF-8 one uses the model and launch code directly.
+    pub fn open_path(self: &Rc<Self>, window: WindowId, path: PathBuf) {
+        match decision(path.is_dir(), path.is_file()) {
+            OpenDecision::Navigate => {
+                if let Some(path) = path.to_str() {
+                    self.dispatch_for_window(
+                        window,
+                        Caller::Ui,
+                        Invocation::new("nav.go", vec![("path".to_string(), path.to_string())]),
+                    );
+                } else {
+                    self.nav_go_path(window, path);
+                }
+            }
+            OpenDecision::Launch => {
+                if let Some(path) = path.to_str() {
+                    self.dispatch_for_window(
+                        window,
+                        Caller::Ui,
+                        Invocation::new("file.open", vec![("paths".to_string(), path.to_string())]),
+                    );
+                } else {
+                    self.launch_file(&path);
+                }
+            }
+            OpenDecision::Missing => {
+                crate::log!("open", "{} is gone; nothing to open", path.display())
+            }
+        }
+    }
+
+    /// The one launch path, shared by `file.open` and a double-click. A failure
+    /// is logged, never a panic.
+    pub fn launch_file(&self, path: &Path) {
+        let uri = gio::File::for_path(path).uri().to_string();
+        match gio::AppInfo::launch_default_for_uri(&uri, None::<&gio::AppLaunchContext>) {
+            Ok(()) => crate::log!("open", "launched {}", path.display()),
+            Err(error) => crate::log!("open", "could not launch {}: {error}", path.display()),
+        }
+    }
+
+    fn selected_paths(&self, window: WindowId) -> Vec<PathBuf> {
+        let Some(window) = self.window_snapshot(window) else {
+            return Vec::new();
+        };
+        let Some(tab) = window.tab(window.focused_tab) else {
+            return Vec::new();
+        };
+        tab.selection
+            .names
+            .iter()
+            .map(|name| tab.folder.join(name))
+            .collect()
+    }
+
     pub fn quit(self: &Rc<Self>) {
         self.save_now(true);
         self.application.quit();
@@ -349,7 +451,7 @@ impl Process {
             Event::PillMoved { window, .. } => self.on_pill_moved(*window),
             Event::LayoutChanged { window, .. } => self.on_layout_changed(*window),
             Event::SelectionChanged { window } => self.on_selection_changed(*window),
-            Event::Navigated { window, .. } => self.on_navigated(*window),
+            Event::Navigated { window, folder, .. } => self.on_navigated(*window, folder),
             Event::ScrollAnchorChanged { window, .. } => self.on_scroll_anchor_changed(*window),
         }
     }
@@ -413,7 +515,10 @@ impl Process {
         self.refresh(id, false);
     }
 
-    fn on_navigated(self: &Rc<Self>, id: WindowId) {
+    fn on_navigated(self: &Rc<Self>, id: WindowId, folder: &Path) {
+        if let Some(ui) = self.window(id) {
+            ui.push_recent(folder);
+        }
         self.refresh(id, false);
     }
 
@@ -475,6 +580,30 @@ impl Process {
                 }
                 crate::log!("sidebar", "saved {} width {width} design px", side.as_str());
             }
+            Change::SetSection { section, state } => {
+                for ui in self.windows.borrow().values() {
+                    ui.set_section(*section, *state);
+                }
+                crate::log!(
+                    "sidebar",
+                    "{} section is {}",
+                    section.as_str(),
+                    state.as_str()
+                );
+            }
+            Change::AddPin(_) | Change::RemovePin(_) | Change::MovePin { .. } => {
+                let windows: Vec<Rc<WindowUi>> = self.windows.borrow().values().cloned().collect();
+                for ui in windows {
+                    ui.reload_sidebar();
+                }
+                crate::log!("pins", "the sidebars follow the config");
+            }
+            Change::SetSort { .. } => {
+                let windows: Vec<Rc<WindowUi>> = self.windows.borrow().values().cloned().collect();
+                for ui in windows {
+                    ui.sort_changed();
+                }
+            }
             other => crate::log!("command", "change applied: {other:?}"),
         }
     }
@@ -500,6 +629,19 @@ impl Process {
             command.name(),
             command.effect()
         );
+        if command.name() == "file.open" {
+            let paths = argument_paths(command, "paths")
+                .filter(|paths| !paths.is_empty())
+                .unwrap_or_else(|| self.selected_paths(window));
+            if paths.is_empty() {
+                crate::log!("open", "file.open has nothing selected");
+            } else {
+                for path in paths {
+                    self.launch_file(&path);
+                }
+            }
+            return Outcome::Done;
+        }
         match command.effect() {
             Effect::Settings => return self.settings_change(window, command),
             Effect::View => {}
@@ -619,18 +761,39 @@ impl Process {
                 self.finish(result);
             }
             "nav.back" => {
+                if let Some(ui) = self.window(window) {
+                    ui.arm_anchor_restore();
+                }
                 let result = self.workspace.borrow_mut().nav_back();
+                if result.as_ref().map_or(true, Vec::is_empty)
+                    && let Some(ui) = self.window(window)
+                {
+                    ui.clear_anchor_restore();
+                }
                 self.finish(result);
             }
             "nav.forward" => {
+                if let Some(ui) = self.window(window) {
+                    ui.arm_anchor_restore();
+                }
                 let result = self.workspace.borrow_mut().nav_forward();
+                if result.as_ref().map_or(true, Vec::is_empty)
+                    && let Some(ui) = self.window(window)
+                {
+                    ui.clear_anchor_restore();
+                }
                 self.finish(result);
             }
             "nav.up" => {
                 let result = self.workspace.borrow_mut().nav_up();
                 self.finish(result);
             }
-            "nav.refresh" => crate::log!("command", "nav.refresh waits for the folder view (P2i)"),
+            "nav.refresh" => {
+                if let Some(ui) = self.window(window) {
+                    ui.reload_folder();
+                    crate::log!("folder", "nav.refresh reloaded the listing");
+                }
+            }
             "nav.focus-path" => {
                 if let Some(ui) = self.window(window) {
                     ui.focus_path();
@@ -641,12 +804,15 @@ impl Process {
                     ui.open_search(text.as_deref());
                 }
             }
-            "selection.all" | "selection.none" => {
-                crate::log!(
-                    "command",
-                    "{} waits for the folder view (P2i)",
-                    command.name()
-                )
+            "selection.all" => {
+                let names = self
+                    .window(window)
+                    .map(|ui| ui.listed_names())
+                    .unwrap_or_default();
+                self.selection_all(window, &names);
+            }
+            "selection.none" => {
+                self.selection_none(window);
             }
             "trash.open" => crate::log!(
                 "trash",
@@ -714,6 +880,13 @@ impl Process {
 fn argument_path(command: &CheckedCommand, name: &str) -> Option<PathBuf> {
     match command.get(name) {
         Some(Value::Path(path)) => Some(path.clone()),
+        _ => None,
+    }
+}
+
+fn argument_paths(command: &CheckedCommand, name: &str) -> Option<Vec<PathBuf>> {
+    match command.get(name) {
+        Some(Value::Paths(paths)) => Some(paths.clone()),
         _ => None,
     }
 }
