@@ -10,6 +10,7 @@
 
 pub mod command;
 pub mod config;
+pub mod fileops;
 pub(crate) mod fsutil;
 pub mod session;
 pub mod workspace;
