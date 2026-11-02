@@ -2076,3 +2076,20 @@ restore), and a frame-by-frame look at the pill during a slide (the agent's time
 | look-body `sidebar.rs` | section expand/collapse | 200 |
 | look-body `split.rs` | tile move/resize, drop settle, slide back | 200 |
 | look-body `split.rs` | split view fade in/out (plus a 250 ms timer) | 250 |
+
+## Animations 1.5× slower (Claude, Nov 2, 2026; Kyle chose 1.5×)
+
+Claude made this change directly; it touches both look programs. New `spike/src/look_shared/motion.rs`:
+`SLOWDOWN = 1.5` and `ms(base)`, included by both bins the way `blur.rs` is. Every duration in the
+table above now goes through it, and so do the timers that wait for an animation: the header's
+group fade (`FADE_MS`), the search close (`ms(200) + 10`) and the split fade-out (`ms(250)`). The
+20 ms and 50 ms kick-off timers and the theme reload's 200 ms debounce are not animations, so they
+are unchanged. The header CSS transitions (`hover_ms`, `slide_ms`) are now format variables. The
+new values are 180 (hover), 225 (slides), 300 (crossfades, sections, tiles) and 375 ms (split
+fade). To retune, change `SLOWDOWN`.
+
+Gates: fmt, clippy `-D warnings` clean; tests 4 + 71 + 13 pass (one new `motion` test in each bin);
+release build ok. 8-second runs of `look-body`, `look-body --tiles 6 --pins 14 --scale 0.5`,
+`look-header --tabs 3` and `look-header --tabs 30 --scale 0.5` printed no warnings. Live: a tile
+swap in `look-body` settles in the right place with its pill. The feel of the new speed is for Kyle
+to judge.

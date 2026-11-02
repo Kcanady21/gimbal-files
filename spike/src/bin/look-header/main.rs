@@ -4,6 +4,8 @@
 #[path = "../../look_shared/blur.rs"]
 mod blur;
 mod header;
+#[path = "../../look_shared/motion.rs"]
+mod motion;
 mod strip;
 mod style;
 #[path = "../../theme.rs"]

@@ -9,7 +9,8 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::time::Duration;
 
-const FADE_MS: u64 = 200;
+/// The pill and accordion crossfade, before `motion::ms`.
+const FADE_MS: u32 = 200;
 
 /// The mockup's float icon, drawn as a `gtk::Svg` paintable: the icon theme's older
 /// symbolic path ignores `gpa:` slots, so loading it by name would lose the fills.
@@ -119,7 +120,7 @@ pub fn show(app: &adw::Application, args: &Args) {
     // `width - child_width` and the revealer does not clip, so its outline painted
     // under the nav buttons while it closed (P1l item 2).
     search.set_transition_type(gtk::RevealerTransitionType::Crossfade);
-    search.set_transition_duration(200);
+    search.set_transition_duration(crate::motion::ms(200));
     search.set_child(Some(&field));
     // A closed crossfade revealer still measures its child, so the field starts
     // hidden; `open_search` shows it again just before the fade in.
@@ -606,7 +607,7 @@ fn pill_revealer(pill: &impl IsA<gtk::Widget>) -> gtk::Revealer {
     let revealer = gtk::Revealer::new();
     revealer.add_css_class("gl-pill-wrap");
     revealer.set_transition_type(gtk::RevealerTransitionType::Crossfade);
-    revealer.set_transition_duration(FADE_MS as u32);
+    revealer.set_transition_duration(crate::motion::ms(FADE_MS));
     revealer.set_child(Some(pill));
     revealer.set_reveal_child(true);
     revealer
@@ -1002,16 +1003,19 @@ impl Ui {
             }
         }
         let ui = self.clone();
-        glib::timeout_add_local_once(Duration::from_millis(FADE_MS), move || {
-            // Take the result into a `let` first: an `if let` scrutinee's temporary lives
-            // through the whole block, so the `borrow_mut` would still be held when
-            // `refresh()` borrows the model again (P1i-r4, item 1).
-            let first = ui.model.borrow_mut().group_selected();
-            if let Some(first) = first {
-                ui.animate_group.set(Some(first));
-                ui.refresh();
-            }
-        });
+        glib::timeout_add_local_once(
+            Duration::from_millis(crate::motion::ms(FADE_MS).into()),
+            move || {
+                // Take the result into a `let` first: an `if let` scrutinee's temporary lives
+                // through the whole block, so the `borrow_mut` would still be held when
+                // `refresh()` borrows the model again (P1i-r4, item 1).
+                let first = ui.model.borrow_mut().group_selected();
+                if let Some(first) = first {
+                    ui.animate_group.set(Some(first));
+                    ui.refresh();
+                }
+            },
+        );
     }
 
     fn open_search(self: &Rc<Self>) {
@@ -1042,7 +1046,9 @@ impl Ui {
         self.search_entry.set_text("");
         self.search.set_reveal_child(false);
         let weak = Rc::downgrade(self);
-        glib::timeout_add_local_once(Duration::from_millis(210), move || {
+        // Hide the field once the search crossfade has finished.
+        let after_fade = Duration::from_millis((crate::motion::ms(200) + 10).into());
+        glib::timeout_add_local_once(after_fade, move || {
             if let Some(ui) = weak.upgrade()
                 && !ui.search_open.get()
             {

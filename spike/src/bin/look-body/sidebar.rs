@@ -739,7 +739,7 @@ impl PinnedList {
             let y = start + (to as f64 - start) * v;
             rows.set_y(&w, y);
         });
-        let anim = adw::TimedAnimation::new(widget, 0.0, 1.0, 150, target);
+        let anim = adw::TimedAnimation::new(widget, 0.0, 1.0, crate::motion::ms(150), target);
         self.animations.borrow_mut().push(anim.clone().upcast());
         anim.play();
     }
@@ -860,7 +860,7 @@ impl LeftPanel {
             pill.set_child(Some(&pill_label));
             let revealer = gtk::Revealer::new();
             revealer.set_transition_type(gtk::RevealerTransitionType::SlideDown);
-            revealer.set_transition_duration(200);
+            revealer.set_transition_duration(crate::motion::ms(200));
             revealer.set_reveal_child(true);
             revealer.set_child(Some(content));
             section.append(&pill);

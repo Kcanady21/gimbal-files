@@ -1310,7 +1310,7 @@ impl SplitView {
         outer.set_propagate_natural_height(false);
         let revealer = gtk::Revealer::new();
         revealer.set_transition_type(gtk::RevealerTransitionType::Crossfade);
-        revealer.set_transition_duration(250);
+        revealer.set_transition_duration(crate::motion::ms(250));
         revealer.set_child(Some(&outer));
         revealer.set_reveal_child(false);
         let this = Self {
@@ -1427,13 +1427,16 @@ impl SplitView {
     pub fn fade_out(&self, done: Box<dyn Fn()>) {
         self.inner.revealer.set_reveal_child(false);
         let weak = Rc::downgrade(&self.inner);
-        glib::timeout_add_local_once(std::time::Duration::from_millis(250), move || {
-            if let Some(inner) = weak.upgrade()
-                && !inner.revealer.reveals_child()
-            {
-                done();
-            }
-        });
+        glib::timeout_add_local_once(
+            std::time::Duration::from_millis(crate::motion::ms(250).into()),
+            move || {
+                if let Some(inner) = weak.upgrade()
+                    && !inner.revealer.reveals_child()
+                {
+                    done();
+                }
+            },
+        );
     }
 }
 
@@ -1876,7 +1879,7 @@ impl Inner {
                 );
             }
         });
-        let anim = adw::TimedAnimation::new(widget, 0.0, 1.0, 200, target);
+        let anim = adw::TimedAnimation::new(widget, 0.0, 1.0, crate::motion::ms(200), target);
         self.slots.borrow_mut()[slot].slide = Some(anim.clone().upcast());
         anim.play();
     }

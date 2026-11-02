@@ -168,6 +168,8 @@ pub fn css(scale: f64, font: Option<&str>, opacity: f64) -> String {
     let trash_inner = (p(TRASH) - 2 * thin).max(1);
     let close_inner = (itc - 2 * thin).max(1);
     let pitch = p(PILL_W) + p(GAP_L);
+    let hover_ms = crate::motion::ms(120);
+    let slide_ms = crate::motion::ms(150);
     let window_bg = fill(BG);
     let pill_bg = fill(RECESSED);
     let pill_active = fill(RAISED);
@@ -200,12 +202,12 @@ window.gimbal-look, window.gimbal-look.background {{ background-color: {window_b
 .gl-search-field entry {{ min-width: {search_entry_w}px; }}
 .gl-search-glyph {{ -gtk-icon-size: {inav}px; margin-right: {gm}px; color: {FG}; }}
 .gl-path-label {{ font-size: {tc}px; }}
-.gl-pill {{ all: unset; min-height: {inner_h}px; padding: 0 {gm}px; border: {mid}px solid {OUTLINE}; border-radius: {rp}px; background-color: {pill_bg}; color: {FG}; transition: background-color 120ms; }}
+.gl-pill {{ all: unset; min-height: {inner_h}px; padding: 0 {gm}px; border: {mid}px solid {OUTLINE}; border-radius: {rp}px; background-color: {pill_bg}; color: {FG}; transition: background-color {hover_ms}ms; }}
 .gl-pill.tab, .gl-pill.group {{ min-width: {pill_w}px; }}
 .gl-pill.active {{ background-color: {pill_active}; color: {RAISED_FG}; }}
 .gl-pill.selected {{ background-color: {pill_selected}; }}
 .gl-pill.active.selected {{ background-color: {pill_selected_active}; }}
-.gl-pill-wrap {{ transition: transform 150ms; }}
+.gl-pill-wrap {{ transition: transform {slide_ms}ms; }}
 .gl-pill-wrap.slide-left {{ transform: translateX(-{pitch}px); }}
 .gl-pill-wrap.slide-right {{ transform: translateX({pitch}px); }}
 .gl-pill label {{ font-size: {tc}px; }}

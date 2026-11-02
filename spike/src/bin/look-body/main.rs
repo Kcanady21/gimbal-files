@@ -9,6 +9,8 @@ mod blur;
 mod grid;
 mod icons;
 mod layout;
+#[path = "../../look_shared/motion.rs"]
+mod motion;
 mod preview;
 mod sidebar;
 mod split;
