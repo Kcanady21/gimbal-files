@@ -325,6 +325,34 @@ pub const COMMANDS: &[CommandSpec] = &[
         undo: false,
         arguments: &[],
     },
+    // Clipboard commands (Kyle approved adding them, Nov 2). Cut and copy only
+    // put the files on the clipboard; paste is the file operation.
+    CommandSpec {
+        name: "file.cut",
+        summary: "Put files on the clipboard to move them.",
+        effect: Effect::View,
+        undo: false,
+        arguments: &[PATHS_FROM_SELECTION],
+    },
+    CommandSpec {
+        name: "file.copy-to-clipboard",
+        summary: "Put files on the clipboard to copy them.",
+        effect: Effect::View,
+        undo: false,
+        arguments: &[PATHS_FROM_SELECTION],
+    },
+    CommandSpec {
+        name: "file.paste",
+        summary: "Copy or move the clipboard's files into a folder.",
+        effect: Effect::Files,
+        undo: true,
+        arguments: &[ArgSpec {
+            name: "in",
+            kind: ArgKind::Path,
+            presence: Presence::Context(ContextSource::CurrentFolder),
+            default: None,
+        }],
+    },
     CommandSpec {
         name: "trash.open",
         summary: "Open the trash.",

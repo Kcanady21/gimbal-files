@@ -532,6 +532,9 @@ pub fn default_hotkeys() -> BTreeMap<String, Hotkey> {
         ("<Control>f", "search.open"),
         ("<Control>a", "selection.all"),
         ("<Control>z", "file.undo"),
+        ("<Control>x", "file.cut"),
+        ("<Control>c", "file.copy-to-clipboard"),
+        ("<Control>v", "file.paste"),
         ("<Control>equal", "view.zoom-in"),
         ("<Control>minus", "view.zoom-out"),
         ("<Alt>Left", "nav.back"),
@@ -2143,7 +2146,7 @@ mod tests {
         assert_eq!(config.sort.order, SortOrder::Ascending);
         assert!(config.sort.folders_first);
         assert!(config.sort.folders.is_empty());
-        assert_eq!(config.hotkeys.len(), 15);
+        assert_eq!(config.hotkeys.len(), 18);
         assert_eq!(config.home, PathBuf::from("/home/kyle"));
 
         let expected = [
