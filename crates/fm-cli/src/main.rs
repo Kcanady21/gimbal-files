@@ -1,22 +1,31 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! The command-line front end for Gimbal Files.
 //!
-//! Commands are not available yet: they arrive through `fm-core`'s registry.
+//! The CLI reads the command registry: `commands` lists it, and `check`
+//! validates an invocation as the `Cli` caller. Nothing runs a command yet.
 
 #![forbid(unsafe_code)]
 
 use std::process::ExitCode;
 
+use fm_core::command::{Caller, Invocation, Registry};
+
 const USAGE: &str = "\
 Usage: gimbal-files-cli [--help | --version]
+       gimbal-files-cli commands
+       gimbal-files-cli check <command> [key=value ...]
 
-Commands come later, through the command registry; none are available yet.
+`commands` lists every command in the registry. `check` validates one as the
+Cli caller and prints the checked command, or the error. Nothing runs a
+command yet.
 ";
 
 #[derive(Debug, PartialEq, Eq)]
 enum Action {
     Help,
     Version,
+    Commands,
+    Check(Vec<String>),
     UsageError,
 }
 
@@ -28,6 +37,10 @@ fn action_for(args: &[String]) -> Action {
         [] => Action::Help,
         [arg] if arg == "--help" => Action::Help,
         [arg] if arg == "--version" => Action::Version,
+        [arg] if arg == "commands" => Action::Commands,
+        [command, rest @ ..] if command == "check" && !rest.is_empty() => {
+            Action::Check(rest.to_vec())
+        }
         _ => Action::UsageError,
     }
 }
@@ -44,8 +57,49 @@ fn main() -> ExitCode {
             println!("gimbal-files-cli {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
         }
+        Action::Commands => {
+            print_commands();
+            ExitCode::SUCCESS
+        }
+        Action::Check(tokens) => check_command(&tokens),
         Action::UsageError => {
             eprint!("{USAGE}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+/// One command per line: name, effect, arguments, summary, in catalogue order.
+fn print_commands() {
+    for spec in Registry::new().commands() {
+        let arguments = spec.arguments();
+        let rendered = if arguments.is_empty() {
+            "(none)".to_string()
+        } else {
+            arguments
+                .iter()
+                .map(|argument| argument.label())
+                .collect::<Vec<String>>()
+                .join(", ")
+        };
+        println!(
+            "{} | {} | {} | {}",
+            spec.name, spec.effect, rendered, spec.summary
+        );
+    }
+}
+
+fn check_command(tokens: &[String]) -> ExitCode {
+    let result = Invocation::parse(tokens)
+        .and_then(|invocation| Registry::new().validate(Caller::Cli, &invocation));
+
+    match result {
+        Ok(command) => {
+            println!("{command}");
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("{error}");
             ExitCode::from(2)
         }
     }
@@ -75,10 +129,32 @@ mod tests {
     }
 
     #[test]
+    fn commands_lists_the_registry() {
+        assert_eq!(action_for(&args(&["commands"])), Action::Commands);
+    }
+
+    #[test]
+    fn check_keeps_the_command_and_its_arguments() {
+        assert_eq!(
+            action_for(&args(&["check", "nav.go", "path=/tmp"])),
+            Action::Check(args(&["nav.go", "path=/tmp"]))
+        );
+    }
+
+    #[test]
+    fn check_without_a_command_is_a_usage_error() {
+        assert_eq!(action_for(&args(&["check"])), Action::UsageError);
+    }
+
+    #[test]
     fn anything_else_is_a_usage_error() {
         assert_eq!(action_for(&args(&["open"])), Action::UsageError);
         assert_eq!(
             action_for(&args(&["--version", "extra"])),
+            Action::UsageError
+        );
+        assert_eq!(
+            action_for(&args(&["commands", "extra"])),
             Action::UsageError
         );
     }

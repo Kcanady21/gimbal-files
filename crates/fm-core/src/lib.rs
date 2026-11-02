@@ -8,6 +8,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod command;
+
 /// The application ID used by the UI and, later, the agent socket.
 ///
 /// Kyle's niri config only skips the focus-ring fill behind windows whose app
