@@ -11,7 +11,7 @@ use adw::prelude::*;
 use fm_core::command::{Caller, CheckedCommand, Effect, Invocation, Outcome, Registry, Value};
 use fm_core::config::{self, Change, ConfigFile};
 use fm_core::session::{self, SessionProblem};
-use fm_core::workspace::{Event, WindowId, Workspace};
+use fm_core::workspace::{Event, Heights, TabId, WindowId, Workspace};
 use gtk::gio;
 use gtk::glib;
 use std::cell::{Cell, RefCell};
@@ -296,6 +296,37 @@ impl Process {
         self.finish(result);
     }
 
+    /// Focus one split tile's tab, used by every click that lands in a tile.
+    pub fn focus_tab(self: &Rc<Self>, window: WindowId, tab: TabId) {
+        self.focus_model_window(window);
+        let result = self.workspace.borrow_mut().focus_tab(tab);
+        self.finish(result);
+    }
+
+    /// Focus a tile and then run a command against that tab (a tile's ✕, or
+    /// its Open in New Window).
+    pub fn focus_tab_and_dispatch(
+        self: &Rc<Self>,
+        window: WindowId,
+        tab: TabId,
+        invocation: Invocation,
+    ) {
+        self.focus_model_window(window);
+        let focus = self.workspace.borrow_mut().focus_tab(tab);
+        let mut handler = commands::UiHandler {
+            caller: Caller::Ui,
+            window,
+            process: Rc::downgrade(self),
+        };
+        let outcome = Registry::new().dispatch(Caller::Ui, &invocation, &mut handler);
+        if let Outcome::Error(error) = outcome {
+            crate::log!("command", "{error}");
+            if let Ok(events) = focus {
+                self.apply_events(&events);
+            }
+        }
+    }
+
     pub fn clear_pill_selection(self: &Rc<Self>, window: WindowId) {
         let index = self
             .window_snapshot(window)
@@ -311,18 +342,42 @@ impl Process {
         self.finish(result);
     }
 
-    /// A grid click, after the view has collected the visible order.
-    pub fn file_click(self: &Rc<Self>, window: WindowId, request: ClickRequest) {
+    /// A grid click in one split tile: focus that tab first, then select, and
+    /// apply both operations' events as one update.
+    pub fn file_click_tab(
+        self: &Rc<Self>,
+        window: WindowId,
+        tab: Option<TabId>,
+        request: ClickRequest,
+    ) {
         self.focus_model_window(window);
-        let result = {
+        let mut events = Vec::new();
+        {
             let mut workspace = self.workspace.borrow_mut();
-            match request {
+            if let Some(tab) = tab {
+                match workspace.focus_tab(tab) {
+                    Ok(mut focus) => events.append(&mut focus),
+                    Err(error) => {
+                        crate::log!("workspace", "{error}");
+                        return;
+                    }
+                }
+            }
+            let result = match request {
                 ClickRequest::Plain(name) => workspace.file_click(name),
                 ClickRequest::Ctrl(name) => workspace.file_ctrl_click(name),
                 ClickRequest::Shift { name, order } => workspace.file_shift_click(name, &order),
+            };
+            match result {
+                Ok(mut result) => events.append(&mut result),
+                Err(error) => crate::log!("workspace", "{error}"),
             }
-        };
-        self.finish(result);
+        }
+        if events.is_empty() {
+            return;
+        }
+        self.apply_events(&events);
+        self.schedule_save();
     }
 
     pub fn selection_all(self: &Rc<Self>, window: WindowId, names: &[OsString]) {
@@ -337,10 +392,75 @@ impl Process {
         self.finish(result);
     }
 
-    pub fn record_scroll_anchor(self: &Rc<Self>, window: WindowId, name: OsString) {
+    /// A tile drop, after the UI has hit-tested it. The model decides whether
+    /// the move is refused.
+    pub fn apply_tile_drop(
+        self: &Rc<Self>,
+        window: WindowId,
+        from: TabId,
+        drop: fm_core::workspace::Drop,
+    ) {
         self.focus_model_window(window);
-        let result = self.workspace.borrow_mut().record_scroll_anchor(Some(name));
+        let result = self.workspace.borrow_mut().apply_tile_drop(from, drop);
         self.finish(result);
+    }
+
+    /// The column border's new share, written once when its drag ends.
+    pub fn set_width_share(self: &Rc<Self>, window: WindowId, permille: u16) {
+        self.focus_model_window(window);
+        let result = self.workspace.borrow_mut().set_width_share(permille);
+        self.finish(result);
+    }
+
+    /// One column's hand heights, written once when its border drag ends.
+    pub fn set_column_heights(self: &Rc<Self>, window: WindowId, column: usize, heights: Heights) {
+        self.focus_model_window(window);
+        let result = self
+            .workspace
+            .borrow_mut()
+            .set_column_heights(column, heights);
+        self.finish(result);
+    }
+
+    /// Record one tile's anchor. `fm-core` records the focused tab only, so an
+    /// unfocused tile is focused for the one update and the old focus is put
+    /// back without touching the UI.
+    pub fn record_scroll_anchor_for(
+        self: &Rc<Self>,
+        window: WindowId,
+        tab: Option<TabId>,
+        name: OsString,
+    ) {
+        self.focus_model_window(window);
+        let mut events = Vec::new();
+        let mut hidden = false;
+        {
+            let mut workspace = self.workspace.borrow_mut();
+            let previous = workspace.focused().map(|window| window.focused_tab);
+            if let Some(tab) = tab
+                && previous != Some(tab)
+            {
+                match workspace.focus_tab(tab) {
+                    Ok(_) => hidden = true,
+                    Err(error) => crate::log!("workspace", "{error}"),
+                }
+            }
+            match workspace.record_scroll_anchor(Some(name)) {
+                Ok(mut result) => {
+                    if !hidden {
+                        events.append(&mut result);
+                    }
+                }
+                Err(error) => crate::log!("workspace", "{error}"),
+            }
+            if hidden && let Some(previous) = previous {
+                let _ = workspace.focus_tab(previous);
+            }
+        }
+        if !events.is_empty() {
+            self.apply_events(&events);
+        }
+        self.schedule_save();
     }
 
     /// Navigate the focused tab to `path` without going through a string
@@ -598,10 +718,10 @@ impl Process {
                 }
                 crate::log!("pins", "the sidebars follow the config");
             }
-            Change::SetSort { .. } => {
+            Change::SetSort { folder, .. } => {
                 let windows: Vec<Rc<WindowUi>> = self.windows.borrow().values().cloned().collect();
                 for ui in windows {
-                    ui.sort_changed();
+                    ui.sort_changed(folder.as_deref());
                 }
             }
             other => crate::log!("command", "change applied: {other:?}"),

@@ -19,6 +19,7 @@ mod open;
 mod platform;
 mod save;
 mod sidebar;
+mod split;
 
 use std::cell::RefCell;
 use std::path::PathBuf;

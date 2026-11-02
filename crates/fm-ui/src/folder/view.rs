@@ -16,7 +16,7 @@ use gtk::glib;
 use gtk::prelude::*;
 
 use fm_core::config::{SortBy, SortOrder, SortRule};
-use fm_core::workspace::{FileSelection, WindowId};
+use fm_core::workspace::{FileSelection, TabId, WindowId};
 
 use crate::app::Process;
 use crate::folder::{click_request, is_hidden_name, sort, status_text};
@@ -48,6 +48,12 @@ pub struct FolderView {
     error: gtk::Label,
     process: Weak<Process>,
     window: WindowId,
+    /// The tab this grid shows, when it is a split tile. A click or a scroll
+    /// anchor then names that tab before the model acts on "the focused tab".
+    tab: Option<TabId>,
+    /// A split tile only writes the one status line while it is the focused
+    /// tile; the single folder view has no gate.
+    status_gate: Rc<Cell<bool>>,
 
     current: RefCell<Option<PathBuf>>,
     sort_rule: Rc<Cell<SortRule>>,
@@ -80,6 +86,8 @@ impl FolderView {
         window: WindowId,
         status: gtk::Label,
         scale: f64,
+        tab: Option<TabId>,
+        status_gate: Option<Rc<Cell<bool>>>,
     ) -> Rc<Self> {
         let default_rule = SortRule {
             by: SortBy::Name,
@@ -148,6 +156,8 @@ impl FolderView {
             error,
             process: Rc::downgrade(process),
             window,
+            tab,
+            status_gate: status_gate.unwrap_or_else(|| Rc::new(Cell::new(true))),
             current: RefCell::new(None),
             sort_rule,
             started: Cell::new(Instant::now()),
@@ -453,6 +463,19 @@ impl FolderView {
         }
     }
 
+    /// Turn this grid's share of the one status line on or off. A split tile
+    /// only writes it while it is the focused tile.
+    pub fn set_status_gate(&self, on: bool) {
+        self.status_gate.set(on);
+        if on {
+            self.update_status();
+        }
+    }
+
+    pub fn refresh_status(&self) {
+        self.update_status();
+    }
+
     /// Put the view back on a tab's anchor without re-reading the folder.
     pub fn restore_anchor(&self, anchor: Option<OsString>, folder_memory: bool) {
         let stored = anchor.or_else(|| {
@@ -517,7 +540,7 @@ impl FolderView {
             &order,
         );
         if let Some(process) = self.process.upgrade() {
-            process.file_click(self.window, request);
+            process.file_click_tab(self.window, self.tab, request);
         }
     }
 
@@ -594,7 +617,7 @@ impl FolderView {
         };
         self.anchors.borrow_mut().insert(folder, name.clone());
         if let Some(process) = self.process.upgrade() {
-            process.record_scroll_anchor(self.window, name);
+            process.record_scroll_anchor_for(self.window, self.tab, name);
         }
     }
 
@@ -814,6 +837,9 @@ impl FolderView {
     }
 
     fn update_status(&self) {
+        if !self.status_gate.get() {
+            return;
+        }
         let (files, folders) = self.counts.get();
         self.status
             .set_text(&status_text(files, folders, self.selected.get()));

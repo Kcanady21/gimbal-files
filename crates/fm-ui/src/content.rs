@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! The body's content area: the folder grid, its status line, and P2h's
-//! placeholder while a split group waits for P2j.
+//! The body's content area: one folder grid for a normal pill, the split view
+//! for a group of two or more, and the placeholder when there is no tab.
+//!
+//! Every page already exists, so a group forming or dissolving only moves the
+//! stack; the split view keeps one folder view per tab for as long as the tile
+//! is shown.
 
 use std::cell::{Cell, RefCell};
 use std::ffi::OsString;
@@ -14,18 +18,22 @@ use fm_core::workspace::{TabId, Window, WindowId};
 
 use crate::app::Process;
 use crate::folder::{FolderView, status_text};
+use crate::look::motion;
+use crate::split::SplitView;
 
 pub struct Content {
     root: gtk::Box,
     stack: gtk::Stack,
     placeholder: gtk::Label,
     folder: Rc<FolderView>,
+    split: SplitView,
     status: gtk::Label,
     process: Weak<Process>,
     displayed_folder: RefCell<Option<PathBuf>>,
     displayed_tab: Cell<Option<TabId>>,
     /// Set by nav.back/forward so the next folder change restores its anchor.
     restore_anchor: Cell<bool>,
+    split_shown: Cell<bool>,
 }
 
 impl Content {
@@ -37,6 +45,8 @@ impl Content {
         let stack = gtk::Stack::new();
         stack.set_vexpand(true);
         stack.set_hexpand(true);
+        stack.set_transition_type(gtk::StackTransitionType::Crossfade);
+        stack.set_transition_duration(motion::ms(250));
 
         let placeholder = gtk::Label::builder()
             .label("")
@@ -53,9 +63,11 @@ impl Content {
         status.set_hexpand(true);
         status.set_xalign(0.5);
 
-        let folder = FolderView::new(process, window, status.clone(), scale);
+        let folder = FolderView::new(process, window, status.clone(), scale, None, None);
+        let split = SplitView::new(process, window, status.clone(), scale);
         stack.add_named(&placeholder, Some("placeholder"));
         stack.add_named(folder.widget(), Some("folder"));
+        stack.add_named(split.widget(), Some("split"));
         stack.set_visible_child_name("folder");
 
         root.append(&stack);
@@ -70,11 +82,13 @@ impl Content {
             stack,
             placeholder,
             folder,
+            split,
             status,
             process: Rc::downgrade(process),
             displayed_folder: RefCell::new(None),
             displayed_tab: Cell::new(None),
             restore_anchor: Cell::new(false),
+            split_shown: Cell::new(false),
         })
     }
 
@@ -90,7 +104,14 @@ impl Content {
         self.restore_anchor.set(false);
     }
 
+    fn on_split_page(&self) -> bool {
+        self.stack.visible_child_name().as_deref() == Some("split")
+    }
+
     pub fn listed_names(&self) -> Vec<OsString> {
+        if self.on_split_page() {
+            return self.split.listed_names();
+        }
         if self.stack.visible_child_name().as_deref() != Some("folder") {
             return Vec::new();
         }
@@ -98,36 +119,71 @@ impl Content {
     }
 
     pub fn reload(&self) {
-        self.folder.reload();
+        if self.on_split_page() {
+            self.split.reload_focused();
+        } else {
+            self.folder.reload();
+        }
+    }
+
+    /// Cancel a split tile drag: Esc, a lost grab, a right button mid-drag or
+    /// the window losing focus. Returns whether a drag was active.
+    pub fn cancel_drag(&self) -> bool {
+        self.split.cancel_drag()
     }
 
     pub fn apply_scale(&self, scale: f64) {
         self.folder.apply_scale(scale);
+        self.split.set_scale(scale);
     }
 
-    pub fn refresh_sort(&self, rule: SortRule) {
-        self.folder.set_sort(rule);
+    /// Re-sort every tile showing `folder`, or every tile when it is `None`.
+    pub fn refresh_sort(&self, folder: Option<&Path>) {
+        self.split.refresh_sort(folder);
+        if self.on_split_page() {
+            return;
+        }
+        let Some(current) = self.displayed_folder.borrow().clone() else {
+            return;
+        };
+        if folder.is_none_or(|folder| folder == current) {
+            let Some(process) = self.process.upgrade() else {
+                return;
+            };
+            let rule = {
+                let config = process.config.borrow();
+                config.config().sort_for(&current)
+            };
+            self.folder.set_sort(rule);
+        }
     }
 
     /// Reflect the focused tab. A normal pill shows its folder grid; a split
-    /// group keeps the P2h placeholder until P2j.
+    /// group shows one tile per tab.
     pub fn show(&self, window: &Window) {
         let Some(group) = window.focused_group() else {
             self.show_placeholder("No tabs");
             return;
         };
         if group.is_split() {
-            let folders: Vec<String> = group
-                .layout
-                .columns
-                .iter()
-                .flat_map(|column| column.iter())
-                .filter_map(|id| group.tab(*id))
-                .map(|tab| tab.folder.display().to_string())
-                .collect();
-            self.show_placeholder(&folders.join("\n"));
+            let restore = self.restore_anchor.replace(false);
+            self.folder.set_status_gate(false);
+            self.split.show(window, group, restore);
+            self.stack.set_visible_child_name("split");
+            self.split_shown.set(true);
             return;
         }
+
+        self.folder.set_status_gate(true);
+
+        if self.split_shown.replace(false) {
+            self.split.blur();
+            // Leaving a split must rebuild the single grid from the model,
+            // restoring that tab's own anchor.
+            *self.displayed_folder.borrow_mut() = None;
+            self.displayed_tab.set(None);
+        }
+
         let Some(tab) = group.tabs.first() else {
             self.show_placeholder("No tabs");
             return;
@@ -160,6 +216,10 @@ impl Content {
     }
 
     pub fn show_placeholder(&self, text: &str) {
+        self.folder.set_status_gate(false);
+        if self.split_shown.replace(false) {
+            self.split.blur();
+        }
         self.placeholder.set_text(text);
         self.stack.set_visible_child_name("placeholder");
         self.status.set_text(&status_text(0, 0, 0));

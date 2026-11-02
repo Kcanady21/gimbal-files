@@ -309,18 +309,12 @@ impl WindowUi {
         self.sidebar.set_section(section, state);
     }
 
-    pub fn sort_changed(&self) {
-        let Some(window) = self.workspace_window() else {
-            return;
-        };
-        let Some(tab) = window.tab(window.focused_tab) else {
-            return;
-        };
-        let Some(process) = self.process.upgrade() else {
-            return;
-        };
-        let rule = process.config.borrow().config().sort_for(&tab.folder);
-        self.content.refresh_sort(rule);
+    pub fn sort_changed(&self, folder: Option<&std::path::Path>) {
+        self.content.refresh_sort(folder);
+    }
+
+    pub fn cancel_split_drag(&self) -> bool {
+        self.content.cancel_drag()
     }
 
     pub fn push_recent(&self, folder: &std::path::Path) {
@@ -474,6 +468,7 @@ impl WindowUi {
                     }
                 } else {
                     ui.flush_widths();
+                    ui.cancel_split_drag();
                 }
             });
 
@@ -505,6 +500,9 @@ impl WindowUi {
                 return gtk::glib::Propagation::Proceed;
             }
             if let Some(ui) = weak.upgrade() {
+                if ui.cancel_split_drag() {
+                    return gtk::glib::Propagation::Stop;
+                }
                 ui.header.escape(&ui)
             } else {
                 gtk::glib::Propagation::Proceed

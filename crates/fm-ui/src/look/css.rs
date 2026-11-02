@@ -106,6 +106,8 @@ window.gimbal-look, window.gimbal-look.background {{ background-color: {window_b
 .gl-pill.active.selected {{ background-color: {pill_selected_active}; }}
 .gl-pill label {{ font-size: {tc}px; }}
 .gl-pill.tab {{ margin-bottom: {gs}px; }}
+.gl-pill.tile {{ min-width: 0; }}
+.gl-pill.tile.wide {{ min-width: {pill_w}px; }}
 .gl-pill-close {{ all: unset; min-width: {close_inner}px; min-height: {close_inner}px; padding: 0; -gtk-icon-size: {close_inner}px; border: {thin}px solid {FG}; border-radius: {rp}px; color: {FG}; margin-left: {gm}px; }}
 .gl-pill-close:hover {{ background-color: {HOVER_STRONG}; }}
 .gl-pill-close:focus-visible {{ box-shadow: 0 0 0 {thin}px {FOCUS_RING}; }}
@@ -144,7 +146,7 @@ gridview > child {{ padding: 0; }}
 .gl-cell image {{ -gtk-icon-size: {igrid}px; color: {FG}; -gtk-icon-palette: {folder_palette}; }}
 .gl-cell label {{ font-size: {trow}px; }}
 .gl-tile {{ background-color: {tile}; border: {thin}px solid {OUTLINE}; border-radius: {r}px; color: {FG}; }}
-.gl-tile.focused {{ box-shadow: 0 0 0 {thin}px {FOCUS_RING}; }}
+.gl-tile.focused {{ box-shadow: inset 0 0 0 {thin}px {FOCUS_RING}; }}
 .gl-drop-line {{ background-color: {OUTLINE}; min-height: {thin}px; border-radius: {rp}px; }}
 .gl-status {{ min-height: {statush}px; font-size: {tc}px; }}
 .gl-num {{ font-size: {tmono}px; }}
@@ -278,6 +280,15 @@ mod tests {
     use super::*;
 
     const PLAIN: f64 = 0.85;
+
+    #[test]
+    fn the_focused_tile_ring_is_drawn_inside_the_frame() {
+        // Claude's P2j review: each tile sits in a clipping scroller, so an
+        // outer box-shadow ring was cut off and the focused tile looked like
+        // the others.
+        let plain = css(1.0, None, PLAIN);
+        assert!(plain.contains(".gl-tile.focused { box-shadow: inset 0 0 0 2px @accent_color; }"));
+    }
 
     #[test]
     fn a_selected_grid_cell_is_filled_after_the_transparent_rule() {
