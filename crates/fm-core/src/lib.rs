@@ -9,6 +9,7 @@
 #![forbid(unsafe_code)]
 
 pub mod command;
+pub mod config;
 
 /// The application ID used by the UI and, later, the agent socket.
 ///

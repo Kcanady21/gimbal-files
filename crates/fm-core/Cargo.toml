@@ -9,6 +9,8 @@ publish.workspace = true
 repository.workspace = true
 
 [dependencies]
+glib.workspace = true
+toml_edit.workspace = true
 
 [lints]
 workspace = true
