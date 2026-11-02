@@ -2093,3 +2093,11 @@ release build ok. 8-second runs of `look-body`, `look-body --tiles 6 --pins 14 -
 `look-header --tabs 3` and `look-header --tabs 30 --scale 0.5` printed no warnings. Live: a tile
 swap in `look-body` settles in the right place with its pill. The feel of the new speed is for Kyle
 to judge.
+
+## Kyle's look at the slower motion (Nov 2, 2026): one change (P1m-r9-sidebar-collapse.md)
+
+Kyle: the slower animations "look great", but the sidebar collapse is "still practically instant".
+It has no animation: `wire_collapse` swaps the paned child (panel ↔ strip) in one frame. The
+section pills (Recent Directories and the others) already slide over `ms(200)`. P1m-r9 animates the
+panels' inner edge, with the panel clipped rather than squeezed (a shrinkable GtkPaned child is
+allocated below its minimum, `gtkpaned.c:1129` / `:1372`).
