@@ -417,43 +417,121 @@ pub fn frame_rect(slot: Rect, scale: f64) -> Rect {
     }
 }
 
-/// The pill's y in the visible area for a slot (P1m-r6). `slot` and `frame`
-/// are in content coordinates; the result is in view coordinates, i.e. the
-/// content y minus `scroll`. The pill sits at the slot's top until that top
-/// has scrolled above the view, then sticks at the top of the visible area
-/// (`0`). Its own tile's bottom pushes it up: it never sits lower than the
-/// frame's bottom minus the pill's height, so it leaves together with the
-/// frame's last visible pixel. A frame entirely below the view leaves the
-/// pill at its natural position (also below).
-pub fn sticky_pill_y(slot: Rect, frame: Rect, scroll: i32, visible_h: i32, pill_h: i32) -> i32 {
+/// The grid scroller's size inside a tile: the frame's content box. The grid
+/// view's own `gap-m` margins sit inside the scroller. It does not shrink
+/// while the tile is stuck, so the contents never re-lay out, only slide
+/// under the frame's top border.
+pub fn grid_size(slot: Rect, scale: f64) -> (i32, i32) {
+    let thin = scaled(LINE_THIN, scale);
+    let band = scaled(CONTROL_H, scale) + scaled(GAP_S, scale);
+    (
+        (slot.w - 2 * thin).max(1),
+        (slot.h - band - 2 * thin).max(1),
+    )
+}
+
+/// The shortest a stuck tile's frame may stay visible: one grid row.
+pub fn min_frame_height(scale: f64) -> i32 {
+    scaled(CELL_H, scale).max(1)
+}
+
+/// A tile's stuck geometry (P1m-r7). `slot` and `frame` are in content
+/// coordinates (`frame` is `frame_rect(slot, scale)`), `scroll` is the outer
+/// scroller's value, and the result is in content coordinates too, because
+/// that is the space the split's Fixed children live in: subtract `scroll`
+/// for view coordinates.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Stuck {
+    /// The pill's content y. View y is this minus `scroll`.
+    pub pill_y: i32,
+    /// The frame's on-screen box in content coordinates. While the tile is
+    /// stuck its top border stays `gap-s` under the pill (view y
+    /// `pill_h + gap_s`) and its bottom keeps moving with the page.
+    pub frame: Rect,
+    /// How far the contents move up inside the frame: the distance the page
+    /// has scrolled past the slot's top. The grid scrolls with the page and
+    /// is clipped under the frame's own top border.
+    pub content_offset: i32,
+}
+
+/// The frame's top in content coordinates for a slot: its natural top until
+/// the slot's top goes above the view, then the fixed stuck top, and finally
+/// (with the tile down to its minimum) the frame moving off with its bottom.
+pub fn stuck_geometry(
+    slot: Rect,
+    frame: Rect,
+    scroll: i32,
+    visible_h: i32,
+    pill_h: i32,
+    minimum: i32,
+) -> Stuck {
     let natural = slot.y - scroll;
-    let frame_top = frame.y - scroll;
-    let frame_bottom = frame.y + frame.h - scroll;
-    // A frame entirely below the view leaves the pill where the tile is.
-    if frame_top >= visible_h {
-        return natural;
+    // The pill band above the frame: the pill itself plus `gap-s`.
+    let gap = frame.y - slot.y - pill_h;
+    let band = pill_h + gap;
+    let bottom = frame.y + frame.h - scroll;
+    let minimum = minimum.clamp(0, frame.h.max(0));
+    let not_stuck = Stuck {
+        pill_y: slot.y,
+        frame,
+        content_offset: 0,
+    };
+    // The slot's top is still in view (or the whole tile is below the view):
+    // the pill and the frame simply travel with the page.
+    if natural >= 0 || frame.y - scroll >= visible_h {
+        return not_stuck;
     }
-    natural.max(0).min(frame_bottom - pill_h)
+    if bottom - band < minimum {
+        // Below the minimum the whole tile, pill included, scrolls off
+        // together: pill, frame top and frame bottom move up as one, and the
+        // contents freeze at the last scrolled position.
+        let d = band + minimum - bottom;
+        return Stuck {
+            pill_y: scroll - d,
+            frame: Rect {
+                x: frame.x,
+                y: frame.y + frame.h - minimum,
+                w: frame.w,
+                h: minimum,
+            },
+            content_offset: (frame.h - minimum).max(0),
+        };
+    }
+    // Stuck: the pill at the view's top, the frame's top `gap-s` under it,
+    // the frame's bottom still on the slot's bottom, contents scrolled past
+    // the slot top and clipped under the frame's top border.
+    Stuck {
+        pill_y: scroll,
+        frame: Rect {
+            x: frame.x,
+            y: scroll + band,
+            w: frame.w,
+            h: bottom - band,
+        },
+        content_offset: scroll - slot.y,
+    }
 }
 
 /// The pill's rect in content coordinates (what the hit tests use): centred
-/// in the slot, `pill_h` tall, at its sticky position. `slot` already carries
+/// in the slot, `pill_h` tall, at its stuck position. `slot` already carries
 /// its column's scroll offset, like `State.rects`.
 pub fn pill_content_rect(slot: Rect, scroll: i32, visible_h: i32, scale: f64) -> Rect {
     let pill_h = scaled(CONTROL_H, scale);
-    let top = sticky_pill_y(slot, frame_rect(slot, scale), scroll, visible_h, pill_h) + scroll;
+    let stuck = stuck_geometry(
+        slot,
+        frame_rect(slot, scale),
+        scroll,
+        visible_h,
+        pill_h,
+        min_frame_height(scale),
+    );
     let pw = pill_width(slot.w, scale);
     Rect {
         x: slot.x + (slot.w - pw) / 2,
-        y: top,
+        y: stuck.pill_y,
         w: pw,
         h: pill_h,
     }
-}
-
-/// The sticky pill's top in the tile's own space: the click test's `y`.
-pub fn pill_local_top(slot: Rect, scroll: i32, visible_h: i32, scale: f64) -> i32 {
-    pill_content_rect(slot, scroll, visible_h, scale).y - slot.y
 }
 
 /// The rect of every tile, indexed by tile id, from its column and row.
@@ -797,7 +875,7 @@ pub fn border_at(
         return None;
     }
     let pill_h = scaled(CONTROL_H, scale);
-    let gap_s = scaled(GAP_S, scale);
+    let minimum = min_frame_height(scale);
     for (column, s) in slots.iter().enumerate() {
         if s.len() < 2 {
             continue;
@@ -808,7 +886,20 @@ pub fn border_at(
         }
         for row in 1..s.len() {
             let top = s[row - 1].y + s[row - 1].h;
-            let next_frame_top = s[row].y + pill_h + gap_s;
+            // The strip's lower end is the next frame's *visible* top: while
+            // that tile is stuck it is pinned under the pill, so the strip
+            // follows the frame's top; its upper end already follows a stuck
+            // tile's moving frame bottom through `top`.
+            let next_frame_top = stuck_geometry(
+                s[row],
+                frame_rect(s[row], scale),
+                scroll,
+                visible_h,
+                pill_h,
+                minimum,
+            )
+            .frame
+            .y;
             if y >= top && y < next_frame_top {
                 return Some(Border::Heights { column, row });
             }
@@ -973,6 +1064,11 @@ struct State {
     scroll: i32,
     widgets: Vec<gtk::Box>, // indexed by tile id: the outer pill+frame box
     frames: Vec<gtk::Box>,
+    /// The fixed planes that hold each tile's grid and the grid scrollers
+    /// themselves, moved up while the tile is stuck so the contents keep
+    /// scrolling with the page (P1m-r7).
+    grid_planes: Vec<gtk::Fixed>,
+    grids: Vec<gtk::ScrolledWindow>,
     pills: Vec<gtk::Box>,
     /// The pill clipping scrollers, indexed by tile id: Fixed children that
     /// follow the tile's slot and the scroll value (P1m-r6).
@@ -1042,13 +1138,17 @@ struct Slot {
     generation: Rc<Cell<u64>>,
 }
 
-/// One tile's widget tree (P1m-r6). The tile itself holds only the framed
+/// One tile's widget tree (P1m-r6/r7). The tile itself holds only the framed
 /// pane; its pill lives in `pill_wrap`, a clipping scroller that is a sibling
 /// of the tile in the split's Fixed, so the pill can stay at the top of the
-/// view while the tile scrolls and still be cut to the tile's width.
+/// view while the tile scrolls and still be cut to the tile's width. The
+/// frame clips its own contents and holds `grid_plane`, a fixed that moves the
+/// grid up inside it by the amount the page scrolled past the slot (P1m-r7).
 struct TileWidgets {
     outer: gtk::Box,
     frame: gtk::Box,
+    grid_plane: gtk::Fixed,
+    grid: gtk::ScrolledWindow,
     pill: gtk::Box,
     close: gtk::Button,
     pill_wrap: gtk::ScrolledWindow,
@@ -1177,6 +1277,8 @@ impl SplitView {
                     scroll: 0,
                     widgets: vec![],
                     frames: vec![],
+                    grid_planes: vec![],
+                    grids: vec![],
                     pills: vec![],
                     pill_wraps: vec![],
                     rects: vec![],
@@ -1297,6 +1399,8 @@ impl Inner {
             st.scroll = 0;
             st.pills.clear();
             st.frames.clear();
+            st.grid_planes.clear();
+            st.grids.clear();
             st.rects.clear();
             st.selection = Selection::new(0);
             st.next_uid = 0;
@@ -1339,6 +1443,8 @@ impl Inner {
             st.heights[column] = Heights::Default;
             st.widgets.push(parts.outer.clone());
             st.frames.push(parts.frame.clone());
+            st.grid_planes.push(parts.grid_plane.clone());
+            st.grids.push(parts.grid.clone());
             st.pills.push(parts.pill.clone());
             st.pill_wraps.push(parts.pill_wrap.clone());
             st.selection.selected.push(false);
@@ -1419,6 +1525,8 @@ impl Inner {
             st.tiles.remove(index);
             st.widgets.remove(index);
             st.frames.remove(index);
+            st.grid_planes.remove(index);
+            st.grids.remove(index);
             st.pills.remove(index);
             st.pill_wraps.remove(index);
             if index < st.selection.selected.len() {
@@ -1442,10 +1550,11 @@ impl Inner {
 
     /// Recompute every tile's rect and move it there: immediately for a
     /// viewport/scale/border change, over 200 ms for a close, an add or a drop.
-    /// The pill's sticky position is a view position, not part of the layout:
-    /// it is applied here from the same scroll value the pinned column uses.
+    /// The stuck geometry is a view position, not part of the layout: the
+    /// pill's wrap, the frame's top margin and the grid's content offset are
+    /// applied here from the same scroll value the pinned column uses.
     fn relayout(&self, animate: bool) {
-        let (rects, widgets, pills, wraps, frames, scale, scroll, view_h) = {
+        let (rects, widgets, pills, wraps, frames, planes, grids, scale, scroll, view_h) = {
             let mut st = self.state.borrow_mut();
             let rects = st.rects();
             // Until the scroller has a viewport, keep the provisional layout:
@@ -1461,12 +1570,16 @@ impl Inner {
                 st.pills.clone(),
                 st.pill_wraps.clone(),
                 st.frames.clone(),
+                st.grid_planes.clone(),
+                st.grids.clone(),
                 st.scale,
                 st.scroll,
                 st.view[1],
             )
         };
         let band = scaled(CONTROL_H, scale) + scaled(GAP_S, scale);
+        let pill_h = scaled(CONTROL_H, scale);
+        let minimum = min_frame_height(scale);
         for (slot, widget) in widgets.iter().enumerate() {
             if let Some(&rect) = rects.get(slot) {
                 if let Some(pill) = pills.get(slot) {
@@ -1484,17 +1597,31 @@ impl Inner {
                         });
                     }
                 }
-                // The frame starts under the pill band (its CSS margin, which
-                // has to follow a scale change).
-                if let Some(frame) = frames.get(slot)
-                    && frame.margin_top() != band
-                {
-                    frame.set_margin_top(band);
+                let stuck = stuck_geometry(
+                    rect,
+                    frame_rect(rect, scale),
+                    scroll,
+                    view_h,
+                    pill_h,
+                    minimum,
+                );
+                // The frame's top margin keeps its border `gap-s` under the
+                // pill while stuck; its bottom keeps the slot's bottom.
+                if let Some(frame) = frames.get(slot) {
+                    let top = stuck.frame.y - rect.y;
+                    if frame.margin_top() != top {
+                        frame.set_margin_top(top);
+                    }
+                }
+                // The grid moves up with the page inside the clipping frame.
+                if let (Some(plane), Some(grid)) = (planes.get(slot), grids.get(slot)) {
+                    let (w, h) = grid_size(rect, scale);
+                    grid.set_size_request(w, h);
+                    plane.move_(grid, 0.0, -(stuck.content_offset as f64));
                 }
                 if let Some(wrap) = wraps.get(slot) {
                     wrap.set_size_request(rect.w.max(1), band.max(1));
-                    let top = rect.y + pill_local_top(rect, scroll, view_h, scale);
-                    self.fixed.move_(wrap, rect.x as f64, top as f64);
+                    self.fixed.move_(wrap, rect.x as f64, stuck.pill_y as f64);
                     // The pill paints over its own tile.
                     wrap.insert_after(&self.fixed, Some(widget));
                 }
@@ -1594,13 +1721,24 @@ impl Inner {
         frame.add_css_class("gl-tile");
         frame.set_vexpand(true);
         frame.set_margin_top(band);
-        frame.append(&crate::grid::folder_view(items, true));
+        // The frame is the clip for its contents (P1m-r7): while the tile is
+        // stuck the grid moves up inside it and disappears under its own top
+        // border, never under the pill.
+        frame.set_overflow(gtk::Overflow::Hidden);
+        let grid = crate::grid::folder_view(items, true);
+        let grid_plane = gtk::Fixed::new();
+        grid_plane.set_hexpand(true);
+        grid_plane.set_vexpand(true);
+        grid_plane.put(&grid, 0.0, 0.0);
+        frame.append(&grid_plane);
         content.append(&frame);
         clip.set_child(Some(&content));
         outer.append(&clip);
         TileWidgets {
             outer,
             frame,
+            grid_plane,
+            grid,
             pill,
             close,
             pill_wrap,
@@ -1692,14 +1830,17 @@ impl Inner {
         anim.play();
     }
 
-    /// Put a tile's pill scroller at its slot's sticky position, cut to the
-    /// slot's width, and raise it over the tile (P1m-r6).
-    fn place_pill(&self, slot: usize, rect: Rect) {
-        let (wrap, widget, scale, scroll, view_h) = {
+    /// Put one tile back at its stuck geometry: the pill's wrap, the frame's
+    /// top margin and the grid's content offset (P1m-r7).
+    fn place_stuck(&self, slot: usize, rect: Rect) {
+        let (wrap, widget, frame, plane, grid, scale, scroll, view_h) = {
             let st = self.state.borrow();
             (
                 st.pill_wraps.get(slot).cloned(),
                 st.widgets.get(slot).cloned(),
+                st.frames.get(slot).cloned(),
+                st.grid_planes.get(slot).cloned(),
+                st.grids.get(slot).cloned(),
                 st.scale,
                 st.scroll,
                 st.view[1],
@@ -1709,19 +1850,50 @@ impl Inner {
             return;
         };
         let band = scaled(CONTROL_H, scale) + scaled(GAP_S, scale);
+        let stuck = stuck_geometry(
+            rect,
+            frame_rect(rect, scale),
+            scroll,
+            view_h,
+            scaled(CONTROL_H, scale),
+            min_frame_height(scale),
+        );
         wrap.set_size_request(rect.w.max(1), band.max(1));
-        let top = rect.y + pill_local_top(rect, scroll, view_h, scale);
-        self.fixed.move_(&wrap, rect.x as f64, top as f64);
+        self.fixed.move_(&wrap, rect.x as f64, stuck.pill_y as f64);
+        if let Some(frame) = frame {
+            frame.set_margin_top(stuck.frame.y - rect.y);
+        }
+        if let (Some(plane), Some(grid)) = (plane, grid) {
+            let (w, h) = grid_size(rect, scale);
+            grid.set_size_request(w, h);
+            plane.move_(&grid, 0.0, -(stuck.content_offset as f64));
+        }
         if let Some(widget) = widget {
             wrap.insert_after(&self.fixed, Some(&widget));
         }
     }
 
-    /// While a tile is dragged, its pill rides at the tile's top (P1m-r6).
+    /// While a tile is dragged, its pill rides at the tile's top and the tile
+    /// shows its natural geometry, not its stuck one (P1m-r6/r7).
     fn drag_pill(&self, slot: usize, rect: Rect) {
-        let wrap = self.state.borrow().pill_wraps.get(slot).cloned();
+        let (wrap, frame, plane, grid, band) = {
+            let st = self.state.borrow();
+            (
+                st.pill_wraps.get(slot).cloned(),
+                st.frames.get(slot).cloned(),
+                st.grid_planes.get(slot).cloned(),
+                st.grids.get(slot).cloned(),
+                scaled(CONTROL_H, st.scale) + scaled(GAP_S, st.scale),
+            )
+        };
         if let Some(wrap) = wrap {
             self.fixed.move_(&wrap, rect.x as f64, rect.y as f64);
+        }
+        if let Some(frame) = frame {
+            frame.set_margin_top(band);
+        }
+        if let (Some(plane), Some(grid)) = (plane, grid) {
+            plane.move_(&grid, 0.0, 0.0);
         }
     }
 
@@ -1988,7 +2160,7 @@ impl Inner {
             None => {
                 self.hide_drop_line();
                 self.slide_to(from, &widgets[from], rects[from]);
-                self.place_pill(from, rects[from]);
+                self.place_stuck(from, rects[from]);
                 crate::log!("split", "drag ended with no drop; sliding back");
             }
         }
@@ -2006,7 +2178,7 @@ impl Inner {
             };
             if let (Some(rect), Some(widget)) = (rect, widget) {
                 self.slide_to(from, &widget, rect);
-                self.place_pill(from, rect);
+                self.place_stuck(from, rect);
             }
         }
         self.hide_drop_line();
@@ -2770,6 +2942,47 @@ mod tests {
     }
 
     #[test]
+    fn a_stuck_tiles_strip_follows_its_frame_top() {
+        // Two 700-tall slots: the lower one starts at 824. At scroll 900 its
+        // top is above the view, so its frame top sticks at view 58 (content
+        // 958) instead of its natural 882. The strip under it runs from the
+        // upper frame's bottom (800) to that stuck top.
+        let slots = [
+            vec![
+                Rect {
+                    x: 40,
+                    y: 100,
+                    w: 300,
+                    h: 700,
+                },
+                Rect {
+                    x: 40,
+                    y: 824,
+                    w: 300,
+                    h: 700,
+                },
+            ],
+            vec![],
+        ];
+        for y in 800..958 {
+            assert_eq!(
+                border_at(&slots, 45, y, 900, VIEW.1, 1.0),
+                Some(Border::Heights { column: 0, row: 1 }),
+                "y {y} in the stuck strip"
+            );
+        }
+        // The lower frame's border itself is not a border.
+        assert_eq!(border_at(&slots, 45, 958, 900, VIEW.1, 1.0), None);
+        // Its stuck pill is at content 900..950 and is never a border.
+        assert_eq!(border_at(&slots, 200, 925, 900, VIEW.1, 1.0), None);
+        // The gap between the stuck pill and the frame top still grabs.
+        assert_eq!(
+            border_at(&slots, 45, 955, 900, VIEW.1, 1.0),
+            Some(Border::Heights { column: 0, row: 1 })
+        );
+    }
+
+    #[test]
     fn pill_hit_test() {
         let rects = rects_for(&initial_columns(4));
         let r = rects[0];
@@ -2793,58 +3006,92 @@ mod tests {
         (slot, frame_rect(slot, 1.0))
     }
 
+    fn stuck_at(scroll: i32) -> Stuck {
+        let (slot, frame) = sticky_case();
+        stuck_geometry(
+            slot,
+            frame,
+            scroll,
+            VIEW.1,
+            scaled(CONTROL_H, 1.0),
+            min_frame_height(1.0),
+        )
+    }
+
     #[test]
     fn a_visible_slot_leaves_its_pill_at_the_slot_top() {
         let (slot, frame) = sticky_case();
-        let ph = scaled(CONTROL_H, 1.0);
         // The slot fully visible at the top.
-        assert_eq!(sticky_pill_y(slot, frame, 0, VIEW.1, ph), 100);
-        assert_eq!(frame_rect(slot, 1.0).y, 158);
+        let g = stuck_at(0);
+        assert_eq!(g.pill_y, 100);
+        assert_eq!(g.frame, frame);
+        assert_eq!(g.content_offset, 0);
         // Still fully visible after a 40 px scroll: no change relative to the
         // slot, so in the view it simply follows the scroll.
-        assert_eq!(sticky_pill_y(slot, frame, 40, VIEW.1, ph), 60);
+        let g = stuck_at(40);
+        assert_eq!(g.pill_y, 100);
+        assert_eq!(g.pill_y - 40, 60);
+        assert_eq!(g.frame, frame);
         // In content coordinates the pill is still at the slot's top; the
         // scroller moves both by 40.
         assert_eq!(pill_content_rect(slot, 40, VIEW.1, 1.0).y, 100);
     }
 
     #[test]
-    fn a_slot_top_above_the_view_sticks_the_pill_at_the_top() {
-        let (slot, frame) = sticky_case();
-        let ph = scaled(CONTROL_H, 1.0);
+    fn a_slot_top_above_the_view_sticks_the_pill_and_the_frame_top() {
         // The slot's top is 100 px above the visible area.
-        assert_eq!(sticky_pill_y(slot, frame, 200, VIEW.1, ph), 0);
-        // The hit test sees it at the top of the view: content y 200.
-        assert_eq!(pill_content_rect(slot, 200, VIEW.1, 1.0).y, 200);
-        // A further scroll keeps it at the top while the frame is visible.
-        assert_eq!(sticky_pill_y(slot, frame, 500, VIEW.1, ph), 0);
+        let g = stuck_at(200);
+        // The pill is at the view's top: content y 200, view y 0.
+        assert_eq!(g.pill_y, 200);
+        assert_eq!(g.pill_y - 200, 0);
+        // The frame's top border stays `gap-s` under the pill; its bottom is
+        // still the slot's bottom (800 in content, 600 in the view).
+        assert_eq!(g.frame.y, 200 + 58);
+        assert_eq!(g.frame.y + g.frame.h, 800);
+        assert_eq!(g.frame.y + g.frame.h - 200, 600);
+        assert_eq!(g.frame.h, 542);
+        // The contents have moved up by the 100 px scrolled past the top.
+        assert_eq!(g.content_offset, 100);
+        // The hit test sees the pill at the top of the view: content y 200.
+        assert_eq!(pill_content_rect(sticky_case().0, 200, VIEW.1, 1.0).y, 200);
+        // A further scroll keeps the pill and frame top still and shortens
+        // the frame from below.
+        let g = stuck_at(500);
+        assert_eq!((g.pill_y, g.frame.y), (500, 558));
+        assert_eq!(g.frame.h, 242);
+        assert_eq!(g.content_offset, 400);
     }
 
     #[test]
-    fn the_tiles_own_bottom_pushes_its_pill_up() {
-        let (slot, frame) = sticky_case();
-        let ph = scaled(CONTROL_H, 1.0);
-        assert_eq!(frame.y + frame.h, 800);
-        // Ten pixels of the frame are still visible: the pill's bottom rides
-        // the frame's bottom, 40 px above the view's top.
-        let y = sticky_pill_y(slot, frame, 790, VIEW.1, ph);
-        assert_eq!(y, -40);
-        assert_eq!(y + ph, 10);
-        // At the frame's last pixel the pill is exactly off the top.
-        assert_eq!(sticky_pill_y(slot, frame, 800, VIEW.1, ph) + ph, 0);
+    fn the_frame_shrinks_to_one_grid_row_at_the_minimum() {
+        // The frame's visible height reaches one grid row (144) at scroll
+        // 598: 800 - 598 - 58 = 144.
+        let g = stuck_at(598);
+        assert_eq!(g.pill_y - 598, 0);
+        assert_eq!(g.frame.y - 598, 58);
+        assert_eq!(g.frame.h, min_frame_height(1.0));
+        assert_eq!(g.frame.h, 144);
+        assert_eq!(g.content_offset, 598 - 100);
     }
 
     #[test]
-    fn the_frame_fully_off_leaves_the_pill_with_it() {
-        let (slot, frame) = sticky_case();
-        let ph = scaled(CONTROL_H, 1.0);
-        let y = sticky_pill_y(slot, frame, 850, VIEW.1, ph);
-        assert!(y + ph <= 0, "the pill must be above the view: {y}");
-        // The pill's bottom stays on the frame's bottom as it leaves.
-        assert_eq!(y + ph, -50);
-        // A frame entirely below the view has not pushed anything yet.
-        let below = sticky_pill_y(slot, frame, 0, VIEW.1, ph);
-        assert_eq!(below, 100);
+    fn below_the_minimum_the_whole_tile_scrolls_off() {
+        // At the threshold the pill is at the top and the frame is one row.
+        // Past it the whole tile keeps the geometry it had in content
+        // coordinates and the page scrolls it off, pill and all.
+        let at = stuck_at(598);
+        let past = stuck_at(650);
+        assert_eq!(past.pill_y, at.pill_y);
+        assert_eq!(past.frame, at.frame);
+        assert_eq!(past.content_offset, at.content_offset);
+        // In the view the pill and the frame's top are 52 px above the top.
+        assert_eq!(past.pill_y - 650, -52);
+        assert_eq!(past.frame.h, 144);
+        // At the frame's last pixel both are off the view, together.
+        let gone = stuck_at(800);
+        assert_eq!(gone.frame.y + gone.frame.h - 800, 0);
+        assert_eq!(gone.pill_y + scaled(CONTROL_H, 1.0) - 800, -152);
+        assert!(gone.pill_y + scaled(CONTROL_H, 1.0) - 800 <= 0);
     }
 
     #[test]
@@ -2870,11 +3117,19 @@ mod tests {
             1.0
         ));
         let pinned = slots[1][0];
+        let g = stuck_geometry(
+            pinned,
+            frame_rect(pinned, 1.0),
+            300,
+            VIEW.1,
+            scaled(CONTROL_H, 1.0),
+            min_frame_height(1.0),
+        );
         assert_eq!(
-            pill_content_rect(pinned, 300, VIEW.1, 1.0).y,
-            pinned.y,
+            g.pill_y, pinned.y,
             "a pinned column's pill top is its slot top"
         );
+        assert_eq!(g.content_offset, 0, "a pinned tile stays whole");
         // The tall column's first pill sticks instead.
         assert_eq!(
             pill_content_rect(slots[0][0], 300, VIEW.1, 1.0).y,

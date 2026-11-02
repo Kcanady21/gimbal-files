@@ -1622,3 +1622,218 @@ tile's contents, and the tile must never go behind its pill. Kyle chose the rule
 - the contents keep scrolling and disappear under the frame's own top border.
 
 Brief P1m-r7. r6's sticky-pill positioning is committed as the base it builds on.
+
+## P1m-r7 changes
+
+Built on P1m-r6. Only `spike/src/bin/look-body/split.rs` and `main.rs` (temporary timer call only,
+removed) changed under that folder, plus this note. Below, command output and the timer log are
+**[observed]**, GTK/gtk-rs source citations are **[read]**, and everything that needs a real pointer
+or a screenshot is **[inferred]**.
+
+### Item 1: the whole tile top sticks
+
+`sticky_pill_y` (r6) is replaced by one pure function, `stuck_geometry`, in
+`spike/src/bin/look-body/split.rs`. Its inputs are the slot rect, the frame rect, the scroll value,
+the visible height, the pill height and the frame minimum; it returns a `Stuck` in **content
+coordinates** (the space the split's `GtkFixed` children live in; subtract `scroll` for view
+coordinates):
+
+```text
+Stuck { pill_y, frame (visible rect), content_offset }
+```
+
+- slot top still in view: the pill stays at the slot top, the frame is its natural rect, offset 0;
+- slot top above the view and the frame's visible height still at least one grid row:
+  `pill_y = scroll` (view 0), the frame's top is `scroll + pill_h + gap_s` (view `pill_h + gap_s`,
+  i.e. the border stays `gap-s` under the pill), its bottom stays the slot's bottom, and
+  `content_offset = scroll - slot.y`;
+- the frame's visible height would drop below `min_frame_height` (one grid row, `CELL_H`): the whole
+  tile, pill included, keeps its content-space geometry and the page scrolls it off; the frame's
+  visible height stays one row (`frame.y + frame.h` is the slot's bottom).
+
+The minimum is `scaled(CELL_H, scale)` (144 design px); it is the frame part of the existing
+`min_slot_height` (`pill + gap-s + one grid row`). While the tile is stuck the frame only ever gets
+shorter, so `bottom - band < minimum` is the spec's "frame's bottom reaches the pill's height plus
+`gap-s` plus the frame's minimum".
+
+### Which offset belongs to which scroller
+
+- The **outer page scroller** still owns the page scroll: a tile's outer box stays at its slot rect
+  in the Fixed's content coordinates, so the page moves it exactly as before.
+- The **content offset** is not put on the grid's own vertical adjustment. That adjustment belongs
+  to the grid's own scrolling: it has no range at all when the grid is shorter than the tile
+  (`upper - page_size = 0`, so the offset would clamp), and for a longer grid it would fight the
+  grid's own position. Instead the frame's child is a `GtkFixed` (`grid_plane`) holding the grid at
+  its natural size, and `relayout` moves the grid up by `content_offset` inside it. The grid keeps
+  its natural height while stuck, so its cells never re-lay out, they only slide. The tile's own
+  clipping scroller stays at range 0 (logged below), so the page offset cannot be applied a second
+  time through the tile's clip; the grid's own scroller keeps whatever range it had in r6.
+- The **frame clips**: `gtk::Overflow::Hidden` on the frame clips its children to its padding box,
+  inside the 2 px border. The grid therefore disappears under the frame's own top border, and the
+  `gap-s` strip between the pill and that border stays empty. The pill is still a separate Fixed
+  child (r6) so it never overlaps the frame's contents.
+
+The frame's top margin is `stuck.frame.y - slot.y` (the pill band when not stuck, `band + offset`
+while stuck); the pill wrap moves to `stuck.pill_y`. `place_pill` became `place_stuck`, and a tile
+drag resets its frame margin and grid offset (`drag_pill`) so the dragged tile shows its natural
+geometry; a no-drop slide-back restores the stuck one.
+
+### Hit tests while stuck
+
+`pill_content_rect`, `pill_at`, `pill_zone` and `press_on_pill` all follow the new pill position.
+`border_at`'s height strip now ends at the lower tile's *visible* frame top from `stuck_geometry`
+(its upper end is the upper tile's frame bottom, which stays the slot's bottom and therefore follows
+a stuck tile's moving frame bottom). The strip still excludes any drawn pill. Drop zones and the
+drop line are in content coordinates and are unchanged.
+
+### Unit tests
+
+Added in the look-body binary:
+
+- `split::tests::a_visible_slot_leaves_its_pill_at_the_slot_top` (not stuck)
+- `split::tests::a_slot_top_above_the_view_sticks_the_pill_and_the_frame_top` (stuck mid-scroll)
+- `split::tests::the_frame_shrinks_to_one_grid_row_at_the_minimum` (at the minimum)
+- `split::tests::below_the_minimum_the_whole_tile_scrolls_off` (scrolled off)
+- `split::tests::a_stuck_tiles_strip_follows_its_frame_top` (border strip)
+- `split::tests::a_pinned_column_never_moves_its_pills` (adapted from r6)
+
+r6's `the_tiles_own_bottom_pushes_its_pill_up` and `the_frame_fully_off_leaves_the_pill_with_it`
+encoded the old "pill rides the frame bottom" rule; they no longer hold and were replaced by the two
+minimum/scrolled-off tests. The other r6 sticky tests were kept and adapted to `stuck_geometry`.
+
+### Temporary timer log (harness removed before delivery)
+
+Debug binary, `GIMBAL_R7_TIMER=1 GIMBAL_SPIKE_LOG=1 look-body --tiles 4`, niri-tiled 1272×1398, same
+reproduction as r6: 2 + 2, left column hand heights `[1056, 564]` (the +493 px border drag), so the
+column is 1,644 content px against a 1,191 px view and the maximum scroll is 453. The timer set those
+heights, drove the outer adjustment through five values and logged Tab 1's actual widget bounds
+(relative to the split's Fixed), its content offset and, for a cross-check, the pure function's
+values. `clip range` is the tile's own clipping scroller's `upper - page_size`. [observed]
+
+```text
+[gimbal-look-body 2.038] temp: r7 1 of 5 scroll 0: pill y 0 (view 0) frame [40, 58] 97x998 (view y 58) content 0 clip range 0 (model pill 0 frame y 58 offset 0)
+[gimbal-look-body 2.198] temp: r7 2 of 5 scroll 113: pill y 113 (view 0) frame [40, 171] 97x885 (view y 58) content 113 clip range 0 (model pill 113 frame y 171 offset 113)
+[gimbal-look-body 2.358] temp: r7 3 of 5 scroll 227: pill y 227 (view 0) frame [40, 285] 97x771 (view y 58) content 227 clip range 0 (model pill 227 frame y 285 offset 227)
+[gimbal-look-body 2.518] temp: r7 4 of 5 scroll 340: pill y 340 (view 0) frame [40, 398] 97x658 (view y 58) content 340 clip range 0 (model pill 340 frame y 398 offset 340)
+[gimbal-look-body 2.678] temp: r7 5 of 5 scroll 453: pill y 453 (view 0) frame [40, 511] 97x545 (view y 58) content 453 clip range 0 (model pill 453 frame y 511 offset 453)
+```
+
+The pill's view y stays 0 and the frame's view top stays 58 (`pill_h + gap-s`) at every nonzero
+scroll, while its content y moves down by exactly the scroll and its height shrinks by the same
+amount (`998 → 885 → … → 545`; the content bottom stays 1,056 = the slot bottom). `content` equals
+the model offset at every step, the frame's top border is therefore at view 58 (8 px under the
+50 px pill), and the tile's own scroller never gains a range. A second temporary run at
+`--scale 0.5` with hand heights `[2400, 1200]` gave the same pattern with a 29 px band and offsets
+132/265/397/529. [observed]
+
+### RULES.md's four commands, from `$SPIKE`
+
+`cargo fmt --check` (rustup 1.95.0 toolchain):
+
+```text
+(fmt exit 0; no output)
+```
+
+`cargo clippy --all-targets -- -D warnings`:
+
+```text
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.02s
+(clippy exit 0)
+```
+
+`cargo test`:
+
+```text
+     Running unittests src/main.rs (target/debug/deps/gimbal_spike-27f41c3be3242da9)
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running unittests src/bin/look-body/main.rs (target/debug/deps/look_body-0c97cc23f4ccae67)
+test result: ok. 67 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running unittests src/bin/look-header/main.rs (target/debug/deps/look_header-4abd02268319d43d)
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+```
+
+`cargo build --release`:
+
+```text
+   Compiling gimbal-spike v0.0.0 (/home/kyle/Documents/03.) Code-Projects/gimbal-files/spike)
+    Finished `release` profile [optimized] target(s) in 1.58s
+```
+
+### 10-second release runs (stopped by PID with SIGTERM, from `/tmp/gimbal-spike-p1m-r7`)
+
+Default, `--tiles 5`, and `--tiles 6 --pins 14 --scale 0.5` each ran for 10 s and wrote nothing:
+exit 143, empty stderr/stdout. No GTK warnings, no `Gtk-CRITICAL`, no CSS/theme/icon warnings, no
+panics, and no `VK_SUBOPTIMAL_KHR` in these runs. [observed]
+
+### API citations
+
+- `gtk::Overflow::Hidden`: `gtk4-0.11.5:src/auto/enums.rs:7486-7490`;
+  `WidgetExt::set_overflow` `gtk4-0.11.5:src/auto/widget.rs:1344-1348`.
+- The overflow clip is a rounded clip around the **padding box** applied around the children's
+  snapshot, after background and border: `gtk-4.22.4:gtk/gtkwidget.c:12129-12138`; picking is
+  likewise limited to the padding box, `gtk-4.22.4:gtk/gtkwidget.c:10443-10453`.
+- A `GtkFixed` measures a child at its preferred size and applies the child transform to the
+  measured bounds, so a child at `-offset` reduces the fixed's own measured height:
+  `gtk-4.22.4:gtk/gtkfixedlayout.c:242-289`; allocate at preferred size
+  `gtk-4.22.4:gtk/gtkfixedlayout.c:297-321`.
+- Widget margins are applied inside the allocation and CSS margins are a separate box-model inset
+  (`gtk-4.22.4:gtk/gtkwidget.c:4246-4288`); that is why the grid's `.gl-grid.tile { margin: 16px }`
+  still insets the `GridView` inside the scroller, and why the earlier negative-margin experiment
+  was rejected (a GtkBox measured it as a negative minimum and emitted
+  `GtkBox … adjusted size vertical min -55 …`).
+- `GestureDrag` callbacks and the Fixed hit-test conversion are unchanged from r4/r6.
+
+### Not verified live (Claude's check)
+
+- The paint order and clipping themselves: the log proves the frame's allocation, the pill's
+  position and the applied offset, and the source [read] proves `overflow: hidden` clips at the
+  padding box, but no screenshot was taken. That contents visibly slide under the frame's top
+  border and never under the pill is [inferred].
+- The stuck drag (pressing a stuck pill and moving it), click/Ctrl/Shift selection, the ✕ and the
+  right-click menu at the stuck position: they all use the pill widget at its drawn position, but
+  no pointer was injected (RULES). [inferred]
+- The border strip while the upper stuck tile's frame bottom is moving: `border_at` is pure-tested
+  in content coordinates; the hover cursor and the real grab were not replayed. [inferred]
+- The minimum/scrolled-off transition at a real scroll position: driven and unit-tested, not wheeled
+  by hand. [inferred]
+- Wheel-over-tile behaviour while stuck: the tile's clip range logs 0, but the grid inside it keeps
+  its own scroller (and the r6 range it had), so which of the two takes a wheel event was not
+  replayed. [inferred]
+
+### Anything I'd change outside my files
+
+None. `grid.rs`, `style.rs`, `main.rs` (apart from the temporary timer call, removed) are otherwise
+unchanged. The spec's "Stuck tiles" rule already says what this implements; it could add that the
+frame's minimum visible height is one grid row (`144` design px), which is what this code uses.
+
+## Review and live check of P1m-r7 (Claude, with Kyle's look, Nov 2, 2026): passes
+
+Kyle: "looks good so far". Reviewed the diff (`split.rs` only). `stuck_geometry` is continuous at
+both thresholds: at the minimum, `scroll - slot.y = frame.h - minimum`, so the scrolled-off branch
+starts from exactly the stuck geometry, and past it the pill, the frame and the content offset are
+constant in content coordinates, so the page carries the whole tile off. The grid sits at its
+natural size in a `GtkFixed` inside a frame with `overflow: hidden`, so it slides rather than
+re-laying out, and is clipped at the frame's padding box.
+
+Gates, from `spike/` (rustup 1.95.0): `cargo fmt --check` clean; clippy `-D warnings` clean;
+`cargo test` 4 + 67 + 12 pass; release build ok. 10-second runs of `look-body`,
+`look-body --tiles 3` and `look-body --tiles 6 --pins 14 --scale 0.5` printed nothing. No temporary
+logs left in `src/`.
+
+Live, release build, niri-tiled on DP-2 (DP-3 off), wheel injected over the gap between the columns
+(a new wheel axis on the test device):
+
+- **4 tiles, Tab 1's lower border dragged down 500 px:** after 3 and 7 wheel notches Tab 1's pill
+  stays at the top of the view, its frame top border stays 8 px under the pill, the frame bottom
+  moves up with the page, and the file labels are cut cleanly by the frame's own top border. The
+  gap between the pill and the border stays empty; nothing goes behind the pill. The pinned right
+  column holds still.
+- **6 tiles (3 + 3), one notch at a time:** both top tiles stick together; Tab 1 shrinks to one row
+  of files, then the whole tile, pill included, scrolls off, and Tab 3 reaches the top.
+- **Half width (1280):** the same stick and clip with one-column tiles.
+- A wheel over a tile scrolls that tile's own file list first, as in r6. Unchanged; Kyle hasn't
+  asked for anything different.
+
+Not replayed: dragging a stuck tile by its pill, the ✕ and the right-click menu at the stuck
+position, and the border strip under a stuck tile. They use the same hit tests the unit tests
+cover.
