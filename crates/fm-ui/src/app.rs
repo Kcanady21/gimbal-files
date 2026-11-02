@@ -10,6 +10,7 @@
 use adw::prelude::*;
 use fm_core::command::{Caller, CheckedCommand, Effect, Invocation, Outcome, Registry, Value};
 use fm_core::config::{self, Change, ConfigFile};
+use fm_core::fileops::{Decisions, Plan, Report, Request};
 use fm_core::session::{self, SessionProblem};
 use fm_core::workspace::{Event, Heights, TabId, WindowId, Workspace};
 use gtk::gio;
@@ -21,6 +22,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use crate::commands;
+use crate::fileops::{self, FileOps, ProgressView, clipboard, dialogs, menu as menus, progress};
 use crate::folder::ClickRequest;
 use crate::frame::WindowUi;
 use crate::look::Look;
@@ -38,6 +40,7 @@ pub struct Process {
     save_source: RefCell<Option<glib::SourceId>>,
     debounce: Cell<Debounce>,
     preserve_bad: Cell<bool>,
+    fileops: RefCell<Option<Rc<FileOps>>>,
 }
 
 impl Process {
@@ -94,9 +97,16 @@ impl Process {
             save_source: RefCell::new(None),
             debounce: Cell::new(Debounce::new(SAVE_DELAY_MS)),
             preserve_bad: Cell::new(false),
+            fileops: RefCell::new(None),
         });
+        let fileops = FileOps::new(&process);
+        *process.fileops.borrow_mut() = Some(fileops);
         process.restore_session();
         process
+    }
+
+    pub fn fileops(&self) -> Option<Rc<FileOps>> {
+        self.fileops.borrow().clone()
     }
 
     fn restore_session(self: &Rc<Self>) {
@@ -515,7 +525,7 @@ impl Process {
         }
     }
 
-    fn selected_paths(&self, window: WindowId) -> Vec<PathBuf> {
+    pub fn selected_paths(&self, window: WindowId) -> Vec<PathBuf> {
         let Some(window) = self.window_snapshot(window) else {
             return Vec::new();
         };
@@ -749,6 +759,35 @@ impl Process {
             command.name(),
             command.effect()
         );
+        match command.name() {
+            "file.cut" => {
+                self.put_on_clipboard(window, caller, command, clipboard::ClipboardMode::Cut);
+                return Outcome::Done;
+            }
+            "file.copy-to-clipboard" => {
+                self.put_on_clipboard(window, caller, command, clipboard::ClipboardMode::Copy);
+                return Outcome::Done;
+            }
+            "file.paste" => {
+                self.paste(window, caller, command);
+                return Outcome::Done;
+            }
+            "app.disk-usage" => {
+                let path = argument_path(command, "path").or_else(|| self.current_folder(window));
+                if let Some(path) = path {
+                    self.launch_disk_usage(&path);
+                }
+                return Outcome::Done;
+            }
+            _ => {}
+        }
+
+        if command.effect() == Effect::Files
+            && let Some(outcome) = self.run_file_command(window, caller, command)
+        {
+            return outcome;
+        }
+
         if command.name() == "file.open" {
             let paths = argument_paths(command, "paths")
                 .filter(|paths| !paths.is_empty())
@@ -946,6 +985,363 @@ impl Process {
         Outcome::Done
     }
 
+    // The arms share one "fill only when the argument is absent" shape; a
+    // match guard would hide which context argument each command gets.
+    #[allow(clippy::collapsible_match)]
+    fn filled_invocation(
+        &self,
+        window: WindowId,
+        caller: Caller,
+        command: &CheckedCommand,
+    ) -> Result<Invocation, String> {
+        let mut arguments: Vec<(String, String)> = Vec::new();
+        for argument in command.arguments() {
+            match &argument.value {
+                Value::Paths(paths) => {
+                    for path in paths {
+                        arguments.push((argument.name.to_string(), utf8_path(path)?));
+                    }
+                }
+                value => arguments.push((argument.name.to_string(), value.to_string())),
+            }
+        }
+
+        if matches!(caller, Caller::Ui | Caller::Hotkey) {
+            match command.name() {
+                "file.trash"
+                | "file.copy"
+                | "file.move"
+                | "file.cut"
+                | "file.copy-to-clipboard" => {
+                    if command.get("paths").is_none() {
+                        for path in self.selected_paths(window) {
+                            arguments.push(("paths".to_string(), utf8_path(&path)?));
+                        }
+                    }
+                }
+                "file.rename" => {
+                    if command.get("path").is_none()
+                        && let Some(path) = self.selected_paths(window).first()
+                    {
+                        arguments.push(("path".to_string(), utf8_path(path)?));
+                    }
+                }
+                "file.new-folder" | "file.paste" => {
+                    if command.get("in").is_none()
+                        && let Some(folder) = self.current_folder(window)
+                    {
+                        arguments.push(("in".to_string(), utf8_path(&folder)?));
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        Ok(Invocation::new(command.name(), arguments))
+    }
+
+    fn request_from_command(
+        &self,
+        window: WindowId,
+        caller: Caller,
+        command: &CheckedCommand,
+    ) -> Result<Option<Request>, String> {
+        let invocation = self.filled_invocation(window, caller, command)?;
+        let checked = Registry::new()
+            .validate(caller, &invocation)
+            .map_err(|error| error.to_string())?;
+        fm_core::fileops::request_for(&checked).map_err(|error| error.to_string())
+    }
+
+    fn run_file_command(
+        self: &Rc<Self>,
+        window: WindowId,
+        caller: Caller,
+        command: &CheckedCommand,
+    ) -> Option<Outcome> {
+        let request = match self.request_from_command(window, caller, command) {
+            Ok(Some(request)) => request,
+            Ok(None) => return None,
+            Err(error) => {
+                crate::log!("fileops", "{}: {error}", command.name());
+                return Some(Outcome::Done);
+            }
+        };
+
+        if command.dry_run() {
+            let lines = self
+                .fileops()
+                .map(|fileops| fileops.plan_lines(&request))
+                .unwrap_or_default();
+            crate::log!(
+                "fileops",
+                "{} dry run: {}",
+                command.name(),
+                lines.join(" | ")
+            );
+            return Some(Outcome::DryRun(lines));
+        }
+
+        if let Some(fileops) = self.fileops() {
+            let id = fileops.submit(window, request, false);
+            crate::log!("fileops", "{} queued as job {id}", command.name());
+        }
+        Some(Outcome::Done)
+    }
+
+    fn put_on_clipboard(
+        self: &Rc<Self>,
+        window: WindowId,
+        caller: Caller,
+        command: &CheckedCommand,
+        mode: clipboard::ClipboardMode,
+    ) {
+        let paths = argument_paths(command, "paths")
+            .filter(|paths| !paths.is_empty())
+            .unwrap_or_else(|| {
+                if matches!(caller, Caller::Ui | Caller::Hotkey) {
+                    self.selected_paths(window)
+                } else {
+                    Vec::new()
+                }
+            });
+        if paths.is_empty() {
+            crate::log!("fileops", "{} has nothing selected", command.name());
+            return;
+        }
+        let Some(ui) = self.window(window) else {
+            return;
+        };
+        match clipboard::write(&ui.display(), mode, &paths) {
+            Ok(()) => crate::log!(
+                "fileops",
+                "{} put {} item(s) on the clipboard",
+                mode.as_str(),
+                paths.len()
+            ),
+            Err(error) => crate::log!("fileops", "clipboard: {error}"),
+        }
+    }
+
+    fn paste(self: &Rc<Self>, window: WindowId, caller: Caller, command: &CheckedCommand) {
+        let folder = argument_path(command, "in").or_else(|| {
+            if matches!(caller, Caller::Ui | Caller::Hotkey) {
+                self.current_folder(window)
+            } else {
+                None
+            }
+        });
+        let Some(folder) = folder else {
+            crate::log!("fileops", "file.paste has no folder");
+            return;
+        };
+        let dry_run = command.dry_run();
+        let Some(ui) = self.window(window) else {
+            return;
+        };
+        let weak = Rc::downgrade(self);
+        clipboard::read(&ui.display(), move |result| {
+            let Some(process) = weak.upgrade() else {
+                return;
+            };
+            let payload = match result {
+                Ok(payload) => payload,
+                Err(error) => {
+                    crate::log!("fileops", "paste: {error}");
+                    return;
+                }
+            };
+            let paths: Vec<PathBuf> = payload
+                .uris
+                .iter()
+                .filter_map(|uri| gio::File::for_uri(uri).path())
+                .collect();
+            if paths.is_empty() {
+                crate::log!("fileops", "paste: the clipboard has no local files");
+                return;
+            }
+            let request = match payload.mode {
+                clipboard::ClipboardMode::Cut => Request::Move {
+                    paths,
+                    to: folder.clone(),
+                },
+                clipboard::ClipboardMode::Copy => Request::Copy {
+                    paths,
+                    to: folder.clone(),
+                },
+            };
+            if dry_run {
+                let lines = process
+                    .fileops()
+                    .map(|fileops| fileops.plan_lines(&request))
+                    .unwrap_or_default();
+                crate::log!("fileops", "paste dry run: {}", lines.join(" | "));
+                return;
+            }
+            if let Some(fileops) = process.fileops() {
+                let id = fileops.submit(window, request, clipboard::clear_after_cut(payload.mode));
+                crate::log!("fileops", "paste ({}): job {id}", payload.mode.as_str());
+            }
+        });
+    }
+
+    fn current_folder(&self, window: WindowId) -> Option<PathBuf> {
+        self.window_snapshot(window)
+            .and_then(|window| window.tab(window.focused_tab).map(|tab| tab.folder.clone()))
+    }
+
+    pub fn clipboard_has_files(&self, window: WindowId) -> bool {
+        self.window(window)
+            .is_some_and(|ui| clipboard::display_has_files(&ui.display()))
+    }
+
+    /// A right press on a grid cell. The tile is focused first; an unselected
+    /// item becomes the selection before the menu opens.
+    pub fn right_click_item(
+        self: &Rc<Self>,
+        window: WindowId,
+        tab: Option<TabId>,
+        name: OsString,
+        anchor: &gtk::Widget,
+    ) {
+        self.focus_model_window(window);
+        let selected = self.window_snapshot(window).is_some_and(|window| {
+            let tab = tab
+                .and_then(|tab| window.tab(tab))
+                .or_else(|| window.tab(window.focused_tab));
+            tab.is_some_and(|tab| tab.selection.names.contains(&name))
+        });
+        if selected {
+            if let Some(tab) = tab {
+                let result = self.workspace.borrow_mut().focus_tab(tab);
+                self.finish(result);
+            }
+        } else {
+            self.file_click_tab(window, tab, ClickRequest::Plain(name));
+        }
+
+        let paths = self.selected_paths(window);
+        let items: Vec<fileops::ItemInfo> = paths
+            .iter()
+            .map(|path| fileops::ItemInfo {
+                path: path.clone(),
+                is_dir: path.is_dir(),
+            })
+            .collect();
+        if let Some(ui) = self.window(window) {
+            dialogs::show_menu(&ui, anchor, &menus::item_menu(&items), None);
+        }
+    }
+
+    /// A right press on empty grid space.
+    pub fn right_click_background(
+        self: &Rc<Self>,
+        window: WindowId,
+        tab: Option<TabId>,
+        folder: PathBuf,
+        anchor: &gtk::Widget,
+        at: (f64, f64),
+    ) {
+        self.focus_model_window(window);
+        if let Some(tab) = tab {
+            let result = self.workspace.borrow_mut().focus_tab(tab);
+            self.finish(result);
+        }
+        let fileops = self.fileops();
+        let undo = fileops.as_ref().and_then(|fileops| fileops.undo_summary());
+        let baobab = fileops
+            .as_ref()
+            .is_some_and(|fileops| fileops.baobab_available());
+        let has_files = self.clipboard_has_files(window);
+        let items = menus::background_menu(&folder, undo.as_deref(), baobab, has_files);
+        if let Some(ui) = self.window(window) {
+            // The anchor is the whole grid scroller: point at the click, or
+            // the popover lands at the scroller's edge, outside the window
+            // (Claude's P2k review).
+            dialogs::show_menu(&ui, anchor, &items, Some(at));
+        }
+    }
+
+    pub fn fileop_started(&self, window: WindowId) {
+        if let Some(ui) = self.window(window) {
+            ui.fileop_started();
+        }
+    }
+
+    pub fn fileop_progress(&self, window: WindowId, view: Option<ProgressView>) {
+        if let Some(ui) = self.window(window) {
+            ui.fileop_progress(view);
+        }
+    }
+
+    pub fn fileop_finished(
+        &self,
+        window: WindowId,
+        request: &Request,
+        plan: &Plan,
+        report: &Report,
+    ) {
+        let summary = if *request == Request::Undo {
+            progress::undo_status(plan, report)
+        } else {
+            progress::summary(request, report)
+        };
+        let failures = progress::failure_lines(report);
+        let details = (!failures.is_empty()).then(|| failures.join("\n"));
+        crate::log!("fileops", "summary: {summary}");
+        for line in report.lines() {
+            crate::log!("fileops", "item: {line}");
+        }
+        if let Some(ui) = self.window(window) {
+            ui.show_summary(&summary, details);
+        }
+    }
+
+    pub fn fileop_refused(&self, window: WindowId, request: &Request, message: &str) {
+        crate::log!("fileops", "refused: {message}");
+        if let Some(ui) = self.window(window) {
+            if matches!(request, Request::Undo) && message.contains("nothing to undo") {
+                ui.show_nothing_to_undo();
+            } else {
+                ui.show_summary(&format!("{}: {message}", request.summary()), None);
+            }
+        }
+    }
+
+    pub fn fileop_clear_clipboard(&self, window: WindowId) {
+        if let Some(ui) = self.window(window) {
+            clipboard::clear(&ui.display());
+            crate::log!("fileops", "cleared the clipboard after a cut paste");
+        }
+    }
+
+    pub fn fileop_conflicts(
+        &self,
+        window: WindowId,
+        flow: fileops::conflict::ConflictFlow,
+        done: Box<dyn Fn(Decisions)>,
+    ) {
+        if let Some(ui) = self.window(window) {
+            dialogs::show_conflicts(&ui, flow, Rc::from(done));
+        }
+    }
+
+    fn launch_disk_usage(&self, path: &Path) {
+        let Some(executable) = menus::find_on_path("baobab", std::env::var_os("PATH").as_deref())
+        else {
+            crate::log!("disk-usage", "baobab is not on PATH");
+            return;
+        };
+        match std::process::Command::new(executable).arg(path).spawn() {
+            Ok(_) => crate::log!("disk-usage", "launched baobab for {}", path.display()),
+            Err(error) => crate::log!(
+                "disk-usage",
+                "could not launch baobab for {}: {error}",
+                path.display()
+            ),
+        }
+    }
+
     pub fn schedule_save(self: &Rc<Self>) {
         let now = crate::save::now_ms();
         let mut debounce = self.debounce.get();
@@ -995,6 +1391,15 @@ impl Process {
         self.window(window)
             .is_some_and(|ui| ui.header().dialogs_open())
     }
+}
+
+fn utf8_path(path: &Path) -> Result<String, String> {
+    path.to_str().map(str::to_string).ok_or_else(|| {
+        format!(
+            "a command argument cannot hold the non-UTF-8 name {}",
+            path.display()
+        )
+    })
 }
 
 fn argument_path(command: &CheckedCommand, name: &str) -> Option<PathBuf> {

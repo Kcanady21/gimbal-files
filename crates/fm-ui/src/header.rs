@@ -308,6 +308,20 @@ impl Header {
         self.dialogs.get() > 0
     }
 
+    pub fn begin_dialog(&self) {
+        self.dialogs.set(self.dialogs.get() + 1);
+    }
+
+    pub fn end_dialog(&self) {
+        self.dialogs.set(self.dialogs.get().saturating_sub(1));
+    }
+
+    /// The path bar and search field are the window's own text entries. The
+    /// rename and new-folder entries report through `WindowUi::editing`.
+    pub fn text_focused(&self) -> bool {
+        self.path_entry.has_focus() || self.search_entry.has_focus()
+    }
+
     fn window_ui(&self) -> Option<Rc<WindowUi>> {
         self.ui.borrow().upgrade()
     }
@@ -858,7 +872,10 @@ impl Header {
         row.append(&rename);
         box_.append(&row);
         popover.set_child(Some(&box_));
-        popover.connect_closed(|popover| {
+        ui.set_editing(true);
+        let ui_closed = ui.clone();
+        popover.connect_closed(move |popover| {
+            ui_closed.set_editing(false);
             if popover.parent().is_some() {
                 popover.unparent();
             }

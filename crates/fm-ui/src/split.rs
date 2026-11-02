@@ -844,7 +844,7 @@ impl Cursor {
 struct Inner {
     window: WindowId,
     process: Weak<Process>,
-    status: gtk::Label,
+    status: Rc<crate::folder::StatusLine>,
     outer: gtk::ScrolledWindow,
     fixed: gtk::Fixed,
     line: gtk::Box,
@@ -868,7 +868,12 @@ pub struct SplitView {
 }
 
 impl SplitView {
-    pub fn new(process: &Rc<Process>, window: WindowId, status: gtk::Label, scale: f64) -> Self {
+    pub fn new(
+        process: &Rc<Process>,
+        window: WindowId,
+        status: Rc<crate::folder::StatusLine>,
+        scale: f64,
+    ) -> Self {
         let fixed = gtk::Fixed::new();
         let line = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         line.add_css_class("gl-drop-line");

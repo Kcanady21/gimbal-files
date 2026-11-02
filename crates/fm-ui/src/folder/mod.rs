@@ -4,10 +4,58 @@
 mod sort;
 mod view;
 
+use std::cell::{Cell, RefCell};
 use std::ffi::OsString;
 use std::path::Path;
+use std::rc::Rc;
+
+use gtk::prelude::*;
 
 pub use view::FolderView;
+
+/// The one status line. A folder view writes its counts here; a finished file
+/// operation temporarily holds the line for its summary, so a live listing
+/// cannot overwrite the summary before it has been read.
+pub struct StatusLine {
+    label: gtk::Label,
+    counts: RefCell<String>,
+    held: Cell<bool>,
+}
+
+impl StatusLine {
+    pub fn new() -> Rc<Self> {
+        let label = gtk::Label::new(Some(&status_text(0, 0, 0)));
+        label.add_css_class("gl-status");
+        label.set_hexpand(true);
+        label.set_xalign(0.5);
+        Rc::new(Self {
+            label,
+            counts: RefCell::new(status_text(0, 0, 0)),
+            held: Cell::new(false),
+        })
+    }
+
+    pub fn widget(&self) -> &gtk::Label {
+        &self.label
+    }
+
+    pub fn set_counts(&self, text: String) {
+        *self.counts.borrow_mut() = text.clone();
+        if !self.held.get() {
+            self.label.set_text(&text);
+        }
+    }
+
+    pub fn show_summary(&self, text: &str) {
+        self.held.set(true);
+        self.label.set_text(text);
+    }
+
+    pub fn end_summary(&self) {
+        self.held.set(false);
+        self.label.set_text(&self.counts.borrow());
+    }
+}
 
 /// The status line under the grid. `selected` is the model's count, so it is
 /// shown even when a live listing has not realised every name yet.

@@ -149,6 +149,11 @@ gridview > child {{ padding: 0; }}
 .gl-tile.focused {{ box-shadow: inset 0 0 0 {thin}px {FOCUS_RING}; }}
 .gl-drop-line {{ background-color: {OUTLINE}; min-height: {thin}px; border-radius: {rp}px; }}
 .gl-status {{ min-height: {statush}px; font-size: {tc}px; }}
+.gl-progress {{ padding: {gs}px {gl}px; }}
+.gl-progress-label {{ font-size: {tsmall}px; color: alpha({FG}, 0.75); }}
+.gl-progress-bar trough {{ min-height: {thin}px; border-radius: {rp}px; background-color: {track}; }}
+.gl-progress-bar progress {{ min-height: {thin}px; border-radius: {rp}px; background-color: {OUTLINE}; }}
+.gl-conflict-apply {{ margin-top: {gm}px; font-size: {trow}px; }}
 .gl-num {{ font-size: {tmono}px; }}
 .gl-pline {{ font-size: {tmono}px; margin-left: {gm}px; }}
 .gl-action-row .gl-icon-button {{ margin-left: {gm}px; }}

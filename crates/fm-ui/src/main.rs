@@ -9,6 +9,7 @@ mod app;
 mod commands;
 mod content;
 mod events;
+mod fileops;
 mod folder;
 mod frame;
 mod header;

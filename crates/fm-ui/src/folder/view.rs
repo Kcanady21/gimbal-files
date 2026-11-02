@@ -19,7 +19,7 @@ use fm_core::config::{SortBy, SortOrder, SortRule};
 use fm_core::workspace::{FileSelection, TabId, WindowId};
 
 use crate::app::Process;
-use crate::folder::{click_request, is_hidden_name, sort, status_text};
+use crate::folder::{StatusLine, click_request, is_hidden_name, sort};
 use crate::look::icons::{self, MockupIcon};
 use crate::look::tokens::*;
 
@@ -44,7 +44,7 @@ pub struct FolderView {
     dir_list: gtk::DirectoryList,
     sorted: gtk::SortListModel,
     selection: gtk::MultiSelection,
-    status: gtk::Label,
+    status: Rc<StatusLine>,
     error: gtk::Label,
     process: Weak<Process>,
     window: WindowId,
@@ -78,13 +78,16 @@ pub struct FolderView {
     scroll_gen: Cell<u64>,
     settle_pending: Rc<Cell<bool>>,
     cap_pending: Rc<Cell<bool>>,
+    /// Set by a right press on a cell so the scroller's background gesture
+    /// does not open a second menu for the same press.
+    context_on_item: Rc<Cell<bool>>,
 }
 
 impl FolderView {
     pub fn new(
         process: &Rc<Process>,
         window: WindowId,
-        status: gtk::Label,
+        status: Rc<StatusLine>,
         scale: f64,
         tab: Option<TabId>,
         status_gate: Option<Rc<Cell<bool>>>,
@@ -175,6 +178,7 @@ impl FolderView {
             scroll_gen: Cell::new(0),
             settle_pending: Rc::new(Cell::new(false)),
             cap_pending: Rc::new(Cell::new(false)),
+            context_on_item: Rc::new(Cell::new(false)),
         });
 
         this.wire_factory(&factory);
@@ -206,6 +210,7 @@ impl FolderView {
                 };
                 let click = gtk::GestureClick::new();
                 click.set_button(1);
+                let right_item = item.downgrade();
                 let item = item.downgrade();
                 let weak = Rc::downgrade(&view);
                 click.connect_released(move |gesture, _, _, _| {
@@ -225,6 +230,28 @@ impl FolderView {
                     view.click_item(info.name().into_os_string(), modifiers);
                 });
                 cell.add_controller(click);
+
+                let right = gtk::GestureClick::new();
+                right.set_button(3);
+                let weak = Rc::downgrade(&view);
+                right.connect_pressed(move |gesture, _, _, _| {
+                    let Some(view) = weak.upgrade() else {
+                        return;
+                    };
+                    let Some(item) = right_item.upgrade() else {
+                        return;
+                    };
+                    let Some(info) = item.item().and_downcast::<gio::FileInfo>() else {
+                        return;
+                    };
+                    view.context_on_item.set(true);
+                    // The scroller's own right press sees this flag in the
+                    // same event, before this idle runs.
+                    let flag = view.context_on_item.clone();
+                    glib::idle_add_local_once(move || flag.set(false));
+                    view.right_click_item(info.name().into_os_string(), gesture.widget());
+                });
+                cell.add_controller(right);
             });
         }
         {
@@ -294,6 +321,24 @@ impl FolderView {
                         view.schedule_cap();
                     }
                 });
+        }
+        {
+            let right = gtk::GestureClick::new();
+            right.set_button(3);
+            let weak = Rc::downgrade(self);
+            right.connect_pressed(move |gesture, _, x, y| {
+                let Some(view) = weak.upgrade() else {
+                    return;
+                };
+                if view.context_on_item.replace(false) {
+                    return;
+                }
+                let Some(folder) = view.current.borrow().clone() else {
+                    return;
+                };
+                view.background_click(folder, gesture.widget(), (x, y));
+            });
+            self.scroller.add_controller(right);
         }
         {
             let weak = Rc::downgrade(self);
@@ -541,6 +586,24 @@ impl FolderView {
         );
         if let Some(process) = self.process.upgrade() {
             process.file_click_tab(self.window, self.tab, request);
+        }
+    }
+
+    fn right_click_item(&self, name: OsString, anchor: Option<gtk::Widget>) {
+        let Some(anchor) = anchor else {
+            return;
+        };
+        if let Some(process) = self.process.upgrade() {
+            process.right_click_item(self.window, self.tab, name, &anchor);
+        }
+    }
+
+    fn background_click(&self, folder: PathBuf, anchor: Option<gtk::Widget>, at: (f64, f64)) {
+        let Some(anchor) = anchor else {
+            return;
+        };
+        if let Some(process) = self.process.upgrade() {
+            process.right_click_background(self.window, self.tab, folder, &anchor, at);
         }
     }
 
@@ -841,8 +904,11 @@ impl FolderView {
             return;
         }
         let (files, folders) = self.counts.get();
-        self.status
-            .set_text(&status_text(files, folders, self.selected.get()));
+        self.status.set_counts(crate::folder::status_text(
+            files,
+            folders,
+            self.selected.get(),
+        ));
     }
 
     fn map_cell(&self, cell: &gtk::Widget, position: u32) {

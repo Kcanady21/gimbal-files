@@ -61,6 +61,8 @@ pub struct WindowUi {
     pending_right: Cell<Option<i32>>,
     expected_left: Cell<i32>,
     expected_right: Cell<i32>,
+    /// True while a rename or new-folder popover owns a text entry.
+    editing: Cell<bool>,
 }
 
 struct SideAnim {
@@ -167,6 +169,7 @@ impl WindowUi {
             pending_right: Cell::new(None),
             expected_left: Cell::new(0),
             expected_right: Cell::new(0),
+            editing: Cell::new(false),
         });
         header.wire(&ui);
         ui.wire();
@@ -188,6 +191,12 @@ impl WindowUi {
 
     pub fn window(&self) -> &adw::ApplicationWindow {
         &self.window
+    }
+
+    /// Both `RootExt` and `WidgetExt` provide `display`, so name the one the
+    /// clipboard needs once here.
+    pub fn display(&self) -> gtk::gdk::Display {
+        gtk::prelude::WidgetExt::display(&self.window)
     }
 
     pub fn header(&self) -> &Rc<Header> {
@@ -295,6 +304,46 @@ impl WindowUi {
 
     pub fn listed_names(&self) -> Vec<std::ffi::OsString> {
         self.content.listed_names()
+    }
+
+    pub fn focused_folder(&self) -> Option<PathBuf> {
+        self.workspace_window()
+            .and_then(|window| window.tab(window.focused_tab).map(|tab| tab.folder.clone()))
+    }
+
+    /// A dialog owns the keyboard; hotkeys are ignored while it is up.
+    pub fn begin_dialog(&self) {
+        self.header.begin_dialog();
+    }
+
+    pub fn end_dialog(&self) {
+        self.header.end_dialog();
+    }
+
+    pub fn set_editing(&self, editing: bool) {
+        self.editing.set(editing);
+    }
+
+    /// Whether a text entry in this window has focus: the path bar, the search
+    /// field, or a rename/new-folder popover.
+    pub fn text_entry_focused(&self) -> bool {
+        self.editing.get() || self.header.text_focused()
+    }
+
+    pub fn fileop_started(&self) {
+        self.content.begin_fileop();
+    }
+
+    pub fn fileop_progress(&self, view: Option<crate::fileops::ProgressView>) {
+        self.content.set_progress(view);
+    }
+
+    pub fn show_summary(&self, text: &str, failures: Option<String>) {
+        self.content.show_summary(text, failures);
+    }
+
+    pub fn show_nothing_to_undo(&self) {
+        self.content.show_nothing_to_undo();
     }
 
     pub fn reload_folder(&self) {

@@ -51,13 +51,13 @@ pub fn install_hotkeys(app: &std::rc::Rc<WindowUi>, window: &gtk::Window) {
     controller.set_scope(gtk::ShortcutScope::Global);
     let hotkeys = process.hotkeys();
     for (accelerator, invocation) in bindings(&hotkeys) {
-        if gtk::accelerator_parse(accelerator.as_str()).is_none() {
+        let Some((key, modifiers)) = gtk::accelerator_parse(accelerator.as_str()) else {
             crate::log!(
                 "hotkey",
                 "cannot parse accelerator {accelerator:?}; skipped"
             );
             continue;
-        }
+        };
         let Some(trigger) = gtk::ShortcutTrigger::parse_string(&accelerator) else {
             crate::log!(
                 "hotkey",
@@ -75,6 +75,11 @@ pub fn install_hotkeys(app: &std::rc::Rc<WindowUi>, window: &gtk::Window) {
                 .process_upgrade()
                 .is_some_and(|process| process.hotkeys_blocked(app.id))
             {
+                return gtk::glib::Propagation::Proceed;
+            }
+            // The path bar, search field, rename and new-folder entries keep
+            // the editing keys. The other hotkeys still run.
+            if app.text_entry_focused() && crate::fileops::keys::entry_owns_key(key, modifiers) {
                 return gtk::glib::Propagation::Proceed;
             }
             app.dispatch(Caller::Hotkey, invocation.clone());

@@ -2,23 +2,26 @@
 //! The body's content area: one folder grid for a normal pill, the split view
 //! for a group of two or more, and the placeholder when there is no tab.
 //!
-//! Every page already exists, so a group forming or dissolving only moves the
-//! stack; the split view keeps one folder view per tab for as long as the tile
-//! is shown.
+//! The progress row sits above the one status line. A finished operation holds
+//! the status line for a few seconds; a click on it opens the failure details.
 
 use std::cell::{Cell, RefCell};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::rc::{Rc, Weak};
 
+use gtk::glib;
 use gtk::prelude::*;
 
 use fm_core::config::{SortBy, SortOrder, SortRule};
 use fm_core::workspace::{TabId, Window, WindowId};
 
 use crate::app::Process;
-use crate::folder::{FolderView, status_text};
+use crate::fileops::ProgressView;
+use crate::fileops::dialogs;
+use crate::folder::{FolderView, StatusLine, status_text};
 use crate::look::motion;
+use crate::look::tokens::*;
 use crate::split::SplitView;
 
 pub struct Content {
@@ -27,13 +30,18 @@ pub struct Content {
     placeholder: gtk::Label,
     folder: Rc<FolderView>,
     split: SplitView,
-    status: gtk::Label,
+    status: Rc<StatusLine>,
+    progress_row: gtk::Box,
+    progress_label: gtk::Label,
+    progress_bar: gtk::ProgressBar,
     process: Weak<Process>,
     displayed_folder: RefCell<Option<PathBuf>>,
     displayed_tab: Cell<Option<TabId>>,
     /// Set by nav.back/forward so the next folder change restores its anchor.
     restore_anchor: Cell<bool>,
     split_shown: Cell<bool>,
+    summary_gen: Rc<Cell<u64>>,
+    last_failures: Rc<RefCell<Option<String>>>,
 }
 
 impl Content {
@@ -58,10 +66,52 @@ impl Content {
             .vexpand(true)
             .build();
 
-        let status = gtk::Label::new(Some(&status_text(0, 0, 0)));
-        status.add_css_class("gl-status");
-        status.set_hexpand(true);
-        status.set_xalign(0.5);
+        let status = StatusLine::new();
+        let progress_row = gtk::Box::new(gtk::Orientation::Horizontal, scaled(GAP_S, scale));
+        progress_row.add_css_class("gl-progress");
+        progress_row.set_visible(false);
+        let progress_label = gtk::Label::new(None);
+        progress_label.add_css_class("gl-progress-label");
+        progress_label.set_xalign(0.0);
+        progress_label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        let progress_bar = gtk::ProgressBar::new();
+        progress_bar.add_css_class("gl-progress-bar");
+        progress_bar.set_hexpand(true);
+        progress_bar.set_valign(gtk::Align::Center);
+        progress_bar.set_show_text(false);
+        let cancel = gtk::Button::with_label("Cancel");
+        cancel.add_css_class("gl-menu-item");
+        cancel.set_valign(gtk::Align::Center);
+        progress_row.append(&progress_label);
+        progress_row.append(&progress_bar);
+        progress_row.append(&cancel);
+
+        let last_failures: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+        {
+            let failures = last_failures.clone();
+            let cancel_process = Rc::downgrade(process);
+            cancel.connect_clicked(move |_| {
+                if let Some(process) = cancel_process.upgrade()
+                    && let Some(fileops) = process.fileops()
+                {
+                    fileops.cancel_current();
+                }
+            });
+            let click = gtk::GestureClick::new();
+            click.set_button(1);
+            let process = Rc::downgrade(process);
+            click.connect_released(move |_, _, _, _| {
+                let Some(text) = failures.borrow().clone() else {
+                    return;
+                };
+                if let Some(process) = process.upgrade()
+                    && let Some(ui) = process.window(window)
+                {
+                    dialogs::show_details(&ui, &text);
+                }
+            });
+            status.widget().add_controller(click);
+        }
 
         let folder = FolderView::new(process, window, status.clone(), scale, None, None);
         let split = SplitView::new(process, window, status.clone(), scale);
@@ -75,21 +125,29 @@ impl Content {
         rule.add_css_class("gl-rule");
         rule.add_css_class("inset");
         root.append(&rule);
-        root.append(&status);
+        root.append(&progress_row);
+        root.append(status.widget());
 
-        Rc::new(Self {
+        let this = Rc::new(Self {
             root,
             stack,
             placeholder,
             folder,
             split,
             status,
+            progress_row,
+            progress_label,
+            progress_bar,
             process: Rc::downgrade(process),
             displayed_folder: RefCell::new(None),
             displayed_tab: Cell::new(None),
             restore_anchor: Cell::new(false),
             split_shown: Cell::new(false),
-        })
+            summary_gen: Rc::new(Cell::new(0)),
+            last_failures,
+        });
+        this.apply_scale(scale);
+        this
     }
 
     pub fn widget(&self) -> &gtk::Box {
@@ -135,6 +193,57 @@ impl Content {
     pub fn apply_scale(&self, scale: f64) {
         self.folder.apply_scale(scale);
         self.split.set_scale(scale);
+        self.progress_row.set_spacing(scaled(GAP_S, scale));
+        self.progress_row.set_margin_start(scaled(GAP_L, scale));
+        self.progress_row.set_margin_end(scaled(GAP_L, scale));
+    }
+
+    /// A new operation starts: hide the old row and let the counts back in.
+    pub fn begin_fileop(&self) {
+        self.summary_gen.set(self.summary_gen.get() + 1);
+        self.status.end_summary();
+        self.progress_row.set_visible(false);
+        self.progress_label.set_text("");
+        self.progress_bar.set_fraction(0.0);
+        *self.last_failures.borrow_mut() = None;
+    }
+
+    pub fn set_progress(&self, view: Option<ProgressView>) {
+        match view {
+            Some(view) => {
+                self.progress_label.set_text(&view.label);
+                self.progress_bar.set_fraction(view.fraction);
+                self.progress_row.set_visible(true);
+            }
+            None => {
+                self.progress_row.set_visible(false);
+            }
+        }
+    }
+
+    /// Hold the status line for a few seconds, then go back to the counts.
+    pub fn show_summary(&self, text: &str, failures: Option<String>) {
+        self.progress_row.set_visible(false);
+        *self.last_failures.borrow_mut() = failures;
+        self.status.show_summary(text);
+        let generation = self.summary_gen.get() + 1;
+        self.summary_gen.set(generation);
+        let status = self.status.clone();
+        let gen_cell = self.summary_gen.clone();
+        let failures = self.last_failures.clone();
+        glib::timeout_add_local_once(
+            std::time::Duration::from_millis(crate::fileops::progress::SUMMARY_MS),
+            move || {
+                if gen_cell.get() == generation {
+                    status.end_summary();
+                    *failures.borrow_mut() = None;
+                }
+            },
+        );
+    }
+
+    pub fn show_nothing_to_undo(&self) {
+        self.show_summary("Nothing to undo", None);
     }
 
     /// Re-sort every tile showing `folder`, or every tile when it is `None`.
@@ -222,7 +331,7 @@ impl Content {
         }
         self.placeholder.set_text(text);
         self.stack.set_visible_child_name("placeholder");
-        self.status.set_text(&status_text(0, 0, 0));
+        self.status.set_counts(status_text(0, 0, 0));
     }
 
     fn folder_rule(&self, folder: &Path) -> Option<SortRule> {
