@@ -48,15 +48,19 @@ pub fn title_row(title: &str, icon: &str, button_first: bool) -> (gtk::Box, gtk:
     label.set_xalign(0.0);
     // The title yields to the collapse button at the panel's minimum width.
     label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    // The button itself is an overlay child of the sidebar host (r9), so the
+    // row keeps its exact size with a slot of the same 48 × 48 footprint.
+    // The left panel's slot is at the window edge; the preview's is at the
+    // row end.
+    let slot = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    slot.add_css_class("gl-icon-slot");
     let button = icon_button(icon);
-    // The left panel's button sits at the window edge, exactly where its
-    // collapsed strip's expand button is; the preview's stays at the row end.
     if button_first {
-        row.append(&button);
+        row.append(&slot);
     }
     row.append(&label);
     if !button_first {
-        row.append(&button);
+        row.append(&slot);
     }
     (row, button)
 }

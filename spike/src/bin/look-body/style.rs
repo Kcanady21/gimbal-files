@@ -136,7 +136,6 @@ pub fn css(scale: f64, font: Option<&str>, opacity: f64) -> String {
     // Kyle, Nov 1: 16 px (gap-m) between an open section's content and the next pill.
     let section_tail = (p(GAP_M) - section_gap).max(0);
     let (hair, thin, mid) = (p(LINE_HAIR), p(LINE_THIN), p(LINE_MID));
-    let strip_pad = gm + mid;
     let (r, rp) = (p(RADIUS), p(RADIUS_PILL));
     let (tt, titem, tc, trow, tmono, tsmall, ttiny) = (
         p(TEXT_TITLE),
@@ -166,6 +165,9 @@ pub fn css(scale: f64, font: Option<&str>, opacity: f64) -> String {
 window.gimbal-look, window.gimbal-look.background {{ background-color: {window_bg}; color: {FG}; font-size: {tc}px; {font} }}
 .gl-header-slot {{ min-height: {hh}px; }}
 .gl-panel {{ border: {mid}px solid {OUTLINE}; border-radius: {r}px; padding: {gm}px; }}
+.gl-panel.gl-anim {{ border-color: transparent; }}
+.gl-panel-outline {{ all: unset; border: {mid}px solid {OUTLINE}; border-radius: {r}px; }}
+.gl-icon-slot {{ min-width: {irow}px; min-height: {irow}px; padding: {gs}px; }}
 .gl-title {{ font-size: {tt}px; }} .gl-rule {{ min-height: {hair}px; background-color: {RULE}; }}
 .gl-rule.inset {{ margin-left: {gxl}px; margin-right: {gxl}px; }}
 .gl-icon-button {{ all: unset; color: {FG}; padding: {gs}px; min-width: {irow}px; min-height: {irow}px; border-radius: {r}px; -gtk-icon-size: {irow}px; }}
@@ -201,7 +203,7 @@ gridview > child {{ padding: 0; }}
 .gl-tile.focused {{ box-shadow: 0 0 0 {thin}px {FOCUS_RING}; }}
 .gl-drop-line {{ background-color: {OUTLINE}; min-height: {thin}px; border-radius: {rp}px; }}
 .gl-status {{ min-height: {statush}px; font-size: {tc}px; }} .gl-num {{ font-size: {tmono}px; }} .gl-pline {{ font-size: {tmono}px; margin-left: {gm}px; }}
-.gl-collapse-strip {{ min-width: {g2}px; }} .gl-collapse-strip.left {{ padding: {strip_pad}px 0 0 0; }} .gl-collapse-strip.right {{ padding: {strip_pad}px 0 0 0; }} .gl-action-row .gl-icon-button {{ margin-left: {gm}px; }} .gl-action-row image {{ color: {FG}; -gtk-icon-palette: {save_as_palette}; }}
+.gl-action-row .gl-icon-button {{ margin-left: {gm}px; }} .gl-action-row image {{ color: {FG}; -gtk-icon-palette: {save_as_palette}; }}
 window.gimbal-look .gl-frame gridview, window.gimbal-look .gl-frame listview, window.gimbal-look .gl-frame textview, window.gimbal-look .gl-frame textview > text, window.gimbal-look .gl-frame scrolledwindow, window.gimbal-look .gl-frame viewport, window.gimbal-look .gl-frame gridview > child, window.gimbal-look windowhandle {{ background-color: transparent; }}",
         hh = p(HEADER_H), pinrow = p(PIN_ROW_H), dirrow = p(DIR_ROW_H),
         barw = p(BAR_W), barh = p(BAR_H), mbarw = p(MAIN_BAR_W), mbarh = p(MAIN_BAR_H),

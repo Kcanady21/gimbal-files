@@ -2101,3 +2101,253 @@ It has no animation: `wire_collapse` swaps the paned child (panel ↔ strip) in 
 section pills (Recent Directories and the others) already slide over `ms(200)`. P1m-r9 animates the
 panels' inner edge, with the panel clipped rather than squeezed (a shrinkable GtkPaned child is
 allocated below its minimum, `gtkpaned.c:1129` / `:1372`).
+
+## P1m-r9 changes
+
+Built on P1m-r8 in `spike/src/bin/look-body/` (`main.rs`, `layout.rs`, `sidebar.rs`, `style.rs`) plus this
+note. Only files under `look-body/` and this note changed. Command output and the timer log are
+**[observed]**, GTK/gtk-rs source citations are **[read]**, and the look/feel items are **[inferred]**.
+
+### What changed
+
+1. **The panel is clipped, not squeezed.** Each sidebar is now a `GtkOverlay` host that is the paned
+   child, with three children:
+
+   - an `EXTERNAL` horizontal `GtkScrolledWindow` holding the panel root;
+   - a `gl-panel-outline` box (the moving outline);
+   - the panel's existing collapse/expand button (now one button per side), with `halign` start
+     (left panel) or end (preview) and margins that the animation moves.
+
+   I chose the `EXTERNAL` scroller because it does not propagate the child's horizontal minimum:
+   `gtk_scrolled_window_measure` only asks the child for its size when
+   `propagate_natural_width` is set or the policy is `NEVER`
+   (`gtk-4.22.4:gtk/gtkscrolledwindow.c:1848-1849`), and in the horizontal branch `EXTERNAL`
+   contributes neither minimum nor natural width (`:1887-1904`). The auto-added
+   `GtkViewport` then allocates the panel its `width_request` (`MAX (allocation, minimum)`,
+   `gtk-4.22.4:gtk/gtkviewport.c:510-537`, allocation at `:547-552`) and clips it with
+   `GTK_OVERFLOW_HIDDEN` (`gtk-4.22.4:gtk/gtkviewport.c:433-435`). The paned can therefore move the
+   host below `SIDEBAR_MIN` / `PREVIEW_MIN` while the panel keeps its own layout and is cut at the
+   moving edge. This is the r9 alternative to a shrinkable paned child, which would allocate the
+   panel below its minimum at `gtk-4.22.4:gtk/gtkpaned.c:1129` and `:1372`.
+
+   The left panel's adjustment is pinned to 0; the preview's to `upper - page_size`, so its right
+   edge stays on the window edge and content is revealed leftwards. The pins are connected to both
+   `changed` and `value-changed`, so a wheel cannot slide a clipped panel.
+
+2. **The slide.** `Ui::toggle_sidebar` sets the side's target state, then starts a
+   `adw::TimedAnimation` from the visible width now to the strip width (collapse) or the expanded
+   width (expand), over `crate::motion::ms(200)`. Every frame calls `layout::motion_width(start, end, v)`
+   and `layout::left_position` / `layout::preview_position`; the content area, split view and grid
+   reflow as on a border drag (the timer log shows the grid cap changing 2→3 during the preview
+   collapse). A collapse sets the panel's `width_request` to the current (pre-animation) width; an
+   expand sets it to the target width. It is reset to `SIDEBAR_MIN` / `PREVIEW_MIN` only when the
+   animation finishes, so normal border drags still re-layout the panel.
+
+   Each side has an `Rc<Cell<u64>>` generation, incremented by `begin_motion`. The animation target
+   and its `done` handler both check it before touching anything, the same generation pattern as
+   `split.rs`'s `slide_to`. A newer animation (reverse or retarget) therefore stops the older one.
+   The side's collapse flag is set at the start, so `body_widths` already reports the end width to
+   `apply_positions`; `apply_positions` calls `retarget_side` for a running side instead of setting
+   its position, keeping the current edge and starting a new run to the new end width.
+
+3. **The button glides, the outline fades.** `layout::button_inset(scale, left, progress)` moves the
+   button's start/end margin from the panel's `gap-m + line-mid` inset (19 at scale 1, 10 at 0.5) to
+   the strip's centred position (10 / 9 start-end at scale 1, 5 / 5 at 0.5; GTK's two expanding
+   spacers give the odd pixel to the first). `margin-top` is constant (`panel_button_inset`), so the
+   vertical position never changes. `layout::outline_opacity(progress)` is 1 until the last 35 % and
+   then falls linearly to 0; expand runs the same curve backwards. The panel's CSS border is made
+   transparent with `gl-anim` for the duration and the `gl-panel-outline` overlay draws the same
+   border at the moving host edge, so the outline follows the edge and fades rather than being cut
+   with the panel. At the end the overlay is hidden and the panel border returns.
+
+   The title row keeps a `gl-icon-slot` placeholder of exactly the button's 48 × 48 footprint, so the
+   panel's own layout is unchanged by moving the real button into the overlay.
+
+4. **Frames are ours, not drags.** Both `position` notify handlers check `animating(side)` first and
+   only record `expected_*`; they never write `left_width` / `right_width` and never run the
+   collapsed snap-back during a frame. A collapsed (not animating) side still snaps to the strip, and
+   an expanded side clamps a drag into `SIDEBAR_MIN` / `PREVIEW_MIN`, because the host's own minimum
+   is only the strip. The saved widths are therefore untouched by any number of collapses/expands;
+   the timer log shows `348.0 / 648.0` on every line.
+
+5. **Everything the strip did is kept.** The host's `width_request` is `layout::strip_width`, the
+   button is at the same centred x as P1m-r7's strip (18 left / 1207 preview in this window), its top
+   margin reproduces the strip's `gap-m + line-mid` padding, the panel and outline are hidden when
+   collapsed, and the window-side/bottom `gap-s` margins moved from the panel roots to the hosts.
+   `.gl-collapse-strip` had no widget left and was removed from `style.rs`.
+
+### Per-frame arithmetic and tests
+
+`layout.rs` now has `motion_width`, `collapse_progress`, `panel_button_inset`, `button_inset` and
+`outline_opacity`, all pure. Tests added in `layout::tests`:
+
+- `sidebar_motion_starts_mid_and_ends_on_both_sides` — start/mid/end for collapse and expand at
+  scale 1, with the left and preview edge helpers both round-tripping the mid width.
+- `a_reverse_restarts_from_the_current_width` — 348→67 at 50 % is 208; the reverse is 208→348
+  (mid 278) or 208→67 (mid 138).
+- `a_retarget_uses_the_new_end_width` — an expand from 67 to 348 interrupted at 208 retargets to 500:
+  208 at the retarget, 354 at half the new run, 500 at the end; a 320 target too.
+- `the_button_glides_from_the_panel_to_the_strip_centre` — both sides and scales 1.0 / 0.5.
+- `the_outline_fades_over_the_last_part_only` — full at 0.5/0.65, 0.571 at 0.8, zero at 1.0.
+
+### RULES.md's four commands, from `$SPIKE`
+
+`cargo fmt --check` (rustup 1.95.0 toolchain):
+
+```text
+(fmt exit 0; no output)
+```
+
+`cargo clippy --all-targets -- -D warnings`:
+
+```text
+    Checking gimbal-spike v0.0.0 (/home/kyle/Documents/03.) Code-Projects/gimbal-files/spike)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.41s
+```
+
+`cargo test`:
+
+```text
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 76 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+```
+
+`cargo build --release`:
+
+```text
+    Finished `release` profile [optimized] target(s) in 0.02s
+```
+
+### 10-second release runs (from `/tmp/gimbal-spike-p1m-r9`, stopped by PID with SIGTERM)
+
+Default and `--tiles 3` each printed only the allowed intermittent notice:
+
+```text
+(look-body:436792): Gdk-WARNING **: 06:12:10.662: vkAcquireNextImageKHR(): A swapchain no longer
+matches the surface properties exactly, but can still be used to present to the surface
+successfully. (VK_SUBOPTIMAL_KHR) (1000001003)
+```
+
+`--tiles 6 --pins 14 --scale 0.5` printed nothing (0 lines). No GTK/theme/CSS/icon warnings and no
+panics in any run. [observed]
+
+### Temporary timer log (harness removed before delivery)
+
+Debug binary, `GIMBAL_R9_TIMER=1 GIMBAL_SPIKE_LOG=1 look-body --tiles 3`, niri-tiled 1272 × 1398.
+The timer toggled the left sidebar collapsed/expanded, collapsed the preview and reversed it at
+mid-animation, then did one extra collapse+scale-change retarget check. It logged the paned's
+visible width, the panel root's `width()` (GTK's **content** width, `gtk-4.22.4:gtk/gtkwidget.c:12821-12845`;
+the total allocation adds the 3 px border and 16 px padding each side, i.e. 270 + 38 = 308 and
+610 + 38 = 648), the button's x in window coordinates, and the saved widths. [observed]
+
+```text
+[1.665] temp: r9 left before: visible L 308 R 648; panel L 270 R 610; button x L 27 R 1197; saved L 348.0 R 648.0
+[1.665] sidebar: collapsing left sidebar from 308 to 67 (panel 308)
+[1.665] temp: r9 left collapse 0%: visible L 308 R 648; panel L 270 R 610; button x L 27 R 1197; saved L 348.0 R 648.0
+[1.764] temp: r9 left collapse 33%: visible L 137 R 648; panel L 270 R 610; button x L 21 R 1197; saved L 348.0 R 648.0
+[1.864] temp: r9 left collapse 66%: visible L 76 R 648; panel L 270 R 610; button x L 18 R 1197; saved L 348.0 R 648.0
+[1.963] sidebar: collapsed left sidebar (panel 270)
+[1.984] temp: r9 left collapse 100%: visible L 67 R 648; panel L 270 R 610; button x L 18 R 1197; saved L 348.0 R 648.0
+[2.264] sidebar: expanding left sidebar from 67 to 308 (panel 308)
+[2.264] temp: r9 left expand 0%: visible L 67 R 648; panel L 270 R 610; button x L 18 R 1197; saved L 348.0 R 648.0
+[2.364] temp: r9 left expand 33%: visible L 233 R 648; panel L 270 R 610; button x L 24 R 1197; saved L 348.0 R 648.0
+[2.464] temp: r9 left expand 66%: visible L 299 R 648; panel L 270 R 610; button x L 27 R 1197; saved L 348.0 R 648.0
+[2.567] sidebar: expanded left sidebar (panel 270)
+[2.584] temp: r9 left expand 100%: visible L 308 R 648; panel L 270 R 610; button x L 27 R 1197; saved L 348.0 R 648.0
+[2.864] sidebar: collapsing preview sidebar from 648 to 67 (panel 648)
+[2.864] temp: r9 preview collapse 0%: visible L 308 R 648; panel L 270 R 610; button x L 27 R 1197; saved L 348.0 R 648.0
+[2.964] temp: r9 preview collapse 33%: visible L 308 R 229; panel L 270 R 610; button x L 27 R 1204; saved L 348.0 R 648.0
+[3.014] temp: r9 preview before reverse: visible L 308 R 135; panel L 270 R 610; button x L 27 R 1206; saved L 348.0 R 648.0
+[3.014] sidebar: expanding preview sidebar from 135 to 648 (panel 648)
+[3.014] temp: r9 preview reverse 0%: visible L 308 R 135; panel L 270 R 610; button x L 27 R 1206; saved L 348.0 R 648.0
+[3.114] temp: r9 preview reverse 33%: visible L 308 R 489; panel L 270 R 610; button x L 27 R 1200; saved L 348.0 R 648.0
+[3.214] temp: r9 preview reverse 66%: visible L 308 R 630; panel L 270 R 610; button x L 27 R 1197; saved L 348.0 R 648.0
+[3.324] sidebar: expanded preview sidebar (panel 610)
+[3.334] temp: r9 preview reverse 100%: visible L 308 R 648; panel L 270 R 610; button x L 27 R 1197; saved L 348.0 R 648.0
+[3.665] sidebar: collapsing left sidebar from 308 to 67 (panel 308)
+[3.665] temp: r9 retarget collapse 0%: visible L 308 R 648; panel L 270 R 610; button x L 27 R 1197; saved L 348.0 R 648.0
+[3.764] temp: r9 retarget before scale: visible L 135 R 648; panel L 270 R 610; button x L 21 R 1197; saved L 348.0 R 648.0
+[3.765] temp: r9 retarget after scale: visible L 137 R 518; panel L 270 R 610; button x L 23 R 1199; saved L 348.0 R 648.0
+[3.914] temp: r9 retarget later: visible L 64 R 518; panel L 216 R 488; button x L 14 R 1213; saved L 348.0 R 648.0
+[4.068] sidebar: collapsed left sidebar (panel 216)
+[4.114] temp: r9 retarget end: visible L 53 R 518; panel L 216 R 488; button x L 14 R 1213; saved L 348.0 R 648.0
+```
+
+The 33 %/66 % widths look closer to the end than the linear midpoint because `AdwTimedAnimation`'s
+default easing is ease-out (the same as the tile slides); the pure function itself is linear. The
+panel content width is constant at 270 / 610 through every collapse and expand (the brief's
+"pre-animation width while clipped"), while the visible width travels 308 ↔ 67 and 648 ↔ 67. The
+button x travels 27 ↔ 18 (left) and 1197 ↔ 1207 (preview), and the saved widths never move. The
+scale-change retarget at 3.765 shows the panel re-laying out at 0.8 (270 → 216) and the strip end
+changing to 53, again without touching `left_width`/`right_width`. The only warning in the timer run
+was the allowed `VK_SUBOPTIMAL_KHR` notice.
+
+### API citations
+
+- `GtkScrolledWindow`'s horizontal measure ignores an `EXTERNAL` child:
+  `gtk-4.22.4:gtk/gtkscrolledwindow.c:1848-1849`, `:1887-1904`; the `GtkViewport` allocation and
+  clipping: `gtk-4.22.4:gtk/gtkviewport.c:433-435`, `:510-537`, `:540-552`.
+- `gtk_widget_get_width` is the content width (why the logged panel values are 38 px smaller than
+  the visible allocation): `gtk-4.22.4:gtk/gtkwidget.c:12821-12845`.
+- A paned allocates a shrinkable child below its request: `gtk-4.22.4:gtk/gtkpaned.c:1129`, `:1372`.
+- `gtk::Overlay` gives its main child the full allocation and positions overlay children by their
+  alignment/margins: `gtk-4.22.4:gtk/gtkoverlaylayout.c:408-433`.
+- gtk-rs: `ScrolledWindowExt::set_policy`/`set_propagate_natural_width` and
+  `ScrolledWindow::hadjustment` (`gtk4-0.11.5:src/auto/scrolled_window.rs`),
+  `AdjustmentExt` (`gtk4-0.11.5:src/auto/adjustment.rs`), `WidgetExt::set_opacity`,
+  `set_can_target`, `compute_bounds` (`gtk4-0.11.5:src/auto/widget.rs`), `Overlay::{set_child,
+  add_overlay}` (`gtk4-0.11.5:src/auto/overlay.rs`).
+- `adw::TimedAnimation` / `CallbackAnimationTarget` and the `done` signal:
+  `libadwaita-0.9.2:src/auto/timed_animation.rs:23-44`, `:src/auto/animation.rs:134-146`; the
+  generation/stop pattern is the one already used in `split.rs:1833-1885`.
+
+### Not verified live (Claude's check)
+
+- The feel of the slide: whether the 300 ms base (`ms(200)`) and the ease-out curve read as one
+  motion, and whether the content reflowing each frame looks like the border drag. The log proves
+  the widths and positions; no screenshot or pointer was used. [inferred]
+- The outline fade: that the `gl-panel-outline` border sits exactly over the panel's own border at
+  rest, follows the moving edge, is not visible through the clipped content, and disappears before
+  the strip. [inferred]
+- The button's glide: the timer reads its window x (27 ↔ 18, 1197 ↔ 1207) and the vertical margin is
+  constant, but the pixels were not seen. [inferred]
+- A click mid-animation through the real button (the timer called `toggle_sidebar` directly, per
+  RULES' no-injection rule), and that the button stays clickable while it is gliding. [inferred]
+- Grabbing the paned handle while collapsed or animating: it is held by the position handler's
+  snap-back rather than by disabling the handle widget; the pointer path was not replayed. [inferred]
+- The final frame of a collapse: the panel is clipped to the strip width and then hidden, leaving
+  only the centred button. [inferred]
+
+### Anything I'd change outside my files
+
+None. `grid.rs`, `preview.rs`, `split.rs`, `icons.rs` and the shared files are unchanged. The
+`look-style-spec.md` rule already says what this implements; it could note that the strip's button
+target is the first (ceil) spacer's x, which is why the left end inset is 10 and the preview's is 9
+at scale 1.
+
+## Review and live check of P1m-r9 (Claude, Nov 2, 2026): passes
+
+Reviewed the notes and the approach. Each panel sits in an overlay host. An `EXTERNAL` scroller
+clips the panel at its pre-animation width instead of letting the paned squeeze it. A separate
+outline box follows the moving edge and fades, and the button lives in the overlay and glides on
+its margins. Per-side generations stop stale animations, and the `position` handlers only record
+`expected_*` during a frame, so the saved widths can't drift.
+
+Gates, from `spike/` (rustup 1.95.0): fmt clean; clippy `-D warnings` clean; tests 4 + 76 + 13
+pass; release build ok. The three 10-second runs printed nothing but the allowed `VK_SUBOPTIMAL_KHR`
+notice. No temporary logs left in `src/`.
+
+Live, niri-tiled on DP-2 (DP-3 off), 4 tiles. To screenshot mid-slide, Claude built a scratch copy
+with `SLOWDOWN = 15` (deleted afterwards) and drove it with real clicks on the buttons:
+
+- **Left collapse:** the panel keeps its layout and is cut off at the moving edge. The tiles widen
+  frame by frame, the outline rides the edge and fades near the end, and the strip ends with only
+  the centred button and no outline.
+- **Left expand, then a second click mid-slide:** the log shows `collapsing left sidebar from 346
+  to 67`. It reversed from the current width, and the button stayed clickable while gliding.
+- **Preview collapse:** the panel is anchored to the right edge and cut off on its left (the text
+  ends and the save icons stay in place), and it ends as the right strip.
+
+Not checked live: grabbing the handle while collapsed or animating, and a window resize
+mid-slide. The timer log covers the scale-change retarget.

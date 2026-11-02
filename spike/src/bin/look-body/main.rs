@@ -156,13 +156,23 @@ struct Ui {
     inner: gtk::Paned,
     left: Rc<RefCell<sidebar::LeftPanel>>,
     left_root: gtk::Box,
-    left_strip: gtk::Box,
+    left_host: gtk::Overlay,
+    left_clip: gtk::ScrolledWindow,
+    left_outline: gtk::Box,
+    left_button: gtk::Button,
     left_collapsed: Cell<bool>,
+    left_anim: RefCell<Option<SideAnim>>,
+    left_gen: Rc<Cell<u64>>,
     right_root: gtk::Box,
-    right_strip: gtk::Box,
+    right_host: gtk::Overlay,
+    right_clip: gtk::ScrolledWindow,
+    right_outline: gtk::Box,
+    right_button: gtk::Button,
     right_collapsed: Cell<bool>,
+    right_anim: RefCell<Option<SideAnim>>,
+    right_gen: Rc<Cell<u64>>,
     /// Set while the preview pane's width must be (re-)applied: at startup
-    /// and after every collapse/expand swap (it changes max-position).
+    /// and after every collapse/expand animation (it changes max-position).
     right_dirty: Cell<bool>,
     /// Saved sidebar widths in design px: dragging a border updates them, a
     /// scale change re-applies them scaled.
@@ -173,6 +183,22 @@ struct Ui {
     expected_left: Cell<i32>,
     expected_right: Cell<i32>,
     split: split::SplitView,
+}
+
+/// One sidebar collapse/expand run. `start`/`end` are visible widths; every
+/// frame moves the paned edge to `motion_width`. `expanded` is the width the
+/// clipped panel keeps its own layout at, and `current` is where the edge is
+/// now (a reverse or a retarget starts from it). `gen` is the generation the
+/// animation's target and done handlers check, the same pattern the tile
+/// slides use.
+struct SideAnim {
+    generation: u64,
+    start: Cell<i32>,
+    end: Cell<i32>,
+    expanded: Cell<i32>,
+    current: Cell<i32>,
+    scale: f64,
+    _animation: adw::TimedAnimation,
 }
 
 impl Ui {
@@ -195,27 +221,47 @@ impl Ui {
 
     /// Regenerate the stylesheet on the same provider and re-apply the
     /// Rust-side sizes that read the same token table × scale.
-    fn apply_scale(&self) {
+    fn apply_scale(self: &Rc<Self>) {
         let s = self.scale();
         self.reload_css();
         self.blur.set_scale(s);
         let px = |t: f64| scaled(t, s);
-        self.left_root.set_width_request(px(SIDEBAR_MIN));
-        self.left_strip.set_width_request(layout::strip_width(s));
-        self.right_root.set_width_request(px(PREVIEW_MIN));
-        self.right_strip.set_width_request(layout::strip_width(s));
+        // While a sidebar animates its panel keeps the pre-animation layout
+        // width; the retarget in `apply_positions` scales or replaces it.
+        if !self.animating(true) {
+            self.left_root.set_width_request(px(SIDEBAR_MIN));
+        }
+        if !self.animating(false) {
+            self.right_root.set_width_request(px(PREVIEW_MIN));
+        }
+        // The hosts are the paned children now; their floor is the strip, so
+        // a collapsed sidebar and the handle's hard stop are the same width.
+        let strip = layout::strip_width(s);
+        self.left_host.set_width_request(strip);
+        self.right_host.set_width_request(strip);
         // The side panels are inset gap-s from the window's outer side and
         // bottom (the sketch's frame is gone); a collapsed strip keeps the
         // same insets. Tops stay directly under the header.
         let inset = layout::inset(s);
-        self.left_root.set_margin_start(inset);
-        self.left_root.set_margin_bottom(inset);
-        self.left_strip.set_margin_start(inset);
-        self.left_strip.set_margin_bottom(inset);
-        self.right_root.set_margin_end(inset);
-        self.right_root.set_margin_bottom(inset);
-        self.right_strip.set_margin_end(inset);
-        self.right_strip.set_margin_bottom(inset);
+        self.left_host.set_margin_start(inset);
+        self.left_host.set_margin_bottom(inset);
+        self.right_host.set_margin_end(inset);
+        self.right_host.set_margin_bottom(inset);
+        let top = layout::panel_button_inset(s);
+        self.left_button.set_margin_top(top);
+        self.right_button.set_margin_top(top);
+        for left in [true, false] {
+            if self.animating(left) {
+                continue;
+            }
+            let p = if self.collapsed(left) { 1.0 } else { 0.0 };
+            let h = layout::button_inset(s, left, p);
+            if left {
+                self.left_button.set_margin_start(h);
+            } else {
+                self.right_button.set_margin_end(h);
+            }
+        }
         self.left.borrow_mut().set_scale(s);
         self.split.set_scale(s);
         grid::set_scale(s);
@@ -228,6 +274,346 @@ impl Ui {
             w.content,
             w.preview
         );
+    }
+
+    fn anim_slot(&self, left: bool) -> &RefCell<Option<SideAnim>> {
+        if left {
+            &self.left_anim
+        } else {
+            &self.right_anim
+        }
+    }
+
+    fn gen_cell(&self, left: bool) -> Rc<Cell<u64>> {
+        if left {
+            self.left_gen.clone()
+        } else {
+            self.right_gen.clone()
+        }
+    }
+
+    fn animating(&self, left: bool) -> bool {
+        self.anim_slot(left).borrow().is_some()
+    }
+
+    fn collapsed(&self, left: bool) -> bool {
+        if left {
+            self.left_collapsed.get()
+        } else {
+            self.right_collapsed.get()
+        }
+    }
+
+    fn set_collapsed(&self, left: bool, value: bool) {
+        if left {
+            self.left_collapsed.set(value);
+        } else {
+            self.right_collapsed.set(value);
+            self.right_dirty.set(true);
+        }
+    }
+
+    fn panel_root(&self, left: bool) -> gtk::Box {
+        if left {
+            self.left_root.clone()
+        } else {
+            self.right_root.clone()
+        }
+    }
+
+    fn clip(&self, left: bool) -> gtk::ScrolledWindow {
+        if left {
+            self.left_clip.clone()
+        } else {
+            self.right_clip.clone()
+        }
+    }
+
+    fn outline(&self, left: bool) -> gtk::Box {
+        if left {
+            self.left_outline.clone()
+        } else {
+            self.right_outline.clone()
+        }
+    }
+
+    /// The sidebar's visible width from the paned, which is where a reverse
+    /// starts when no animation is running.
+    fn current_width(&self, left: bool) -> i32 {
+        if left {
+            layout::left_from_position(self.outer.position(), self.scale())
+        } else {
+            layout::preview_from_position(self.inner.width(), self.inner.position(), self.scale())
+        }
+    }
+
+    /// The visible width this sidebar expands to at the current window and
+    /// scale, with the side itself treated as expanded (the widths function
+    /// may still narrow it along with the other panel).
+    fn expanded_width(&self, left: bool) -> i32 {
+        let (w, _) = layout::body_widths(
+            self.window.width(),
+            self.scale(),
+            self.left_width.get(),
+            self.right_width.get(),
+            if left {
+                false
+            } else {
+                self.left_collapsed.get()
+            },
+            if left {
+                self.right_collapsed.get()
+            } else {
+                false
+            },
+        );
+        if left { w.left } else { w.preview }
+    }
+
+    /// Keep the right panel's content anchored to its right edge in the
+    /// clipping scroller: the viewport translates by its adjustment, so the
+    /// maximum value sits at `upper - page_size`. The left panel stays at 0.
+    fn anchor_clip(&self, left: bool) {
+        let adjustment = self.clip(left).hadjustment();
+        {
+            let anchor = if left {
+                0.0
+            } else {
+                (adjustment.upper() - adjustment.page_size()).max(0.0)
+            };
+            if (adjustment.value() - anchor).abs() > 0.5 {
+                adjustment.set_value(anchor);
+            }
+        }
+    }
+
+    /// One animation frame: move the paned edge to `width`, glide the button
+    /// by the same collapse progress and fade the outline over the last part.
+    fn frame_sidebar(&self, left: bool, width: i32) {
+        let (generation, expanded) = {
+            let slot = self.anim_slot(left);
+            let borrowed = slot.borrow();
+            let Some(anim) = borrowed.as_ref() else {
+                return;
+            };
+            (anim.generation, anim.expanded.get())
+        };
+        if self.gen_cell(left).get() != generation {
+            return;
+        }
+        let width = width.max(1);
+        if let Some(anim) = self.anim_slot(left).borrow().as_ref() {
+            anim.current.set(width);
+        }
+        let scale = self.scale();
+        let progress = layout::collapse_progress(width, expanded, scale);
+        if left {
+            let position = layout::left_position(width, scale);
+            self.expected_left.set(position);
+            if self.outer.position() != position {
+                self.outer.set_position(position);
+            }
+        } else {
+            let position = layout::preview_position(self.inner.width(), width, scale);
+            let position = position.max(0);
+            self.expected_right.set(position);
+            if self.inner.position() != position {
+                self.inner.set_position(position);
+            }
+        }
+        let inset = layout::button_inset(scale, left, progress);
+        if left {
+            self.left_button.set_margin_start(inset);
+        } else {
+            self.right_button.set_margin_end(inset);
+        }
+        self.outline(left)
+            .set_opacity(layout::outline_opacity(progress));
+        self.anchor_clip(left);
+    }
+
+    /// Start (or restart) one sidebar animation from `start` to `end`. The
+    /// panel's own layout width is `expanded` throughout; a newer generation
+    /// makes every older target and done handler a no-op.
+    fn begin_motion(self: &Rc<Self>, left: bool, start: i32, end: i32, expanded: i32) {
+        let generation = {
+            let cell = self.gen_cell(left);
+            let next = cell.get() + 1;
+            cell.set(next);
+            next
+        };
+        let gen_cell = self.gen_cell(left);
+        let weak = Rc::downgrade(self);
+        let target = adw::CallbackAnimationTarget::new(move |v| {
+            if gen_cell.get() != generation {
+                return;
+            }
+            let width = layout::motion_width(start, end, v);
+            if let Some(ui) = weak.upgrade() {
+                ui.frame_sidebar(left, width);
+            }
+        });
+        let duration = if start == end {
+            1
+        } else {
+            crate::motion::ms(200)
+        };
+        let animation = adw::TimedAnimation::new(&self.window, 0.0, 1.0, duration, target);
+        let done_cell = self.gen_cell(left);
+        let done_weak = Rc::downgrade(self);
+        animation.connect_done(move |_| {
+            if done_cell.get() != generation {
+                return;
+            }
+            if let Some(ui) = done_weak.upgrade() {
+                ui.finish_sidebar(left);
+            }
+        });
+        *self.anim_slot(left).borrow_mut() = Some(SideAnim {
+            generation,
+            start: Cell::new(start),
+            end: Cell::new(end),
+            expanded: Cell::new(expanded),
+            current: Cell::new(start),
+            scale: self.scale(),
+            _animation: animation.clone(),
+        });
+        animation.play();
+    }
+
+    /// A click, or a click mid-animation: the target is the opposite of the
+    /// current direction, starting from the width the edge is at right now.
+    fn toggle_sidebar(self: &Rc<Self>, left: bool) {
+        let running = {
+            let slot = self.anim_slot(left);
+            let borrowed = slot.borrow();
+            borrowed.as_ref().map(|a| {
+                (
+                    a.current.get(),
+                    a.expanded.get(),
+                    a.start.get(),
+                    a.end.get(),
+                )
+            })
+        };
+        let collapsing_now = running.is_some_and(|(_, _, start, end)| end < start);
+        let target_collapsed = if running.is_some() {
+            !collapsing_now
+        } else {
+            !self.collapsed(left)
+        };
+        self.set_collapsed(left, target_collapsed);
+        let scale = self.scale();
+        let strip = layout::strip_width(scale);
+        let start = match running {
+            Some((current, _, _, _)) => current,
+            None => self.current_width(left).max(1),
+        };
+        let end = if target_collapsed {
+            strip
+        } else {
+            self.expanded_width(left).max(strip)
+        };
+        let expanded = match running {
+            // The panel keeps the layout width it had before this animation
+            // or any reverse of it.
+            Some((_, expanded, _, _)) => expanded,
+            None if target_collapsed => start.max(end),
+            None => end,
+        };
+        if running.is_none() {
+            self.panel_root(left).set_width_request(expanded);
+        }
+        self.panel_root(left).add_css_class("gl-anim");
+        self.clip(left).set_visible(true);
+        self.outline(left).set_visible(true);
+        self.outline(left)
+            .set_opacity(layout::outline_opacity(layout::collapse_progress(
+                start, expanded, scale,
+            )));
+        let action = if target_collapsed {
+            "collapsing"
+        } else {
+            "expanding"
+        };
+        crate::log!(
+            "sidebar",
+            "{action} {} sidebar from {start} to {end} (panel {expanded})",
+            if left { "left" } else { "preview" }
+        );
+        self.begin_motion(left, start, end, expanded);
+    }
+
+    /// The animation reached its end width: drop the clipping animation
+    /// state, put the button and outline back to their resting values and let
+    /// the normal layout path take over. A stale generation does nothing.
+    fn finish_sidebar(self: &Rc<Self>, left: bool) {
+        let anim = self.anim_slot(left).borrow_mut().take();
+        let Some(anim) = anim else {
+            return;
+        };
+        if self.gen_cell(left).get() != anim.generation {
+            return;
+        }
+        let collapsed = self.collapsed(left);
+        let scale = self.scale();
+        let root = self.panel_root(left);
+        root.remove_css_class("gl-anim");
+        root.set_width_request(if left {
+            scaled(SIDEBAR_MIN, scale)
+        } else {
+            scaled(PREVIEW_MIN, scale)
+        });
+        let outline = self.outline(left);
+        outline.set_visible(false);
+        outline.set_opacity(1.0);
+        self.clip(left).set_visible(!collapsed);
+        let progress = if collapsed { 1.0 } else { 0.0 };
+        let inset = layout::button_inset(scale, left, progress);
+        if left {
+            self.left_button.set_margin_start(inset);
+        } else {
+            self.right_button.set_margin_end(inset);
+        }
+        let action = if collapsed { "collapsed" } else { "expanded" };
+        crate::log!(
+            "sidebar",
+            "{action} {} sidebar (panel {})",
+            if left { "left" } else { "preview" },
+            root.width()
+        );
+        self.apply_positions(true);
+    }
+
+    /// A window resize or scale change during an animation keeps the panel's
+    /// layout width but moves the end width; start a new run from the current
+    /// edge. A same-width call (every ordinary resize notify) is a no-op.
+    fn retarget_side(self: &Rc<Self>, left: bool, end: i32) {
+        let (current, old_end, expanded, old_scale) = {
+            let slot = self.anim_slot(left);
+            let borrowed = slot.borrow();
+            let Some(anim) = borrowed.as_ref() else {
+                return;
+            };
+            (
+                anim.current.get(),
+                anim.end.get(),
+                anim.expanded.get(),
+                anim.scale,
+            )
+        };
+        let scale = self.scale();
+        if end == old_end && (scale - old_scale).abs() < 1e-9 {
+            return;
+        }
+        let new_expanded = if self.collapsed(left) {
+            // Keep the panel's design width through a scale change.
+            (expanded as f64 * scale / old_scale).round() as i32
+        } else {
+            end.max(current)
+        };
+        self.panel_root(left).set_width_request(new_expanded);
+        self.begin_motion(left, current, end, new_expanded);
     }
 
     /// The pure widths function (layout.rs) driven by the window's current
@@ -264,16 +650,29 @@ impl Ui {
     /// the inner's own next max-position notify applies it instead
     /// (`right_dirty`); scale and collapse changes have fresh allocations
     /// and pass true.
-    fn apply_positions(&self, apply_preview: bool) {
+    fn apply_positions(self: &Rc<Self>, apply_preview: bool) {
         let (w, min_w) = self.body_widths();
         self.window.set_size_request(min_w, -1);
-        let left = layout::left_position(w.left, self.scale());
-        self.expected_left.set(left);
-        self.outer.set_position(left);
-        if apply_preview && self.inner.width() > 0 {
+        if self.animating(true) {
+            // The resize/scale retargets the running animation instead of
+            // snapping to its end width.
+            self.retarget_side(true, w.left);
+        } else {
+            let left = layout::left_position(w.left, self.scale());
+            self.expected_left.set(left);
+            if self.outer.position() != left {
+                self.outer.set_position(left);
+            }
+        }
+        if self.animating(false) {
+            self.retarget_side(false, w.preview);
+        } else if apply_preview && self.inner.width() > 0 {
             let pos = self.right_position(w.preview);
             self.expected_right.set(pos);
-            self.inner.set_position(pos);
+            self.right_dirty.set(false);
+            if self.inner.position() != pos {
+                self.inner.set_position(pos);
+            }
         } else {
             self.right_dirty.set(true);
         }
@@ -290,70 +689,72 @@ fn dragged(expected: i32, position: i32) -> Option<f64> {
 }
 
 /// `paned.connect_notify_local` with the `Rc<Ui>` wired in.
-fn on_notify(ui: &Rc<Ui>, paned: &Paned, prop: &str, run: impl Fn(&Ui, &Paned) + 'static) {
+fn on_notify(ui: &Rc<Ui>, paned: &Paned, prop: &str, run: impl Fn(&Rc<Ui>, &Paned) + 'static) {
     let ui = ui.clone();
     paned.connect_notify_local(Some(prop), move |paned, _| run(&ui, paned));
 }
 
-/// Collapse (or expand) one sidebar: hide the panel behind a `gap-2xl` strip
-/// at the window edge holding the same button. The left sidebar is the outer
-/// paned's start child, the preview the inner paned's end child.
-fn wire_collapse(ui: &Rc<Ui>, trigger: &gtk::Button, left: bool, collapse: bool) {
-    let ui = ui.clone();
-    trigger.connect_clicked(move |_| {
-        if left {
-            ui.left_collapsed.set(collapse);
-            let child = if collapse {
-                ui.left_strip.clone()
-            } else {
-                ui.left_root.clone()
-            };
-            ui.outer.set_start_child(Some(&child));
-        } else {
-            ui.right_collapsed.set(collapse);
-            ui.right_dirty.set(true);
-            let child = if collapse {
-                ui.right_strip.clone()
-            } else {
-                ui.right_root.clone()
-            };
-            ui.inner.set_end_child(Some(&child));
-        }
-        ui.apply_positions(false);
-        let side = if left { "left" } else { "preview" };
-        let action = if collapse { "collapsed" } else { "expanded" };
-        crate::log!("sidebar", "{action} {side} sidebar");
-    });
-}
-
-fn strip(icon: &str, left: bool) -> gtk::Box {
-    let strip = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-    strip.add_css_class("gl-collapse-strip");
-    strip.add_css_class(if left { "left" } else { "right" });
-    let button = sidebar::icon_button(icon);
-    // Vertically the button keeps the title row's start position. A Box does
-    // not honour halign on its main axis, so two expanding spacers centre the
-    // button across the collapsed strip (item 7).
+/// A sidebar host: a `GtkOverlay` whose main child is an `EXTERNAL`
+/// horizontal scroller around the panel. EXTERNAL is the part that makes the
+/// paned move a clipping viewport instead of squeezing the panel: the
+/// scroller's horizontal measure is zero (`gtk-4.22.4:gtk/gtkscrolledwindow.c:1843-1855`,
+/// `:1887-1922`), while `gtk_viewport_size_allocate` gives the panel its
+/// `width_request` and clips it (`gtk-4.22.4:gtk/gtkviewport.c:496-566`).
+/// The left panel is anchored at adjustment 0; the preview is anchored at
+/// `upper - page_size` so its right edge stays on the window's right.
+/// The outline and the button are overlay children, so the edge and the
+/// button can move without being clipped.
+fn sidebar_host(
+    panel: &gtk::Box,
+    button: &gtk::Button,
+    left: bool,
+) -> (gtk::Overlay, gtk::ScrolledWindow, gtk::Box) {
+    let host = gtk::Overlay::new();
+    let clip = gtk::ScrolledWindow::new();
+    clip.set_policy(gtk::PolicyType::External, gtk::PolicyType::Never);
+    clip.set_propagate_natural_width(false);
+    clip.set_child(Some(panel));
+    let outline = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    outline.add_css_class("gl-panel-outline");
+    outline.set_hexpand(true);
+    outline.set_vexpand(true);
+    outline.set_halign(gtk::Align::Fill);
+    outline.set_valign(gtk::Align::Fill);
+    outline.set_can_target(false);
+    outline.set_visible(false);
     button.set_valign(gtk::Align::Start);
-    let before = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-    before.set_hexpand(true);
-    let after = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-    after.set_hexpand(true);
-    strip.append(&before);
-    strip.append(&button);
-    strip.append(&after);
-    strip
+    button.set_halign(if left {
+        gtk::Align::Start
+    } else {
+        gtk::Align::End
+    });
+    host.set_child(Some(&clip));
+    host.add_overlay(&outline);
+    host.add_overlay(button);
+    // A wheel or a trackpad must not slide the clipped panel: pin the
+    // adjustment to its anchor whenever GTK or an input device moves it.
+    let adjustment = clip.hadjustment();
+    {
+        let pin = move |adjustment: &gtk::Adjustment| {
+            let anchor = if left {
+                0.0
+            } else {
+                (adjustment.upper() - adjustment.page_size()).max(0.0)
+            };
+            if (adjustment.value() - anchor).abs() > 0.5 {
+                adjustment.set_value(anchor);
+            }
+        };
+        adjustment.connect_changed(pin);
+        adjustment.connect_value_changed(pin);
+    }
+    (host, clip, outline)
 }
 
-fn expand_button(strip: &gtk::Box) -> gtk::Button {
-    let mut child = strip.first_child();
-    while let Some(widget) = child {
-        if let Some(button) = widget.downcast_ref::<gtk::Button>() {
-            return button.clone();
-        }
-        child = widget.next_sibling();
-    }
-    panic!("strip holds its expand button")
+/// One click on either button toggles the side; mid-animation it reverses.
+fn wire_toggle(ui: &Rc<Ui>, button: &gtk::Button, left: bool) {
+    let ui = ui.clone();
+    button.connect_clicked(move |_| ui.toggle_sidebar(left));
 }
 
 fn dev_slider(lo: f64, hi: f64, step: f64, value: f64) -> gtk::Scale {
@@ -425,6 +826,10 @@ fn show(app: &adw::Application, args: &Args) {
     inner.set_resize_end_child(false);
     inner.set_shrink_start_child(true);
     inner.set_shrink_end_child(false);
+    // The sidebar hosts keep the paned from allocating a panel below its
+    // own minimum: each panel lives in an EXTERNAL horizontal scroller whose
+    // measure ignores the child's minimum, so the paned only ever moves the
+    // host and the panel is clipped at the moving edge (r9).
 
     // Content column: folder view / split view, then rule and status line.
     let stack = gtk::Stack::new();
@@ -439,16 +844,18 @@ fn show(app: &adw::Application, args: &Args) {
     content.append(&status_rule);
     content.append(&grid::status_label(args.items));
 
-    // Left sidebar and its collapse strip.
+    // Left sidebar and its host (clipping holder + outline + button).
     let left = Rc::new(RefCell::new(sidebar::LeftPanel::new(&args.drives)));
     left.borrow_mut().set_pin_count(args.pins);
     let left_root = left.borrow().root.clone();
-    let left_strip = strip("sidebar-show-symbolic", true);
+    let left_button = left.borrow().collapse_button.clone();
+    let (left_host, left_clip, left_outline) = sidebar_host(&left_root, &left_button, true);
 
-    // Preview sidebar and its collapse strip.
+    // Preview sidebar and its host.
     let right = preview::PreviewPanel::new();
     let right_root = right.root.clone();
-    let right_strip = strip("sidebar-show-right-symbolic", false);
+    let right_button = right.collapse_button.clone();
+    let (right_host, right_clip, right_outline) = sidebar_host(&right_root, &right_button, false);
 
     // Split view. A slot breaks the cycle: on_exit fades out and returns to
     // the single folder view. Every tile shows the same fake item count, so
@@ -482,11 +889,21 @@ fn show(app: &adw::Application, args: &Args) {
         inner: inner.clone(),
         left: left.clone(),
         left_root,
-        left_strip,
+        left_host,
+        left_clip,
+        left_outline,
+        left_button,
         left_collapsed: Cell::new(false),
+        left_anim: RefCell::new(None),
+        left_gen: Rc::new(Cell::new(0)),
         right_root,
-        right_strip,
+        right_host,
+        right_clip,
+        right_outline,
+        right_button,
         right_collapsed: Cell::new(false),
+        right_anim: RefCell::new(None),
+        right_gen: Rc::new(Cell::new(0)),
         right_dirty: Cell::new(true),
         left_width: Cell::new(SIDEBAR_W),
         right_width: Cell::new(PREVIEW_W),
@@ -494,9 +911,9 @@ fn show(app: &adw::Application, args: &Args) {
         expected_right: Cell::new(0),
         split,
     });
-    outer.set_start_child(Some(&ui.left_root));
+    outer.set_start_child(Some(&ui.left_host));
     inner.set_start_child(Some(&content));
-    inner.set_end_child(Some(&ui.right_root));
+    inner.set_end_child(Some(&ui.right_host));
 
     // The saved widths are set before the first allocation (a position set
     // then is honoured, clamped, by gtk_paned_compute_position). The inner
@@ -505,6 +922,9 @@ fn show(app: &adw::Application, args: &Args) {
     // computed at allocation time, and a window resize defers to it too
     // (see `apply_positions`).
     on_notify(&ui, &inner, "max-position", |ui, _| {
+        if ui.animating(false) {
+            return;
+        }
         if ui.right_dirty.get() && ui.inner.max_position() > 0 {
             ui.right_dirty.set(false);
             let (w, _) = ui.body_widths();
@@ -535,12 +955,26 @@ fn show(app: &adw::Application, args: &Args) {
     on_notify(&ui, &outer, "position", |ui, paned| {
         let position = paned.position();
         let visible = layout::left_from_position(position, ui.scale());
+        if ui.animating(true) {
+            // An animation frame is ours: it is not a drag and must not be
+            // snapped back to the end width.
+            ui.expected_left.set(position);
+            return;
+        }
         if ui.left_collapsed.get() {
             let target = layout::left_position(ui.body_widths().0.left, ui.scale());
             if position != target {
                 paned.set_position(target);
             }
         } else {
+            let min = layout::left_position(scaled(SIDEBAR_MIN, ui.scale()), ui.scale());
+            if position < min {
+                ui.expected_left.set(min);
+                if position != min {
+                    paned.set_position(min);
+                }
+                return;
+            }
             let implied = layout::left_position(ui.body_widths().0.left, ui.scale());
             if dragged(ui.expected_left.get(), position).is_some() && position != implied {
                 ui.left_width.set(visible as f64 / ui.scale());
@@ -550,12 +984,26 @@ fn show(app: &adw::Application, args: &Args) {
     });
     on_notify(&ui, &inner, "position", |ui, paned| {
         let position = paned.position();
+        if ui.animating(false) {
+            ui.expected_right.set(position);
+            return;
+        }
         if ui.right_collapsed.get() {
             let target = ui.right_position(ui.body_widths().0.preview);
             if position != target {
                 paned.set_position(target);
             }
         } else {
+            if ui.inner.width() > 0 {
+                let max = ui.right_position(scaled(PREVIEW_MIN, ui.scale()));
+                if position > max {
+                    ui.expected_right.set(max);
+                    if position != max {
+                        paned.set_position(max);
+                    }
+                    return;
+                }
+            }
             let implied = ui.right_position(ui.body_widths().0.preview);
             if !ui.right_dirty.get()
                 && dragged(ui.expected_right.get(), position).is_some()
@@ -594,10 +1042,10 @@ fn show(app: &adw::Application, args: &Args) {
     pin_remove.connect_clicked(move |_| removed.borrow_mut().remove_pin());
     let drive_left = left.clone();
     drive_ctl.connect_value_changed(move |s| drive_left.borrow_mut().set_drive(0, s.value()));
-    wire_collapse(&ui, &left.borrow().collapse_button, true, true);
-    wire_collapse(&ui, &expand_button(&ui.left_strip), true, false);
-    wire_collapse(&ui, &right.collapse_button, false, true);
-    wire_collapse(&ui, &expand_button(&ui.right_strip), false, false);
+    // One button per side now: expanded it is the panel's collapse button,
+    // collapsed the strip's expand button; mid-animation it reverses.
+    wire_toggle(&ui, &ui.left_button, true);
+    wire_toggle(&ui, &ui.right_button, false);
 
     // Start in split view when --tiles says so.
     if args.tiles > 1 {

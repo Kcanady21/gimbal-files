@@ -60,6 +60,53 @@ pub fn strip_width(scale: f64) -> i32 {
     scaled(GAP_2XL, scale).max(button) + scaled(GAP_M, scale) + scaled(LINE_MID, scale)
 }
 
+/// The sidebar button's horizontal inset from the panel's window-side edge:
+/// the panel's `line-mid` border plus its `gap-m` padding. The button is an
+/// overlay child of the host (r9), so this is a margin, not a row position.
+pub fn panel_button_inset(scale: f64) -> i32 {
+    scaled(GAP_M, scale) + scaled(LINE_MID, scale)
+}
+
+/// The sidebar button's inset at collapse progress `p` (0 expanded, 1 in the
+/// strip). On the left it is a start margin, on the preview an end margin.
+/// The strip has no horizontal padding; GTK's box gives the first of the two
+/// expanding spacers the odd pixel, so the start gap is the ceiling and the
+/// end gap the floor of `(strip − button) / 2` (the P1m timer measured 10 / 9
+/// at scale 1 and 5 / 5 at 0.5).
+pub fn button_inset(scale: f64, left: bool, progress: f64) -> i32 {
+    let button = scaled(ICON_ROW, scale) + 2 * scaled(GAP_S, scale);
+    let spare = (strip_width(scale) - button).max(0);
+    let strip = if left { (spare + 1) / 2 } else { spare / 2 };
+    let panel = panel_button_inset(scale);
+    (panel as f64 + (strip - panel) as f64 * progress.clamp(0.0, 1.0)).round() as i32
+}
+
+/// The visible sidebar width at `t` (0..=1) on the way from `start` to `end`.
+/// Both directions use the same line; a reverse starts again from the width
+/// the previous frame ended at.
+pub fn motion_width(start: i32, end: i32, t: f64) -> i32 {
+    let t = t.clamp(0.0, 1.0);
+    (start as f64 + (end - start) as f64 * t).round() as i32
+}
+
+/// How far a sidebar is collapsed at a visible width: 0 at `expanded`, 1 at
+/// the strip. `expanded` is the panel's own (clipped) width for this
+/// animation, so a panel that was already narrowed by the window counts that
+/// narrowed width as expanded.
+pub fn collapse_progress(width: i32, expanded: i32, scale: f64) -> f64 {
+    let strip = strip_width(scale);
+    let span = (expanded - strip).max(1) as f64;
+    ((expanded - width) as f64 / span).clamp(0.0, 1.0)
+}
+
+/// The panel outline's opacity at collapse progress `p`: full until the last
+/// 35 % of the slide, then linear to zero at the strip. Expanding is the same
+/// curve backwards, so the outline is back before the edge reaches the panel.
+pub fn outline_opacity(progress: f64) -> f64 {
+    const FADE: f64 = 0.35;
+    ((1.0 - progress.clamp(0.0, 1.0)) / FADE).clamp(0.0, 1.0)
+}
+
 /// The narrowest content column: the worse of the single view (a
 /// `grid-margin` inset each side plus one cell) and the split view (a
 /// `gap-2xl` Fixed inset each side, the `gap-l` gutter and two columns of the
@@ -261,6 +308,106 @@ mod tests {
             let pad = scaled(GAP_M, scale) + scaled(LINE_MID, scale);
             assert_eq!(scaled(LINE_MID, scale) + scaled(GAP_M, scale), pad);
         }
+    }
+
+    #[test]
+    fn sidebar_motion_starts_mid_and_ends_on_both_sides() {
+        let (w, _) = body_widths(2560, 1.0, 348.0, 648.0, false, false);
+        let strip = strip_width(1.0);
+        // Collapse, left and preview: same width arithmetic.
+        for expanded in [w.left, w.preview] {
+            assert_eq!(motion_width(expanded, strip, 0.0), expanded);
+            assert_eq!(motion_width(expanded, strip, 1.0), strip);
+            let mid = motion_width(expanded, strip, 0.5);
+            assert!(mid < expanded && mid > strip);
+            // The mid frame still places the paned edge where the width says.
+            let inner_w = 2000;
+            assert_eq!(
+                left_from_position(left_position(mid, 1.0), 1.0),
+                mid,
+                "left edge at the mid width"
+            );
+            assert_eq!(
+                preview_from_position(inner_w, preview_position(inner_w, mid, 1.0), 1.0),
+                mid,
+                "preview edge at the mid width"
+            );
+        }
+        // Expand is the same line from the strip back out.
+        for expanded in [w.left, w.preview] {
+            assert_eq!(motion_width(strip, expanded, 0.0), strip);
+            assert_eq!(
+                motion_width(strip, expanded, 0.5),
+                motion_width(expanded, strip, 0.5)
+            );
+            assert_eq!(motion_width(strip, expanded, 1.0), expanded);
+        }
+    }
+
+    #[test]
+    fn a_reverse_restarts_from_the_current_width() {
+        let (w, _) = body_widths(2560, 1.0, 348.0, 648.0, false, false);
+        let strip = strip_width(1.0);
+        let mid = motion_width(w.left, strip, 0.5);
+        assert_eq!(mid, 208);
+        // Clicking at 50 % expands from 208, not from either end.
+        assert_eq!(motion_width(mid, w.left, 0.0), mid);
+        assert_eq!(motion_width(mid, w.left, 0.5), 278);
+        assert_eq!(motion_width(mid, w.left, 1.0), w.left);
+        // The same for a collapse interrupted while expanding.
+        assert_eq!(motion_width(mid, strip, 0.0), mid);
+        assert_eq!(motion_width(mid, strip, 0.5), 138);
+        assert_eq!(motion_width(mid, strip, 1.0), strip);
+    }
+
+    #[test]
+    fn a_retarget_uses_the_new_end_width() {
+        let strip = strip_width(1.0);
+        let mid = motion_width(strip, 348, 0.5);
+        assert_eq!(mid, 208);
+        // A window resize or scale change gives the expand a wider target;
+        // the retarget starts from the current 208 and reaches 500.
+        assert_eq!(motion_width(mid, 500, 0.0), mid);
+        assert_eq!(motion_width(mid, 500, 0.5), 354);
+        assert_eq!(motion_width(mid, 500, 1.0), 500);
+        // A narrower target retargets the same way.
+        assert_eq!(motion_width(mid, 320, 1.0), 320);
+    }
+
+    #[test]
+    fn the_button_glides_from_the_panel_to_the_strip_centre() {
+        // Scale 1: panel inset 19; strip gaps 10 (start) and 9 (end).
+        assert_eq!(panel_button_inset(1.0), 19);
+        assert_eq!(button_inset(1.0, true, 0.0), 19);
+        assert_eq!(button_inset(1.0, true, 0.5), 15);
+        assert_eq!(button_inset(1.0, true, 1.0), 10);
+        assert_eq!(button_inset(1.0, false, 0.0), 19);
+        assert_eq!(button_inset(1.0, false, 0.5), 14);
+        assert_eq!(button_inset(1.0, false, 1.0), 9);
+        // Scale 0.5: panel inset 10, both strip gaps 5 (34 − 24 = 10 spare).
+        assert_eq!(panel_button_inset(0.5), 10);
+        assert_eq!(button_inset(0.5, true, 0.0), 10);
+        assert_eq!(button_inset(0.5, true, 0.5), 8);
+        assert_eq!(button_inset(0.5, true, 1.0), 5);
+        assert_eq!(button_inset(0.5, false, 1.0), 5);
+        // The button's vertical inset is the panel's border + padding.
+        assert_eq!(
+            panel_button_inset(1.0),
+            scaled(LINE_MID, 1.0) + scaled(GAP_M, 1.0)
+        );
+    }
+
+    #[test]
+    fn the_outline_fades_over_the_last_part_only() {
+        assert_eq!(outline_opacity(0.0), 1.0);
+        assert_eq!(outline_opacity(0.5), 1.0);
+        assert_eq!(outline_opacity(0.65), 1.0);
+        assert!((outline_opacity(0.8) - 0.571).abs() < 0.001);
+        assert_eq!(outline_opacity(1.0), 0.0);
+        // Expanding is the same curve backwards: as progress falls the
+        // outline comes back.
+        assert!(outline_opacity(0.9) < outline_opacity(0.8));
+        assert!(outline_opacity(0.8) < outline_opacity(0.7));
     }
 
     #[test]
