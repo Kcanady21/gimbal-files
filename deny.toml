@@ -25,6 +25,9 @@ allow = [
     "Unicode-3.0",
     # memchr: effectively public domain (Unlicense), compatible with GPLv3.
     "Unlicense",
+    # libloading (through wayland-sys, for GDK's Wayland backend): the ISC
+    # license is a permissive MIT-style license, compatible with GPLv3.
+    "ISC",
 ]
 confidence-threshold = 0.8
 
@@ -43,7 +46,9 @@ highlight = "all"
 deny = [
     { crate = "gtk4", wrappers = ["fm-ui", "libadwaita"], reason = "only fm-ui may use GTK" },
     { crate = "gtk4-sys", wrappers = ["gtk4", "libadwaita-sys"], reason = "only fm-ui may use GTK" },
-    { crate = "gdk4", wrappers = ["gsk4", "gtk4", "libadwaita"], reason = "only fm-ui may use GDK" },
+    { crate = "gdk4-wayland", wrappers = ["fm-ui"], reason = "only fm-ui may use GDK" },
+    { crate = "gdk4-wayland-sys", wrappers = ["gdk4-wayland"], reason = "only fm-ui may use GDK" },
+    { crate = "gdk4", wrappers = ["gsk4", "gtk4", "libadwaita", "gdk4-wayland"], reason = "only fm-ui may use GDK" },
     { crate = "gdk4-sys", wrappers = ["gdk4", "gsk4-sys", "gtk4-sys", "libadwaita-sys"], reason = "only fm-ui may use GDK" },
     { crate = "gsk4", wrappers = ["gtk4"], reason = "only fm-ui may use GSK" },
     { crate = "gsk4-sys", wrappers = ["gsk4", "gtk4-sys"], reason = "only fm-ui may use GSK" },

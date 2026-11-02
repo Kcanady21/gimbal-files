@@ -15,6 +15,9 @@ path = "src/main.rs"
 [dependencies]
 gtk.workspace = true
 adw.workspace = true
+gdk4-wayland.workspace = true
+wayland-client.workspace = true
+wayland-protocols.workspace = true
 fm-core.workspace = true
 
 [lints]

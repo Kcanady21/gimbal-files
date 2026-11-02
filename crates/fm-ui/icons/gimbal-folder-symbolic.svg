@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
+<!-- Converted from gimbal-files-prompts/phase1/icons/folder.svg (exact geometry).
+     Colour slots follow look-style-spec.md: front accent, back shade(accent, 0.7),
+     side shade(accent, 0.6), tab window_fg at 0.85, front-shadow shade(accent, 0.45).
+     The palette is set by .gl-cell image in style.rs; no fixed colours here. -->
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:gpa="http://www.gtk.org/svg"
+     width="97.29" height="79.58" viewBox="0 0 97.29 79.58" gpa:version="1">
+  <path id="back" d="M 48.64 8.97 C 47.20 8.97, 45.49 8.06, 44.84 6.96 L 41.93 2.01 C 41.28 0.90, 39.57 0.00, 38.13 0.00 L 5.26 0.00 C 2.63 0.00, 0.00 2.24, 0.00 4.48 L 0.00 6.73 C 0.00 7.96, 0.00 9.98, 0.00 11.21 L 0.00 75.10 C 0.00 76.33, 3.81 79.58, 5.26 79.58 L 92.03 79.58 C 93.47 79.58, 97.29 76.33, 97.29 75.10 L 97.29 13.45 C 97.29 10.09, 95.97 8.97, 92.03 8.97 L 48.64 8.97 Z" gpa:fill="success"/>
+  <path id="side" d="M 92.03 8.97 L 86.77 8.97 C 90.71 8.97, 92.03 10.09, 92.03 13.45 L 92.03 75.10 C 92.03 76.33, 88.21 79.58, 86.77 79.58 L 92.03 79.58 C 93.47 79.58, 97.29 76.33, 97.29 75.10 L 97.29 13.45 C 97.29 10.09, 95.97 8.97, 92.03 8.97 Z" gpa:fill="warning"/>
+  <path id="tab" d="M 89.40 32.51 C 89.40 34.97, 87.03 36.99, 84.14 36.99 L 13.15 36.99 C 10.25 36.99, 7.89 34.97, 7.89 32.51 L 7.89 19.06 C 7.89 16.59, 10.25 14.57, 13.15 14.57 L 84.14 14.57 C 87.03 14.57, 89.40 16.59, 89.40 19.06 L 89.40 32.51 Z" gpa:fill="foreground" fill-opacity="0.85"/>
+  <path id="front" d="M 92.03 26.90 L 5.26 26.90 C 2.63 26.90, 0.00 29.14, 0.00 31.38 L 0.00 75.10 C 0.00 77.34, 2.63 79.58, 5.26 79.58 L 92.03 79.58 C 94.66 79.58, 97.29 77.34, 97.29 75.10 L 97.29 31.38 C 97.29 29.14, 94.66 26.90, 92.03 26.90 Z" gpa:fill="accent"/>
+  <path id="front-shadow" d="M 92.03 26.90 L 86.77 26.90 C 89.40 26.90, 92.03 29.14, 92.03 31.38 L 92.03 75.10 C 92.03 77.34, 89.40 79.58, 86.77 79.58 L 92.03 79.58 C 94.66 79.58, 97.29 77.34, 97.29 75.10 L 97.29 31.38 C 97.29 29.14, 94.66 26.90, 92.03 26.90 Z" gpa:fill="error"/>
+</svg>
