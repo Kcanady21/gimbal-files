@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! One shared look: tokens, generated stylesheet, live theme, opacity/blur and
-//! motion. The app owns one `Look` for the process; no other module builds CSS.
+//! One shared look: tokens, generated stylesheet, live theme, opacity and
+//! motion. The process owns one `Look`; each window owns its own blur.
+//! No other module builds CSS.
 
 pub mod blur;
 pub mod css;
@@ -15,14 +16,15 @@ pub struct Look {
     provider: gtk::CssProvider,
     /// The watcher owns its monitors; dropping this value stops them.
     _theme: theme::Watcher,
-    blur: blur::Blur,
     scale: f64,
     opacity: f64,
     font: Option<String>,
 }
 
 impl Look {
-    pub fn new(window: &gtk::Window, scale: f64, opacity: f64, font: Option<String>) -> Self {
+    /// Install the one stylesheet provider for the display and start the
+    /// theme watcher. Call once per process, before the first window.
+    pub fn new(scale: f64, opacity: f64, font: Option<String>) -> Self {
         let provider = gtk::CssProvider::new();
         if let Some(display) = gtk::gdk::Display::default() {
             gtk::style_context_add_provider_for_display(
@@ -37,11 +39,9 @@ impl Look {
             );
         }
         let theme = theme::Watcher::new();
-        let blur = blur::Blur::attach(window, scale, opacity);
         let look = Self {
             provider,
             _theme: theme,
-            blur,
             scale,
             opacity,
             font,
@@ -59,12 +59,10 @@ impl Look {
     pub fn set_scale(&mut self, scale: f64) {
         self.scale = scale;
         self.reload();
-        self.blur.set_scale(scale);
     }
 
     pub fn set_opacity(&mut self, opacity: f64) {
         self.opacity = opacity;
         self.reload();
-        self.blur.set_opacity(opacity);
     }
 }

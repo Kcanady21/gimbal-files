@@ -135,6 +135,31 @@ fn closing_a_window_focuses_another_and_the_last_says_so() {
 }
 
 #[test]
+fn focus_window_moves_the_focus_and_refuses_an_unknown_id() {
+    let mut workspace = workspace();
+    let first = workspace.windows[0].id;
+    workspace.window_new(None).unwrap();
+    let second = workspace.windows[1].id;
+    assert_eq!(workspace.focused_window, Some(second));
+
+    let events = workspace.focus_window(first).unwrap();
+    assert_eq!(events, vec![Event::WindowFocused(first)]);
+    assert_eq!(workspace.focused_window, Some(first));
+
+    // Focusing the window that already has the focus changes nothing.
+    assert!(workspace.focus_window(first).unwrap().is_empty());
+    assert_eq!(workspace.focused_window, Some(first));
+
+    let unknown = WindowId::from_raw(999);
+    assert_eq!(
+        workspace.focus_window(unknown),
+        Err(WorkspaceError::NoSuchWindow(unknown))
+    );
+    assert_eq!(workspace.focused_window, Some(first));
+    workspace.check_invariants().unwrap();
+}
+
+#[test]
 fn tab_new_opens_after_the_focused_pill_and_inherits_its_folder() {
     let mut workspace = workspace();
     workspace.tab_new(Some(folder("/tmp/a"))).unwrap();
@@ -425,15 +450,6 @@ fn group_split_uses_the_lowest_free_number() {
     let mut workspace = workspace();
     workspace.tab_new(None).unwrap();
     workspace.tab_new(None).unwrap();
-    let window = workspace.focused().unwrap();
-    assert_eq!(
-        window
-            .groups
-            .values()
-            .map(|group| group.number)
-            .collect::<Vec<_>>(),
-        vec![1, 2, 3]
-    );
 
     workspace.pill_ctrl_click(0).unwrap();
     workspace.pill_ctrl_click(1).unwrap();
@@ -442,6 +458,33 @@ fn group_split_uses_the_lowest_free_number() {
     let group = &window.groups[&window.pills[0]];
     assert_eq!(group.number, 1);
     assert_eq!(group.title(), "Group 1");
+}
+
+#[test]
+fn only_split_groups_take_group_numbers() {
+    // Claude's P2h review: five single tabs, then a split of the third and
+    // fourth pills, was labelled "Group 3" because the singles held 1 and 2.
+    let mut workspace = workspace();
+    for _ in 0..4 {
+        workspace.tab_new(None).unwrap();
+    }
+    workspace.pill_ctrl_click(2).unwrap();
+    workspace.pill_ctrl_click(3).unwrap();
+    workspace.group_split().unwrap();
+    let window = workspace.focused().unwrap();
+    let first = &window.groups[&window.pills[2]];
+    assert!(first.is_split());
+    assert_eq!(first.title(), "Group 1");
+
+    // A single tab that becomes a split through "Add to Group" takes the next
+    // free number among splits: here the focused tab joins pill 0.
+    workspace.tab_focus(1).unwrap();
+    workspace.group_add_tab(0).unwrap();
+    let window = workspace.focused().unwrap();
+    let second = &window.groups[&window.pills[0]];
+    assert!(second.is_split());
+    assert_eq!(second.title(), "Group 2");
+    workspace.check_invariants().unwrap();
 }
 
 #[test]

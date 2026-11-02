@@ -98,6 +98,7 @@ window.gimbal-look, window.gimbal-look.background {{ background-color: {window_b
 .gl-search-field entry {{ min-width: {search_entry_w}px; }}
 .gl-search-glyph {{ -gtk-icon-size: {inav}px; margin-right: {gm}px; color: {FG}; }}
 .gl-path-label {{ font-size: {tc}px; }}
+.gl-path.invalid {{ border-color: @error_bg_color; }}
 .gl-pill {{ all: unset; min-height: {pill_h}px; padding: 0 {gm}px; border: {mid}px solid {OUTLINE}; border-radius: {rp}px; background-color: {pill_bg}; color: {FG}; transition: background-color {hover_ms}ms; }}
 .gl-pill.tab, .gl-pill.group {{ min-width: {pill_w}px; }}
 .gl-pill.active {{ background-color: {pill_active}; color: {RAISED_FG}; }}

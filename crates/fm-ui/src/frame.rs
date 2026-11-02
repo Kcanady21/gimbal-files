@@ -1,25 +1,33 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! The empty Gimbal window: header strip, left sidebar, content area and
-//! preview sidebar, with Phase 1's resizable borders and r9's animated
-//! collapse. Settings come from the one `ConfigFile` and go back to it.
+//! One window's UI: P2g's frame (header strip, sidebars, content) with P2h's
+//! header and content placeholder. Every widget reads the model through the
+//! process and sends commands back through it.
 
 use std::cell::{Cell, RefCell};
-use std::rc::Rc;
+use std::path::PathBuf;
+use std::rc::{Rc, Weak};
 
 use adw::prelude::*;
-use fm_core::command::{Caller, CheckedCommand, Effect, Invocation, Outcome, Registry};
-use fm_core::config::{self, Change, ConfigFile, Side};
+use fm_core::command::{Caller, Invocation};
+use fm_core::config::{Change, Side};
+use fm_core::workspace::{Window, WindowId};
 
+use crate::app::Process;
 use crate::commands;
+use crate::header::Header;
 use crate::layout;
-use crate::look::Look;
+use crate::look::blur::Blur;
 use crate::look::motion;
 use crate::look::tokens::*;
 
-pub struct App {
+pub struct WindowUi {
+    pub id: WindowId,
+    process: Weak<Process>,
     window: adw::ApplicationWindow,
-    config: RefCell<ConfigFile>,
-    look: RefCell<Look>,
+    header: Rc<Header>,
+    blur: RefCell<Blur>,
+    content_frame: gtk::Box,
+    content_label: gtk::Label,
 
     /// Left sidebar | (content | preview): two nested horizontal Paneds.
     outer: gtk::Paned,
@@ -43,27 +51,15 @@ pub struct App {
     right_anim: RefCell<Option<SideAnim>>,
     right_gen: Rc<Cell<u64>>,
 
-    /// Set while the preview width must be (re-)applied: at startup and after
-    /// every collapse/expand animation, when max-position changes.
     right_dirty: Cell<bool>,
-    /// Saved sidebar widths in design px.
     left_width: Cell<f64>,
     right_width: Cell<f64>,
-    /// Border drags update these cells live; the config is written once, on
-    /// button release.
     pending_left: Cell<Option<i32>>,
     pending_right: Cell<Option<i32>>,
-    /// The positions `apply_positions` last applied: a `position` notify with
-    /// any other value is a user drag.
     expected_left: Cell<i32>,
     expected_right: Cell<i32>,
 }
 
-/// One sidebar collapse/expand run. `start`/`end` are visible widths; every
-/// frame moves the paned edge to `motion_width`. `expanded` is the width the
-/// clipped panel keeps its own layout at, and `current` is where the edge is
-/// now (a reverse or a retarget starts from it). `generation` makes stale
-/// animation callbacks no-ops.
 struct SideAnim {
     generation: u64,
     end: Cell<i32>,
@@ -73,13 +69,13 @@ struct SideAnim {
     _animation: adw::TimedAnimation,
 }
 
-impl App {
-    pub fn new(application: &adw::Application, config: ConfigFile) -> Rc<Self> {
-        let scale = config.config().look.base * config.config().look.scale;
-        let opacity = config.config().look.opacity;
-        let font = Some(config.config().look.font.clone()).filter(|font| !font.is_empty());
-        let left_config = config.config().sidebars.left;
-        let right_config = config.config().sidebars.right;
+impl WindowUi {
+    pub fn new(process: &Rc<Process>, application: &adw::Application, id: WindowId) -> Rc<Self> {
+        let config = process.config.borrow().config().clone();
+        let scale = process.scale();
+        let opacity = process.opacity();
+        let left_config = config.sidebars.left;
+        let right_config = config.sidebars.right;
 
         let window = adw::ApplicationWindow::builder()
             .application(application)
@@ -94,13 +90,9 @@ impl App {
         let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
         window.set_content(Some(&root));
 
-        // The header strip is empty until P2h.
-        let header = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-        header.add_css_class("gl-header");
-        header.set_hexpand(true);
-        root.append(&header);
+        let header = Header::new(id, scale);
+        root.append(header.widget());
 
-        // Body frame: left sidebar | content | preview in two nested Paneds.
         let frame = gtk::Box::new(gtk::Orientation::Vertical, 0);
         frame.add_css_class("gl-frame");
         frame.set_vexpand(true);
@@ -120,11 +112,18 @@ impl App {
         inner.set_shrink_start_child(true);
         inner.set_shrink_end_child(false);
 
-        // The content area: status line placeholder and nothing else.
+        // The content placeholder until P2i: the focused folder, centred.
         let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        let spacer = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        spacer.set_vexpand(true);
-        content.append(&spacer);
+        let content_label = gtk::Label::builder()
+            .label("")
+            .css_classes(["gl-title"])
+            .halign(gtk::Align::Center)
+            .valign(gtk::Align::Center)
+            .justify(gtk::Justification::Center)
+            .wrap(true)
+            .vexpand(true)
+            .build();
+        content.append(&content_label);
         let status_rule = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         status_rule.add_css_class("gl-rule");
         status_rule.add_css_class("inset");
@@ -135,8 +134,6 @@ impl App {
         status.set_xalign(0.5);
         content.append(&status);
 
-        // Left sidebar and preview sidebar, each a panel with a title row and
-        // a collapse button that lives in the host overlay.
         let (left_root, left_button) = panel("Pinned Folders", "sidebar-show-symbolic", true);
         let (left_host, left_clip, left_outline) = sidebar_host(&left_root, &left_button, true);
         let (right_root, right_button) = panel("File Name", "sidebar-show-right-symbolic", false);
@@ -147,12 +144,16 @@ impl App {
         inner.set_start_child(Some(&content));
         inner.set_end_child(Some(&right_host));
 
-        let look = Look::new(window.upcast_ref::<gtk::Window>(), scale, opacity, font);
+        let blur = Blur::attach(window.upcast_ref::<gtk::Window>(), scale, opacity);
 
-        let app = Rc::new(Self {
+        let ui = Rc::new(Self {
+            id,
+            process: Rc::downgrade(process),
             window,
-            config: RefCell::new(config),
-            look: RefCell::new(look),
+            header: header.clone(),
+            blur: RefCell::new(blur),
+            content_frame: frame,
+            content_label,
             outer: outer.clone(),
             inner: inner.clone(),
             left_root,
@@ -179,10 +180,18 @@ impl App {
             expected_left: Cell::new(0),
             expected_right: Cell::new(0),
         });
-        app.wire();
-        app.apply_scale();
-        app.log_startup();
-        app
+        header.wire(&ui);
+        ui.wire();
+        ui.apply_scale();
+        ui.update_content();
+        crate::log!(
+            "window",
+            "built model window {} ({}×{})",
+            id,
+            ui.window.width(),
+            ui.window.height()
+        );
+        ui
     }
 
     pub fn present(&self) {
@@ -193,195 +202,134 @@ impl App {
         &self.window
     }
 
-    pub fn hotkeys(&self) -> std::collections::BTreeMap<String, fm_core::config::Hotkey> {
-        self.config.borrow().config().hotkeys.clone()
+    pub fn header(&self) -> &Rc<Header> {
+        &self.header
     }
 
-    /// The only command path: build the invocation, validate and dispatch
-    /// through the registry, and let the handler see who called.
-    pub fn dispatch(self: &Rc<Self>, caller: Caller, invocation: Invocation) {
-        let mut handler = commands::UiHandler {
-            caller,
-            app: Rc::downgrade(self),
+    pub fn home(&self) -> PathBuf {
+        self.process
+            .upgrade()
+            .map(|process| process.home())
+            .unwrap_or_else(|| PathBuf::from("/"))
+    }
+
+    pub fn workspace_window(&self) -> Option<Window> {
+        self.process
+            .upgrade()
+            .and_then(|process| process.window_snapshot(self.id))
+    }
+
+    pub fn process_upgrade(&self) -> Option<Rc<Process>> {
+        self.process.upgrade()
+    }
+
+    pub fn dispatch(&self, caller: Caller, invocation: Invocation) {
+        if let Some(process) = self.process.upgrade() {
+            process.dispatch_for_window(self.id, caller, invocation);
+        }
+    }
+
+    pub fn focus_and_dispatch(&self, index: usize, invocation: Invocation) {
+        if let Some(process) = self.process.upgrade() {
+            process.focus_pill_and_dispatch(self.id, index, invocation);
+        }
+    }
+
+    pub fn pill_click(&self, index: usize, modifiers: gtk::gdk::ModifierType) {
+        if let Some(process) = self.process.upgrade() {
+            process.pill_click(self.id, index, modifiers);
+        }
+    }
+
+    pub fn focus_pill(&self, index: usize) {
+        if let Some(process) = self.process.upgrade() {
+            process.focus_pill(self.id, index);
+        }
+    }
+
+    pub fn clear_pill_selection(&self) {
+        if let Some(process) = self.process.upgrade() {
+            process.clear_pill_selection(self.id);
+        }
+    }
+
+    pub fn close_pill(self: &Rc<Self>, index: usize) {
+        let Some(window) = self.workspace_window() else {
+            return;
         };
-        let outcome = Registry::new().dispatch(caller, &invocation, &mut handler);
-        match outcome {
-            Outcome::Error(error) => crate::log!("command", "{error}"),
-            Outcome::DryRun(lines) => {
-                crate::log!(
-                    "command",
-                    "{} dry run: {} lines",
-                    invocation.name(),
-                    lines.len()
-                )
-            }
-            Outcome::Done => {}
-        }
-    }
-
-    pub fn handle_command(self: &Rc<Self>, caller: Caller, command: &CheckedCommand) -> Outcome {
-        crate::log!(
-            "command",
-            "{} via {caller} ({})",
-            command.name(),
-            command.effect()
-        );
-        if command.effect() != Effect::Settings {
-            crate::log!("command", "command: {} not built yet", command.name());
-            return Outcome::Done;
-        }
-
-        let change = {
-            let config = self.config.borrow();
-            let current = &config.config().home;
-            config::change_for(command, config.config(), current)
+        let Some(group_id) = window.pills.get(index).copied() else {
+            return;
         };
-        let Some(change) = change else {
-            crate::log!(
-                "command",
-                "{}: no config change could be made",
-                command.name()
-            );
-            return Outcome::Done;
+        let Some(group) = window.groups.get(&group_id) else {
+            return;
         };
-        let applied = self.config.borrow_mut().apply(change.clone());
-        match &applied {
-            Ok(()) => crate::log!("command", "{} applied", command.name()),
-            // `apply` still updates the in-memory config when the file cannot
-            // be written; the current session keeps the change (P2c).
-            Err(error) => crate::log!("config", "{error}"),
-        }
-        self.after_change(&change);
-        Outcome::Done
-    }
-
-    fn after_change(self: &Rc<Self>, change: &Change) {
-        match change {
-            Change::SetScale(_) => self.apply_scale(),
-            Change::SetOpacity(opacity) => {
-                self.look.borrow_mut().set_opacity(*opacity);
-                crate::log!("opacity", "setting {opacity:.2}: blur follows live");
-            }
-            Change::SetSidebarCollapsed { side, collapsed } => {
-                self.toggle_sidebar_to(*side, *collapsed);
-            }
-            Change::SetSidebarWidth { side, width } => {
-                let design = f64::from(*width);
-                if *side == Side::Left {
-                    self.left_width.set(design);
-                } else {
-                    self.right_width.set(design);
-                }
-                self.apply_positions(true);
-                crate::log!("sidebar", "saved {} width {width} design px", side.as_str());
-            }
-            other => crate::log!("command", "change applied: {other:?}"),
+        if group.is_split() {
+            self.header.confirm_group(self, index, group.tabs.len());
+        } else {
+            self.focus_and_dispatch(index, Invocation::new("tab.close", Vec::new()));
         }
     }
 
-    fn log_startup(&self) {
-        let config = self.config.borrow();
-        let config = config.config();
-        crate::log!(
-            "config",
-            "scale {:.2} (base {:.2}), opacity {:.2}, font {:?}, left collapsed {} width {}, right collapsed {} width {}",
-            config.look.scale,
-            config.look.base,
-            config.look.opacity,
-            config.look.font,
-            config.sidebars.left.collapsed,
-            config.sidebars.left.width,
-            config.sidebars.right.collapsed,
-            config.sidebars.right.width,
-        );
+    pub fn confirm_and_close_group(self: &Rc<Self>, index: usize, tabs: usize) {
+        self.header.confirm_group(self, index, tabs);
+    }
+
+    pub fn focus_path(&self) {
+        self.header.focus_path();
+    }
+
+    pub fn open_search(&self, query: Option<&str>) {
+        self.header.open_search(query);
+    }
+
+    pub fn refresh_header(self: &Rc<Self>, fade: bool) {
+        self.header.rebuild(self, fade);
+    }
+
+    pub fn update_content(&self) {
+        let Some(window) = self.workspace_window() else {
+            self.content_label.set_text("No window");
+            return;
+        };
+        let Some(group) = window.focused_group() else {
+            self.content_label.set_text("No tabs");
+            return;
+        };
+        let text = if group.is_split() {
+            let folders: Vec<String> = group
+                .layout
+                .columns
+                .iter()
+                .flat_map(|column| column.iter())
+                .filter_map(|id| group.tab(*id))
+                .map(|tab| tab.folder.display().to_string())
+                .collect();
+            folders.join("\n")
+        } else {
+            group
+                .tabs
+                .first()
+                .map(|tab| tab.folder.display().to_string())
+                .unwrap_or_default()
+        };
+        self.content_label.set_text(&text);
     }
 
     fn scale(&self) -> f64 {
-        let config = self.config.borrow();
-        config.config().look.base * config.config().look.scale
+        self.process
+            .upgrade()
+            .map(|process| process.scale())
+            .unwrap_or(1.0)
     }
 
-    fn wire(self: &Rc<Self>) {
-        let weak = Rc::downgrade(self);
-        self.outer
-            .connect_notify_local(Some("max-position"), move |_, _| {
-                if let Some(app) = weak.upgrade()
-                    && app.outer.max_position() > 0
-                {
-                    app.apply_positions(false);
-                }
-            });
-        let weak = Rc::downgrade(self);
-        self.inner
-            .connect_notify_local(Some("max-position"), move |_, _| {
-                if let Some(app) = weak.upgrade() {
-                    app.on_inner_max_position();
-                }
-            });
-        let weak = Rc::downgrade(self);
-        self.outer
-            .connect_notify_local(Some("position"), move |paned, _| {
-                if let Some(app) = weak.upgrade() {
-                    app.on_outer_position(paned);
-                }
-            });
-        let weak = Rc::downgrade(self);
-        self.inner
-            .connect_notify_local(Some("position"), move |paned, _| {
-                if let Some(app) = weak.upgrade() {
-                    app.on_inner_position(paned);
-                }
-            });
-
-        for (button, left) in [(&self.left_button, true), (&self.right_button, false)] {
-            let weak = Rc::downgrade(self);
-            let side = if left { "left" } else { "right" };
-            button.connect_clicked(move |_| {
-                if let Some(app) = weak.upgrade() {
-                    app.dispatch(
-                        Caller::Ui,
-                        Invocation::new(
-                            "view.toggle-sidebar",
-                            vec![("side".to_string(), side.to_string())],
-                        ),
-                    );
-                }
-            });
-        }
-
-        // GtkPaned has no drag-end signal. A capture-phase legacy controller
-        // sees the button release without claiming the sequence the handle's
-        // own gesture uses; that is when a border drag's width is written.
-        let release = gtk::EventControllerLegacy::new();
-        release.set_propagation_phase(gtk::PropagationPhase::Capture);
-        let weak = Rc::downgrade(self);
-        release.connect_event(move |_, event| {
-            if event.event_type() == gtk::gdk::EventType::ButtonRelease
-                && let Some(app) = weak.upgrade()
-            {
-                app.flush_widths();
-            }
-            gtk::glib::Propagation::Proceed
-        });
-        self.window.add_controller(release);
-
-        // A drag that ends by losing the window also keeps what it reached.
-        let weak = Rc::downgrade(self);
-        self.window
-            .connect_notify_local(Some("is-active"), move |window, _| {
-                if !window.is_active()
-                    && let Some(app) = weak.upgrade()
-                {
-                    app.flush_widths();
-                }
-            });
-
-        commands::install_hotkeys(self, self.window.upcast_ref::<gtk::Window>());
+    pub fn set_opacity(&self, opacity: f64) {
+        self.blur.borrow_mut().set_opacity(opacity);
     }
 
-    fn apply_scale(self: &Rc<Self>) {
+    pub fn apply_scale(self: &Rc<Self>) {
         let scale = self.scale();
-        self.look.borrow_mut().set_scale(scale);
+        self.blur.borrow_mut().set_scale(scale);
+        self.header.set_scale(self, scale);
         let px = |token: f64| scaled(token, scale);
         if !self.animating(true) {
             self.left_root.set_width_request(px(SIDEBAR_MIN));
@@ -427,6 +375,140 @@ impl App {
         );
     }
 
+    pub fn set_saved_sidebar_width(self: &Rc<Self>, side: Side, width: u32) {
+        let design = f64::from(width);
+        if side == Side::Left {
+            self.left_width.set(design);
+        } else {
+            self.right_width.set(design);
+        }
+        self.apply_positions(true);
+    }
+
+    fn wire(self: &Rc<Self>) {
+        let weak = Rc::downgrade(self);
+        self.outer
+            .connect_notify_local(Some("max-position"), move |_, _| {
+                if let Some(ui) = weak.upgrade()
+                    && ui.outer.max_position() > 0
+                {
+                    ui.apply_positions(false);
+                }
+            });
+        let weak = Rc::downgrade(self);
+        self.inner
+            .connect_notify_local(Some("max-position"), move |_, _| {
+                if let Some(ui) = weak.upgrade() {
+                    ui.on_inner_max_position();
+                }
+            });
+        let weak = Rc::downgrade(self);
+        self.outer
+            .connect_notify_local(Some("position"), move |paned, _| {
+                if let Some(ui) = weak.upgrade() {
+                    ui.on_outer_position(paned);
+                }
+            });
+        let weak = Rc::downgrade(self);
+        self.inner
+            .connect_notify_local(Some("position"), move |paned, _| {
+                if let Some(ui) = weak.upgrade() {
+                    ui.on_inner_position(paned);
+                }
+            });
+
+        for (button, left) in [(&self.left_button, true), (&self.right_button, false)] {
+            let ui = self.clone();
+            let side = if left { "left" } else { "right" };
+            button.connect_clicked(move |_| {
+                ui.dispatch(
+                    Caller::Ui,
+                    Invocation::new(
+                        "view.toggle-sidebar",
+                        vec![("side".to_string(), side.to_string())],
+                    ),
+                );
+            });
+        }
+
+        // GtkPaned has no drag-end signal. A capture-phase legacy controller
+        // sees the button release without claiming the handle's own gesture.
+        let release = gtk::EventControllerLegacy::new();
+        release.set_propagation_phase(gtk::PropagationPhase::Capture);
+        let weak = Rc::downgrade(self);
+        release.connect_event(move |_, event| {
+            if event.event_type() == gtk::gdk::EventType::ButtonRelease
+                && let Some(ui) = weak.upgrade()
+            {
+                ui.flush_widths();
+            }
+            gtk::glib::Propagation::Proceed
+        });
+        self.window.add_controller(release);
+
+        // A drag that ends by losing the window keeps what it reached; an
+        // activation also focuses this window's model window.
+        let weak = Rc::downgrade(self);
+        self.window
+            .connect_notify_local(Some("is-active"), move |window, _| {
+                let Some(ui) = weak.upgrade() else {
+                    return;
+                };
+                if window.is_active() {
+                    if let Some(process) = ui.process.upgrade() {
+                        process.activate_window(ui.id);
+                    }
+                } else {
+                    ui.flush_widths();
+                }
+            });
+
+        // Closing the GTK window runs the one command path. The model's
+        // WindowClosed event is what destroys the widget.
+        let weak = Rc::downgrade(self);
+        self.window.connect_close_request(move |_| {
+            if let Some(ui) = weak.upgrade() {
+                ui.dispatch(Caller::Ui, Invocation::new("window.close", Vec::new()));
+            }
+            gtk::glib::Propagation::Stop
+        });
+
+        let weak = Rc::downgrade(self);
+        self.window.connect_destroy(move |_| {
+            if let Some(ui) = weak.upgrade()
+                && let Some(process) = ui.process.upgrade()
+            {
+                process.forget_window(ui.id);
+            }
+        });
+
+        // Escape closes an empty search (and then clears a pill selection).
+        let keys = gtk::EventControllerKey::new();
+        keys.set_propagation_phase(gtk::PropagationPhase::Bubble);
+        let weak = Rc::downgrade(self);
+        keys.connect_key_pressed(move |_, key, _, _| {
+            if key != gtk::gdk::Key::Escape {
+                return gtk::glib::Propagation::Proceed;
+            }
+            if let Some(ui) = weak.upgrade() {
+                ui.header.escape(&ui)
+            } else {
+                gtk::glib::Propagation::Proceed
+            }
+        });
+        self.window.add_controller(keys);
+
+        // A click on the body closes an open, empty search: the body is not
+        // focusable, so the entry's focus-leave never fires.
+        let click = gtk::GestureClick::new();
+        click.set_button(1);
+        let header = self.header.clone();
+        click.connect_released(move |_, _, _, _| header.dismiss_empty_search());
+        self.content_frame.add_controller(click);
+
+        commands::install_hotkeys(self, self.window.upcast_ref::<gtk::Window>());
+    }
+
     fn on_inner_max_position(&self) {
         if self.animating(false) {
             return;
@@ -446,7 +528,6 @@ impl App {
         let position = paned.position();
         let visible = layout::left_from_position(position, self.scale());
         if self.animating(true) {
-            // An animation frame is ours: it is not a drag.
             self.expected_left.set(position);
             return;
         }
@@ -509,8 +590,10 @@ impl App {
         }
     }
 
-    /// Write the widths a just-finished border drag reached, once each.
     fn flush_widths(&self) {
+        let Some(process) = self.process.upgrade() else {
+            return;
+        };
         let scale = self.scale();
         for left in [true, false] {
             let pending = if left {
@@ -524,7 +607,7 @@ impl App {
             let min = if left { SIDEBAR_MIN } else { PREVIEW_MIN };
             let design = ((visible as f64) / scale).round().max(min) as u32;
             let side = if left { Side::Left } else { Side::Right };
-            let applied = self.config.borrow_mut().apply(Change::SetSidebarWidth {
+            let applied = process.config.borrow_mut().apply(Change::SetSidebarWidth {
                 side,
                 width: design,
             });
@@ -696,8 +779,8 @@ impl App {
                 return;
             }
             let width = layout::motion_width(start, end, v);
-            if let Some(app) = weak.upgrade() {
-                app.frame_sidebar(left, width);
+            if let Some(ui) = weak.upgrade() {
+                ui.frame_sidebar(left, width);
             }
         });
         let duration = if start == end { 1 } else { motion::ms(200) };
@@ -708,8 +791,8 @@ impl App {
             if done_cell.get() != generation {
                 return;
             }
-            if let Some(app) = done_weak.upgrade() {
-                app.finish_sidebar(left);
+            if let Some(ui) = done_weak.upgrade() {
+                ui.finish_sidebar(left);
             }
         });
         let scale = self.scale();
@@ -724,9 +807,7 @@ impl App {
         animation.play();
     }
 
-    /// Animate a sidebar to `target_collapsed`, starting at the edge it has
-    /// right now (so a second click mid-animation reverses it).
-    fn toggle_sidebar_to(self: &Rc<Self>, side: Side, target_collapsed: bool) {
+    pub fn toggle_sidebar_to(self: &Rc<Self>, side: Side, target_collapsed: bool) {
         let left = side == Side::Left;
         let running = {
             let slot = self.anim_slot(left);
@@ -888,16 +969,6 @@ fn rule() -> gtk::Box {
     rule
 }
 
-fn icon_button(icon: &str) -> gtk::Button {
-    let button = gtk::Button::new();
-    button.set_child(Some(&gtk::Image::from_icon_name(icon)));
-    button.add_css_class("gl-icon-button");
-    button
-}
-
-/// A panel title row with the collapse button's 48 × 48 slot. The button
-/// itself is an overlay child of the sidebar host, so the row keeps its exact
-/// size during a collapse.
 fn title_row(title: &str, icon: &str, button_first: bool) -> (gtk::Box, gtk::Button) {
     let row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     let label = gtk::Label::new(Some(title));
@@ -918,6 +989,13 @@ fn title_row(title: &str, icon: &str, button_first: bool) -> (gtk::Box, gtk::But
     (row, button)
 }
 
+fn icon_button(icon: &str) -> gtk::Button {
+    let button = gtk::Button::new();
+    button.set_child(Some(&gtk::Image::from_icon_name(icon)));
+    button.add_css_class("gl-icon-button");
+    button
+}
+
 fn panel(title: &str, icon: &str, button_first: bool) -> (gtk::Box, gtk::Button) {
     let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
     root.add_css_class("gl-panel");
@@ -928,12 +1006,6 @@ fn panel(title: &str, icon: &str, button_first: bool) -> (gtk::Box, gtk::Button)
     (root, button)
 }
 
-/// A sidebar host: an overlay whose main child is an `EXTERNAL` horizontal
-/// scroller around the panel. EXTERNAL is what makes the paned move a
-/// clipping viewport instead of squeezing the panel
-/// (gtk-4.22.4:gtk/gtkscrolledwindow.c:1843-1855,
-/// gtk/gtkviewport.c:496-566). The outline and button are overlays, so they
-/// are not clipped.
 fn sidebar_host(
     panel: &gtk::Box,
     button: &gtk::Button,
@@ -961,8 +1033,6 @@ fn sidebar_host(
     host.set_child(Some(&clip));
     host.add_overlay(&outline);
     host.add_overlay(button);
-    // A wheel or trackpad must not slide the clipped panel: pin the adjustment
-    // to its anchor whenever GTK or an input device moves it.
     let adjustment = clip.hadjustment();
     let pin = move |adjustment: &gtk::Adjustment| {
         let anchor = if left {

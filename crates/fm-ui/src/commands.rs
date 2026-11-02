@@ -2,16 +2,19 @@
 //! Hotkey bindings and the UI's command handler.
 //!
 //! The mapping from the config's hotkey table to invocations is pure and
-//! tested. GTK's controller only adds the widget plumbing.
+//! tested. GTK's controller only adds the widget plumbing; every hotkey runs
+//! through its own window, which is focused before the command dispatches.
 
 use std::collections::BTreeMap;
 use std::rc::Weak;
 
 use fm_core::command::{Caller, CheckedCommand, Handler, Invocation, Outcome};
 use fm_core::config::Hotkey;
+use fm_core::workspace::WindowId;
 use gtk::prelude::WidgetExt;
 
-use crate::frame::App;
+use crate::app::Process;
+use crate::frame::WindowUi;
 
 /// One accelerator and the invocation it runs, in the config's sorted order.
 pub fn bindings(hotkeys: &BTreeMap<String, Hotkey>) -> Vec<(String, Invocation)> {
@@ -21,17 +24,18 @@ pub fn bindings(hotkeys: &BTreeMap<String, Hotkey>) -> Vec<(String, Invocation)>
         .collect()
 }
 
-/// The handler gets the caller for the dispatch that reached it. P2b's
-/// `Handler::handle` does not pass one, so the caller travels here instead.
+/// The handler gets the caller and the window for the dispatch that reached
+/// it. `Handler::handle` does not pass either, so they travel here.
 pub struct UiHandler {
     pub caller: Caller,
-    pub app: Weak<App>,
+    pub window: WindowId,
+    pub process: Weak<Process>,
 }
 
 impl Handler for UiHandler {
     fn handle(&mut self, command: &CheckedCommand) -> Outcome {
-        match self.app.upgrade() {
-            Some(app) => app.handle_command(self.caller, command),
+        match self.process.upgrade() {
+            Some(process) => process.handle_command(self.window, self.caller, command),
             None => Outcome::Done,
         }
     }
@@ -39,10 +43,13 @@ impl Handler for UiHandler {
 
 /// Bind every hotkey from the config. An accelerator GTK cannot parse is
 /// logged and skipped; the rest still install.
-pub fn install_hotkeys(app: &std::rc::Rc<App>, window: &gtk::Window) {
+pub fn install_hotkeys(app: &std::rc::Rc<WindowUi>, window: &gtk::Window) {
+    let Some(process) = app.process_upgrade() else {
+        return;
+    };
     let controller = gtk::ShortcutController::new();
     controller.set_scope(gtk::ShortcutScope::Global);
-    let hotkeys = app.hotkeys();
+    let hotkeys = process.hotkeys();
     for (accelerator, invocation) in bindings(&hotkeys) {
         if gtk::accelerator_parse(accelerator.as_str()).is_none() {
             crate::log!(
@@ -64,6 +71,12 @@ pub fn install_hotkeys(app: &std::rc::Rc<App>, window: &gtk::Window) {
             let Some(app) = weak.upgrade() else {
                 return gtk::glib::Propagation::Proceed;
             };
+            if app
+                .process_upgrade()
+                .is_some_and(|process| process.hotkeys_blocked(app.id))
+            {
+                return gtk::glib::Propagation::Proceed;
+            }
             app.dispatch(Caller::Hotkey, invocation.clone());
             gtk::glib::Propagation::Stop
         });

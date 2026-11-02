@@ -162,7 +162,8 @@ pub struct Group {
     /// A user-chosen name, if any.
     pub name: Option<String>,
     /// The number in the default "Group N" label: the lowest number not used
-    /// by another group in its window when the group was made.
+    /// by another split group in its window when this group became a split.
+    /// A single tab's number means nothing and is never shown.
     pub number: u32,
 }
 
@@ -761,7 +762,7 @@ impl Workspace {
                 };
 
                 let mut number = source_group.number;
-                if !numbers.insert(number) {
+                if tabs.len() >= 2 && !numbers.insert(number) {
                     let duplicate = number;
                     number = first_free_number(&numbers);
                     numbers.insert(number);
@@ -878,6 +879,18 @@ impl Workspace {
                 tab: tab_id,
             },
         ])
+    }
+
+    /// Make `id` the most recently focused window. An unknown id is refused.
+    pub fn focus_window(&mut self, id: WindowId) -> Result<Vec<Event>, WorkspaceError> {
+        if !self.windows.iter().any(|window| window.id == id) {
+            return Err(WorkspaceError::NoSuchWindow(id));
+        }
+        if self.focused_window == Some(id) {
+            return Ok(Vec::new());
+        }
+        self.focused_window = Some(id);
+        Ok(vec![Event::WindowFocused(id)])
     }
 
     /// Close the focused window. Closing the last one says so, and the app
@@ -1415,6 +1428,14 @@ impl Workspace {
             target_split_after = group.is_split();
         }
 
+        if target_split_after && !target_split_before {
+            let window = &mut self.windows[window_index];
+            let number = split_number_excluding(window, Some(target_group));
+            if let Some(group) = window.groups.get_mut(&target_group) {
+                group.number = number;
+            }
+        }
+
         let window = &mut self.windows[window_index];
         window.focused_tab = tab_id;
         let had_selection = window.selection.selected.iter().any(|value| *value);
@@ -1932,7 +1953,7 @@ impl Workspace {
                         "group {group_id} is stored under another id"
                     )));
                 }
-                if !numbers.insert(group.number) {
+                if group.is_split() && !numbers.insert(group.number) {
                     return Err(broken(format!(
                         "window {} uses group number {} twice",
                         window.id, group.number
@@ -2291,8 +2312,19 @@ fn reorder_tabs(group: &mut Group) {
 }
 
 fn next_group_number(window: &Window) -> u32 {
+    split_number_excluding(window, None)
+}
+
+/// The lowest positive number no *split* group in the window uses, ignoring
+/// `exclude`. Only splits show "Group N", so a single tab's number never
+/// pushes a real group's label up.
+fn split_number_excluding(window: &Window, exclude: Option<GroupId>) -> u32 {
     let mut number = 1;
-    while window.groups.values().any(|group| group.number == number) {
+    while window
+        .groups
+        .values()
+        .any(|group| group.is_split() && Some(group.id) != exclude && group.number == number)
+    {
         number += 1;
     }
     number
