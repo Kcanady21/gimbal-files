@@ -1837,3 +1837,17 @@ Live, release build, niri-tiled on DP-2 (DP-3 off), wheel injected over the gap 
 Not replayed: dragging a stuck tile by its pill, the ✕ and the right-click menu at the stuck
 position, and the border strip under a stuck tile. They use the same hit tests the unit tests
 cover.
+
+## Kyle's findings after P1m-r7 (Nov 2, 2026): needs fixes (P1m-r8-drag-cancel-pills.md)
+
+- **Right click mid-drag:** drag a tile over a tile in the other column, press the right button,
+  then release the left. The dragged tile goes back, but the target stays where it slid, so the two
+  overlap. Read from the source: the second button resets the single-button `GestureDrag`
+  (`gtkgesturesingle.c:206-214`), and `cancel_drag` slides back only the dragged tile, leaving the
+  others at their preview rects.
+- **The target's pill doesn't follow its tile:** `slide_to` animates only the tile's outer box.
+  Since r6 the pill is a separate `pill_wrap`, which `relayout` moves straight to its final place,
+  and the drop preview doesn't move it at all.
+- Claude's live reproduction stopped early: with DP-3 enabled, the virtual pointer's absolute range
+  covers both outputs, so its coordinates no longer land on DP-2. Live checks need DP-3 off, or the
+  helper has to map coordinates across both outputs.
