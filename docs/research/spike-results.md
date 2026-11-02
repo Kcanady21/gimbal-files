@@ -1,7 +1,7 @@
 # Phase 1 spike results (P1h)
 
 Acceptance run of the Phase 1 toolkit spike, Nov 1, 2026. Claude ran the automated drag rows;
-Kyle ran the hands-on checklist. The verdict at the end is for Kyle to approve.
+Kyle ran the hands-on checklist. Kyle approved the verdict, and Phase 1 finished Nov 2 (see the end).
 
 ## Versions
 
@@ -58,9 +58,9 @@ was intact afterwards in every row.
 | 4 | Open in New Window | pass | |
 | 5 | 100k folder | pass* | Narrowing stops at 2 columns. Expected: the spike's header sets the window's minimum width, which still leaves room for 2 cells (P1e's notes call it the 2-column minimum); the one-column floor was proven in `look-body`. Kyle also found no way to delete: neither the Delete key nor a right-click menu. Deleting was not in the spike; it goes on the Phase 2 feature list. |
 | 6 | Noctalia theme change, spike | pass | Changed live, no restart. |
-| 7 | `look-header` against the sketch | **fail** | See "Look findings" below. In Noctalia's colours; pills reorder, select and deselect; Ctrl+= / Ctrl+- rescale. |
-| 8 | `look-body` against the sketch | **fail** | See "Look findings" below. |
-| 9 | Live scale and theme in both look programs | **fail** | Colours didn't follow a Noctalia change; Ctrl+= / Ctrl+- do nothing (in `look-body`). |
+| 7 | `look-header` against the sketch | **fail**, then pass on rerun | See "Look findings" and "Rerun" below. In Noctalia's colours; pills reorder, select and deselect; Ctrl+= / Ctrl+- rescale. |
+| 8 | `look-body` against the sketch | **fail**, then pass on rerun | See "Look findings" and "Rerun" below. |
+| 9 | Live scale and theme in both look programs | **fail**, then pass on rerun | Colours didn't follow a Noctalia change; Ctrl+= / Ctrl+- do nothing (in `look-body`). |
 | 10 | Transparency and blur | pass | |
 
 ### Why row 9 failed (checked in the code)
@@ -248,4 +248,19 @@ On the strength of these answers, the look-polish briefs `P1l` (header) and `P1m
   - A plain click on a pinned row moves it down one. Click should select, double-click open, and
     only a drag reorder.
   - The highlighted pinned row is intended: it marks the current folder.
-- **Row 9 (live scale and theme in both programs):** not reported yet.
+- **Row 8, final (Nov 2): pass.** P1m-r3 to P1m-r9 added:
+  - rebalance on close, and moving a tile by dropping it between tiles;
+  - border-resized tiles, where vertical borders push the tiles below;
+  - a pinned short column, and stuck tiles whose pill stays in view;
+  - a cancelled drag that restores every tile, and pills that move with their tiles;
+  - an animated sidebar collapse.
+
+  Pinned rows select on click, open on double-click, and only a drag reorders. Every animation is
+  now 1.5× slower through one shared setting (`look_shared/motion.rs`). Kyle: "aesthetically it's
+  pretty much there … we've hit the foundation of the aesthetics".
+- **Row 9 (live scale and theme in both programs), Nov 2: pass.** Kyle: "Scale and Theme change
+  works".
+
+**Phase 1 is done (Nov 2, 2026).** Every hands-on row passes (3 and 5 with the expected notes
+above), and the toolkit verdict stands. Phase 2 starts from the plan's Phase 2 section, with the
+look carried over from `spike/src/bin/look-*` and the style spec.

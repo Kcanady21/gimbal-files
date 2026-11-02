@@ -90,7 +90,7 @@ P1i and P1j are separate small programs inside the spike (`spike/src/bin/`), so 
 
 ## Phase 2: architecture
 
-**Toolkit: GTK4 + libadwaita.** The P1h acceptance run passed the deal-breakers (drag-out to Zen from any folder, 8 of 8 rows; the 100,000-file folder), and the look rows failed only on polish. Kyle approved the verdict Nov 1. Results: `docs/research/spike-results.md`. The look-polish round P1l (header) and P1m (body) finishes Phase 1's look before Phase 2 builds on it.
+**Toolkit: GTK4 + libadwaita.** The P1h acceptance run passed the deal-breakers (drag-out to Zen from any folder, 8 of 8 rows; the 100,000-file folder), and the look rows failed only on polish. Kyle approved the verdict Nov 1. Results: `docs/research/spike-results.md`. The look-polish rounds P1l (header) and P1m-r1 to r9 (body) finished Phase 1's look. Rows 7–9 passed on rerun, and **Phase 1 is done (Nov 2, 2026)**. Phase 2 builds on `spike/src/bin/look-*`, `look_shared/` and the style spec.
 
 Start after the spike picks a toolkit. The core is UI-agnostic, so a toolkit change later costs only the UI crate.
 
