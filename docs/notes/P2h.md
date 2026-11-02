@@ -1233,3 +1233,32 @@ driving the pointer):
 - pill drag and the accordion;
 - typing in the path bar;
 - a close-and-relaunch restore.
+
+## Live checks finished (Claude, Nov 2, 2026; Kyle asked to finish them)
+
+Release build with the group-number fix, niri-tiled on DP-2, scratch config and state folders.
+Kyle's real config and state were never created. Only the allowed `VK_SUBOPTIMAL` notice was
+logged.
+
+- **Group numbering, live:** pills kyle, a, b, c; Ctrl-click a and b, right-click, Split View.
+  The result is `pills ["kyle", "Group 1 · 2 tabs", "c"]`. The fix shows.
+- **The group ✕:** it opened "Close this group and its 2 tabs?" with Cancel and Close. Cancel kept
+  the group.
+- **Float:** a click turned the window floating (niri `is_floating` true; the log shows
+  `niri toggle-window-floating: exit 0`), and a second click tiled it again.
+  - A few earlier clicks on the window buttons didn't register. Claude's own screenshots trigger
+    niri's "Screenshot captured" notice in the top-right corner, over those buttons. It's a test
+    artefact, not an app bug.
+- **Pill drag:** dragging "c" to the front gave `["c", "kyle", "Group 1 · 2 tabs"]`.
+- **The accordion:** nine more folders through a second launch condensed the strip into "13 tabs"
+  (11 pills, one a group of 2), and the path bar took the space. Hovering listed every pill with
+  its ✕, and the ✕ on "d" closed it.
+- **A real restart:**
+  - the window's Close button saved the session, closed the last window and quit;
+  - relaunching restored the same 11 pills in order, with the same active pill and the group.
+  - One wrinkle: the log printed "session: saved" a second time after `LastWindowClosed`. That
+    was `session::save`'s no-op for an empty workspace, which writes nothing, so the message is
+    misleading but harmless. A later brief can log it only when something was written.
+
+Still unchecked: typing in the path bar and the letter hotkeys (Ctrl+T, Ctrl+W, Ctrl+L). Claude's
+virtual keyboard can't deliver letters, so Kyle needs to try those.
