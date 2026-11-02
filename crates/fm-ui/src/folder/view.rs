@@ -19,7 +19,8 @@ use fm_core::config::{SortBy, SortOrder, SortRule};
 use fm_core::workspace::{FileSelection, TabId, WindowId};
 
 use crate::app::Process;
-use crate::folder::{StatusLine, click_request, is_hidden_name, sort};
+use crate::dnd::{self, DragItem};
+use crate::folder::{ClickRequest, StatusLine, click_request, is_hidden_name, sort};
 use crate::look::icons::{self, MockupIcon};
 use crate::look::tokens::*;
 
@@ -183,6 +184,7 @@ impl FolderView {
 
         this.wire_factory(&factory);
         this.wire_signals();
+        this.attach_background_drop_target();
         this
     }
 
@@ -212,6 +214,7 @@ impl FolderView {
                 click.set_button(1);
                 let right_item = item.downgrade();
                 let item = item.downgrade();
+                let drag_item = item.clone();
                 let weak = Rc::downgrade(&view);
                 click.connect_released(move |gesture, _, _, _| {
                     let Some(view) = weak.upgrade() else {
@@ -252,6 +255,8 @@ impl FolderView {
                     view.right_click_item(info.name().into_os_string(), gesture.widget());
                 });
                 cell.add_controller(right);
+                view.setup_cell_drag_source(&cell, drag_item.clone());
+                view.setup_cell_drop_target(&cell, drag_item);
             });
         }
         {
@@ -574,6 +579,180 @@ impl FolderView {
                     .map(|info| info.name().into_os_string())
             })
             .collect()
+    }
+
+    fn info_for_name(&self, name: &OsString) -> Option<gio::FileInfo> {
+        (0..self.selection.n_items())
+            .filter_map(|position| self.selection.item(position))
+            .filter_map(|object| object.downcast::<gio::FileInfo>().ok())
+            .find(|info| info.name().as_os_str() == name.as_os_str())
+    }
+
+    /// The model's selection becomes the drag set. An unselected pressed item
+    /// is made the only selection first, through the model, exactly as a
+    /// plain click would.
+    fn drag_items(&self, name: OsString) -> Vec<DragItem> {
+        let Some(process) = self.process.upgrade() else {
+            return Vec::new();
+        };
+        if let Some(tab) = self.tab {
+            process.focus_tab(self.window, tab);
+        }
+        let selected = self
+            .wanted
+            .borrow()
+            .iter()
+            .any(|candidate| candidate.as_os_str() == name.as_os_str());
+        if !selected {
+            process.file_click_tab(self.window, self.tab, ClickRequest::Plain(name));
+        }
+        let Some(folder) = self.current.borrow().clone() else {
+            return Vec::new();
+        };
+        let names = self.wanted.borrow().clone();
+        names
+            .into_iter()
+            .map(|name| {
+                let is_dir = self
+                    .info_for_name(&name)
+                    .is_some_and(|info| info.file_type() == gio::FileType::Directory);
+                DragItem {
+                    path: folder.join(name),
+                    is_dir,
+                }
+            })
+            .collect()
+    }
+
+    fn setup_cell_drag_source(
+        self: &Rc<Self>,
+        cell: &gtk::Box,
+        item: glib::WeakRef<gtk::ListItem>,
+    ) {
+        let source = gtk::DragSource::new();
+        source.set_actions(gdk::DragAction::COPY | gdk::DragAction::MOVE);
+        let weak = Rc::downgrade(self);
+        let scale = self.scale.clone();
+        source.connect_prepare(move |source, _, _| {
+            let view = weak.upgrade()?;
+            let item = item.upgrade()?;
+            let info = item.item().and_downcast::<gio::FileInfo>()?;
+            let name = info.name().into_os_string();
+            let items = view.drag_items(name.clone());
+            if items.is_empty() {
+                return None;
+            }
+            let first = items
+                .first()
+                .and_then(|item| item.path.file_name())
+                .map(std::ffi::OsString::from);
+            let icon = first
+                .and_then(|name| view.info_for_name(&name))
+                .and_then(|info| info.icon());
+            let paths: Vec<PathBuf> = items.iter().map(|item| item.path.clone()).collect();
+            dnd::set_internal_drag(items.clone());
+            let widget = dnd::drag_icon(icon.as_ref(), items.len(), scale.get());
+            let paintable = gtk::WidgetPaintable::new(Some(&widget));
+            let hot = scaled(ICON_GRID, scale.get()) / 2;
+            source.set_icon(Some(&paintable), hot, hot);
+            crate::log!(
+                "dnd",
+                "prepare: {} item(s), first {}",
+                items.len(),
+                items
+                    .first()
+                    .map(|item| item.path.display().to_string())
+                    .unwrap_or_default()
+            );
+            dnd::content_for(&paths)
+        });
+        let weak_end = Rc::downgrade(self);
+        source.connect_drag_end(move |_, drag, delete_data| {
+            dnd::clear_internal_drag();
+            // GTK4 sets `delete_data` when a drop succeeds with MOVE, and
+            // Firefox/Zen reports MOVE on every Wayland drop. Honouring it
+            // would destroy sources on a copy drag; the drop side moves.
+            crate::log!(
+                "dnd",
+                "drag-end: action={:?} delete_data={} (ignored)",
+                drag.selected_action(),
+                delete_data
+            );
+            if let Some(view) = weak_end.upgrade()
+                && let Some(process) = view.process.upgrade()
+            {
+                process.drag_finished(view.window);
+            }
+        });
+        let weak_cancel = Rc::downgrade(self);
+        source.connect_drag_cancel(move |_, _, _| {
+            dnd::clear_internal_drag();
+            if let Some(view) = weak_cancel.upgrade()
+                && let Some(process) = view.process.upgrade()
+            {
+                process.drag_finished(view.window);
+            }
+            false
+        });
+        cell.add_controller(source);
+    }
+
+    fn setup_cell_drop_target(
+        self: &Rc<Self>,
+        cell: &gtk::Box,
+        item: glib::WeakRef<gtk::ListItem>,
+    ) {
+        let weak = Rc::downgrade(self);
+        let folder: Rc<dyn Fn() -> Option<PathBuf>> = Rc::new(move || {
+            let view = weak.upgrade()?;
+            let item = item.upgrade()?;
+            let info = item.item().and_downcast::<gio::FileInfo>()?;
+            if info.file_type() != gio::FileType::Directory {
+                return None;
+            }
+            let folder = view.current.borrow().clone()?;
+            Some(folder.join(info.name()))
+        });
+        dnd::attach_folder_target(
+            cell,
+            self.process.clone(),
+            self.window,
+            folder,
+            Some("only folders are drop targets"),
+            None,
+        );
+    }
+
+    fn attach_background_drop_target(self: &Rc<Self>) {
+        let weak = Rc::downgrade(self);
+        let folder: Rc<dyn Fn() -> Option<PathBuf>> =
+            Rc::new(move || weak.upgrade()?.current.borrow().clone());
+        // The grid is behind every cell. While a cell is under the pointer
+        // its own target owns the drop and the grid bows out, so a file cell
+        // does not light the whole grid.
+        let grid = self.grid.clone();
+        let mask: Rc<dyn Fn(f64, f64) -> bool> = Rc::new(move |x, y| {
+            let Some(mut widget) = grid.pick(x, y, gtk::PickFlags::DEFAULT) else {
+                return true;
+            };
+            loop {
+                if widget.has_css_class("gl-cell") {
+                    return false;
+                }
+                let Some(parent) = widget.parent() else {
+                    return true;
+                };
+                widget = parent;
+            }
+        });
+        dnd::attach_folder_target(
+            &self.grid,
+            self.process.clone(),
+            self.window,
+            folder,
+            None,
+            Some(mask),
+        );
     }
 
     fn click_item(&self, name: OsString, modifiers: gdk::ModifierType) {

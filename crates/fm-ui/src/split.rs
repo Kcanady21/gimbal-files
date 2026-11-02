@@ -28,6 +28,7 @@ use gtk::glib;
 use gtk::pango;
 
 use crate::app::Process;
+use crate::dnd;
 use crate::folder::FolderView;
 use crate::look::motion;
 use crate::look::tokens::*;
@@ -2165,6 +2166,27 @@ fn attach_handlers(
     pill: &gtk::Box,
     close: &gtk::Button,
 ) {
+    if let Some(inner) = weak.upgrade()
+        && let Some(process) = inner.process.upgrade()
+    {
+        let weak_folder = weak.clone();
+        dnd::attach_folder_target(
+            pill,
+            Rc::downgrade(&process),
+            inner.window,
+            Rc::new(move || {
+                let inner = weak_folder.upgrade()?;
+                let process = inner.process.upgrade()?;
+                process.tab_folder(inner.window, id)
+            }),
+            None,
+            None,
+        );
+        let spring = process.clone();
+        let window = inner.window;
+        dnd::spring_load(pill, Rc::new(move || spring.spring_focus_tab(window, id)));
+    }
+
     let click = gtk::GestureClick::new();
     click.set_button(1);
     click.set_propagation_phase(gtk::PropagationPhase::Capture);

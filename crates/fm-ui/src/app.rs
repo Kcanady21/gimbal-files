@@ -22,6 +22,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use crate::commands;
+use crate::dnd::{self, DropModifiers};
 use crate::fileops::{self, FileOps, ProgressView, clipboard, dialogs, menu as menus, progress};
 use crate::folder::ClickRequest;
 use crate::frame::WindowUi;
@@ -41,6 +42,12 @@ pub struct Process {
     debounce: Cell<Debounce>,
     preserve_bad: Cell<bool>,
     fileops: RefCell<Option<Rc<FileOps>>>,
+    /// The session was empty, so `restore_session` opened a home tab that no
+    /// one asked for. The first command-line open may reuse it (P2l item 5).
+    fresh_home: Cell<bool>,
+    /// A spring-loaded tab focuses the model without rebuilding the header,
+    /// which would unparent the pill the drag is over.
+    suppress_header: Cell<bool>,
 }
 
 impl Process {
@@ -98,6 +105,8 @@ impl Process {
             debounce: Cell::new(Debounce::new(SAVE_DELAY_MS)),
             preserve_bad: Cell::new(false),
             fileops: RefCell::new(None),
+            fresh_home: Cell::new(false),
+            suppress_header: Cell::new(false),
         });
         let fileops = FileOps::new(&process);
         *process.fileops.borrow_mut() = Some(fileops);
@@ -130,6 +139,13 @@ impl Process {
             self.preserve_bad.set(true);
         }
         let empty = workspace.windows.is_empty();
+        // A missing session file means this is a fresh start; its automatic
+        // home tab may be reused by the first command-line open.
+        let fresh = self
+            .session_path
+            .as_ref()
+            .is_none_or(|path| !path.is_file());
+        self.fresh_home.set(fresh);
         *self.workspace.borrow_mut() = workspace;
         crate::log!(
             "session",
@@ -352,6 +368,214 @@ impl Process {
         self.finish(result);
     }
 
+    pub fn clear_fresh_home(&self) {
+        self.fresh_home.set(false);
+    }
+
+    fn focused_window_id(&self) -> Option<WindowId> {
+        self.workspace.borrow().focused_window
+    }
+
+    /// Command-line arguments: a folder is a tab; files in one folder share a
+    /// tab with all of them selected (P2l item 5).
+    pub fn open_arguments(self: &Rc<Self>, paths: &[PathBuf], reuse_fresh: bool) {
+        let groups = crate::cli::group_arguments(paths, &|path| path.is_dir());
+        if groups.is_empty() {
+            return;
+        }
+        let mut reuse = reuse_fresh && self.fresh_home.replace(false);
+        for group in groups {
+            let Some(window) = self.focused_window_id() else {
+                return;
+            };
+            match group {
+                crate::cli::Argument::Folder(folder) => {
+                    crate::log!("launch", "argument folder {}", folder.display());
+                    if reuse {
+                        self.nav_go_path(window, folder);
+                    } else {
+                        self.open_request(&[folder]);
+                    }
+                }
+                crate::cli::Argument::Files { folder, names } => {
+                    crate::log!(
+                        "launch",
+                        "argument files in {}: {:?}",
+                        folder.display(),
+                        names
+                    );
+                    if reuse {
+                        self.nav_go_select(window, folder.clone(), &names);
+                    } else {
+                        self.open_request(std::slice::from_ref(&folder));
+                    }
+                    let Some(window) = self.focused_window_id() else {
+                        return;
+                    };
+                    self.selection_all(window, &names);
+                    crate::log!(
+                        "launch",
+                        "command line selected {} file(s) in {}: {:?}",
+                        names.len(),
+                        folder.display(),
+                        names
+                    );
+                }
+            }
+            reuse = false;
+        }
+        if let Some(window) = self.focused_window_id() {
+            let tabs = self
+                .window_snapshot(window)
+                .map(|window| window.tab_count())
+                .unwrap_or(0);
+            let selected = self
+                .window_snapshot(window)
+                .and_then(|window| {
+                    window
+                        .tab(window.focused_tab)
+                        .map(|tab| tab.selection.names.len())
+                })
+                .unwrap_or(0);
+            crate::log!(
+                "launch",
+                "command line done: {tabs} tab(s), {selected} selected in the focused tab"
+            );
+        }
+    }
+
+    pub fn tab_folder(&self, window: WindowId, tab: TabId) -> Option<PathBuf> {
+        self.window_snapshot(window)
+            .and_then(|window| window.tab(tab).map(|tab| tab.folder.clone()))
+    }
+
+    /// 700 ms over a header pill focuses its tab without rebuilding the header
+    /// (which would remove the pill under the drag).
+    pub fn spring_focus_pill(self: &Rc<Self>, window: WindowId, index: usize) {
+        self.suppress_header.set(true);
+        self.focus_model_window(window);
+        let result = self.workspace.borrow_mut().pill_click(index);
+        self.finish(result);
+        self.suppress_header.set(false);
+        if let Some(ui) = self.window(window) {
+            ui.update_content();
+        }
+        crate::log!("dnd", "spring-loaded header pill {index}");
+    }
+
+    /// The same for a split tile's pill.
+    pub fn spring_focus_tab(self: &Rc<Self>, window: WindowId, tab: TabId) {
+        self.suppress_header.set(true);
+        self.focus_model_window(window);
+        let result = self.workspace.borrow_mut().focus_tab(tab);
+        self.finish(result);
+        self.suppress_header.set(false);
+        if let Some(ui) = self.window(window) {
+            ui.update_content();
+        }
+        crate::log!("dnd", "spring-loaded tile {tab}");
+    }
+
+    /// A drag ended: the header can follow the spring-loaded focus again.
+    pub fn drag_finished(self: &Rc<Self>, window: WindowId) {
+        if let Some(ui) = self.window(window) {
+            ui.refresh_header(false);
+            ui.update_content();
+        }
+    }
+
+    pub fn show_drop_reason(&self, window: WindowId, reason: &str) {
+        crate::log!("dnd", "refused: {reason}");
+        if let Some(ui) = self.window(window) {
+            ui.show_summary(&format!("Cannot drop: {reason}"), None);
+        }
+    }
+
+    /// Submit a folder drop after the asynchronous filesystem check. The
+    /// worker owns the conflict dialog, progress, Cancel and undo.
+    pub fn drop_on_folder(
+        self: &Rc<Self>,
+        window: WindowId,
+        target: PathBuf,
+        paths: Vec<PathBuf>,
+        modifiers: DropModifiers,
+    ) {
+        if paths.is_empty() {
+            return;
+        }
+        if let Err(reason) = dnd::validate_folder_drop(&target, &paths) {
+            self.show_drop_reason(window, &reason);
+            return;
+        }
+        let first = paths[0].clone();
+        let count = paths.len();
+        let weak = Rc::downgrade(self);
+        dnd::same_filesystem_async(first, target.clone(), move |same| {
+            let Some(process) = weak.upgrade() else {
+                return;
+            };
+            let operation =
+                dnd::operation_for(&dnd::Target::Grid(target.clone()), &paths, same, modifiers);
+            let (request, action) = match operation {
+                Ok(dnd::Operation::Copy { to }) => {
+                    (Request::Copy { paths, to }, dnd::DropAction::Copy)
+                }
+                Ok(dnd::Operation::Move { to }) => {
+                    (Request::Move { paths, to }, dnd::DropAction::Move)
+                }
+                Ok(_) => return,
+                Err(reason) => {
+                    process.show_drop_reason(window, &reason);
+                    return;
+                }
+            };
+            if let Some(fileops) = process.fileops() {
+                let id = fileops.submit(window, request, false);
+                crate::log!(
+                    "dnd",
+                    "drop {count} item(s) into {}: same filesystem {same}, modifiers {}, action {:?} -> job {id}",
+                    target.display(),
+                    modifiers.as_str(),
+                    action
+                );
+            }
+        });
+    }
+
+    /// The Trash button: `file.trash` for every dropped path, modifiers
+    /// ignored.
+    pub fn drop_on_trash(self: &Rc<Self>, window: WindowId, paths: Vec<PathBuf>) {
+        if paths.is_empty() {
+            return;
+        }
+        let count = paths.len();
+        if let Some(fileops) = self.fileops() {
+            let id = fileops.submit(window, Request::Trash { paths }, false);
+            crate::log!("dnd", "drop {count} item(s) on the Trash -> job {id}");
+        }
+    }
+
+    /// Pin dropped folders, one `pins.add` per folder. Files are filtered by
+    /// the caller before this point.
+    pub fn pin_folders(self: &Rc<Self>, window: WindowId, folders: Vec<PathBuf>) {
+        for folder in folders {
+            let Some(path) = folder.to_str() else {
+                crate::log!(
+                    "dnd",
+                    "cannot pin the non-UTF-8 folder {}",
+                    folder.display()
+                );
+                continue;
+            };
+            crate::log!("dnd", "pin {}", folder.display());
+            self.dispatch_for_window(
+                window,
+                Caller::Ui,
+                Invocation::new("pins.add", vec![("path".to_string(), path.to_string())]),
+            );
+        }
+    }
+
     /// A grid click in one split tile: focus that tab first, then select, and
     /// apply both operations' events as one update.
     pub fn file_click_tab(
@@ -478,6 +702,17 @@ impl Process {
     pub fn nav_go_path(self: &Rc<Self>, window: WindowId, path: PathBuf) {
         self.focus_model_window(window);
         let result = self.workspace.borrow_mut().nav_go(path, None);
+        self.finish(result);
+    }
+
+    /// The command line's file form: `nav_go(folder, select)` picks the first
+    /// name, then `selection_all` adds the rest of the group.
+    fn nav_go_select(self: &Rc<Self>, window: WindowId, path: PathBuf, names: &[OsString]) {
+        self.focus_model_window(window);
+        let result = self
+            .workspace
+            .borrow_mut()
+            .nav_go(path, names.first().cloned());
         self.finish(result);
     }
 
@@ -658,7 +893,9 @@ impl Process {
 
     fn refresh(self: &Rc<Self>, id: WindowId, fade: bool) {
         if let Some(ui) = self.window(id) {
-            ui.refresh_header(fade);
+            if !self.suppress_header.get() {
+                ui.refresh_header(fade);
+            }
             ui.update_content();
         }
     }

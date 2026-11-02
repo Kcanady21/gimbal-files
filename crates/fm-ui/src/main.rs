@@ -6,8 +6,10 @@
 //! instance through GApplication's open signal.
 
 mod app;
+mod cli;
 mod commands;
 mod content;
+mod dnd;
 mod events;
 mod fileops;
 mod folder;
@@ -65,6 +67,7 @@ fn activate(application: &adw::Application) {
     let (process, created) = ensure_process(application);
     if created {
         crate::log!("fm_ui", "activated; the session is restored");
+        process.clear_fresh_home();
     } else {
         crate::log!("fm_ui", "activated again; opening a window at home");
         process.open_request(&[]);
@@ -73,10 +76,10 @@ fn activate(application: &adw::Application) {
 
 fn open(application: &adw::Application, files: &[gio::File], hint: &str) {
     let (process, created) = ensure_process(application);
-    let paths: Vec<PathBuf> = files.iter().filter_map(folder_for).collect();
+    let paths: Vec<PathBuf> = files.iter().filter_map(|file| file.path()).collect();
     crate::log!(
         "fm_ui",
-        "open ({hint}) with {} folder argument(s): {paths:?}",
+        "open ({hint}) with {} argument(s): {paths:?}",
         paths.len()
     );
     if created {
@@ -86,20 +89,8 @@ fn open(application: &adw::Application, files: &[gio::File], hint: &str) {
         );
     }
     if !paths.is_empty() {
-        process.open_request(&paths);
-    }
-}
-
-/// A folder argument opens itself; a file argument opens its parent folder.
-fn folder_for(file: &gio::File) -> Option<PathBuf> {
-    let path = file.path()?;
-    if path.is_dir() {
-        Some(path)
+        process.open_arguments(&paths, created);
     } else {
-        Some(
-            path.parent()
-                .map(std::path::Path::to_path_buf)
-                .unwrap_or(path),
-        )
+        process.clear_fresh_home();
     }
 }

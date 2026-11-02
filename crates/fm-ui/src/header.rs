@@ -17,11 +17,11 @@ use fm_core::command::{Caller, Invocation};
 use fm_core::workspace::{Group, Window, WindowId};
 use gtk::{gdk, glib, pango};
 
+use crate::dnd;
 use crate::frame::WindowUi;
 use crate::look::motion;
 use crate::look::tokens::*;
 use crate::platform;
-
 const FADE_MS: u32 = 200;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -33,6 +33,9 @@ pub struct PillView {
     pub tabs: usize,
     pub active: bool,
     pub selected: bool,
+    /// The folder a drop on this pill goes into: the group's focused tab when
+    /// it contains one, else its first tab.
+    pub folder: PathBuf,
 }
 
 #[derive(Clone, Debug)]
@@ -83,6 +86,11 @@ pub fn view(window: &Window) -> HeaderView {
         .enumerate()
         .filter_map(|(index, group_id)| {
             let group = window.groups.get(group_id)?;
+            let folder = group
+                .tab(window.focused_tab)
+                .or_else(|| group.tabs.first())
+                .map(|tab| tab.folder.clone())
+                .unwrap_or_default();
             Some(PillView {
                 index,
                 label: pill_label(group),
@@ -96,6 +104,7 @@ pub fn view(window: &Window) -> HeaderView {
                     .get(index)
                     .copied()
                     .unwrap_or(false),
+                folder,
             })
         })
         .collect();
@@ -618,6 +627,26 @@ impl Header {
             header_cancel.drag_cancel();
         });
         pill.add_controller(drag);
+
+        if let Some(ui) = self.window_ui()
+            && let Some(process) = ui.process_upgrade()
+        {
+            let folder = view.folder.clone();
+            dnd::attach_folder_target(
+                &pill,
+                Rc::downgrade(&process),
+                self.window_id,
+                Rc::new(move || Some(folder.clone())),
+                None,
+                None,
+            );
+            let spring = process.clone();
+            let window = self.window_id;
+            dnd::spring_load(
+                &pill,
+                Rc::new(move || spring.spring_focus_pill(window, index)),
+            );
+        }
 
         let wrapper = pill_revealer(&pill);
         if self.animate_group.get() == Some(index) {
@@ -1142,6 +1171,9 @@ impl Header {
                 ui.dispatch(Caller::Ui, Invocation::new("trash.open", Vec::new()));
             }
         });
+        if let Some(process) = ui.process_upgrade() {
+            dnd::attach_trash_target(&self.trash, Rc::downgrade(&process), self.window_id);
+        }
 
         let window = ui.window().clone();
         let float_action = platform::controls_here().float;

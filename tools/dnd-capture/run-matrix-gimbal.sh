@@ -2,14 +2,19 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Run the 8-row gimbal matrix with automated drags (P1g).
 #
-#   usage: run-matrix-gimbal.sh
+#   usage: run-matrix-gimbal.sh [gimbal|app]
+#
+# `gimbal` (default) is the Phase 1 spike; `app` is the Phase 2
+# target/release/gimbal-files, which takes the row's files on its command line
+# and preselects them (P2l item 5). `app` must not run under a separate session
+# bus and run.sh refuses it while Kyle's own gimbal-files is open.
 #
 # Rows, in this order: for `outside`, then `downloads`:
 #   sample.png; sample-dir; sample-link.png; sample.png,sample.txt
 # (the last row also sets GIMBAL_AUTODRAG_SELECT, so the spike preselects
 # both files before the runner presses on the first row).
 #
-# Each row is a full capture run (run.sh --auto gimbal <location>).  There
+# Each row is a full capture run (run.sh --auto <mode> <location>).  There
 # are 2 s between runs.  The whole matrix stops at the first `aborted:` in a
 # run's result.txt, when run.sh itself fails (an exit code other than 0 or
 # autodrag's abort code 3), or when a run reports `source_intact: no` — a
@@ -17,7 +22,7 @@
 # past.
 #
 # Each row's capture lands in
-#   docs/research/phase0/captures/<timestamp>-gimbal-<location>/
+#   docs/research/phase0/captures/<timestamp>-<mode>-<location>/
 # exactly as in a manual run.
 
 set -u
@@ -25,6 +30,12 @@ set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
 PROJ="/home/kyle/Documents/03.) Code-Projects/gimbal-files"
 CAPS="$PROJ/docs/research/phase0/captures"
+
+MODE="${1:-gimbal}"
+case "$MODE" in
+  gimbal|app) ;;
+  *) echo "usage: $0 [gimbal|app]" >&2; exit 2 ;;
+esac
 
 ROWS=(
   "outside sample.png"
@@ -59,14 +70,14 @@ for row in "${ROWS[@]}"; do
     *,*) sel="$files" ;;
   esac
   echo ""
-  echo "=== gimbal matrix row: $loc $files ==="
+  echo "=== $MODE matrix row: $loc $files ==="
   # snapshot the matching run directories BEFORE the row (P0a2-r1 minor 9):
   # only a run directory new after this row may be read
-  before="$(ls -d "$CAPS/"*-gimbal-"$loc" 2>/dev/null | sort)"
+  before="$(ls -d "$CAPS/"*-"$MODE"-"$loc" 2>/dev/null | sort)"
   GIMBAL_AUTODRAG_FILE="$files" GIMBAL_AUTODRAG_SELECT="$sel" \
-    "$HERE/run.sh" --auto gimbal "$loc"
+    "$HERE/run.sh" --auto "$MODE" "$loc"
   rc=$?
-  after="$(ls -d "$CAPS/"*-gimbal-"$loc" 2>/dev/null | sort)"
+  after="$(ls -d "$CAPS/"*-"$MODE"-"$loc" 2>/dev/null | sort)"
   rundir="$(comm -13 <(printf '%s\n' "$before") <(printf '%s\n' "$after") | head -n1)"
   answer="(no result.txt)"
   intact="(no source_intact line)"
@@ -96,4 +107,4 @@ for row in "${ROWS[@]}"; do
 done
 
 echo ""
-echo "matrix complete: all 8 rows ran without an abort and with source_intact: yes"
+echo "matrix complete: all 8 $MODE rows ran without an abort and with source_intact: yes"

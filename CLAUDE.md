@@ -57,8 +57,11 @@ PATH="$T:$PATH" cargo deny check
 - Whenever you run the app, set `XDG_CONFIG_HOME` and `XDG_STATE_HOME` to folders under
   `/tmp/gimbal-*`, so it never reads or writes Kyle's real `~/.config/gimbal-files` or
   `~/.local/state/gimbal-files`. If Kyle's instance is already running (`pgrep -a gimbal-files`),
-  a plain launch hands its arguments to his window (GApplication) and opens tabs there. Run your
-  copy on its own session bus instead: `dbus-run-session -- target/release/gimbal-files …`.
+  a plain launch hands its arguments to his window (GApplication) and opens tabs there. Don't
+  launch then: write in your notes what still needs a run. Never use `dbus-run-session` to get
+  around it: each private session leaves about 15 services running (accessibility bus, account
+  and volume monitors, portals), and nine such launches used up Kyle's inotify limit, which broke
+  file watching for every app on his desktop.
 - Read-only commands: `niri msg --json …` reads, `pkg-config`, `ls`, `grep`, and reading files
   anywhere.
 

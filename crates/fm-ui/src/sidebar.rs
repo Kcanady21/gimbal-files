@@ -19,6 +19,7 @@ use fm_core::config::{self, Section, SectionState};
 use fm_core::workspace::WindowId;
 
 use crate::app::Process;
+use crate::dnd;
 use crate::look::css::bar_class;
 use crate::look::motion;
 use crate::look::tokens::*;
@@ -88,6 +89,14 @@ impl Sidebar {
         root.append(&scroll);
         root.append(&rule());
         let main = DriveRow::new("Main Drive", true, scale);
+        dnd::attach_folder_target(
+            &main.root,
+            Rc::downgrade(process),
+            window,
+            Rc::new(|| Some(PathBuf::from("/"))),
+            None,
+            None,
+        );
         root.append(&main.root);
 
         let this = Rc::new(Self {
@@ -227,7 +236,15 @@ impl Sidebar {
             if let Some((total, free)) = filesystem(&root) {
                 row.set_values(total, free);
             }
-            attach_click(&row.root, &self.process, self.window, root);
+            attach_click(&row.root, &self.process, self.window, root.clone());
+            dnd::attach_folder_target(
+                &row.root,
+                self.process.clone(),
+                self.window,
+                Rc::new(move || Some(root.clone())),
+                None,
+                None,
+            );
             self.devices_content.append(&row.root);
             rows.push(row);
         }
@@ -791,6 +808,11 @@ impl PinnedList {
         rows.set_hexpand(true);
         rows.set_valign(gtk::Align::Start);
         root.append(&rows);
+        // The empty part of the pinned list is a drop target of its own; the
+        // rows above it have their own targets.
+        let empty = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        empty.add_css_class("gl-pin-empty");
+        root.append(&empty);
         let click = gtk::GestureClick::new();
         let this = Rc::new(Self {
             root,
@@ -854,6 +876,7 @@ impl PinnedList {
             }
         });
         this.rows.add_controller(right);
+        dnd::attach_pin_target(&this.root, this.process.clone(), window);
         this
     }
 
@@ -893,6 +916,15 @@ impl PinnedList {
             name.set_ellipsize(gtk::pango::EllipsizeMode::End);
             row.append(&name);
             self.rows.append_row(&row, (index as i32 * row_h) as f64);
+            let pin = path.clone();
+            dnd::attach_folder_target(
+                &row,
+                self.process.clone(),
+                self.window,
+                Rc::new(move || Some(pin.clone())),
+                None,
+                None,
+            );
             widgets.push(row);
             gens.push(Rc::new(Cell::new(0)));
         }

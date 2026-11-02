@@ -127,6 +127,7 @@ window.gimbal-look, window.gimbal-look.background {{ background-color: {window_b
 .gl-pinned-row image {{ -gtk-icon-size: {ipin}px; }}
 .gl-pinned-row label {{ font-size: {titem}px; margin-left: {gs}px; }}
 .gl-pinned-row.sel {{ background-color: {pin_sel}; }}
+.gl-pin-empty {{ min-height: {pinrow}px; }}
 .gl-dir-row {{ min-height: {dirrow}px; }}
 .gl-dir-row label {{ font-size: {titem}px; }}
 .gl-drive-name {{ font-size: {titem}px; }}
@@ -148,6 +149,8 @@ gridview > child {{ padding: 0; }}
 .gl-tile {{ background-color: {tile}; border: {thin}px solid {OUTLINE}; border-radius: {r}px; color: {FG}; }}
 .gl-tile.focused {{ box-shadow: inset 0 0 0 {thin}px {FOCUS_RING}; }}
 .gl-drop-line {{ background-color: {OUTLINE}; min-height: {thin}px; border-radius: {rp}px; }}
+.gl-drop-target {{ box-shadow: inset 0 0 0 {thin}px {FOCUS_RING}; }}
+.gl-drag-badge {{ min-width: {gs}px; min-height: {gs}px; padding: 0 {gs}px; border-radius: {rp}px; background-color: {OUTLINE}; color: @accent_fg_color; font-size: {ttiny}px; }}
 .gl-status {{ min-height: {statush}px; font-size: {tc}px; }}
 .gl-progress {{ padding: {gs}px {gl}px; }}
 .gl-progress-label {{ font-size: {tsmall}px; color: alpha({FG}, 0.75); }}

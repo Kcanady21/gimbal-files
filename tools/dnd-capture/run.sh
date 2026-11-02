@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Record one Wayland drag-and-drop run: <source app> -> Zen browser tab.
 #
-#   usage: run.sh [--auto] <dolphin|thunar|nautilus|cosmic|gimbal> <outside|downloads>
+#   usage: run.sh [--auto] <dolphin|thunar|nautilus|cosmic|gimbal|app> <outside|downloads>
 #
 # With --auto, the drag itself is performed by autodrag/autodrag.py (P0a2):
 # the launch, capture and cleanup below are unchanged, only the "press
@@ -11,7 +11,9 @@
 # `gimbal` is the Phase 1 GTK4 spike (P1g): the binary at
 # $PROJ/spike/target/release/gimbal-spike, the test folders
 # ~/gimbal-dnd-test-gimbal and ~/Downloads/gimbal-dnd-test-gimbal, and
-# GIMBAL_AUTODRAG_SELECT passed through as --select.  Every source gets a
+# GIMBAL_AUTODRAG_SELECT passed through as --select.  `app` is the Phase 2
+# binary at $PROJ/target/release/gimbal-files, launched with the file paths
+# themselves so P2l item 5 preselects them.  Every source gets a
 # source-integrity check: the dragged files are hashed before the drag and
 # again after cleanup, and result.txt gets `source_intact: yes|no`.
 #
@@ -50,13 +52,19 @@ fi
 SOURCE_APP="${1:-}"
 LOCATION="${2:-}"
 case "$SOURCE_APP" in
-  dolphin|thunar|nautilus|cosmic|gimbal) ;;
-  *) echo "usage: $0 [--auto] <dolphin|thunar|nautilus|cosmic|gimbal> <outside|downloads>" >&2; exit 2 ;;
+  dolphin|thunar|nautilus|cosmic|gimbal|app) ;;
+  *) echo "usage: $0 [--auto] <dolphin|thunar|nautilus|cosmic|gimbal|app> <outside|downloads>" >&2; exit 2 ;;
 esac
 case "$LOCATION" in
   outside|downloads) ;;
-  *) echo "usage: $0 [--auto] <dolphin|thunar|nautilus|cosmic|gimbal> <outside|downloads>" >&2; exit 2 ;;
+  *) echo "usage: $0 [--auto] <dolphin|thunar|nautilus|cosmic|gimbal|app> <outside|downloads>" >&2; exit 2 ;;
 esac
+
+# autodrag's per-app config and AT-SPI lookup are keyed by source name. The
+# Phase 2 app uses the same GTK4 GridView as the spike, so it borrows the
+# spike's config; the capture directory and meta still say `app`.
+AUTO_SOURCE="$SOURCE_APP"
+if [ "$SOURCE_APP" = app ]; then AUTO_SOURCE=gimbal; fi
 
 die() { echo "run.sh: $*" >&2; exit 1; }
 
@@ -66,7 +74,24 @@ for tool in dbus-monitor busctl flatpak python3 gzip sha256sum; do
 done
 [ -n "${WAYLAND_DISPLAY:-}" ] || die "WAYLAND_DISPLAY is not set; run from inside the niri session"
 
-if [ "$SOURCE_APP" = gimbal ]; then
+if [ "$SOURCE_APP" = app ]; then
+  SOURCE_BIN="$PROJ/target/release/gimbal-files"
+  [ -x "$SOURCE_BIN" ] \
+    || die "gimbal-files not found at $SOURCE_BIN — build it with cargo build --release in $PROJ"
+  # A drag into Zen goes through the document portal on Kyle's real session
+  # bus. A second instance would hand its arguments to his window over
+  # GApplication, so the runner refuses to start while his app is up.
+  if pgrep -x gimbal-files >/dev/null 2>&1; then
+    die "gimbal-files is already running (pgrep -x gimbal-files). The app source needs the real session bus and a fresh process; close your window for this run."
+  fi
+  case "$LOCATION" in
+    outside)  FOLDER="$HOME/gimbal-dnd-test-gimbal" ;;
+    downloads) FOLDER="$HOME/Downloads/gimbal-dnd-test-gimbal" ;;
+  esac
+  for f in "$FOLDER/sample.png" "$FOLDER/sample.txt"; do
+    [ -e "$f" ] || die "missing test file $f — run tools/dnd-capture/make-test-files-gimbal.sh first"
+  done
+elif [ "$SOURCE_APP" = gimbal ]; then
   SOURCE_BIN="$PROJ/spike/target/release/gimbal-spike"
   [ -x "$SOURCE_BIN" ] \
     || die "gimbal-spike not found at $SOURCE_BIN — build it with cargo build --release in spike/"
@@ -129,12 +154,19 @@ mkdir -p "$RUNDIR"
 # only summaries (and meta/result) get committed; raw logs are gzipped and ignored
 [ -e "$CAPS/.gitignore" ] || printf '*.log.gz\n' > "$CAPS/.gitignore"
 
+if [ "$SOURCE_APP" = app ]; then
+  SCRATCH="$(mktemp -d "${TMPDIR:-/tmp}/gimbal-dnd-app-XXXXXX")" \
+    || die "could not create the app's scratch folder"
+  mkdir -p "$SCRATCH/config" "$SCRATCH/state"
+  echo "Scratch config/state: $SCRATCH"
+fi
+
 echo "Run directory: $RUNDIR"
 
 # PIDs of everything this script starts; cleanup only ever touches these.
 # The throwaway Zen sandbox is stopped by its flatpak INSTANCE id — never by
 # the app id, which would also stop Kyle's Zen.
-SRC_PID="" ZEN_PID="" ZEN_INSTANCE="" ZEN_INNER_PID="" DBUS_PID=""
+SRC_PID="" ZEN_PID="" ZEN_INSTANCE="" ZEN_INNER_PID="" DBUS_PID="" SCRATCH=""
 
 # Logging only: the browser process inside the sandbox, if its cmdline still
 # carries the profile flag.  Zen may re-launch itself inside the sandbox with
@@ -216,6 +248,11 @@ cleanup() {
     echo "       Stop it manually with:  flatpak kill $ZEN_INSTANCE" >&2
     exit 1
   fi
+  # The app source gets scratch config and state folders (P2l item 6); they
+  # hold no real settings and are removed with the run.
+  case "$SCRATCH" in
+    */gimbal-dnd-app-*) rm -rf "$SCRATCH" ;;
+  esac
 }
 trap cleanup EXIT
 
@@ -305,8 +342,30 @@ case "$SOURCE_APP" in
             if [ -n "${GIMBAL_AUTODRAG_SELECT:-}" ]; then
               SOURCE_ARGS=(--select "$GIMBAL_AUTODRAG_SELECT")
             fi ;;
+  app)      SOURCE_BIN="$PROJ/target/release/gimbal-files"
+            # P2l item 5: the file paths on the command line open their
+            # folder and preselect the files, so no click resets them.
+            SOURCE_ARGS=()
+            IFS=',' read -r -a APP_ITEMS <<< "${GIMBAL_AUTODRAG_FILE:-sample.png}"
+            for item in "${APP_ITEMS[@]}"; do
+              # A file path preselects that file (P2l item 5). A folder is not
+              # selectable by item 5, so open its parent and let autodrag click
+              # the folder row (the matrix's sample-dir row).
+              if [ -d "$FOLDER/$item" ]; then
+                SOURCE_ARGS+=("$FOLDER")
+              else
+                SOURCE_ARGS+=("$FOLDER/$item")
+              fi
+            done ;;
 esac
-WAYLAND_DEBUG=1 "$SOURCE_BIN" "${SOURCE_ARGS[@]}" "$FOLDER" > "$RUNDIR/source.log" 2>&1 &
+if [ "$SOURCE_APP" = app ]; then
+  XDG_CONFIG_HOME="$SCRATCH/config" XDG_STATE_HOME="$SCRATCH/state" \
+    GIMBAL_LOG=1 WAYLAND_DEBUG=1 \
+    "$SOURCE_BIN" "${SOURCE_ARGS[@]}" > "$RUNDIR/source.log" 2>&1 &
+else
+  WAYLAND_DEBUG=1 "$SOURCE_BIN" "${SOURCE_ARGS[@]}" "$FOLDER" \
+    > "$RUNDIR/source.log" 2>&1 &
+fi
 SRC_PID=$!
 sleep 2
 if ! kill -0 "$SRC_PID" 2>/dev/null; then
@@ -364,7 +423,7 @@ if [ -n "$AUTO" ]; then
   GIMBAL_SRC_PID="$SRC_PID" GIMBAL_ZEN_INSTANCE="$ZEN_INSTANCE" \
   GIMBAL_RUNDIR="$RUNDIR" GIMBAL_FOLDER="$FOLDER" \
   python3 -I "$HERE/autodrag/autodrag.py" run \
-    --source "$SOURCE_APP" --location "$LOCATION" \
+    --source "${AUTO_SOURCE:-$SOURCE_APP}" --location "$LOCATION" \
     --file "${GIMBAL_AUTODRAG_FILE:-sample.png}" \
     ${GIMBAL_AUTODRAG_STOP_AFTER:+--stop-after "$GIMBAL_AUTODRAG_STOP_AFTER"} \
     ${GIMBAL_AUTODRAG_HOLD_S:+--hold-s "$GIMBAL_AUTODRAG_HOLD_S"} \
@@ -422,6 +481,8 @@ COSMIC_COMMIT=""
 if [ "$SOURCE_APP" = gimbal ]; then
   # P1b treats --version as an unknown flag (exit 2): never run it.
   SOURCE_VERSION="gimbal-spike sha256:$(sha256sum "$SOURCE_BIN" | cut -c1-12)"
+elif [ "$SOURCE_APP" = app ]; then
+  SOURCE_VERSION="gimbal-files sha256:$(sha256sum "$SOURCE_BIN" | cut -c1-12)"
 elif [ "$SOURCE_APP" = cosmic ]; then
   # cosmic-files has no --version (it parses every flag as a path); use the
   # git commit of Kyle's build in ~/cosmic-files
