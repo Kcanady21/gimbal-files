@@ -798,7 +798,10 @@ struct Tile {
     pill: gtk::Box,
     pill_wrap: gtk::ScrolledWindow,
     view: Rc<FolderView>,
-    displayed_folder: RefCell<Option<PathBuf>>,
+    /// Shared, so `sync_folder` writes the tile's own cell: a cloned
+    /// `RefCell` was a copy, so every model event re-listed every tile and
+    /// dropped its selection (Claude's review, after Kyle's P2k report).
+    displayed_folder: Rc<RefCell<Option<PathBuf>>>,
     gate: Rc<Cell<bool>>,
     _name: String,
 }
@@ -1243,7 +1246,7 @@ impl Inner {
             pill,
             pill_wrap,
             view,
-            displayed_folder: RefCell::new(None),
+            displayed_folder: Rc::new(RefCell::new(None)),
             gate,
             _name: name.to_string(),
         });
@@ -1283,7 +1286,7 @@ impl Inner {
         let Some(tab) = group.tab(id) else {
             return;
         };
-        let (view, displayed, gate) = {
+        let (view, displayed, gate, pill) = {
             let tiles = self.tiles.borrow();
             let Some(tile) = tiles.iter().find(|tile| tile.id == id) else {
                 return;
@@ -1292,6 +1295,7 @@ impl Inner {
                 tile.view.clone(),
                 tile.displayed_folder.clone(),
                 tile.gate.clone(),
+                tile.pill.clone(),
             )
         };
         let folder = tab.folder.clone();
@@ -1311,6 +1315,11 @@ impl Inner {
                 .map(|process| process.config.borrow().config().sort_for(&folder))
                 .unwrap_or_else(default_rule);
             view.set_folder(&folder, rule, anchor, restore_anchor, back_or_forward);
+            // The tile's pill names its folder, so it follows navigation
+            // inside the tile (Kyle, after P2k: it kept the first name).
+            if let Some(label) = pill.first_child().and_downcast::<gtk::Label>() {
+                label.set_text(&folder_name(&folder));
+            }
             *displayed.borrow_mut() = Some(folder);
         }
         gate.set(id == window.focused_tab);

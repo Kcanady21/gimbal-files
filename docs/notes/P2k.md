@@ -845,3 +845,36 @@ and from Dolphin.
 Cosmetic, for a later brief: the Undo menu item's label describes what undo will do, so undoing a
 copy reads "Undo trashed 3 items". "Undo copy of 3 items" would read better. The status line's
 "Undid: trashed 3 items" is fine.
+
+## Fixes after Kyle's check (Claude, Nov 2, 2026)
+
+Kyle reported that cut, copy, paste and undo with keys, Copy To… / Move To…, pasting to and from
+Dolphin, and the progress bar on a large file all work. He also found two problems.
+
+1. **"The tab pill's name doesn't change when a folder inside the tab is entered."**
+   - The header pill already followed navigation (checked: "kyle" → "backups"). The split-view
+     **tile** pills didn't: their label was set once in `add_tile`.
+   - `sync_folder` now sets the tile pill's label to the folder's name whenever the tile's folder
+     changes. Verified: double-clicking `inner` in the right tile changed its pill from "top" to
+     "inner", and the left tile kept "top".
+2. **"No indicator when an item is selected."** There were two causes.
+   - **The style was too faint:** a translucent tint, hard to see on the blurred background.
+     Kyle chose (Nov 2) a solid accent block with the name in the accent's contrasting colour. A
+     selected cell is now `@accent_bg_color` with `@accent_fg_color` text. Its folder icon uses
+     `SELECTED_FOLDER_PALETTE` (`@accent_fg_color`, shading mixed toward the block), so it doesn't
+     vanish into the accent. The test was updated. Verified in the single grid and in a tile.
+   - **Split tiles dropped every selection:**
+     - `sync_folder` cloned `tile.displayed_folder`, a plain `RefCell`, so it wrote to a copy. Each
+       tile always believed it showed nothing, so every model event (a click, a selection, a focus
+       change) re-listed every tile's folder.
+     - The re-list cleared the selection and reset the view, so the grid never showed the
+       selection.
+     - `displayed_folder` is now `Rc<RefCell<…>>`. Verified: after the fix each tile lists its
+       folder once at start, a selection no longer re-lists anything, and both selected items show
+       the accent block.
+
+Also from this check:
+- Claude's first test launch handed its folder to Kyle's running window (GApplication), adding a
+  tab for `/tmp/gimbal-p2x/top`. `CLAUDE.md` now says to run test copies under `dbus-run-session`
+  when Kyle's instance is running, which is how the rest of this check ran.
+- Kyle's WD-Blue-SSD, now mounted, shows under Devices with its bar at 68% of 1.0 TB.

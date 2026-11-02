@@ -7,7 +7,7 @@
 //! tests; P2h binds it to real pills.
 #![allow(dead_code)]
 
-use crate::look::icons::{FLOAT_PALETTE, FOLDER_PALETTE, SAVE_AS_PALETTE};
+use crate::look::icons::{FLOAT_PALETTE, FOLDER_PALETTE, SAVE_AS_PALETTE, SELECTED_FOLDER_PALETTE};
 use crate::look::motion;
 use crate::look::tokens::*;
 
@@ -167,7 +167,9 @@ gridview > child {{ padding: 0; }}
 .gl-menu-item:disabled {{ color: alpha({FG}, 0.45); }}
 .gl-menu-item:focus-visible {{ box-shadow: 0 0 0 {thin}px {FOCUS_RING}; }}
 window.gimbal-look .gl-frame gridview, window.gimbal-look .gl-frame listview, window.gimbal-look .gl-frame textview, window.gimbal-look .gl-frame textview > text, window.gimbal-look .gl-frame scrolledwindow, window.gimbal-look .gl-frame viewport, window.gimbal-look .gl-frame gridview > child, window.gimbal-look windowhandle {{ background-color: transparent; }}
-window.gimbal-look .gl-frame gridview > child:selected {{ background-color: {pill_selected}; border-radius: {r}px; }}",
+window.gimbal-look .gl-frame gridview > child:selected {{ background-color: @accent_bg_color; color: @accent_fg_color; border-radius: {r}px; }}
+window.gimbal-look .gl-frame gridview > child:selected .gl-cell label {{ color: @accent_fg_color; }}
+window.gimbal-look .gl-frame gridview > child:selected .gl-cell image {{ color: @accent_fg_color; -gtk-icon-palette: {SELECTED_FOLDER_PALETTE}; }}",
         pinrow = p(PIN_ROW_H),
         dirrow = p(DIR_ROW_H),
         barw = p(BAR_W),
@@ -304,8 +306,12 @@ mod tests {
             .find("window.gimbal-look .gl-frame gridview > child, ")
             .expect("the transparent rule");
         let selected = plain
-            .find("window.gimbal-look .gl-frame gridview > child:selected { background-color: alpha(mix(shade(@window_bg_color, 0.8), @accent_color, 0.5), 0.85);")
-            .expect("the selected rule uses the selected role");
+            .find("window.gimbal-look .gl-frame gridview > child:selected { background-color: @accent_bg_color; color: @accent_fg_color;")
+            .expect("a selected cell is a solid accent block (Kyle, Nov 2)");
+        assert!(
+            plain.contains("gridview > child:selected .gl-cell label { color: @accent_fg_color; }")
+        );
+        assert!(plain.contains("gridview > child:selected .gl-cell image { color: @accent_fg_color; -gtk-icon-palette: accent @accent_fg_color"));
         assert!(selected > transparent, "the selected rule must come later");
     }
 

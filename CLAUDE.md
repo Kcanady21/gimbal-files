@@ -56,8 +56,9 @@ PATH="$T:$PATH" cargo deny check
   at a time, and stop it by its PID with SIGTERM. Never leave it running.
 - Whenever you run the app, set `XDG_CONFIG_HOME` and `XDG_STATE_HOME` to folders under
   `/tmp/gimbal-*`, so it never reads or writes Kyle's real `~/.config/gimbal-files` or
-  `~/.local/state/gimbal-files`. If Kyle's instance is already running, a second launch hands off
-  to it (GApplication), so check with `pgrep -a gimbal-files` first and stop if it's running.
+  `~/.local/state/gimbal-files`. If Kyle's instance is already running (`pgrep -a gimbal-files`),
+  a plain launch hands its arguments to his window (GApplication) and opens tabs there. Run your
+  copy on its own session bus instead: `dbus-run-session -- target/release/gimbal-files …`.
 - Read-only commands: `niri msg --json …` reads, `pkg-config`, `ls`, `grep`, and reading files
   anywhere.
 
