@@ -362,8 +362,16 @@ fn run_test_child(marker: &Path, cancel: &Arc<AtomicBool>) -> Result<DecodedImag
         .stderr(Stdio::null())
         .spawn()
         .map_err(|error| PdfFailure::Failed(error.to_string()))?;
-    std::fs::write(marker, child.id().to_string())
-        .map_err(|error| PdfFailure::Failed(error.to_string()))?;
+    // Publish a complete PID atomically: existence of a directly written
+    // marker can otherwise become visible while it is still empty, making
+    // the shutdown assertion accidentally inspect `/proc/` itself.
+    let pending_marker = marker.with_extension("pending");
+    let published = std::fs::write(&pending_marker, child.id().to_string())
+        .and_then(|()| std::fs::rename(&pending_marker, marker));
+    if let Err(error) = published {
+        kill_and_reap(&mut child);
+        return Err(PdfFailure::Failed(error.to_string()));
+    }
     match wait_bounded(&mut child, cancel) {
         Ok(status) => Err(PdfFailure::Failed(format!(
             "the test child finished unexpectedly: {status}"

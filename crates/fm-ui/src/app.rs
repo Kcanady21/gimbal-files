@@ -970,6 +970,7 @@ impl Process {
         self.save_now(true);
         // Owned Poppler children must be killed/reaped while their workers
         // still exist; setting a flag after `application.quit` is too late.
+        crate::folder::size::shutdown();
         crate::pdf::shutdown();
         self.application.quit();
     }
@@ -1946,6 +1947,9 @@ impl Process {
         plan: &Plan,
         report: &Report,
     ) {
+        // A known file operation can change any ancestor's total. Invalidate
+        // conservatively; the next hover recalculates on demand.
+        crate::folder::size::invalidate_all();
         let summary = if *request == Request::Undo {
             progress::undo_status(plan, report)
         } else {

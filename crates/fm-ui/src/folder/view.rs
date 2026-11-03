@@ -16,6 +16,7 @@ use gtk::glib;
 use gtk::prelude::*;
 
 use fm_core::config::{SortBy, SortOrder, SortRule};
+use fm_core::folder_size::RootIdentity;
 use fm_core::preview::{self as core_preview, FileRevision};
 use fm_core::workspace::{FileSelection, TabId, WindowId};
 
@@ -23,7 +24,7 @@ use crate::app::Process;
 use crate::dnd::{self, DragItem};
 use crate::folder::{
     ClickRequest, GridKey, KeyboardFocus, NavMode, SelectionEntry, StatusLine, click_request,
-    details_text, is_hidden_name, keyboard_move, nav_mode, sort, visible_page_rows,
+    details_text, is_hidden_name, keyboard_move, nav_mode, size, sort, visible_page_rows,
 };
 use crate::look::icons::{self, MockupIcon};
 use crate::look::tokens::*;
@@ -94,6 +95,44 @@ pub struct FolderView {
     thumbnails: Rc<RefCell<Thumbnailer>>,
     thumb_bindings: RefCell<HashMap<u64, ThumbBinding>>,
     thumb_poll: RefCell<Option<glib::SourceId>>,
+
+    size_service: Rc<size::Service>,
+    cell_bindings: RefCell<HashMap<gtk::Widget, CellBinding>>,
+    size_hover: RefCell<Option<SizeHover>>,
+    size_hover_delay: RefCell<size::HoverDelay>,
+    size_active: RefCell<Option<SizeActive>>,
+    size_poll: RefCell<Option<glib::SourceId>>,
+    /// Makes superseded hover timers, retries and results harmless.
+    size_gen: Cell<u64>,
+    size_hover_gen: Cell<u64>,
+}
+
+#[derive(Clone)]
+struct CellBinding {
+    name: OsString,
+    display_name: String,
+    modified: String,
+    revision: FileRevision,
+    root: RootIdentity,
+    details: String,
+    folder: bool,
+}
+
+#[derive(Clone)]
+struct SizeHover {
+    cell: gtk::Widget,
+    generation: u64,
+}
+
+struct SizeActive {
+    cell: gtk::Widget,
+    model: size::TooltipModel,
+    started: Option<size::Started>,
+    last_progress_version: u64,
+    progress_throttle: size::ProgressThrottle,
+    generation: u64,
+    retry_pending: bool,
+    keyboard: bool,
 }
 
 struct ThumbBinding {
@@ -203,11 +242,25 @@ impl FolderView {
             thumbnails: Rc::new(RefCell::new(Thumbnailer::new())),
             thumb_bindings: RefCell::new(HashMap::new()),
             thumb_poll: RefCell::new(None),
+            size_service: size::service(),
+            cell_bindings: RefCell::new(HashMap::new()),
+            size_hover: RefCell::new(None),
+            size_hover_delay: RefCell::new(size::HoverDelay::default()),
+            size_active: RefCell::new(None),
+            size_poll: RefCell::new(None),
+            size_gen: Cell::new(0),
+            size_hover_gen: Cell::new(0),
         });
 
         this.wire_factory(&factory);
         this.wire_signals();
         this.attach_background_drop_target();
+        let weak = Rc::downgrade(&this);
+        this.root.connect_destroy(move |_| {
+            if let Some(view) = weak.upgrade() {
+                view.cancel_size_all();
+            }
+        });
         this
     }
 
@@ -281,6 +334,21 @@ impl FolderView {
                     view.right_click_item(info.name().into_os_string(), gesture.widget());
                 });
                 cell.add_controller(right);
+                // Query-tooltip identifies the bound item from the cell's
+                // own binding, never from the pointer's position.
+                let query_weak = Rc::downgrade(&view);
+                cell.connect_query_tooltip(move |cell, _, _, keyboard, tooltip| {
+                    let Some(view) = query_weak.upgrade() else {
+                        return false;
+                    };
+                    let widget: gtk::Widget = cell.clone().upcast();
+                    let Some(text) = view.query_tooltip_text(&widget, keyboard) else {
+                        return false;
+                    };
+                    tooltip.set_text(Some(&text));
+                    true
+                });
+                view.attach_size_motion(&cell);
                 view.setup_cell_drag_source(&cell, drag_item.clone());
                 view.setup_cell_drop_target(&cell, drag_item);
             });
@@ -300,7 +368,7 @@ impl FolderView {
                 };
                 cell.set_size_request(scaled(CELL_W, scale.get()), -1);
                 let details = details_for(&info);
-                cell.set_tooltip_text(Some(&details));
+                cell.set_has_tooltip(true);
                 cell.update_property(&[gtk::accessible::Property::Description(&details)]);
                 // Reset every recycled cell before its own binding is
                 // validated. A thumbnail from A must never remain under B.
@@ -309,7 +377,6 @@ impl FolderView {
                 }
                 if let Some(label) = cell.last_child().and_downcast::<gtk::Label>() {
                     label.set_text(&info.display_name());
-                    label.set_tooltip_text(Some(&details));
                     label.update_property(&[
                         gtk::accessible::Property::Label(&info.display_name()),
                         gtk::accessible::Property::Description(&details),
@@ -320,6 +387,7 @@ impl FolderView {
                 };
                 let name = info.name().into_os_string();
                 let widget: gtk::Widget = cell.clone().upcast();
+                view.bind_size_cell(&widget, &info, &details);
                 view.map_cell(&widget, item.position());
                 view.update_label_mode(&widget, &name);
                 view.request_thumbnail(&info, &widget, item, view.scale.get());
@@ -341,14 +409,12 @@ impl FolderView {
                     .retain(|(candidate, _)| candidate != &widget);
                 if let Some(view) = weak.upgrade() {
                     view.cancel_thumbnail_for(&widget);
+                    view.unbind_size_cell(&widget);
                 }
                 if let Some(image) = cell.first_child().and_downcast::<gtk::Image>() {
                     image.set_paintable(None::<&gdk::Paintable>);
                 }
-                cell.set_tooltip_text(None);
-                if let Some(label) = cell.last_child().and_downcast::<gtk::Label>() {
-                    label.set_tooltip_text(None);
-                }
+                cell.set_has_tooltip(false);
             });
         }
     }
@@ -383,6 +449,45 @@ impl FolderView {
                         view.schedule_cap();
                     }
                 });
+        }
+        {
+            // GTK 4.22 has no built-in key that opens a tooltip. If a
+            // keyboard/assistive query does reach the focused grid, resolve it
+            // through the focused cell's binding and start the same states.
+            let weak = Rc::downgrade(self);
+            self.grid
+                .connect_query_tooltip(move |_, _, _, keyboard, tooltip| {
+                    if !keyboard {
+                        return false;
+                    }
+                    let Some(view) = weak.upgrade() else {
+                        return false;
+                    };
+                    let Some(text) = view.focused_tooltip_text() else {
+                        return false;
+                    };
+                    tooltip.set_text(Some(&text));
+                    true
+                });
+        }
+        {
+            // A keyboard/assistive tooltip demand belongs to the focused grid;
+            // moving focus away dismisses/cancels it without a pointer.
+            let focus = gtk::EventControllerFocus::new();
+            let weak = Rc::downgrade(self);
+            focus.connect_leave(move |_| {
+                if let Some(view) = weak.upgrade() {
+                    let keyboard = view
+                        .size_active
+                        .borrow()
+                        .as_ref()
+                        .is_some_and(|active| active.keyboard);
+                    if keyboard {
+                        view.cancel_size_active();
+                    }
+                }
+            });
+            self.grid.add_controller(focus);
         }
         {
             let right = gtk::GestureClick::new();
@@ -479,6 +584,8 @@ impl FolderView {
             .flatten();
         *self.current.borrow_mut() = Some(folder.clone());
         self.cancel_all_thumbnails();
+        self.cancel_size_all();
+        self.cell_bindings.borrow_mut().clear();
         self.cell_positions.borrow_mut().clear();
         self.cursor.borrow_mut().reset();
         self.sort_rule.set(rule);
@@ -517,6 +624,8 @@ impl FolderView {
         let Some(folder) = self.current.borrow().clone() else {
             return;
         };
+        // An explicit Refresh asks for a fresh total immediately.
+        size::invalidate_path(&folder);
         let rule = self.sort_rule.get();
         let anchor = self.first_visible_name();
         let wanted = self.wanted.borrow().clone();
@@ -643,6 +752,492 @@ impl FolderView {
     /// already does this; the empty part of a split tile needs the same.
     pub fn grab_grid_focus(&self) {
         self.grid.grab_focus();
+    }
+
+    /// A 500 ms continuous-hover timer per cell. The tooltip may appear
+    /// earlier through GTK browse mode, but no recursive work starts before
+    /// this timer's own fresh dwell.
+    fn attach_size_motion(self: &Rc<Self>, cell: &gtk::Box) {
+        let motion = gtk::EventControllerMotion::new();
+        let weak_enter = Rc::downgrade(self);
+        let enter_cell = cell.downgrade();
+        motion.connect_enter(move |_, _, _| {
+            let Some(view) = weak_enter.upgrade() else {
+                return;
+            };
+            let Some(cell) = enter_cell.upgrade() else {
+                return;
+            };
+            let widget: gtk::Widget = cell.upcast();
+            view.hover_enter(&widget);
+        });
+        let weak_leave = Rc::downgrade(self);
+        let leave_cell = cell.downgrade();
+        motion.connect_leave(move |_| {
+            let Some(view) = weak_leave.upgrade() else {
+                return;
+            };
+            let Some(cell) = leave_cell.upgrade() else {
+                return;
+            };
+            let widget: gtk::Widget = cell.upcast();
+            view.hover_leave(&widget);
+        });
+        cell.add_controller(motion);
+    }
+
+    fn bind_size_cell(&self, cell: &gtk::Widget, info: &gio::FileInfo, details: &str) {
+        let Some(folder) = self.current.borrow().clone() else {
+            return;
+        };
+        let name = info.name().into_os_string();
+        let mut path = folder.join(&name);
+        if !path.is_absolute() {
+            path = std::path::absolute(&path).unwrap_or(path);
+        }
+        let binding = CellBinding {
+            name,
+            display_name: info.display_name().to_string(),
+            modified: modified_text(info),
+            revision: revision_from_info(info),
+            root: RootIdentity {
+                path,
+                device: u64::from(info.attribute_uint32("unix::device")),
+                inode: info.attribute_uint64("unix::inode"),
+                modified_sec: info.attribute_uint64("time::modified") as i64,
+                modified_nsec: (info.attribute_uint32("time::modified-usec") as i64) * 1_000,
+            },
+            details: details.to_string(),
+            folder: info.file_type() == gio::FileType::Directory,
+        };
+        self.cell_bindings
+            .borrow_mut()
+            .insert(cell.clone(), binding);
+    }
+
+    fn unbind_size_cell(&self, cell: &gtk::Widget) {
+        self.cell_bindings.borrow_mut().remove(cell);
+        let hovered = self
+            .size_hover
+            .borrow()
+            .as_ref()
+            .is_some_and(|hover| hover.cell == *cell);
+        if hovered {
+            *self.size_hover.borrow_mut() = None;
+            self.size_hover_gen.set(self.size_hover_gen.get() + 1);
+            self.size_hover_delay.borrow_mut().leave();
+        }
+        let active = self
+            .size_active
+            .borrow()
+            .as_ref()
+            .is_some_and(|active| active.cell == *cell);
+        if active {
+            self.cancel_size_active();
+        }
+    }
+
+    fn focused_tooltip_text(self: &Rc<Self>) -> Option<String> {
+        let name = self
+            .cursor
+            .borrow()
+            .name()
+            .map(std::ffi::OsStr::to_os_string)
+            .or_else(|| self.first_selected_name())?;
+        let position = self.position_of_name(&name)?;
+        let cell = self
+            .cell_positions
+            .borrow()
+            .iter()
+            .find(|(_, candidate)| *candidate == position)
+            .map(|(cell, _)| cell.clone())?;
+        self.query_tooltip_text(&cell, true)
+    }
+
+    fn query_tooltip_text(self: &Rc<Self>, cell: &gtk::Widget, keyboard: bool) -> Option<String> {
+        let binding = self.cell_bindings.borrow().get(cell).cloned()?;
+        if !binding.folder {
+            return Some(binding.details);
+        }
+        if let Some(text) = self.active_tooltip_text(cell, &binding) {
+            return Some(text);
+        }
+        if keyboard {
+            // A keyboard/assistive request carries no pointer position; the
+            // cell's own binding says which item it belongs to.
+            self.start_size(cell, &binding, true);
+            if let Some(text) = self.active_tooltip_text(cell, &binding) {
+                return Some(text);
+            }
+        }
+        Some(binding.details)
+    }
+
+    fn active_tooltip_text(&self, cell: &gtk::Widget, binding: &CellBinding) -> Option<String> {
+        let active = self.size_active.borrow();
+        let active = active.as_ref()?;
+        (active.cell == *cell
+            && active
+                .model
+                .matches(&binding.root, &binding.name, &binding.revision))
+        .then(|| active.model.text())
+    }
+
+    fn hover_enter(self: &Rc<Self>, cell: &gtk::Widget) {
+        let Some(binding) = self.cell_bindings.borrow().get(cell).cloned() else {
+            return;
+        };
+        if !binding.folder {
+            return;
+        }
+        if self
+            .size_active
+            .borrow()
+            .as_ref()
+            .is_some_and(|active| active.cell == *cell)
+        {
+            return;
+        }
+        let generation = self.size_hover_gen.get() + 1;
+        self.size_hover_gen.set(generation);
+        self.size_hover_delay
+            .borrow_mut()
+            .enter(self.size_service.now_ms());
+        *self.size_hover.borrow_mut() = Some(SizeHover {
+            cell: cell.clone(),
+            generation,
+        });
+        self.cancel_size_active();
+        let weak = Rc::downgrade(self);
+        let cell = cell.clone();
+        glib::timeout_add_local_once(Duration::from_millis(size::HOVER_DELAY_MS), move || {
+            if let Some(view) = weak.upgrade() {
+                view.hover_due(&cell, generation);
+            }
+        });
+    }
+
+    fn hover_due(self: &Rc<Self>, cell: &gtk::Widget, generation: u64) {
+        let current = self
+            .size_hover
+            .borrow()
+            .as_ref()
+            .is_some_and(|hover| hover.cell == *cell && hover.generation == generation);
+        if !current
+            || !self
+                .size_hover_delay
+                .borrow()
+                .due(self.size_service.now_ms())
+        {
+            return;
+        }
+        let Some(binding) = self.cell_bindings.borrow().get(cell).cloned() else {
+            return;
+        };
+        if !binding.folder {
+            return;
+        }
+        self.start_size(cell, &binding, false);
+        self.refresh_size_tooltip(cell);
+    }
+
+    fn hover_leave(&self, cell: &gtk::Widget) {
+        let hovered = self
+            .size_hover
+            .borrow()
+            .as_ref()
+            .is_some_and(|hover| hover.cell == *cell);
+        if hovered {
+            *self.size_hover.borrow_mut() = None;
+            self.size_hover_gen.set(self.size_hover_gen.get() + 1);
+            self.size_hover_delay.borrow_mut().leave();
+        }
+        let active = self
+            .size_active
+            .borrow()
+            .as_ref()
+            .is_some_and(|active| active.cell == *cell);
+        if active {
+            self.cancel_size_active();
+        }
+    }
+
+    fn start_size(self: &Rc<Self>, cell: &gtk::Widget, binding: &CellBinding, keyboard: bool) {
+        if !binding.folder {
+            return;
+        }
+        self.cancel_size_active();
+        let now = self.size_service.now_ms();
+        let identity = size::TooltipIdentity {
+            root: binding.root.clone(),
+            name: binding.name.clone(),
+            revision: binding.revision.clone(),
+        };
+        let mut model = size::TooltipModel::new(
+            identity,
+            binding.display_name.clone(),
+            binding.modified.clone(),
+        );
+        crate::log!(
+            "folder-size",
+            "request {} (device {}, inode {})",
+            binding.root.path.display(),
+            binding.root.device,
+            binding.root.inode
+        );
+        match self.size_service.request(binding.root.clone()) {
+            size::RequestOutcome::Cached(hit) => {
+                let age = now.saturating_sub(hit.completed_at_ms);
+                crate::log!(
+                    "folder-size",
+                    "cache hit {}: {} contents, {} files, {} folders, age {} ms",
+                    binding.root.path.display(),
+                    fm_core::folder_size::format_bytes(hit.size.totals.contents_bytes),
+                    hit.size.totals.files,
+                    hit.size.totals.folders,
+                    age
+                );
+                model.finish(fm_core::folder_size::ScanResult::Sized(hit.size), age, true);
+                self.install_size_active(cell, model, None, keyboard, false);
+            }
+            size::RequestOutcome::Started(started) => {
+                let stale = started.stale.is_some();
+                model.start(started.stale.clone(), now);
+                crate::log!(
+                    "folder-size",
+                    "start {} (stale shown: {stale})",
+                    binding.root.path.display()
+                );
+                self.install_size_active(cell, model, Some(started), keyboard, false);
+                self.ensure_size_poll();
+            }
+            size::RequestOutcome::Busy => {
+                crate::log!(
+                    "folder-size",
+                    "queue full for {}; the current demand will retry",
+                    binding.root.path.display()
+                );
+                model.start(None, now);
+                self.install_size_active(cell, model, None, keyboard, true);
+                self.schedule_size_retry(cell);
+            }
+            size::RequestOutcome::Stopped => {
+                crate::log!(
+                    "folder-size",
+                    "service stopped for {}; showing unavailable",
+                    binding.root.path.display()
+                );
+                model.finish(
+                    fm_core::folder_size::ScanResult::Unavailable(
+                        fm_core::folder_size::RootState::Unavailable,
+                    ),
+                    0,
+                    false,
+                );
+                self.install_size_active(cell, model, None, keyboard, false);
+            }
+        }
+    }
+
+    fn install_size_active(
+        &self,
+        cell: &gtk::Widget,
+        model: size::TooltipModel,
+        started: Option<size::Started>,
+        keyboard: bool,
+        retry_pending: bool,
+    ) {
+        *self.size_active.borrow_mut() = Some(SizeActive {
+            cell: cell.clone(),
+            model,
+            started,
+            last_progress_version: 0,
+            progress_throttle: size::ProgressThrottle::default(),
+            generation: self.size_gen.get(),
+            retry_pending,
+            keyboard,
+        });
+    }
+
+    fn cancel_size_active(&self) {
+        let Some(active) = self.size_active.borrow_mut().take() else {
+            return;
+        };
+        if let Some(started) = &active.started {
+            self.size_service.cancel(started);
+            crate::log!(
+                "folder-size",
+                "cancel {} (token {})",
+                active.model.identity.root.path.display(),
+                started.token
+            );
+        }
+        self.size_gen.set(self.size_gen.get() + 1);
+    }
+
+    fn refresh_size_tooltip(&self, cell: &gtk::Widget) {
+        let presentation = {
+            let active = self.size_active.borrow();
+            active
+                .as_ref()
+                .map(|active| (active.model.text(), active.keyboard))
+        };
+        let Some((text, keyboard)) = presentation else {
+            return;
+        };
+        cell.update_property(&[gtk::accessible::Property::Description(&text)]);
+        if let Some(label) = cell.last_child().and_downcast::<gtk::Label>() {
+            label.update_property(&[gtk::accessible::Property::Description(&text)]);
+        }
+        if !keyboard {
+            cell.trigger_tooltip_query();
+        }
+    }
+
+    fn ensure_size_poll(self: &Rc<Self>) {
+        if self.size_poll.borrow().is_some() {
+            return;
+        }
+        let weak = Rc::downgrade(self);
+        let source =
+            glib::timeout_add_local(Duration::from_millis(size::DEMAND_POLL_MS), move || {
+                let Some(view) = weak.upgrade() else {
+                    return glib::ControlFlow::Break;
+                };
+                view.poll_size()
+            });
+        *self.size_poll.borrow_mut() = Some(source);
+    }
+
+    fn poll_size(self: &Rc<Self>) -> glib::ControlFlow {
+        let Some(mut active) = self.size_active.borrow_mut().take() else {
+            *self.size_poll.borrow_mut() = None;
+            return glib::ControlFlow::Break;
+        };
+        if active.generation != self.size_gen.get() {
+            *self.size_poll.borrow_mut() = None;
+            return glib::ControlFlow::Break;
+        }
+        let cell = active.cell.clone();
+        let mut changed = false;
+        let mut keep = true;
+        let event = active.started.as_ref().and_then(size::Started::try_next);
+        if let Some(event) = event {
+            let bound_token = active.started.as_ref().map(|started| started.token);
+            if bound_token != Some(event.token) {
+                crate::log!("folder-size", "rejected a result with another token");
+                keep = false;
+            }
+            if keep {
+                let binding = self.cell_bindings.borrow().get(&cell).cloned();
+                match binding {
+                    Some(binding)
+                        if active.model.matches(
+                            &binding.root,
+                            &binding.name,
+                            &binding.revision,
+                        ) =>
+                    {
+                        let now = self.size_service.now_ms();
+                        let age = now.saturating_sub(event.completed_at_ms);
+                        let label = result_label(&event.result);
+                        active.model.finish(event.result, age, event.cached);
+                        crate::log!(
+                            "folder-size",
+                            "result {label} for {} (age {age} ms, cached {})",
+                            active.model.identity.root.path.display(),
+                            event.cached
+                        );
+                        active.started = None;
+                        changed = true;
+                    }
+                    _ => {
+                        crate::log!(
+                            "folder-size",
+                            "rejected a late result for a cell that no longer binds this folder"
+                        );
+                        keep = false;
+                    }
+                }
+            }
+        }
+        if keep && let Some(started) = active.started.as_ref() {
+            let (progress, version) = started.progress();
+            if version != active.last_progress_version {
+                let now = self.size_service.now_ms();
+                if active.progress_throttle.should_show(now) {
+                    active.last_progress_version = version;
+                    active.model.set_progress(progress);
+                    crate::log!(
+                        "folder-size",
+                        "progress for {}: {} files, {} folders",
+                        active.model.identity.root.path.display(),
+                        progress.files,
+                        progress.folders
+                    );
+                    changed = true;
+                }
+            }
+        }
+        let has_demand = keep && active.started.is_some();
+        if keep {
+            *self.size_active.borrow_mut() = Some(active);
+        }
+        if changed {
+            self.refresh_size_tooltip(&cell);
+        }
+        if has_demand {
+            glib::ControlFlow::Continue
+        } else {
+            *self.size_poll.borrow_mut() = None;
+            glib::ControlFlow::Break
+        }
+    }
+
+    fn schedule_size_retry(self: &Rc<Self>, cell: &gtk::Widget) {
+        let Some(generation) = self
+            .size_active
+            .borrow()
+            .as_ref()
+            .filter(|active| active.cell == *cell)
+            .map(|active| active.generation)
+        else {
+            return;
+        };
+        let weak = Rc::downgrade(self);
+        let cell = cell.clone();
+        glib::timeout_add_local_once(Duration::from_millis(150), move || {
+            if let Some(view) = weak.upgrade() {
+                view.retry_size(&cell, generation);
+            }
+        });
+    }
+
+    fn retry_size(self: &Rc<Self>, cell: &gtk::Widget, generation: u64) {
+        let pending = self.size_active.borrow().as_ref().is_some_and(|active| {
+            active.cell == *cell && active.generation == generation && active.retry_pending
+        });
+        if !pending {
+            return;
+        }
+        let keyboard = self
+            .size_active
+            .borrow()
+            .as_ref()
+            .is_some_and(|active| active.keyboard);
+        let Some(binding) = self.cell_bindings.borrow().get(cell).cloned() else {
+            return;
+        };
+        self.start_size(cell, &binding, keyboard);
+        self.refresh_size_tooltip(cell);
+    }
+
+    fn cancel_size_all(&self) {
+        *self.size_hover.borrow_mut() = None;
+        self.size_hover_delay.borrow_mut().leave();
+        self.size_hover_gen.set(self.size_hover_gen.get() + 1);
+        self.cancel_size_active();
+        self.size_gen.set(self.size_gen.get() + 1);
     }
 
     pub fn listed_names(&self) -> Vec<OsString> {
@@ -1157,6 +1752,11 @@ impl FolderView {
             if let Some(view) = weak.upgrade() {
                 view.settle_pending.set(false);
                 if view.loaded.get() {
+                    // A live listing change is a known change to this root's
+                    // entries; invalidate its total conservatively.
+                    if let Some(folder) = view.current.borrow().clone() {
+                        size::invalidate_path(&folder);
+                    }
                     view.rebuild_index();
                     view.apply_selection();
                     view.count_listed();
@@ -1291,6 +1891,9 @@ impl FolderView {
             .and_then(|name| self.info_for_name(name))
             .map(|info| details_for(&info));
         self.grid.set_tooltip_text(tooltip.as_deref());
+        // Keep keyboard/assistive queries reachable even with no selection;
+        // the handler only claims them when a focused item resolves.
+        self.grid.set_has_tooltip(true);
     }
 
     fn selection_entries(&self) -> Vec<SelectionEntry> {
@@ -1339,7 +1942,22 @@ impl FolderView {
         }
     }
 
-    fn key_pressed(&self, key: gdk::Key, modifiers: gdk::ModifierType) -> glib::Propagation {
+    fn key_pressed(
+        self: &Rc<Self>,
+        key: gdk::Key,
+        modifiers: gdk::ModifierType,
+    ) -> glib::Propagation {
+        // A keyboard/assistive request cancels on dismissal like the pointer
+        // path; GTK 4.22 emits no tooltip query from a bare key press.
+        let keyboard_demand = self
+            .size_active
+            .borrow()
+            .as_ref()
+            .is_some_and(|active| active.keyboard);
+        if key == gdk::Key::Escape && keyboard_demand {
+            self.cancel_size_active();
+            return glib::Propagation::Proceed;
+        }
         let count = self.selection.n_items();
         if count == 0 {
             return glib::Propagation::Proceed;
@@ -1656,6 +2274,35 @@ impl FolderView {
         } else {
             cells.push((cell.clone(), position));
         }
+    }
+}
+
+impl Drop for FolderView {
+    fn drop(&mut self) {
+        if let Some(active) = self.size_active.get_mut().take()
+            && let Some(started) = &active.started
+        {
+            self.size_service.cancel(started);
+        }
+    }
+}
+
+fn modified_text(info: &gio::FileInfo) -> String {
+    info.modification_date_time()
+        .and_then(|date| date.format("%Y-%m-%d %H:%M").ok())
+        .map(|date| date.to_string())
+        .unwrap_or_else(|| "Unavailable".to_string())
+}
+
+fn result_label(result: &fm_core::folder_size::ScanResult) -> &'static str {
+    use fm_core::folder_size::{RootState, ScanResult};
+    match result {
+        ScanResult::Sized(size) if size.is_partial() => "partial",
+        ScanResult::Sized(_) => "complete",
+        ScanResult::Cancelled => "cancelled",
+        ScanResult::Unavailable(RootState::Remote) => "remote",
+        ScanResult::Unavailable(RootState::Symlink) => "symlink root",
+        ScanResult::Unavailable(_) => "unavailable",
     }
 }
 

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! The folder view: the GIO listing, the virtualized grid and its status line.
 
+pub mod size;
 mod sort;
 mod view;
 

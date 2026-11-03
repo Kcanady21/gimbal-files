@@ -11,6 +11,7 @@
 pub mod command;
 pub mod config;
 pub mod fileops;
+pub mod folder_size;
 pub(crate) mod fsutil;
 pub mod preview;
 pub mod session;
