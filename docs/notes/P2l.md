@@ -262,3 +262,19 @@ inotify limit (128), so GIO reported "Unable to find default local file monitor 
 folder updates stopped in every app. With Kyle's approval Claude stopped the 135 leftover
 processes on `/tmp/dbus-*` buses, and watching works again. `CLAUDE.md` now forbids
 `dbus-run-session`: when Kyle's app is open, don't launch.
+
+## Follow-up live check (Kyle reports, Nov 2, 2026): passes in part
+
+**[read: Kyle's report]** File transfers work, but there is no visible drag image or
+count badge. Same-drive Ctrl-drag moves instead of copying; cross-drive Shift-drag
+copies instead of moving. Drops in tab content padding do nothing. Cross-drive copy
+without a modifier matches the intended default.
+
+**Kyle reports passing:** Dolphin to Gimbal and Gimbal to Dolphin; a file dropped on a
+pinned folder moves there; a folder dropped on empty pinned-list space becomes pinned.
+
+**Still open:** icon and badge, Ctrl/Shift negotiation, and padding coverage are assigned
+to `P2l-r1-drag-feedback-and-actions.md`. No code changed or gates rerun for this report.
+Tile-pill drops and the Zen matrix remain unverified by this report. Other live items
+not explicitly reported remain open. These are Kyle's observations, not a reviewer-run
+live session.

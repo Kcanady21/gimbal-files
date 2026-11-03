@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use crate::commands;
-use crate::dnd::{self, DropModifiers};
+use crate::dnd::{self, DropIntent};
 use crate::fileops::{self, FileOps, ProgressView, clipboard, dialogs, menu as menus, progress};
 use crate::folder::ClickRequest;
 use crate::frame::WindowUi;
@@ -491,14 +491,15 @@ impl Process {
         }
     }
 
-    /// Submit a folder drop after the asynchronous filesystem check. The
+    /// Submit a folder drop with the action frozen at the drop callback. The
+    /// negotiation, not a later filesystem query, chose Copy or Move; the
     /// worker owns the conflict dialog, progress, Cancel and undo.
     pub fn drop_on_folder(
         self: &Rc<Self>,
         window: WindowId,
         target: PathBuf,
         paths: Vec<PathBuf>,
-        modifiers: DropModifiers,
+        intent: DropIntent,
     ) {
         if paths.is_empty() {
             return;
@@ -507,39 +508,33 @@ impl Process {
             self.show_drop_reason(window, &reason);
             return;
         }
-        let first = paths[0].clone();
         let count = paths.len();
-        let weak = Rc::downgrade(self);
-        dnd::same_filesystem_async(first, target.clone(), move |same| {
-            let Some(process) = weak.upgrade() else {
+        let action = intent.action();
+        let operation =
+            dnd::operation_for_action(&dnd::Target::Grid(target.clone()), &paths, action);
+        let (request, chosen) = match operation {
+            Ok(dnd::Operation::Copy { to }) => (Request::Copy { paths, to }, dnd::DropAction::Copy),
+            Ok(dnd::Operation::Move { to }) => (Request::Move { paths, to }, dnd::DropAction::Move),
+            Ok(_) => return,
+            Err(reason) => {
+                self.show_drop_reason(window, &reason);
                 return;
-            };
-            let operation =
-                dnd::operation_for(&dnd::Target::Grid(target.clone()), &paths, same, modifiers);
-            let (request, action) = match operation {
-                Ok(dnd::Operation::Copy { to }) => {
-                    (Request::Copy { paths, to }, dnd::DropAction::Copy)
-                }
-                Ok(dnd::Operation::Move { to }) => {
-                    (Request::Move { paths, to }, dnd::DropAction::Move)
-                }
-                Ok(_) => return,
-                Err(reason) => {
-                    process.show_drop_reason(window, &reason);
-                    return;
-                }
-            };
-            if let Some(fileops) = process.fileops() {
-                let id = fileops.submit(window, request, false);
-                crate::log!(
-                    "dnd",
-                    "drop {count} item(s) into {}: same filesystem {same}, modifiers {}, action {:?} -> job {id}",
-                    target.display(),
-                    modifiers.as_str(),
-                    action
-                );
             }
-        });
+        };
+        if let Some(fileops) = self.fileops() {
+            let id = fileops.submit(window, request, false);
+            crate::log!(
+                "dnd",
+                "drop {count} item(s) into {}: source {}, selected {}, target preference {}, filesystem {}, modifiers {}, final {} -> job {id}",
+                target.display(),
+                intent.source_text(),
+                dnd::action_text(intent.selected()),
+                dnd::action_text(intent.requested()),
+                dnd::filesystem_text(intent.filesystem()),
+                intent.modifiers_text(),
+                dnd::action_text(Some(chosen))
+            );
+        }
     }
 
     /// The Trash button: `file.trash` for every dropped path, modifiers

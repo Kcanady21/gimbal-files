@@ -633,50 +633,96 @@ impl FolderView {
         source.set_actions(gdk::DragAction::COPY | gdk::DragAction::MOVE);
         let weak = Rc::downgrade(self);
         let scale = self.scale.clone();
-        source.connect_prepare(move |source, _, _| {
-            let view = weak.upgrade()?;
-            let item = item.upgrade()?;
-            let info = item.item().and_downcast::<gio::FileInfo>()?;
-            let name = info.name().into_os_string();
-            let items = view.drag_items(name.clone());
-            if items.is_empty() {
-                return None;
-            }
-            let first = items
-                .first()
-                .and_then(|item| item.path.file_name())
-                .map(std::ffi::OsString::from);
-            let icon = first
-                .and_then(|name| view.info_for_name(&name))
-                .and_then(|info| info.icon());
-            let paths: Vec<PathBuf> = items.iter().map(|item| item.path.clone()).collect();
-            dnd::set_internal_drag(items.clone());
-            let widget = dnd::drag_icon(icon.as_ref(), items.len(), scale.get());
-            let paintable = gtk::WidgetPaintable::new(Some(&widget));
-            let hot = scaled(ICON_GRID, scale.get()) / 2;
-            source.set_icon(Some(&paintable), hot, hot);
-            crate::log!(
-                "dnd",
-                "prepare: {} item(s), first {}",
-                items.len(),
-                items
+        // The icon widget is built in prepare and handed to GTK's own
+        // `GtkDragIcon` in drag-begin. This cell keeps it alive until the drag
+        // ends, so its theme colours and badge survive the whole drag.
+        let icon_widget: Rc<RefCell<Option<gtk::Widget>>> = Rc::new(RefCell::new(None));
+        {
+            let icon_widget = icon_widget.clone();
+            let scale = scale.clone();
+            source.connect_prepare(move |_, _, _| {
+                dnd::prepare_drag();
+                icon_widget.borrow_mut().take();
+                let view = weak.upgrade()?;
+                let item = item.upgrade()?;
+                let info = item.item().and_downcast::<gio::FileInfo>()?;
+                let name = info.name().into_os_string();
+                let items = view.drag_items(name.clone());
+                if items.is_empty() {
+                    return None;
+                }
+                let first = items
                     .first()
-                    .map(|item| item.path.display().to_string())
-                    .unwrap_or_default()
-            );
-            dnd::content_for(&paths)
-        });
+                    .and_then(|item| item.path.file_name())
+                    .map(std::ffi::OsString::from);
+                let icon = first
+                    .and_then(|name| view.info_for_name(&name))
+                    .and_then(|info| info.icon());
+                let paths: Vec<PathBuf> = items.iter().map(|item| item.path.clone()).collect();
+                dnd::set_internal_drag(items.clone());
+                let widget = dnd::drag_icon(icon.as_ref(), items.len(), scale.get());
+                *icon_widget.borrow_mut() = Some(widget);
+                crate::log!(
+                    "dnd",
+                    "prepare: {} item(s), first {}",
+                    items.len(),
+                    items
+                        .first()
+                        .map(|item| item.path.display().to_string())
+                        .unwrap_or_default()
+                );
+                let content = dnd::content_for(&paths);
+                if content.is_none() {
+                    icon_widget.borrow_mut().take();
+                }
+                content
+            });
+        }
+        {
+            let scale = scale.clone();
+            let icon_widget = icon_widget.clone();
+            source.connect_drag_begin(move |_, drag| {
+                crate::log!(
+                    "dnd",
+                    "drag-begin: actions {}, selected {}, modifiers {}",
+                    dnd::actions_text(drag.actions()),
+                    dnd::action_text(dnd::unique_action(drag.selected_action())),
+                    dnd::current_modifiers_text()
+                );
+                drag.connect_selected_action_notify(|drag| {
+                    crate::log!(
+                        "dnd",
+                        "drag selected-action changed: {} (actions {})",
+                        dnd::action_text(dnd::unique_action(drag.selected_action())),
+                        dnd::actions_text(drag.actions())
+                    );
+                });
+                let Some(widget) = icon_widget.borrow().clone() else {
+                    return;
+                };
+                let drag_icon = gtk::DragIcon::for_drag(drag);
+                drag_icon.set_child(Some(&widget));
+                let hot = scaled(ICON_GRID, scale.get()) / 2;
+                drag.set_hotspot(hot, hot);
+            });
+        }
         let weak_end = Rc::downgrade(self);
+        let end_icon = icon_widget.clone();
         source.connect_drag_end(move |_, drag, delete_data| {
+            let modifiers = dnd::current_modifiers_text();
             dnd::clear_internal_drag();
+            end_icon.borrow_mut().take();
+            gtk::DragIcon::for_drag(drag).set_child(None::<&gtk::Widget>);
             // GTK4 sets `delete_data` when a drop succeeds with MOVE, and
             // Firefox/Zen reports MOVE on every Wayland drop. Honouring it
             // would destroy sources on a copy drag; the drop side moves.
             crate::log!(
                 "dnd",
-                "drag-end: action={:?} delete_data={} (ignored)",
+                "drag-end: selected {:?}, action {}, delete_data={} (ignored), modifiers {}",
                 drag.selected_action(),
-                delete_data
+                dnd::action_text(dnd::unique_action(drag.selected_action())),
+                delete_data,
+                modifiers
             );
             if let Some(view) = weak_end.upgrade()
                 && let Some(process) = view.process.upgrade()
@@ -685,8 +731,11 @@ impl FolderView {
             }
         });
         let weak_cancel = Rc::downgrade(self);
-        source.connect_drag_cancel(move |_, _, _| {
+        let cancel_icon = icon_widget;
+        source.connect_drag_cancel(move |_, drag, _| {
             dnd::clear_internal_drag();
+            cancel_icon.borrow_mut().take();
+            gtk::DragIcon::for_drag(drag).set_child(None::<&gtk::Widget>);
             if let Some(view) = weak_cancel.upgrade()
                 && let Some(process) = view.process.upgrade()
             {
@@ -723,30 +772,44 @@ impl FolderView {
         );
     }
 
+    /// Every cell's bounds in the viewport root's coordinates. `compute_bounds`
+    /// accounts for the grid's scroll transform, so the same rectangles work
+    /// for a single tab and for a split tile.
+    fn cell_rects(&self) -> Vec<dnd::DropRect> {
+        let mut rects = Vec::new();
+        let mut child = self.grid.first_child();
+        while let Some(widget) = child {
+            if let Some(bounds) = widget.compute_bounds(&self.root) {
+                rects.push(dnd::DropRect {
+                    x: f64::from(bounds.x()),
+                    y: f64::from(bounds.y()),
+                    width: f64::from(bounds.width()),
+                    height: f64::from(bounds.height()),
+                });
+            }
+            child = widget.next_sibling();
+        }
+        rects
+    }
+
     fn attach_background_drop_target(self: &Rc<Self>) {
         let weak = Rc::downgrade(self);
         let folder: Rc<dyn Fn() -> Option<PathBuf>> =
             Rc::new(move || weak.upgrade()?.current.borrow().clone());
-        // The grid is behind every cell. While a cell is under the pointer
-        // its own target owns the drop and the grid bows out, so a file cell
-        // does not light the whole grid.
-        let grid = self.grid.clone();
+        // The viewport root owns the background, not the grid: the grid's own
+        // allocation ends at its content, which leaves the padding and the
+        // space below a short listing without a target. A cell still owns its
+        // own point, so a file cell's refusal never becomes a background
+        // transfer.
+        let weak_rects = Rc::downgrade(self);
         let mask: Rc<dyn Fn(f64, f64) -> bool> = Rc::new(move |x, y| {
-            let Some(mut widget) = grid.pick(x, y, gtk::PickFlags::DEFAULT) else {
-                return true;
+            let Some(view) = weak_rects.upgrade() else {
+                return false;
             };
-            loop {
-                if widget.has_css_class("gl-cell") {
-                    return false;
-                }
-                let Some(parent) = widget.parent() else {
-                    return true;
-                };
-                widget = parent;
-            }
+            dnd::background_owns(x, y, &view.cell_rects())
         });
         dnd::attach_folder_target(
-            &self.grid,
+            &self.root,
             self.process.clone(),
             self.window,
             folder,

@@ -150,7 +150,7 @@ gridview > child {{ padding: 0; }}
 .gl-tile.focused {{ box-shadow: inset 0 0 0 {thin}px {FOCUS_RING}; }}
 .gl-drop-line {{ background-color: {OUTLINE}; min-height: {thin}px; border-radius: {rp}px; }}
 .gl-drop-target {{ box-shadow: inset 0 0 0 {thin}px {FOCUS_RING}; }}
-.gl-drag-badge {{ min-width: {gs}px; min-height: {gs}px; padding: 0 {gs}px; border-radius: {rp}px; background-color: {OUTLINE}; color: @accent_fg_color; font-size: {ttiny}px; }}
+dnd .gl-drag-badge, .gl-drag-badge {{ min-width: {tsmall}px; min-height: {tsmall}px; padding: {thin}px {gs}px; border-radius: {rp}px; border: {thin}px solid {OUTLINE}; background-color: {BG}; color: {FG}; font-size: {tsmall}px; font-weight: bold; }}
 .gl-status {{ min-height: {statush}px; font-size: {tc}px; }}
 .gl-progress {{ padding: {gs}px {gl}px; }}
 .gl-progress-label {{ font-size: {tsmall}px; color: alpha({FG}, 0.75); }}
@@ -312,6 +312,38 @@ mod tests {
         // The icon and the name keep their normal colours (Kyle, Nov 2).
         assert!(!plain.contains("child:selected .gl-cell"));
         assert!(selected > transparent, "the selected rule must come later");
+    }
+
+    #[test]
+    fn the_drag_badge_is_bold_contrasting_and_reaches_the_drag_icon_root() {
+        let plain = css(1.0, None, PLAIN);
+        let rule = plain
+            .lines()
+            .find(|line| line.contains(".gl-drag-badge"))
+            .expect("the drag badge rule");
+        // The DragIcon is a separate root (CSS node "dnd"), so the rule must
+        // not depend on a `window.gimbal-look` ancestor.
+        assert!(
+            rule.starts_with("dnd .gl-drag-badge, .gl-drag-badge {"),
+            "{rule}"
+        );
+        assert!(
+            rule.contains("background-color: @window_bg_color;"),
+            "{rule}"
+        );
+        assert!(rule.contains("color: @window_fg_color;"), "{rule}");
+        assert!(rule.contains("font-weight: bold;"), "{rule}");
+        // The small text token, not the tiny one, and token-scaled padding.
+        assert!(rule.contains("font-size: 14px;"), "{rule}");
+        assert!(rule.contains("padding: 2px 8px;"), "{rule}");
+        assert!(rule.contains("border-radius: 999px;"), "{rule}");
+        let half = css(0.5, None, PLAIN);
+        let rule = half
+            .lines()
+            .find(|line| line.contains(".gl-drag-badge"))
+            .expect("the drag badge rule");
+        assert!(rule.contains("font-size: 7px;"), "{rule}");
+        assert!(rule.contains("padding: 1px 4px;"), "{rule}");
     }
 
     #[test]

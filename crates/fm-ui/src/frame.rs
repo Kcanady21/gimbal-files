@@ -15,6 +15,7 @@ use fm_core::workspace::{Window, WindowId};
 use crate::app::Process;
 use crate::commands;
 use crate::content::Content;
+use crate::dnd;
 use crate::header::Header;
 use crate::layout;
 use crate::look::blur::Blur;
@@ -91,6 +92,9 @@ impl WindowUi {
             scaled(f64::from(DEFAULT_H), scale),
         );
         window.add_css_class("gimbal-look");
+        // Observe real key events on the window. GTK clears the drag source
+        // widget's controllers when a drag begins, so the tracker sits here.
+        dnd::install_modifier_tracking(window.upcast_ref::<gtk::Window>());
 
         let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
         window.set_content(Some(&root));

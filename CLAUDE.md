@@ -67,7 +67,11 @@ PATH="$T:$PATH" cargo deny check
 
 ## What you must never do
 
-- No git commands and no `sudo`. Claude commits after review.
+- Only ChatGPT (the primary reviewer) and Claude may run git commands. They may
+  run read-only git commands for reviews. Git commands that change files, staging,
+  commits, branches or remotes require Kyle's explicit approval; push only when Kyle
+  says “push”. Other coding agents must run no git commands, including read-only ones.
+  No `sudo` for any agent.
 - No pointer or keyboard injection of any kind: no `/dev/uinput`, `wtype`, `ydotool` or `xdotool`.
   Claude does every live interaction.
 - No `niri msg action …`, no changes to `~/.config` (Noctalia, GTK, niri), and no `gsettings set`.
