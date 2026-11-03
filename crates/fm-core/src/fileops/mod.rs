@@ -32,8 +32,9 @@ use gio::prelude::*;
 use crate::command::{CheckedCommand, Outcome, Value};
 
 pub use trash::{
-    GioTrash, TrashBackend, TrashError, TrashIdentity, TrashItem, TrashRevision, TrashUri,
-    TrashUriError, list_trash, list_trash_with,
+    GioTrash, ObjectComparison, TrashBackend, TrashError, TrashFileKind, TrashFingerprint,
+    TrashIdentity, TrashItem, TrashRevision, TrashTimestamp, TrashUri, TrashUriError, list_trash,
+    list_trash_with,
 };
 
 /// The undo stack keeps at most this many records.
@@ -53,13 +54,34 @@ const MAX_NAME_BYTES: usize = 255;
 /// One typed file operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Request {
-    Trash { paths: Vec<PathBuf> },
-    Copy { paths: Vec<PathBuf>, to: PathBuf },
-    Move { paths: Vec<PathBuf>, to: PathBuf },
-    Rename { path: PathBuf, name: String },
-    NewFolder { name: String, in_folder: PathBuf },
-    Restore { items: Vec<TrashIdentity> },
+    Trash {
+        paths: Vec<PathBuf>,
+    },
+    Copy {
+        paths: Vec<PathBuf>,
+        to: PathBuf,
+    },
+    Move {
+        paths: Vec<PathBuf>,
+        to: PathBuf,
+    },
+    Rename {
+        path: PathBuf,
+        name: String,
+    },
+    NewFolder {
+        name: String,
+        in_folder: PathBuf,
+    },
+    Restore {
+        items: Vec<TrashIdentity>,
+    },
     EmptyTrash,
+    /// Permanently delete exactly this selected, validated snapshot. It never
+    /// means the whole Trash and never scans for other entries.
+    DeleteSelected {
+        items: Vec<TrashIdentity>,
+    },
     Undo,
 }
 
@@ -87,8 +109,17 @@ impl Request {
             }
             Request::Restore { items } => format!("restore {} item(s)", items.len()),
             Request::EmptyTrash => "empty the trash".to_string(),
+            Request::DeleteSelected { items } => {
+                format!("permanently delete {} selected item(s)", items.len())
+            }
             Request::Undo => "undo the last file operation".to_string(),
         }
+    }
+
+    /// Whether this operation permanently deletes Trash items and therefore
+    /// requires its own human confirmation.
+    pub fn needs_permanent_confirmation(&self) -> bool {
+        matches!(self, Request::EmptyTrash | Request::DeleteSelected { .. })
     }
 }
 
@@ -158,6 +189,9 @@ pub fn request_for(command: &CheckedCommand) -> Result<Option<Request>, RequestE
             items: trash_items()?,
         },
         "trash.empty" => Request::EmptyTrash,
+        "trash.delete-permanently" => Request::DeleteSelected {
+            items: trash_items()?,
+        },
         "file.undo" => Request::Undo,
         _ => return Ok(None),
     };
@@ -233,6 +267,10 @@ pub enum Action {
     NewFolder,
     Restore,
     Empty,
+    /// Permanent deletion of one selected Trash item. It is a different
+    /// operation kind from Empty Trash so results and confirmation scopes stay
+    /// distinct.
+    DeleteSelected,
 }
 
 impl Action {
@@ -245,6 +283,7 @@ impl Action {
             Action::NewFolder => "new-folder",
             Action::Restore => "restore",
             Action::Empty => "delete",
+            Action::DeleteSelected => "delete selected",
         }
     }
 
@@ -257,6 +296,7 @@ impl Action {
             Action::NewFolder => "created",
             Action::Restore => "restored",
             Action::Empty => "deleted",
+            Action::DeleteSelected => "deleted",
         }
     }
 }
@@ -292,6 +332,9 @@ pub enum Conflict {
     ParentNotWritable,
     /// An undo item or a trash entry changed under its identity.
     Changed,
+    /// A selected trash entry has no complete supported identity, so it can
+    /// never be admitted to permanent deletion from a snapshot.
+    Unverified,
     /// An undo folder is no longer empty.
     NotEmpty,
 }
@@ -318,6 +361,7 @@ impl Conflict {
             Conflict::MissingParent => "Original folder no longer exists",
             Conflict::ParentNotWritable => "the original folder is not writable",
             Conflict::Changed => "the item changed",
+            Conflict::Unverified => "Cannot verify this Trash item is unchanged",
             Conflict::NotEmpty => "the folder is not empty",
         }
     }
@@ -465,6 +509,15 @@ impl Plan {
     pub fn empty_confirmation(&self) -> Option<EmptyConfirmation> {
         (self.request == Request::EmptyTrash).then(|| EmptyConfirmation {
             fingerprint: empty_fingerprint(self),
+        })
+    }
+
+    /// The immutable snapshot a `trash.delete-permanently` confirmation covers.
+    /// It is a different type from [`EmptyConfirmation`], so an Empty Trash
+    /// approval cannot authorise selected deletion or the reverse.
+    pub fn selected_confirmation(&self) -> Option<SelectedConfirmation> {
+        matches!(self.request, Request::DeleteSelected { .. }).then(|| SelectedConfirmation {
+            fingerprint: selected_fingerprint(self),
         })
     }
 
@@ -639,6 +692,37 @@ fn empty_fingerprint(plan: &Plan) -> u64 {
     hasher.finish()
 }
 
+/// The result of the human confirmation for one immutable selected-item plan.
+/// The worker creates it only after the destructive dialog's response; `execute`
+/// never builds one on its own. The operation kind is part of the fingerprint,
+/// so an Empty Trash approval can never stand in for selected deletion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SelectedConfirmation {
+    fingerprint: u64,
+}
+
+impl SelectedConfirmation {
+    /// Bind a confirmation to exactly this selected plan, including every
+    /// identity and its fingerprint. A different set is a different plan.
+    pub fn for_plan(plan: &Plan) -> Option<Self> {
+        plan.selected_confirmation()
+    }
+
+    fn matches(self, plan: &Plan) -> bool {
+        matches!(plan.request, Request::DeleteSelected { .. })
+            && self.fingerprint == selected_fingerprint(plan)
+    }
+}
+
+fn selected_fingerprint(plan: &Plan) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    "trash.delete-permanently".hash(&mut hasher);
+    for step in &plan.steps {
+        step.trash.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
 // ---------------------------------------------------------------------------
 // Progress, reports and errors
 // ---------------------------------------------------------------------------
@@ -727,12 +811,15 @@ pub enum ExecuteError {
     UnansweredConflicts(Vec<ItemKey>),
     /// `file.undo` with an empty stack.
     NothingToUndo,
-    /// `trash.empty` reached `execute` without the human confirmation.
+    /// A permanent Trash deletion reached `execute` without the human
+    /// confirmation.
     ConfirmationRequired,
     /// A confirmation token was not made for this exact plan.
     ConfirmationMismatch,
     /// `execute` is not the path for an empty plan.
     NotAnEmptyPlan,
+    /// `execute_empty` was given a selected-item plan, or the reverse.
+    NotASelectedPlan,
 }
 
 impl fmt::Display for ExecuteError {
@@ -748,12 +835,15 @@ impl fmt::Display for ExecuteError {
             }
             ExecuteError::NothingToUndo => f.write_str("there is nothing to undo"),
             ExecuteError::ConfirmationRequired => {
-                f.write_str("emptying the trash needs the human confirmation step")
+                f.write_str("permanently deleting Trash items needs the human confirmation step")
             }
             ExecuteError::ConfirmationMismatch => {
                 f.write_str("the trash confirmation is for a different snapshot")
             }
             ExecuteError::NotAnEmptyPlan => f.write_str("this is not an empty-trash plan"),
+            ExecuteError::NotASelectedPlan => {
+                f.write_str("this is not a selected Trash deletion plan")
+            }
         }
     }
 }
@@ -947,6 +1037,7 @@ impl FileOperations {
             Request::NewFolder { name, in_folder } => plan_new_folder(name, in_folder),
             Request::Restore { items } => plan_restore(self.trash.as_ref(), items),
             Request::EmptyTrash => plan_empty(self.trash.as_ref()),
+            Request::DeleteSelected { items } => plan_selected(self.trash.as_ref(), items),
             Request::Undo => plan_undo(self.undo.back()),
         }
     }
@@ -975,7 +1066,7 @@ impl FileOperations {
             });
         }
 
-        if plan.request == Request::EmptyTrash {
+        if plan.request.needs_permanent_confirmation() {
             return Err(ExecuteError::ConfirmationRequired);
         }
 
@@ -1329,7 +1420,7 @@ impl FileOperations {
                 Action::NewFolder => make_folder(&target).map(|()| {
                     builder.new_folder = Some(target.clone());
                 }),
-                Action::Trash | Action::Restore | Action::Empty => {
+                Action::Trash | Action::Restore | Action::Empty | Action::DeleteSelected => {
                     Err("the plan has a step that cannot run here".to_string())
                 }
             };
@@ -1380,7 +1471,7 @@ impl FileOperations {
         plan: &Plan,
         confirmation: EmptyConfirmation,
         cancellable: &gio::Cancellable,
-        mut progress: P,
+        progress: P,
     ) -> Result<Report, ExecuteError> {
         if plan.request != Request::EmptyTrash {
             return Err(ExecuteError::NotAnEmptyPlan);
@@ -1388,8 +1479,42 @@ impl FileOperations {
         if !confirmation.matches(plan) {
             return Err(ExecuteError::ConfirmationMismatch);
         }
+        self.execute_permanent(plan, "confirmed empty trash", cancellable, progress)
+    }
 
-        log_event("starting confirmed empty trash");
+    /// Permanently delete exactly the selected, confirmed plan. It shares the
+    /// checked backend loop with Empty Trash but keeps a separate request,
+    /// confirmation and wording. It never lists or scans the Trash, so a stale
+    /// item cannot expand into an empty-everything fallback.
+    pub fn execute_selected<P: FnMut(Progress)>(
+        &mut self,
+        plan: &Plan,
+        confirmation: SelectedConfirmation,
+        cancellable: &gio::Cancellable,
+        progress: P,
+    ) -> Result<Report, ExecuteError> {
+        if !matches!(plan.request, Request::DeleteSelected { .. }) {
+            return Err(ExecuteError::NotASelectedPlan);
+        }
+        if !confirmation.matches(plan) {
+            return Err(ExecuteError::ConfirmationMismatch);
+        }
+        self.execute_permanent(
+            plan,
+            "confirmed selected permanent deletion",
+            cancellable,
+            progress,
+        )
+    }
+
+    fn execute_permanent<P: FnMut(Progress)>(
+        &mut self,
+        plan: &Plan,
+        label: &str,
+        cancellable: &gio::Cancellable,
+        mut progress: P,
+    ) -> Result<Report, ExecuteError> {
+        log_event(&format!("starting {label}"));
         let mut reporter = Reporter {
             progress: &mut progress,
             items_total: plan.steps.len(),
@@ -1415,24 +1540,29 @@ impl FileOperations {
                 continue;
             };
 
-            match self.trash.revalidate_object(&identity) {
-                Ok(_) => match self.trash.delete(&identity, cancellable) {
-                    Ok(()) => {
-                        deleted.push(identity.clone());
-                        report.items.push(done_result(step, None));
-                    }
-                    Err(error) => report.items.push(result(
-                        step,
-                        None,
-                        ItemOutcome::Failed(error.to_string()),
-                    )),
-                },
+            // Every confirmed item still goes through the checked backend.
+            // That operation re-queries immediately before GIO deletion, so a
+            // change after planning is refused there as well.
+            match self.trash.delete_checked(&identity, cancellable) {
+                Ok(()) => {
+                    deleted.push(identity.clone());
+                    report.items.push(done_result(step, None));
+                }
                 Err(error) => {
                     let outcome = match error {
-                        TrashError::Missing | TrashError::Changed | TrashError::Unverifiable => {
+                        // The item is already gone: report it as skipped so
+                        // the remaining confirmed items still run.
+                        TrashError::Missing => ItemOutcome::Skipped,
+                        TrashError::Cancelled => {
+                            report.cancelled = true;
+                            ItemOutcome::Cancelled
+                        }
+                        TrashError::Changed | TrashError::Unverifiable => {
                             ItemOutcome::Refused(error.to_string())
                         }
-                        _ => ItemOutcome::Failed(error.to_string()),
+                        TrashError::Unavailable(_) | TrashError::Io(_) => {
+                            ItemOutcome::Failed(error.to_string())
+                        }
                     };
                     report.items.push(result(step, None, outcome));
                 }
@@ -1449,7 +1579,7 @@ impl FileOperations {
         }
 
         self.invalidate_trash_entries(&deleted);
-        log_event("finished confirmed empty trash");
+        log_event(&format!("finished {label}"));
         Ok(report)
     }
 
@@ -1865,6 +1995,73 @@ fn plan_empty(backend: &dyn TrashBackend) -> Plan {
             undo: None,
             problem: Some(error.to_string()),
         },
+    }
+}
+
+/// Plan only the selected identities. It deliberately never calls `list`, so a
+/// stale or missing item cannot turn into an empty-the-whole-Trash fallback.
+/// Each item is queried once through its validated Trash URI for a readable
+/// plan; the final check still happens inside `delete_checked`.
+fn plan_selected(backend: &dyn TrashBackend, items: &[TrashIdentity]) -> Plan {
+    let request = Request::DeleteSelected {
+        items: items.to_vec(),
+    };
+    if items.is_empty() {
+        return Plan {
+            request,
+            steps: Vec::new(),
+            undo: None,
+            problem: Some("no Trash items were selected".to_string()),
+        };
+    }
+
+    let mut seen: Vec<TrashUri> = Vec::new();
+    let mut steps = Vec::new();
+    for identity in items {
+        if let Some(previous) = seen.iter().find(|uri| *uri == identity.uri()) {
+            if items
+                .iter()
+                .find(|candidate| candidate.uri() == previous)
+                .is_some_and(|candidate| candidate != identity)
+            {
+                return Plan {
+                    request,
+                    steps: Vec::new(),
+                    undo: None,
+                    problem: Some("the selected Trash items are inconsistent".to_string()),
+                };
+            }
+            continue;
+        }
+        seen.push(identity.uri().clone());
+
+        let conflict = match backend.query_item(identity.uri()) {
+            Ok(fresh) => match identity.compare_object(fresh.identity()) {
+                ObjectComparison::Same => None,
+                ObjectComparison::Changed => Some(Conflict::Changed),
+                ObjectComparison::Unverifiable => Some(Conflict::Unverified),
+            },
+            // Missing is reported as skipped by the checked delete. A backend
+            // failure stays a per-item failure instead of disabling the whole
+            // selected plan.
+            Err(TrashError::Missing) => None,
+            Err(_) => None,
+        };
+        steps.push(Step {
+            action: Action::DeleteSelected,
+            source: None,
+            target: None,
+            conflict,
+            keep_both: false,
+            trash: Some(identity.clone()),
+        });
+    }
+
+    Plan {
+        request,
+        steps,
+        undo: None,
+        problem: None,
     }
 }
 

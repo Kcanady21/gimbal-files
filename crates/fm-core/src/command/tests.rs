@@ -60,6 +60,7 @@ fn the_v1_catalogue_has_every_reviewed_command_in_order() {
         "trash.open",
         "trash.restore",
         "trash.empty",
+        "trash.delete-permanently",
         "preview.edit",
         "preview.discard",
         "preview.save",
@@ -120,28 +121,45 @@ fn summaries_are_one_non_empty_line() {
 }
 
 #[test]
-fn only_the_approved_trash_empty_deletes_permanently() {
+fn exactly_the_two_approved_permanent_commands_delete_permanently() {
+    let mut approved = Vec::new();
     for spec in COMMANDS {
-        let permanent = permanently_deletes(spec.name, spec.effect);
-        if permanent {
-            assert_eq!(
-                spec.name, "trash.empty",
-                "{} is a permanent-delete command outside the one approved exception",
-                spec.name
-            );
+        if permanently_deletes(spec.name, spec.effect) {
+            approved.push(spec.name);
         }
     }
+    assert_eq!(
+        approved,
+        vec!["trash.empty", "trash.delete-permanently"],
+        "only Kyle's two approved permanent-delete commands may exist"
+    );
 
     assert!(permanently_deletes("trash.empty", Effect::Files));
+    assert!(permanently_deletes(
+        "trash.delete-permanently",
+        Effect::Files
+    ));
     assert!(permanently_deletes("file.delete", Effect::Files));
     assert!(permanently_deletes("file.remove", Effect::Files));
     assert!(!permanently_deletes("file.trash", Effect::Files));
     assert!(!permanently_deletes("pins.remove", Effect::Settings));
+    // A differently named Trash deletion is still detected and would be
+    // refused by the catalogue rule, not waved through as ordinary trashing.
+    assert!(permanently_deletes("trash.delete", Effect::Files));
+    assert!(!permanently_deletes(
+        "trash.delete-permanently",
+        Effect::View
+    ));
 
-    // The exception is also the only caller-restricted command.
-    assert!(caller_allowed("trash.empty", Effect::Files, Caller::Ui));
+    // Both approved commands are UI-only for every other caller, including a
+    // dry run.
+    for command in ["trash.empty", "trash.delete-permanently"] {
+        assert!(caller_allowed(command, Effect::Files, Caller::Ui));
+        for caller in [Caller::Hotkey, Caller::Cli, Caller::Agent] {
+            assert!(!caller_allowed(command, Effect::Files, caller));
+        }
+    }
     for caller in [Caller::Hotkey, Caller::Cli, Caller::Agent] {
-        assert!(!caller_allowed("trash.empty", Effect::Files, caller));
         let error = check(caller, &["trash.empty"]).expect_err("only the UI may empty");
         assert_eq!(error.command(), Some("trash.empty"));
         assert_eq!(error.argument(), None);
@@ -150,7 +168,27 @@ fn only_the_approved_trash_empty_deletes_permanently() {
             CommandErrorKind::ForbiddenCaller { caller: actual } if *actual == caller
         ));
         assert!(error.to_string().contains("may not run this command"));
-        let dry = check(caller, &["trash.empty", "dry-run=true"]).expect_err("even a dry run");
+
+        let error = check(
+            caller,
+            &["trash.delete-permanently", "items=trash:///a.txt"],
+        )
+        .expect_err("only the UI may delete selected items");
+        assert_eq!(error.command(), Some("trash.delete-permanently"));
+        assert_eq!(error.argument(), None);
+        assert!(matches!(
+            error.kind(),
+            CommandErrorKind::ForbiddenCaller { caller: actual } if *actual == caller
+        ));
+        let dry = check(
+            caller,
+            &[
+                "trash.delete-permanently",
+                "items=trash:///a.txt",
+                "dry-run=true",
+            ],
+        )
+        .expect_err("even a dry run is refused");
         assert!(matches!(
             dry.kind(),
             CommandErrorKind::ForbiddenCaller { .. }
@@ -326,6 +364,55 @@ fn an_empty_trash_takes_only_its_registry_dry_run() {
     let command = check(Caller::Ui, &["trash.empty", "dry-run=true"]).expect("UI dry run");
     assert!(command.dry_run());
     let error = check(Caller::Ui, &["trash.empty", "path=/"]).expect_err("no path argument");
+    assert!(matches!(error.kind(), CommandErrorKind::UnknownArgument));
+}
+
+#[test]
+fn selected_permanent_deletion_requires_valid_trash_item_uris() {
+    let command = check(
+        Caller::Ui,
+        &[
+            "trash.delete-permanently",
+            "items=trash:///one.txt",
+            "items=trash:///a%20b.txt",
+            "dry-run=true",
+        ],
+    )
+    .expect("the UI may name explicit validated Trash items");
+    assert_eq!(
+        command.get("items"),
+        Some(&Value::TrashItems(vec![
+            TrashUri::parse("trash:///one.txt").unwrap(),
+            TrashUri::parse("trash:///a%20b.txt").unwrap(),
+        ]))
+    );
+    assert!(command.dry_run());
+
+    // There is no empty-list meaning, no implicit all-items or root fallback.
+    let error = check(Caller::Ui, &["trash.delete-permanently"]).expect_err("items are required");
+    assert_eq!(error.argument(), Some("items"));
+    assert!(matches!(error.kind(), CommandErrorKind::MissingArgument));
+
+    for bad in [
+        "items=",
+        "items=trash:///",
+        "items=file:///tmp/a",
+        "items=trash:///../a",
+        "items=trash:///a%2Fb",
+        "items=trash:///a%zz",
+    ] {
+        let error = check(Caller::Ui, &["trash.delete-permanently", bad])
+            .expect_err("only a validated item URI is accepted");
+        assert_eq!(error.command(), Some("trash.delete-permanently"));
+        assert_eq!(error.argument(), Some("items"));
+        assert!(matches!(error.kind(), CommandErrorKind::BadValue { .. }));
+    }
+
+    let error = check(
+        Caller::Ui,
+        &["trash.delete-permanently", "items=trash:///a.txt", "path=/"],
+    )
+    .expect_err("no extra bypass argument");
     assert!(matches!(error.kind(), CommandErrorKind::UnknownArgument));
 }
 

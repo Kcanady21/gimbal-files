@@ -26,6 +26,7 @@ pub enum OpKind {
     NewFolder,
     Restore,
     EmptyTrash,
+    DeleteSelected,
     Undo,
 }
 
@@ -39,6 +40,7 @@ impl OpKind {
             Request::NewFolder { .. } => OpKind::NewFolder,
             Request::Restore { .. } => OpKind::Restore,
             Request::EmptyTrash => OpKind::EmptyTrash,
+            Request::DeleteSelected { .. } => OpKind::DeleteSelected,
             Request::Undo => OpKind::Undo,
         }
     }
@@ -52,6 +54,7 @@ impl OpKind {
             OpKind::NewFolder => "Creating a folder",
             OpKind::Restore => "Restoring",
             OpKind::EmptyTrash => "Deleting",
+            OpKind::DeleteSelected => "Deleting permanently",
             OpKind::Undo => "Undoing",
         }
     }
@@ -141,11 +144,15 @@ fn items(count: usize) -> String {
 }
 
 fn tail(counts: Counts) -> String {
+    tail_with_skipped(counts, "skipped")
+}
+
+fn tail_with_skipped(counts: Counts, skipped: &str) -> String {
     let mut parts = Vec::new();
     for (count, label) in [
         (counts.failed, "failed"),
         (counts.refused, "refused"),
-        (counts.skipped, "skipped"),
+        (counts.skipped, skipped),
         (counts.cancelled, "cancelled"),
     ] {
         if count > 0 {
@@ -227,12 +234,31 @@ pub fn summary(request: &Request, report: &Report) -> String {
             }
         }
         Request::EmptyTrash => {
-            if counts.done == 0 && report.cancelled {
+            if counts.done == 0 && report.cancelled && counts.cancelled == total {
                 "Emptying Trash cancelled".to_string()
             } else if counts.not_done() == 0 {
                 format!("Emptied Trash: {} permanently deleted", items(counts.done))
             } else {
-                format!("Deleted {} of {}{}", counts.done, total, tail(counts))
+                format!(
+                    "Deleted {} of {}{}",
+                    counts.done,
+                    total,
+                    tail_with_skipped(counts, "already gone")
+                )
+            }
+        }
+        Request::DeleteSelected { .. } => {
+            if counts.done == 0 && report.cancelled && counts.cancelled == total {
+                "Permanent deletion cancelled".to_string()
+            } else if counts.not_done() == 0 {
+                format!("Permanently deleted {}", items(counts.done))
+            } else {
+                format!(
+                    "Permanently deleted {} of {}{}",
+                    counts.done,
+                    total,
+                    tail_with_skipped(counts, "already gone")
+                )
             }
         }
         Request::Undo => "Undid the last file operation".to_string(),
@@ -251,7 +277,8 @@ fn name_of(item: &fm_core::fileops::ItemResult) -> String {
 
 fn subject_of(item: &fm_core::fileops::ItemResult) -> String {
     if let Some(trash) = &item.trash {
-        return trash.uri().as_str().to_string();
+        // A name, not the internal trash URI, in user-facing details.
+        return trash.uri().name().to_string_lossy().into_owned();
     }
     item.source.display().to_string()
 }
@@ -264,6 +291,13 @@ pub fn failure_lines(report: &Report) -> Vec<String> {
         .filter_map(|item| match &item.outcome {
             ItemOutcome::Failed(reason) | ItemOutcome::Refused(reason) => {
                 Some(format!("{}: {reason}", subject_of(item)))
+            }
+            // An Empty Trash item that disappeared before the checked delete
+            // is skipped, not a failure; tell the user why it remains absent.
+            ItemOutcome::Skipped
+                if matches!(item.action, Action::Empty | Action::DeleteSelected) =>
+            {
+                Some(format!("{}: already gone from the Trash", subject_of(item)))
             }
             _ => None,
         })
@@ -286,7 +320,7 @@ pub fn undo_summary(plan: &Plan) -> Option<String> {
             Action::Trash => trash += 1,
             Action::Move => moves += 1,
             Action::Rename => renames += 1,
-            Action::Copy | Action::NewFolder | Action::Empty => {}
+            Action::Copy | Action::NewFolder | Action::Empty | Action::DeleteSelected => {}
         }
     }
 
@@ -504,6 +538,38 @@ mod tests {
             "Deleted 2 of 3: 1 failed"
         );
 
+        let selected = Request::DeleteSelected { items: Vec::new() };
+        assert_eq!(
+            summary(
+                &selected,
+                &report(&[ItemOutcome::Done, ItemOutcome::Done, ItemOutcome::Done])
+            ),
+            "Permanently deleted 3 items"
+        );
+        assert_eq!(
+            summary(&selected, &report(&[ItemOutcome::Done])),
+            "Permanently deleted 1 item"
+        );
+        assert_eq!(
+            summary(
+                &selected,
+                &report(&[
+                    ItemOutcome::Done,
+                    ItemOutcome::Refused("the item changed in the trash".into()),
+                    ItemOutcome::Skipped,
+                    ItemOutcome::Cancelled,
+                ])
+            ),
+            "Permanently deleted 1 of 4: 1 refused, 1 already gone, 1 cancelled"
+        );
+        assert!(
+            !summary(
+                &selected,
+                &report(&[ItemOutcome::Done, ItemOutcome::Skipped])
+            )
+            .contains("Emptied Trash")
+        );
+
         let rename = Request::Rename {
             path: std::path::PathBuf::from("/tmp/a"),
             name: "b".into(),
@@ -549,5 +615,60 @@ mod tests {
         assert_eq!(lines.len(), 2);
         assert!(lines[0].contains("file1.txt: no space"));
         assert!(lines[1].contains("file2.txt: the target exists"));
+    }
+
+    #[test]
+    fn an_empty_mixed_result_reports_each_kind_and_visible_details() {
+        let uri = fm_core::fileops::TrashUri::parse("trash:///a.txt").unwrap();
+        let identity = fm_core::fileops::TrashIdentity::new(uri, None, None, None);
+        let empty_report = Report {
+            cancelled: true,
+            items: vec![
+                ItemResult {
+                    action: Action::Empty,
+                    source: std::path::PathBuf::new(),
+                    target: None,
+                    trash: Some(identity.clone()),
+                    outcome: ItemOutcome::Done,
+                },
+                ItemResult {
+                    action: Action::Empty,
+                    source: std::path::PathBuf::new(),
+                    target: None,
+                    trash: Some(identity.clone()),
+                    outcome: ItemOutcome::Skipped,
+                },
+                ItemResult {
+                    action: Action::Empty,
+                    source: std::path::PathBuf::new(),
+                    target: None,
+                    trash: Some(identity.clone()),
+                    outcome: ItemOutcome::Refused(
+                        "Cannot verify this Trash item is unchanged".into(),
+                    ),
+                },
+                ItemResult {
+                    action: Action::Empty,
+                    source: std::path::PathBuf::new(),
+                    target: None,
+                    trash: Some(identity),
+                    outcome: ItemOutcome::Cancelled,
+                },
+            ],
+        };
+        let summary = summary(&Request::EmptyTrash, &empty_report);
+        assert_eq!(
+            summary,
+            "Deleted 1 of 4: 1 refused, 1 already gone, 1 cancelled"
+        );
+        assert!(!summary.contains("Emptied Trash"));
+        let details = failure_lines(&empty_report);
+        assert_eq!(details.len(), 2);
+        assert_eq!(details[0], "a.txt: already gone from the Trash");
+        assert_eq!(
+            details[1],
+            "a.txt: Cannot verify this Trash item is unchanged"
+        );
+        assert!(details.iter().all(|line| !line.contains("trash:///")));
     }
 }

@@ -383,6 +383,17 @@ pub const COMMANDS: &[CommandSpec] = &[
         undo: false,
         arguments: &[],
     },
+    // Kyle approved permanent deletion of selected Trash items on Nov 3.
+    // The items are required and validated; this command never means the whole
+    // Trash. It stays an explicitly clicked UI operation: the registry refuses
+    // every other caller.
+    CommandSpec {
+        name: "trash.delete-permanently",
+        summary: "Permanently delete the selected Trash items.",
+        effect: Effect::Files,
+        undo: false,
+        arguments: &[TRASH_ITEMS],
+    },
     CommandSpec {
         name: "preview.edit",
         summary: "Edit the file shown in the preview.",

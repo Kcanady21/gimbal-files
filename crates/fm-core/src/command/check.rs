@@ -149,7 +149,7 @@ pub enum CommandErrorKind {
     ForbiddenFromContext {
         caller: Caller,
     },
-    /// Emptying the trash is only a UI action.
+    /// A permanent Trash deletion is only an explicitly clicked UI action.
     ForbiddenCaller {
         caller: Caller,
     },

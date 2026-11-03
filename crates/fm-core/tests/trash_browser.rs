@@ -18,9 +18,10 @@ use std::sync::{Arc, Mutex};
 
 use fm_core::fileops::{
     self, Decision, Decisions, FileOperations, ItemKey, ItemOutcome, Request, TrashBackend,
-    TrashError, TrashIdentity, TrashItem, TrashRevision, TrashUri, trashinfo,
+    TrashError, TrashFingerprint, TrashIdentity, TrashItem, TrashUri, trashinfo,
 };
 use gio::prelude::*;
+use glib::translate::IntoGlib;
 
 const CHILD_ENV: &str = "GIMBAL_P2K2_CHILD";
 static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -145,6 +146,29 @@ fn corrupt_metadata_is_not_listed_or_deleted() {
     parent("corrupt", "child_corrupt_metadata");
 }
 
+#[test]
+fn an_empty_revalidates_identity_and_skips_already_gone_items() {
+    parent("empty-revalidate", "child_empty_revalidate_and_missing");
+}
+
+#[test]
+fn selected_deletion_deletes_only_its_snapshot_and_refuses_changes() {
+    parent("selected-snapshot", "child_selected_delete_only_snapshot");
+}
+
+#[test]
+fn selected_deletion_reports_mixed_results_and_final_cancel() {
+    parent("selected-mixed", "child_selected_delete_mixed_and_cancel");
+}
+
+#[test]
+fn selected_deletion_handles_folders_symlinks_external_uris_and_undo() {
+    parent(
+        "selected-tree",
+        "child_selected_delete_tree_external_and_undo",
+    );
+}
+
 // ---------------------------------------------------------------------------
 // The scratch backend
 // ---------------------------------------------------------------------------
@@ -154,6 +178,9 @@ struct ScratchTrash {
     root: PathBuf,
     fail_delete: Arc<Mutex<HashSet<String>>>,
     generations: Arc<Mutex<HashMap<String, u64>>>,
+    deleted: Arc<Mutex<Vec<String>>>,
+    delete_calls: Arc<Mutex<Vec<String>>>,
+    cancel_during_delete: Arc<Mutex<bool>>,
 }
 
 impl ScratchTrash {
@@ -164,11 +191,26 @@ impl ScratchTrash {
             root,
             fail_delete: Arc::new(Mutex::new(HashSet::new())),
             generations: Arc::new(Mutex::new(HashMap::new())),
+            deleted: Arc::new(Mutex::new(Vec::new())),
+            delete_calls: Arc::new(Mutex::new(Vec::new())),
+            cancel_during_delete: Arc::new(Mutex::new(false)),
         }
+    }
+
+    fn cancel_during_delete(&self) {
+        *self.cancel_during_delete.lock().unwrap() = true;
     }
 
     fn fail_delete(&self, uri: &str) {
         self.fail_delete.lock().unwrap().insert(uri.to_string());
+    }
+
+    fn deleted(&self) -> Vec<String> {
+        self.deleted.lock().unwrap().clone()
+    }
+
+    fn delete_calls(&self) -> Vec<String> {
+        self.delete_calls.lock().unwrap().clone()
     }
 
     fn entry_path(&self, uri: &TrashUri) -> PathBuf {
@@ -238,16 +280,18 @@ impl TrashBackend for ScratchTrash {
             let Ok(metadata) = fs::symlink_metadata(&files) else {
                 continue;
             };
-            let revision = TrashRevision::new(format!("generation-{}", self.generation(&uri)));
+            let is_dir = metadata.is_dir() && !metadata.file_type().is_symlink();
+            let fingerprint =
+                scratch_fingerprint(&uri, self.generation(&uri), is_dir, metadata.len());
             items.push(TrashItem::new(
                 TrashIdentity::new(
                     uri,
                     Some(parsed.path),
                     parsed.deletion_date.to_unix(),
-                    Some(revision),
+                    Some(fingerprint),
                 ),
                 stem.to_string_lossy().into_owned(),
-                metadata.is_dir() && !metadata.file_type().is_symlink(),
+                is_dir,
                 None,
             ));
         }
@@ -255,16 +299,11 @@ impl TrashBackend for ScratchTrash {
         Ok(items)
     }
 
-    fn revalidate(&self, item: &TrashIdentity) -> Result<TrashItem, TrashError> {
-        let fresh = self
-            .list()?
+    fn query_item(&self, uri: &TrashUri) -> Result<TrashItem, TrashError> {
+        self.list()?
             .into_iter()
-            .find(|candidate| candidate.uri() == item.uri())
-            .ok_or(TrashError::Missing)?;
-        if !item.agrees_with(fresh.identity()) {
-            return Err(TrashError::Changed);
-        }
-        Ok(fresh)
+            .find(|candidate| candidate.uri() == uri)
+            .ok_or(TrashError::Missing)
     }
 
     fn restore(
@@ -273,7 +312,7 @@ impl TrashBackend for ScratchTrash {
         target: &Path,
         _cancellable: &gio::Cancellable,
     ) -> Result<(), String> {
-        if item.revision().is_some() {
+        if item.fingerprint().is_some() {
             self.revalidate(item).map_err(|error| error.to_string())?;
         }
         if fs::symlink_metadata(target).is_ok() {
@@ -285,28 +324,91 @@ impl TrashBackend for ScratchTrash {
         Ok(())
     }
 
-    fn delete(&self, item: &TrashIdentity, _cancellable: &gio::Cancellable) -> Result<(), String> {
-        self.revalidate_object(item)
-            .map_err(|error| error.to_string())?;
+    fn delete_checked(
+        &self,
+        item: &TrashIdentity,
+        _cancellable: &gio::Cancellable,
+    ) -> Result<(), TrashError> {
+        self.revalidate_object(item)?;
+        if *self.cancel_during_delete.lock().unwrap() {
+            _cancellable.cancel();
+            return Err(TrashError::Cancelled);
+        }
         if self
             .fail_delete
             .lock()
             .unwrap()
             .contains(item.uri().as_str())
         {
-            return Err("the scratch backend refused this deletion".to_string());
+            return Err(TrashError::Io(
+                "the scratch backend refused this deletion".to_string(),
+            ));
         }
         let files = self.entry_path(item.uri());
-        let metadata = fs::symlink_metadata(&files).map_err(|error| error.to_string())?;
+        let metadata =
+            fs::symlink_metadata(&files).map_err(|error| TrashError::Io(error.to_string()))?;
+        self.delete_calls
+            .lock()
+            .unwrap()
+            .push(item.uri().as_str().to_string());
         if metadata.file_type().is_symlink() || !metadata.is_dir() {
-            fs::remove_file(&files).map_err(|error| error.to_string())?;
+            fs::remove_file(&files).map_err(|error| TrashError::Io(error.to_string()))?;
         } else {
             // std's remove_dir_all unlinks symlinks; it never follows them.
-            fs::remove_dir_all(&files).map_err(|error| error.to_string())?;
+            fs::remove_dir_all(&files).map_err(|error| TrashError::Io(error.to_string()))?;
         }
         let _ = fs::remove_file(self.info_path(item.uri()));
+        self.deleted
+            .lock()
+            .unwrap()
+            .push(item.uri().as_str().to_string());
         Ok(())
     }
+}
+
+fn scratch_fingerprint(
+    uri: &TrashUri,
+    generation: u64,
+    is_dir: bool,
+    size: u64,
+) -> TrashFingerprint {
+    let info = gio::FileInfo::new();
+    info.set_attribute_string(
+        gio::FILE_ATTRIBUTE_ID_FILE.as_str(),
+        &format!("l1:{}:{generation}", uri.as_str()),
+    );
+    info.set_attribute_string(gio::FILE_ATTRIBUTE_ID_FILESYSTEM.as_str(), "l1");
+    info.set_attribute_uint64(gio::FILE_ATTRIBUTE_UNIX_DEVICE.as_str(), 1);
+    info.set_attribute_uint64(gio::FILE_ATTRIBUTE_UNIX_INODE.as_str(), generation);
+    info.set_attribute_uint32(
+        gio::FILE_ATTRIBUTE_STANDARD_TYPE.as_str(),
+        u32::try_from(
+            if is_dir {
+                gio::FileType::Directory
+            } else {
+                gio::FileType::Regular
+            }
+            .into_glib(),
+        )
+        .unwrap(),
+    );
+    info.set_attribute_uint64(
+        gio::FILE_ATTRIBUTE_TIME_CHANGED.as_str(),
+        1_700_000_000 + generation,
+    );
+    info.set_attribute_uint32("time::changed-nsec", 123_456_789);
+    info.set_attribute_uint64(gio::FILE_ATTRIBUTE_TIME_MODIFIED.as_str(), 1_700_000_000);
+    info.set_attribute_uint32("time::modified-nsec", 123_456_789);
+    info.set_attribute_uint64(gio::FILE_ATTRIBUTE_STANDARD_SIZE.as_str(), size);
+    info.set_attribute_string(
+        gio::FILE_ATTRIBUTE_STANDARD_TARGET_URI.as_str(),
+        uri.as_str(),
+    );
+    info.set_attribute_string(
+        gio::FILE_ATTRIBUTE_ETAG_VALUE.as_str(),
+        &format!("generation-{generation}"),
+    );
+    TrashFingerprint::from_file_info(&info)
 }
 
 fn percent_encode(name: &OsStr) -> String {
@@ -609,6 +711,54 @@ fn child_empty_snapshot_and_symlink() {
     );
     assert_eq!(fs::read_to_string(&outside).unwrap(), "outside");
     assert!(tree.join("escape").is_symlink() || !tree.exists());
+    let mut calls = backend.delete_calls();
+    calls.sort();
+    assert_eq!(
+        calls,
+        vec!["trash:///old.txt", "trash:///tree"],
+        "each confirmed top-level item, including the folder, reaches the backend once"
+    );
+}
+
+#[test]
+#[ignore]
+fn child_empty_revalidate_and_missing() {
+    let scratch = scratch();
+    let backend = backend(&scratch);
+    for name in ["a.txt", "b.txt", "c.txt"] {
+        backend.add_file(name, &scratch.join(name), "2026-11-02T10:00:00", name);
+    }
+    let mut operations = FileOperations::with_trash_backend(Box::new(backend.clone()));
+    let plan = operations.plan(&Request::EmptyTrash);
+    assert_eq!(plan.steps().len(), 3);
+    let confirmation = plan.empty_confirmation().unwrap();
+
+    // b is already gone before execution; c was replaced at the same URI with
+    // the same original/date display metadata.
+    let _ = fs::remove_file(backend.root.join("files/b.txt"));
+    let _ = fs::remove_file(backend.root.join("info/b.txt.trashinfo"));
+    backend.write_info("c.txt", &scratch.join("c.txt"), "2026-11-02T10:00:00");
+
+    let report = operations
+        .execute_empty(&plan, confirmation, &gio::Cancellable::new(), |_| {})
+        .unwrap();
+    assert_eq!(report.items[0].outcome, ItemOutcome::Done);
+    assert_eq!(report.items[1].outcome, ItemOutcome::Skipped);
+    assert_eq!(
+        report.items[2].outcome,
+        ItemOutcome::Refused("the item changed in the trash".to_string())
+    );
+    assert_eq!(backend.deleted(), vec!["trash:///a.txt"]);
+    assert_eq!(backend.delete_calls(), vec!["trash:///a.txt"]);
+    assert_eq!(
+        backend
+            .list()
+            .unwrap()
+            .iter()
+            .map(|item| item.uri().as_str().to_string())
+            .collect::<Vec<_>>(),
+        vec!["trash:///c.txt"]
+    );
 }
 
 #[test]
@@ -630,7 +780,9 @@ fn child_empty_partial_and_cancel() {
     assert_eq!(report.items.len(), 3);
     assert_eq!(
         report.items[1].outcome,
-        ItemOutcome::Failed("the scratch backend refused this deletion".to_string())
+        ItemOutcome::Failed(
+            "the trash request failed: the scratch backend refused this deletion".to_string(),
+        )
     );
     assert_eq!(
         backend
@@ -651,6 +803,231 @@ fn child_empty_partial_and_cancel() {
         .unwrap();
     assert!(report.cancelled);
     assert_eq!(backend.list().unwrap().len(), 1);
+}
+
+#[test]
+#[ignore]
+fn child_selected_delete_only_snapshot() {
+    let scratch = scratch();
+    let backend = backend(&scratch);
+    for name in ["a.txt", "b.txt", "c.txt"] {
+        backend.add_file(name, &scratch.join(name), "2026-11-03T10:00:00", name);
+    }
+    let items = backend.list().unwrap();
+    let selected = vec![items[0].identity().clone(), items[2].identity().clone()];
+    let mut operations = FileOperations::with_trash_backend(Box::new(backend.clone()));
+    let request = Request::DeleteSelected { items: selected };
+    let plan = operations.plan(&request);
+    assert_eq!(plan.steps().len(), 2);
+    let confirmation = plan.selected_confirmation().unwrap();
+
+    let dry = operations.dry_run(&request);
+    assert!(dry.iter().any(|line| line.contains("trash:///a.txt")));
+    assert!(dry.iter().any(|line| line.contains("trash:///c.txt")));
+    assert!(backend.deleted().is_empty(), "a dry run writes nothing");
+
+    // c was replaced at the same URI with the same original/date metadata.
+    backend.write_info("c.txt", &scratch.join("c.txt"), "2026-11-03T10:00:00");
+    let report = operations
+        .execute_selected(&plan, confirmation, &gio::Cancellable::new(), |_| {})
+        .unwrap();
+    assert_eq!(report.items[0].outcome, ItemOutcome::Done);
+    assert_eq!(
+        report.items[1].outcome,
+        ItemOutcome::Refused("the item changed in the trash".to_string())
+    );
+    assert_eq!(backend.deleted(), vec!["trash:///a.txt"]);
+    assert_eq!(
+        backend
+            .list()
+            .unwrap()
+            .iter()
+            .map(|item| item.uri().as_str().to_string())
+            .collect::<Vec<_>>(),
+        vec!["trash:///b.txt", "trash:///c.txt"],
+        "the unselected item and the refused replacement survive"
+    );
+}
+
+#[test]
+#[ignore]
+fn child_selected_delete_mixed_and_cancel() {
+    let scratch = scratch();
+    let backend = backend(&scratch);
+    for name in ["a.txt", "b.txt", "c.txt", "d.txt", "keep.txt"] {
+        backend.add_file(name, &scratch.join(name), "2026-11-03T10:00:00", name);
+    }
+    let keep = backend
+        .list()
+        .unwrap()
+        .into_iter()
+        .find(|item| item.uri().as_str() == "trash:///keep.txt")
+        .unwrap();
+    backend.fail_delete("trash:///b.txt");
+    let mut operations = FileOperations::with_trash_backend(Box::new(backend.clone()));
+    let items = backend.list().unwrap();
+    let request = Request::DeleteSelected {
+        items: items
+            .iter()
+            .filter(|item| item.uri().as_str() != "trash:///keep.txt")
+            .map(|item| item.identity().clone())
+            .collect(),
+    };
+    let plan = operations.plan(&request);
+    let confirmation = plan.selected_confirmation().unwrap();
+    // c is already gone before execution.
+    let _ = fs::remove_file(backend.root.join("files/c.txt"));
+    let _ = fs::remove_file(backend.root.join("info/c.txt.trashinfo"));
+    let report = operations
+        .execute_selected(&plan, confirmation, &gio::Cancellable::new(), |_| {})
+        .unwrap();
+    assert_eq!(report.items[0].outcome, ItemOutcome::Done);
+    assert!(matches!(report.items[1].outcome, ItemOutcome::Failed(_)));
+    assert_eq!(report.items[2].outcome, ItemOutcome::Skipped);
+    assert_eq!(report.items[3].outcome, ItemOutcome::Done);
+    assert_eq!(backend.deleted(), vec!["trash:///a.txt", "trash:///d.txt"]);
+    assert!(keep.uri().as_str() == "trash:///keep.txt");
+    assert!(
+        backend
+            .list()
+            .unwrap()
+            .iter()
+            .any(|item| item.uri().as_str() == "trash:///keep.txt"),
+        "the unselected item survives"
+    );
+    assert!(
+        operations.plan(&Request::Undo).steps().is_empty(),
+        "selected permanent deletion creates no undo record"
+    );
+
+    // Cancellation during the only (final) item stays Cancelled, not Failed.
+    let scratch2 = crate::scratch().join("cancel");
+    let backend2 = crate::backend(&scratch2);
+    backend2.add_file("f.txt", &scratch2.join("f.txt"), "2026-11-03T11:00:00", "f");
+    let mut remaining = backend2.list().unwrap();
+    let item = remaining.remove(0);
+    backend2.cancel_during_delete();
+    let mut operations = FileOperations::with_trash_backend(Box::new(backend2.clone()));
+    let request = Request::DeleteSelected {
+        items: vec![item.identity().clone()],
+    };
+    let plan = operations.plan(&request);
+    let confirmation = plan.selected_confirmation().unwrap();
+    let report = operations
+        .execute_selected(&plan, confirmation, &gio::Cancellable::new(), |_| {})
+        .unwrap();
+    assert!(report.cancelled);
+    assert_eq!(report.items[0].outcome, ItemOutcome::Cancelled);
+    assert!(backend2.deleted().is_empty());
+    assert_eq!(backend2.list().unwrap().len(), 1);
+}
+
+#[test]
+#[ignore]
+fn child_selected_delete_tree_external_and_undo() {
+    let scratch = scratch();
+    let folder = scratch.join("folder");
+    fs::create_dir_all(&folder).unwrap();
+    let keep_path = folder.join("keep.txt");
+    let backend = backend(&scratch);
+    backend.add_file("keep.txt", &keep_path, "2026-11-03T10:00:00", "keep");
+
+    let tree = backend.root.join("files/tree");
+    fs::create_dir_all(&tree).unwrap();
+    fs::write(tree.join("inside.txt"), "inside").unwrap();
+    let outside = scratch.join("outside.txt");
+    fs::write(&outside, "outside").unwrap();
+    std::os::unix::fs::symlink(&outside, tree.join("escape")).unwrap();
+    backend.write_info("tree", &scratch.join("tree"), "2026-11-03T10:01:00");
+
+    let external_name = r"\run\media\test\drive\.Trash-1000\files\external.txt";
+    backend.add_file(
+        external_name,
+        &scratch.join("external.txt"),
+        "2026-11-03T10:02:00",
+        "external",
+    );
+
+    let items = backend.list().unwrap();
+    let keep = items
+        .iter()
+        .find(|item| item.uri().as_str() == "trash:///keep.txt")
+        .unwrap()
+        .identity()
+        .clone();
+    let mut operations = FileOperations::with_trash_backend(Box::new(backend.clone()));
+
+    // Restore an unselected item first, so a later selected permanent deletion
+    // must not discard that undo record.
+    let restore_request = Request::Restore {
+        items: vec![keep.clone()],
+    };
+    let restore_plan = operations.plan(&restore_request);
+    let decisions = Decisions::from_plan(&restore_plan);
+    let report = operations
+        .execute(&restore_plan, &decisions, &gio::Cancellable::new(), |_| {})
+        .unwrap();
+    assert!(report.all_succeeded(), "{:?}", report.lines());
+    assert_eq!(fs::read_to_string(&keep_path).unwrap(), "keep");
+    assert!(!operations.plan(&Request::Undo).steps().is_empty());
+
+    let selected: Vec<_> = backend
+        .list()
+        .unwrap()
+        .into_iter()
+        .filter(|item| item.uri().as_str() != "trash:///keep.txt")
+        .map(|item| item.identity().clone())
+        .collect();
+    assert!(
+        selected
+            .iter()
+            .any(|identity| { identity.uri().as_str().contains("%5C") })
+    );
+    let request = Request::DeleteSelected { items: selected };
+    let plan = operations.plan(&request);
+    let confirmation = plan.selected_confirmation().unwrap();
+    let report = operations
+        .execute_selected(&plan, confirmation, &gio::Cancellable::new(), |_| {})
+        .unwrap();
+    assert!(report.all_succeeded(), "{:?}", report.lines());
+    assert!(!tree.exists(), "the folder is handed to the backend once");
+    assert_eq!(
+        fs::read_to_string(&outside).unwrap(),
+        "outside",
+        "a symlink inside the deleted folder never follows its target"
+    );
+    assert!(
+        backend
+            .list()
+            .unwrap()
+            .iter()
+            .all(|item| item.uri().as_str() != "trash:///keep.txt"),
+        "restoring removed keep from the Trash"
+    );
+
+    // The earlier Restore undo still runs after the selected deletion.
+    let undo = operations.plan(&Request::Undo);
+    assert!(
+        !undo.steps().is_empty(),
+        "undo for the unselected item survives"
+    );
+    let report = operations
+        .execute(
+            &undo,
+            &Decisions::new(Vec::new()),
+            &gio::Cancellable::new(),
+            |_| {},
+        )
+        .unwrap();
+    assert!(report.all_succeeded(), "{:?}", report.lines());
+    assert!(!keep_path.exists());
+    assert_eq!(
+        fs::read_dir(PathBuf::from(std::env::var_os("XDG_DATA_HOME").unwrap()).join("Trash/files"))
+            .unwrap()
+            .count(),
+        1,
+        "the undo put the restored keep item in the scratch GIO trash"
+    );
 }
 
 #[test]

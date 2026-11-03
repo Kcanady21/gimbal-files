@@ -300,11 +300,15 @@ pub fn must_supply(caller: Caller, effect: Effect, argument: &ArgSpec) -> bool {
     }
 }
 
-/// Whether this caller may run this command at all. Emptying the trash is the
-/// one explicitly clicked UI operation: hotkeys, the CLI and the agent are
-/// refused before a handler or even a dry run can see it.
+/// The permanent-delete commands Kyle approved. Both are explicitly clicked
+/// UI operations: hotkeys, the CLI and the agent are refused before a handler,
+/// including a dry run, can see them. This is the only caller exception.
+pub const UI_ONLY_PERMANENT_COMMANDS: &[&str] = &["trash.empty", "trash.delete-permanently"];
+
+/// Whether this caller may run this command at all. The two approved permanent
+/// deletions are explicitly clicked UI operations.
 pub fn caller_allowed(name: &str, effect: Effect, caller: Caller) -> bool {
-    !(name == "trash.empty" && effect == Effect::Files) || caller == Caller::Ui
+    !(effect == Effect::Files && UI_ONLY_PERMANENT_COMMANDS.contains(&name)) || caller == Caller::Ui
 }
 
 /// Whether the name is `area.verb` in lowercase kebab case.
@@ -324,9 +328,9 @@ pub fn is_well_formed_name(name: &str) -> bool {
     })
 }
 
-/// Whether a command would delete permanently. The catalogue test refuses any
-/// entry for which this is true. `pins.remove` is a `Settings` command, so it
-/// is not a file delete.
+/// Whether a command would delete permanently. The catalogue test allows only
+/// the two reviewed Trash commands and refuses every other entry for which this
+/// is true. `pins.remove` is a `Settings` command, so it is not a file delete.
 pub fn permanently_deletes(name: &str, effect: Effect) -> bool {
     if effect != Effect::Files {
         return false;
@@ -336,7 +340,7 @@ pub fn permanently_deletes(name: &str, effect: Effect) -> bool {
     let area = parts.next().unwrap_or("");
     let verb = parts.next().unwrap_or("");
 
-    (area == "trash" && verb == "empty")
+    (area == "trash" && matches!(verb, "empty" | "delete-permanently"))
         || matches!(
             verb,
             "delete" | "remove" | "purge" | "erase" | "wipe" | "destroy" | "unlink" | "shred"

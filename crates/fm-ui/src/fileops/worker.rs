@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use fm_core::fileops::{
     Decisions, EmptyConfirmation, ExecuteError, FileOperations, ItemOutcome, ItemResult, Plan,
-    Progress, Report, Request,
+    Progress, Report, Request, SelectedConfirmation,
 };
 use gtk::gio;
 use gtk::gio::prelude::*;
@@ -30,6 +30,10 @@ pub enum WorkerMsg {
     },
     /// The destructive Empty Trash dialog returned Empty Trash.
     ConfirmEmpty {
+        id: u64,
+    },
+    /// The destructive selected-deletion dialog returned Delete Permanently.
+    ConfirmSelected {
         id: u64,
     },
     Cancel {
@@ -139,65 +143,92 @@ fn run(jobs: Receiver<WorkerMsg>, control: Receiver<WorkerMsg>, events: Sender<W
             continue;
         }
 
-        if request == Request::EmptyTrash {
-            if wait_for_empty_confirmation(&control, id, &cancellable).is_none() {
-                finish_cancelled(id, request, plan, &events);
-                continue;
-            }
-        } else {
-            let decisions = match wait_for_answer(&control, id, &cancellable) {
-                Some(decisions) => decisions,
-                None => {
+        match &request {
+            Request::EmptyTrash => {
+                if !wait_for_approval(&control, id, &cancellable, Approval::Empty) {
                     finish_cancelled(id, request, plan, &events);
                     continue;
                 }
-            };
-
-            if decisions.is_cancelled() || cancellable.is_cancelled() {
-                finish_cancelled(id, request, plan, &events);
-                continue;
+                let Some(confirmation) = EmptyConfirmation::for_plan(&plan) else {
+                    finish_cancelled(id, request, plan, &events);
+                    continue;
+                };
+                let sender = events.clone();
+                let mut last = Instant::now();
+                let result = operations.execute_empty(
+                    &plan,
+                    confirmation,
+                    &cancellable,
+                    move |progress: Progress| {
+                        if last.elapsed() >= Duration::from_millis(PROGRESS_MS)
+                            || progress.items_done == progress.items_total
+                        {
+                            last = Instant::now();
+                            let _ = sender.send(WorkerEvent::Progress { id, progress });
+                        }
+                    },
+                );
+                finish_operation(id, request, plan, result, &mut operations, &events);
             }
-
-            let sender = events.clone();
-            let mut last = Instant::now();
-            let result = operations.execute(
-                &plan,
-                &decisions,
-                &cancellable,
-                move |progress: Progress| {
-                    if last.elapsed() >= Duration::from_millis(PROGRESS_MS)
-                        || progress.items_done == progress.items_total
-                    {
-                        last = Instant::now();
-                        let _ = sender.send(WorkerEvent::Progress { id, progress });
-                    }
-                },
-            );
-
-            finish_operation(id, request, plan, result, &mut operations, &events);
-            continue;
-        }
-
-        let sender = events.clone();
-        let mut last = Instant::now();
-        let Some(confirmation) = EmptyConfirmation::for_plan(&plan) else {
-            finish_cancelled(id, request, plan, &events);
-            continue;
-        };
-        let result = operations.execute_empty(
-            &plan,
-            confirmation,
-            &cancellable,
-            move |progress: Progress| {
-                if last.elapsed() >= Duration::from_millis(PROGRESS_MS)
-                    || progress.items_done == progress.items_total
-                {
-                    last = Instant::now();
-                    let _ = sender.send(WorkerEvent::Progress { id, progress });
+            Request::DeleteSelected { .. } => {
+                if !wait_for_approval(&control, id, &cancellable, Approval::Selected) {
+                    finish_cancelled(id, request, plan, &events);
+                    continue;
                 }
-            },
-        );
-        finish_operation(id, request, plan, result, &mut operations, &events);
+                let Some(confirmation) = SelectedConfirmation::for_plan(&plan) else {
+                    finish_cancelled(id, request, plan, &events);
+                    continue;
+                };
+                let sender = events.clone();
+                let mut last = Instant::now();
+                let result = operations.execute_selected(
+                    &plan,
+                    confirmation,
+                    &cancellable,
+                    move |progress: Progress| {
+                        if last.elapsed() >= Duration::from_millis(PROGRESS_MS)
+                            || progress.items_done == progress.items_total
+                        {
+                            last = Instant::now();
+                            let _ = sender.send(WorkerEvent::Progress { id, progress });
+                        }
+                    },
+                );
+                finish_operation(id, request, plan, result, &mut operations, &events);
+            }
+            _ => {
+                let decisions = match wait_for_answer(&control, id, &cancellable) {
+                    Some(decisions) => decisions,
+                    None => {
+                        finish_cancelled(id, request, plan, &events);
+                        continue;
+                    }
+                };
+
+                if decisions.is_cancelled() || cancellable.is_cancelled() {
+                    finish_cancelled(id, request, plan, &events);
+                    continue;
+                }
+
+                let sender = events.clone();
+                let mut last = Instant::now();
+                let result = operations.execute(
+                    &plan,
+                    &decisions,
+                    &cancellable,
+                    move |progress: Progress| {
+                        if last.elapsed() >= Duration::from_millis(PROGRESS_MS)
+                            || progress.items_done == progress.items_total
+                        {
+                            last = Instant::now();
+                            let _ = sender.send(WorkerEvent::Progress { id, progress });
+                        }
+                    },
+                );
+
+                finish_operation(id, request, plan, result, &mut operations, &events);
+            }
+        }
     }
 }
 
@@ -239,19 +270,38 @@ fn finish_operation(
     }
 }
 
-fn wait_for_empty_confirmation(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Approval {
+    Empty,
+    Selected,
+}
+
+/// Wait for the one destructive approval that belongs to this job and this
+/// operation kind. The other kind is ignored: an Empty Trash dialog can never
+/// authorise selected deletion, or the reverse.
+fn wait_for_approval(
     control: &Receiver<WorkerMsg>,
     id: u64,
     cancellable: &gio::Cancellable,
-) -> Option<()> {
+    approval: Approval,
+) -> bool {
     loop {
         match control.recv() {
-            Ok(WorkerMsg::ConfirmEmpty { id: confirm_id }) if confirm_id == id => return Some(()),
+            Ok(WorkerMsg::ConfirmEmpty { id: confirm_id })
+                if approval == Approval::Empty && confirm_id == id =>
+            {
+                return true;
+            }
+            Ok(WorkerMsg::ConfirmSelected { id: confirm_id })
+                if approval == Approval::Selected && confirm_id == id =>
+            {
+                return true;
+            }
             Ok(WorkerMsg::Cancel { id: cancel_id }) if cancel_id == id => {
                 cancellable.cancel();
-                return None;
+                return false;
             }
-            Ok(WorkerMsg::Shutdown) | Err(_) => return None,
+            Ok(WorkerMsg::Shutdown) | Err(_) => return false,
             Ok(_) => continue,
         }
     }

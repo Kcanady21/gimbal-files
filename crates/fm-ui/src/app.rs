@@ -10,13 +10,13 @@
 use adw::prelude::*;
 use fm_core::command::{Caller, CheckedCommand, Effect, Invocation, Outcome, Registry, Value};
 use fm_core::config::{self, Change, ConfigFile};
-use fm_core::fileops::{Decisions, Plan, Report, Request};
+use fm_core::fileops::{Decisions, Plan, Report, Request, TrashIdentity, TrashUri};
 use fm_core::session::{self, SessionProblem};
 use fm_core::workspace::{Event, Heights, TabId, WindowId, Workspace};
 use gtk::gio;
 use gtk::glib;
 use std::cell::{Cell, RefCell};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -49,6 +49,9 @@ pub struct Process {
     /// A spring-loaded tab focuses the model without rebuilding the header,
     /// which would unparent the pill the drag is over.
     suppress_header: Cell<bool>,
+    /// The typed Trash identities frozen when the item-menu Delete Permanently
+    /// was clicked. It is taken once, before the worker starts.
+    pending_trash_delete: RefCell<Option<Vec<TrashIdentity>>>,
 }
 
 impl Process {
@@ -108,6 +111,7 @@ impl Process {
             fileops: RefCell::new(None),
             fresh_home: Cell::new(false),
             suppress_header: Cell::new(false),
+            pending_trash_delete: RefCell::new(None),
         });
         let fileops = FileOps::new(&process);
         *process.fileops.borrow_mut() = Some(fileops);
@@ -117,6 +121,54 @@ impl Process {
 
     pub fn fileops(&self) -> Option<Rc<FileOps>> {
         self.fileops.borrow().clone()
+    }
+
+    /// Freeze the full typed Trash identities selected in the item menu. This
+    /// happens before the registry dispatch and before any asynchronous
+    /// planning starts.
+    pub fn stage_trash_delete(&self, items: Vec<TrashIdentity>) {
+        crate::log!(
+            "fileops",
+            "staged {} selected Trash identity(ies) for permanent deletion",
+            items.len()
+        );
+        *self.pending_trash_delete.borrow_mut() = Some(items);
+    }
+
+    /// Take the click-time snapshot exactly once and require its deduplicated
+    /// URIs to equal the registry's validated `items` set. A later browser
+    /// selection or monitor refresh therefore cannot change the deletion set.
+    fn take_trash_delete_for(
+        &self,
+        command: &CheckedCommand,
+    ) -> Result<Vec<TrashIdentity>, String> {
+        let Some(Value::TrashItems(requested)) = command.get("items") else {
+            return Err("the selected Trash items are missing".to_string());
+        };
+        let snapshot = self
+            .pending_trash_delete
+            .borrow_mut()
+            .take()
+            .unwrap_or_default();
+        let mut unique: Vec<TrashIdentity> = Vec::new();
+        for identity in snapshot {
+            if let Some(existing) = unique
+                .iter()
+                .find(|candidate| candidate.uri() == identity.uri())
+            {
+                if existing != &identity {
+                    return Err("the selected Trash items are inconsistent".to_string());
+                }
+                continue;
+            }
+            unique.push(identity);
+        }
+        let requested: HashSet<&str> = requested.iter().map(TrashUri::as_str).collect();
+        let snapshot: HashSet<&str> = unique.iter().map(|item| item.uri().as_str()).collect();
+        if requested != snapshot || unique.is_empty() {
+            return Err("the Trash selection changed before deletion".to_string());
+        }
+        Ok(unique)
     }
 
     fn restore_session(self: &Rc<Self>) {
@@ -1374,18 +1426,33 @@ impl Process {
         caller: Caller,
         command: &CheckedCommand,
     ) -> Option<Outcome> {
-        let request = match self.request_from_command(window, caller, command) {
-            Ok(Some(request)) => request,
-            Ok(None) => return None,
-            Err(error) => {
-                crate::log!("fileops", "{}: {error}", command.name());
-                return Some(Outcome::Done);
+        let request = if command.name() == "trash.delete-permanently" {
+            match self.take_trash_delete_for(command) {
+                Ok(items) => Request::DeleteSelected { items },
+                Err(error) => {
+                    crate::log!("fileops", "{}: {error}", command.name());
+                    if let Some(ui) = self.window(window) {
+                        ui.trash_status(&format!("Could not delete permanently: {error}"));
+                    }
+                    return Some(Outcome::Done);
+                }
+            }
+        } else {
+            match self.request_from_command(window, caller, command) {
+                Ok(Some(request)) => request,
+                Ok(None) => return None,
+                Err(error) => {
+                    crate::log!("fileops", "{}: {error}", command.name());
+                    return Some(Outcome::Done);
+                }
             }
         };
 
         if command.dry_run() {
-            if matches!(request, Request::EmptyTrash | Request::Restore { .. })
-                && let Some(fileops) = self.fileops()
+            if matches!(
+                request,
+                Request::EmptyTrash | Request::Restore { .. } | Request::DeleteSelected { .. }
+            ) && let Some(fileops) = self.fileops()
             {
                 let id = fileops.submit_dry_run(window, request);
                 crate::log!("fileops", "{} dry run queued as job {id}", command.name());
@@ -1614,7 +1681,7 @@ impl Process {
         } else if let Some(fileops) = self.fileops() {
             crate::log!(
                 "fileops",
-                "no visible Trash page for the empty confirmation; cancelling job {id}"
+                "no visible Trash page for the permanent-delete confirmation; cancelling job {id}"
             );
             fileops.cancel_job(id);
         }

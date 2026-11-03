@@ -272,9 +272,12 @@ impl FileOps {
                     current.window
                 };
                 let conflicts = plan.decisions().count();
-                if plan.request() == &Request::EmptyTrash {
+                if plan.request().needs_permanent_confirmation() {
                     if plan.steps().is_empty() {
-                        crate::log!("fileops", "empty job {id} has nothing to confirm");
+                        crate::log!(
+                            "fileops",
+                            "permanent deletion job {id} has nothing to confirm"
+                        );
                         self.cancel_current();
                         return;
                     }
@@ -284,7 +287,7 @@ impl FileOps {
                     if let Some(process) = self.process.borrow().upgrade() {
                         crate::log!(
                             "fileops",
-                            "empty confirmation for job {id}: {} item(s)",
+                            "permanent-delete confirmation for job {id}: {} item(s)",
                             plan.steps().len()
                         );
                         process.fileop_empty_confirmation(window, id, plan.clone());
@@ -473,6 +476,22 @@ impl FileOps {
         }
         crate::log!("fileops", "confirmed empty trash job {id}");
         let _ = self.control.send(worker::WorkerMsg::ConfirmEmpty { id });
+    }
+
+    /// The destructive dialog returned Delete Permanently for the selected
+    /// Trash items. The worker revalidates the immutable selected plan before
+    /// deleting anything.
+    pub fn confirm_selected(self: &Rc<Self>, id: u64) {
+        {
+            let mut slot = self.current.borrow_mut();
+            if let Some(current) = slot.as_mut()
+                && current.id == id
+            {
+                current.answering = false;
+            }
+        }
+        crate::log!("fileops", "confirmed selected deletion job {id}");
+        let _ = self.control.send(worker::WorkerMsg::ConfirmSelected { id });
     }
 
     /// Cancel the running job. Whatever finished stays done; the rest is

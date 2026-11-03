@@ -9,6 +9,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use glib::translate::IntoGlib;
+
 use super::*;
 use crate::command::{Caller, Invocation, Registry};
 
@@ -84,6 +86,8 @@ struct TestTrashState {
     deleted: Vec<String>,
     fail_restore: Vec<String>,
     fail_delete: Vec<String>,
+    cancel_during_delete: bool,
+    list_calls: usize,
 }
 
 #[derive(Clone, Default)]
@@ -118,26 +122,28 @@ impl TestTrash {
             .map(|item| item.uri().as_str().to_string())
             .collect()
     }
+
+    fn list_calls(&self) -> usize {
+        self.state.lock().unwrap().list_calls
+    }
 }
 
 impl TrashBackend for TestTrash {
     fn list(&self) -> Result<Vec<TrashItem>, TrashError> {
-        Ok(self.state.lock().unwrap().items.clone())
+        let mut state = self.state.lock().unwrap();
+        state.list_calls += 1;
+        Ok(state.items.clone())
     }
 
-    fn revalidate(&self, item: &TrashIdentity) -> Result<TrashItem, TrashError> {
-        let state = self.state.lock().unwrap();
-        let Some(fresh) = state
+    fn query_item(&self, uri: &TrashUri) -> Result<TrashItem, TrashError> {
+        self.state
+            .lock()
+            .unwrap()
             .items
             .iter()
-            .find(|candidate| candidate.uri() == item.uri())
-        else {
-            return Err(TrashError::Missing);
-        };
-        if !item.agrees_with(fresh.identity()) {
-            return Err(TrashError::Changed);
-        }
-        Ok(fresh.clone())
+            .find(|candidate| candidate.uri() == uri)
+            .cloned()
+            .ok_or(TrashError::Missing)
     }
 
     fn restore(
@@ -171,40 +177,83 @@ impl TrashBackend for TestTrash {
         Ok(())
     }
 
-    fn delete(&self, item: &TrashIdentity, _cancellable: &gio::Cancellable) -> Result<(), String> {
+    fn delete_checked(
+        &self,
+        item: &TrashIdentity,
+        cancellable: &gio::Cancellable,
+    ) -> Result<(), TrashError> {
+        self.revalidate_object(item)?;
         let mut state = self.state.lock().unwrap();
+        if state.cancel_during_delete {
+            cancellable.cancel();
+            return Err(TrashError::Cancelled);
+        }
         if state
             .fail_delete
             .iter()
             .any(|uri| uri == item.uri().as_str())
         {
-            return Err("the test backend refused this deletion".to_string());
+            return Err(TrashError::Io(
+                "the test backend refused this deletion".to_string(),
+            ));
         }
         let Some(index) = state
             .items
             .iter()
             .position(|candidate| candidate.uri() == item.uri())
         else {
-            return Err("missing".to_string());
+            return Err(TrashError::Missing);
         };
-        if !item.same_object(state.items[index].identity()) {
-            return Err("the item changed in the trash".to_string());
-        }
         state.items.remove(index);
         state.deleted.push(item.uri().as_str().to_string());
         Ok(())
     }
 }
 
-fn trash_item(uri: &str, original: Option<&Path>, deleted_at: Option<i64>) -> TrashItem {
-    trash_item_with_revision(uri, original, deleted_at, Some("generation-1"))
+fn fingerprint(generation: &str) -> TrashFingerprint {
+    let info = gio::FileInfo::new();
+    info.set_attribute_string(gio::FILE_ATTRIBUTE_ID_FILE.as_str(), generation);
+    info.set_attribute_string(gio::FILE_ATTRIBUTE_ID_FILESYSTEM.as_str(), "l1");
+    info.set_attribute_uint64(gio::FILE_ATTRIBUTE_UNIX_DEVICE.as_str(), 1);
+    info.set_attribute_uint64(gio::FILE_ATTRIBUTE_UNIX_INODE.as_str(), 42);
+    info.set_attribute_uint32(
+        gio::FILE_ATTRIBUTE_STANDARD_TYPE.as_str(),
+        u32::try_from(gio::FileType::Regular.into_glib()).unwrap(),
+    );
+    info.set_attribute_uint64(gio::FILE_ATTRIBUTE_TIME_CHANGED.as_str(), 1_700_000_000);
+    info.set_attribute_uint32(gio::FILE_ATTRIBUTE_TIME_CHANGED_USEC.as_str(), 123_456);
+    info.set_attribute_uint32("time::changed-nsec", 123_456_789);
+    info.set_attribute_uint64(gio::FILE_ATTRIBUTE_TIME_MODIFIED.as_str(), 1_700_000_000);
+    info.set_attribute_uint32("time::modified-nsec", 123_456_789);
+    info.set_attribute_uint64(gio::FILE_ATTRIBUTE_STANDARD_SIZE.as_str(), 7);
+    info.set_attribute_string(gio::FILE_ATTRIBUTE_ETAG_VALUE.as_str(), generation);
+    TrashFingerprint::from_file_info(&info)
 }
 
-fn trash_item_with_revision(
+fn core_fingerprint(generation: &str, changed_nsec: u32) -> TrashFingerprint {
+    let info = gio::FileInfo::new();
+    info.set_attribute_string(gio::FILE_ATTRIBUTE_ID_FILE.as_str(), generation);
+    info.set_attribute_string(gio::FILE_ATTRIBUTE_ID_FILESYSTEM.as_str(), "l1");
+    info.set_attribute_uint64(gio::FILE_ATTRIBUTE_UNIX_DEVICE.as_str(), 1);
+    info.set_attribute_uint64(gio::FILE_ATTRIBUTE_UNIX_INODE.as_str(), 42);
+    info.set_attribute_uint32(
+        gio::FILE_ATTRIBUTE_STANDARD_TYPE.as_str(),
+        u32::try_from(gio::FileType::Regular.into_glib()).unwrap(),
+    );
+    info.set_attribute_uint64(gio::FILE_ATTRIBUTE_TIME_CHANGED.as_str(), 1_700_000_000);
+    info.set_attribute_uint32("time::changed-nsec", changed_nsec);
+    TrashFingerprint::from_file_info(&info)
+}
+
+fn trash_item(uri: &str, original: Option<&Path>, deleted_at: Option<i64>) -> TrashItem {
+    trash_item_with_fingerprint(uri, original, deleted_at, Some("generation-1"))
+}
+
+fn trash_item_with_fingerprint(
     uri: &str,
     original: Option<&Path>,
     deleted_at: Option<i64>,
-    revision: Option<&str>,
+    generation: Option<&str>,
 ) -> TrashItem {
     let uri = TrashUri::parse(uri).unwrap();
     let display = uri.name().to_string_lossy().into_owned();
@@ -213,7 +262,7 @@ fn trash_item_with_revision(
             uri,
             original.map(Path::to_path_buf),
             deleted_at,
-            revision.map(TrashRevision::new),
+            generation.map(fingerprint),
         ),
         display,
         false,
@@ -417,7 +466,8 @@ fn a_confirmed_empty_deletes_only_its_snapshot_and_refuses_changes() {
     );
     assert_eq!(backend.remaining(), vec!["trash:///late.txt"]);
 
-    // A changed original location refuses a new deletion.
+    // A different object at the same URI with identical display metadata is
+    // refused. Original path and date alone are not object identity.
     let changing = trash_item(
         "trash:///change.txt",
         Some(&scratch.join("first.txt")),
@@ -429,10 +479,11 @@ fn a_confirmed_empty_deletes_only_its_snapshot_and_refuses_changes() {
     let confirmation = EmptyConfirmation::for_plan(&plan).unwrap();
     {
         let mut state = backend.state.lock().unwrap();
-        state.items[0] = trash_item(
+        state.items[0] = trash_item_with_fingerprint(
             "trash:///change.txt",
-            Some(&scratch.join("second.txt")),
+            Some(&scratch.join("first.txt")),
             Some(1_700_000_200),
+            Some("generation-2"),
         );
     }
     let report = operations
@@ -517,6 +568,92 @@ fn a_partial_empty_and_a_cancel_report_what_was_deleted() {
 }
 
 #[test]
+fn an_already_gone_item_is_skipped_and_the_rest_continue() {
+    let scratch = Scratch::new("empty-already-gone");
+    let a = trash_item("trash:///a.txt", Some(&scratch.join("a.txt")), None);
+    let b = trash_item("trash:///b.txt", Some(&scratch.join("b.txt")), None);
+    let backend = TestTrash::with(vec![a, b]);
+    let mut operations = FileOperations::with_trash_backend(Box::new(backend.clone()));
+    let plan = operations.plan(&Request::EmptyTrash);
+    let confirmation = EmptyConfirmation::for_plan(&plan).unwrap();
+    backend.state.lock().unwrap().items.remove(0);
+
+    let report = operations
+        .execute_empty(&plan, confirmation, &gio::Cancellable::new(), |_| {})
+        .unwrap();
+    assert_eq!(report.items[0].outcome, ItemOutcome::Skipped);
+    assert_eq!(report.items[1].outcome, ItemOutcome::Done);
+    assert_eq!(backend.deleted(), vec!["trash:///b.txt"]);
+}
+
+#[test]
+fn supported_identity_without_optional_etag_or_metadata_deletes() {
+    let _scratch = Scratch::new("empty-no-optional");
+    let uri = TrashUri::parse("trash:///a.txt").unwrap();
+    let item = TrashItem::new(
+        TrashIdentity::new(
+            uri,
+            None,
+            None,
+            Some(core_fingerprint("generation-1", 123_456_789)),
+        ),
+        "a.txt".to_string(),
+        false,
+        None,
+    );
+    let backend = TestTrash::with(vec![item]);
+    let mut operations = FileOperations::with_trash_backend(Box::new(backend.clone()));
+    let plan = operations.plan(&Request::EmptyTrash);
+    let confirmation = EmptyConfirmation::for_plan(&plan).unwrap();
+    let report = operations
+        .execute_empty(&plan, confirmation, &gio::Cancellable::new(), |_| {})
+        .unwrap();
+    assert!(report.all_succeeded(), "{:?}", report.lines());
+    assert_eq!(backend.deleted(), vec!["trash:///a.txt"]);
+}
+
+#[test]
+fn a_precise_ctime_change_refuses_the_confirmed_item() {
+    let scratch = Scratch::new("empty-ctime-change");
+    let uri = TrashUri::parse("trash:///a.txt").unwrap();
+    let item = TrashItem::new(
+        TrashIdentity::new(
+            uri.clone(),
+            Some(scratch.join("a.txt")),
+            Some(1_700_000_000),
+            Some(core_fingerprint("generation-1", 123_456_789)),
+        ),
+        "a.txt".to_string(),
+        false,
+        None,
+    );
+    let backend = TestTrash::with(vec![item]);
+    let mut operations = FileOperations::with_trash_backend(Box::new(backend.clone()));
+    let plan = operations.plan(&Request::EmptyTrash);
+    let confirmation = EmptyConfirmation::for_plan(&plan).unwrap();
+    backend.state.lock().unwrap().items[0] = TrashItem::new(
+        TrashIdentity::new(
+            uri,
+            Some(scratch.join("a.txt")),
+            Some(1_700_000_000),
+            Some(core_fingerprint("generation-1", 123_456_790)),
+        ),
+        "a.txt".to_string(),
+        false,
+        None,
+    );
+
+    let report = operations
+        .execute_empty(&plan, confirmation, &gio::Cancellable::new(), |_| {})
+        .unwrap();
+    assert_eq!(
+        report.items[0].outcome,
+        ItemOutcome::Refused("the item changed in the trash".to_string())
+    );
+    assert!(backend.deleted().is_empty());
+}
+
+#[test]
 fn trash_dry_runs_list_without_writing() {
     let scratch = Scratch::new("trash-dry-run");
     let item = trash_item("trash:///a.txt", Some(&scratch.join("a.txt")), None);
@@ -536,6 +673,233 @@ fn trash_dry_runs_list_without_writing() {
     );
     assert_eq!(backend.deleted(), Vec::<String>::new());
     assert_eq!(backend.remaining(), vec!["trash:///a.txt"]);
+}
+
+#[test]
+fn selected_delete_plans_only_the_typed_items_and_never_lists_trash() {
+    let a = trash_item("trash:///a.txt", None, None);
+    let b = trash_item("trash:///b.txt", None, None);
+    let backend = TestTrash::with(vec![a.clone(), b.clone()]);
+    let mut operations = FileOperations::with_trash_backend(Box::new(backend.clone()));
+
+    let request = Request::DeleteSelected {
+        items: vec![a.identity().clone()],
+    };
+    let plan = operations.plan(&request);
+    assert_eq!(plan.steps().len(), 1);
+    assert_eq!(
+        plan.steps()[0]
+            .trash
+            .as_ref()
+            .map(|item| item.uri().as_str()),
+        Some("trash:///a.txt")
+    );
+    assert_eq!(
+        backend.list_calls(),
+        0,
+        "the selected plan must not scan the whole Trash"
+    );
+
+    let dry_run = operations.dry_run(&request);
+    assert!(dry_run.iter().any(|line| line.contains("trash:///a.txt")));
+    assert!(backend.deleted().is_empty());
+
+    let confirmation = SelectedConfirmation::for_plan(&plan).unwrap();
+    let report = operations
+        .execute_selected(&plan, confirmation, &gio::Cancellable::new(), |_| {})
+        .unwrap();
+    assert!(report.all_succeeded(), "{:?}", report.lines());
+    assert_eq!(backend.deleted(), vec!["trash:///a.txt"]);
+    assert_eq!(backend.remaining(), vec!["trash:///b.txt"]);
+}
+
+#[test]
+fn selected_delete_skips_missing_and_refuses_changed_items() {
+    let a = trash_item("trash:///a.txt", None, None);
+    let b = trash_item("trash:///b.txt", None, None);
+    let unselected = trash_item("trash:///keep.txt", None, None);
+    let backend = TestTrash::with(vec![a.clone(), b.clone(), unselected.clone()]);
+    let mut operations = FileOperations::with_trash_backend(Box::new(backend.clone()));
+    let request = Request::DeleteSelected {
+        items: vec![a.identity().clone(), b.identity().clone()],
+    };
+    let plan = operations.plan(&request);
+    let confirmation = SelectedConfirmation::for_plan(&plan).unwrap();
+
+    backend.state.lock().unwrap().items.remove(1);
+    backend.state.lock().unwrap().items[0] =
+        trash_item_with_fingerprint("trash:///a.txt", None, None, Some("generation-2"));
+
+    let report = operations
+        .execute_selected(&plan, confirmation, &gio::Cancellable::new(), |_| {})
+        .unwrap();
+    assert_eq!(
+        report.items[0].outcome,
+        ItemOutcome::Refused("the item changed in the trash".to_string())
+    );
+    assert_eq!(report.items[1].outcome, ItemOutcome::Skipped);
+    assert!(backend.deleted().is_empty());
+    assert_eq!(
+        backend.remaining(),
+        vec!["trash:///a.txt", "trash:///keep.txt"]
+    );
+}
+
+#[test]
+fn selected_delete_missing_optional_metadata_still_deletes() {
+    let item = trash_item_with_fingerprint("trash:///a.txt", None, None, Some("generation-1"));
+    let backend = TestTrash::with(vec![item.clone()]);
+    let mut operations = FileOperations::with_trash_backend(Box::new(backend.clone()));
+    let request = Request::DeleteSelected {
+        items: vec![item.identity().clone()],
+    };
+    let plan = operations.plan(&request);
+    assert_eq!(plan.steps()[0].conflict, None);
+    let confirmation = SelectedConfirmation::for_plan(&plan).unwrap();
+    let report = operations
+        .execute_selected(&plan, confirmation, &gio::Cancellable::new(), |_| {})
+        .unwrap();
+    assert!(report.all_succeeded(), "{:?}", report.lines());
+    assert_eq!(backend.deleted(), vec!["trash:///a.txt"]);
+}
+
+#[test]
+fn selected_delete_refuses_an_unavailable_identity() {
+    let item = trash_item_with_fingerprint("trash:///a.txt", None, None, None);
+    let backend = TestTrash::with(vec![item.clone()]);
+    let mut operations = FileOperations::with_trash_backend(Box::new(backend.clone()));
+    let request = Request::DeleteSelected {
+        items: vec![item.identity().clone()],
+    };
+    let plan = operations.plan(&request);
+    assert_eq!(plan.steps()[0].conflict, Some(Conflict::Unverified));
+    let confirmation = SelectedConfirmation::for_plan(&plan).unwrap();
+    let report = operations
+        .execute_selected(&plan, confirmation, &gio::Cancellable::new(), |_| {})
+        .unwrap();
+    assert_eq!(
+        report.items[0].outcome,
+        ItemOutcome::Refused("Cannot verify this Trash item is unchanged".to_string())
+    );
+    assert!(backend.deleted().is_empty());
+    assert_eq!(backend.remaining(), vec!["trash:///a.txt"]);
+}
+
+#[test]
+fn selected_delete_reports_a_mixed_result_and_a_final_cancel() {
+    let a = trash_item("trash:///a.txt", None, None);
+    let b = trash_item("trash:///b.txt", None, None);
+    let c = trash_item("trash:///c.txt", None, None);
+    let backend = TestTrash::with(vec![a.clone(), b.clone(), c.clone()]);
+    backend
+        .state
+        .lock()
+        .unwrap()
+        .fail_delete
+        .push("trash:///b.txt".to_string());
+    let mut operations = FileOperations::with_trash_backend(Box::new(backend.clone()));
+    let request = Request::DeleteSelected {
+        items: vec![
+            a.identity().clone(),
+            b.identity().clone(),
+            c.identity().clone(),
+        ],
+    };
+    let plan = operations.plan(&request);
+    let confirmation = SelectedConfirmation::for_plan(&plan).unwrap();
+    let report = operations
+        .execute_selected(&plan, confirmation, &gio::Cancellable::new(), |_| {})
+        .unwrap();
+    assert!(!report.all_succeeded());
+    assert_eq!(backend.deleted(), vec!["trash:///a.txt", "trash:///c.txt"]);
+    assert_eq!(backend.remaining(), vec!["trash:///b.txt"]);
+
+    let d = trash_item("trash:///d.txt", None, None);
+    let backend = TestTrash::with(vec![d.clone()]);
+    backend.state.lock().unwrap().cancel_during_delete = true;
+    let mut operations = FileOperations::with_trash_backend(Box::new(backend.clone()));
+    let request = Request::DeleteSelected {
+        items: vec![d.identity().clone()],
+    };
+    let plan = operations.plan(&request);
+    let confirmation = SelectedConfirmation::for_plan(&plan).unwrap();
+    let report = operations
+        .execute_selected(&plan, confirmation, &gio::Cancellable::new(), |_| {})
+        .unwrap();
+    assert!(report.cancelled);
+    assert_eq!(report.items[0].outcome, ItemOutcome::Cancelled);
+    assert!(backend.deleted().is_empty());
+}
+
+#[test]
+fn selected_delete_needs_its_own_confirmation_and_exact_plan() {
+    let a = trash_item("trash:///a.txt", None, None);
+    let b = trash_item("trash:///b.txt", None, None);
+    let backend = TestTrash::with(vec![a.clone(), b.clone()]);
+    let mut operations = FileOperations::with_trash_backend(Box::new(backend.clone()));
+    let plan = operations.plan(&Request::DeleteSelected {
+        items: vec![a.identity().clone()],
+    });
+    assert!(EmptyConfirmation::for_plan(&plan).is_none());
+    assert!(plan.selected_confirmation().is_some());
+    assert_eq!(
+        operations
+            .execute(
+                &plan,
+                &Decisions::new(Vec::new()),
+                &gio::Cancellable::new(),
+                |_| {}
+            )
+            .unwrap_err(),
+        ExecuteError::ConfirmationRequired
+    );
+    assert!(backend.deleted().is_empty());
+
+    let token = SelectedConfirmation::for_plan(&plan).unwrap();
+    let different = operations.plan(&Request::DeleteSelected {
+        items: vec![a.identity().clone(), b.identity().clone()],
+    });
+    assert_eq!(
+        operations
+            .execute_selected(&different, token, &gio::Cancellable::new(), |_| {})
+            .unwrap_err(),
+        ExecuteError::ConfirmationMismatch
+    );
+    assert!(backend.deleted().is_empty());
+
+    let empty = operations.plan(&Request::EmptyTrash);
+    assert!(SelectedConfirmation::for_plan(&empty).is_none());
+    let empty_token = EmptyConfirmation::for_plan(&empty).unwrap();
+    assert_eq!(
+        operations
+            .execute_empty(&plan, empty_token, &gio::Cancellable::new(), |_| {})
+            .unwrap_err(),
+        ExecuteError::NotAnEmptyPlan
+    );
+}
+
+#[test]
+fn selected_delete_rejects_an_empty_or_inconsistent_snapshot() {
+    let a = trash_item("trash:///a.txt", None, None);
+    let backend = TestTrash::with(vec![a.clone()]);
+    let operations = FileOperations::with_trash_backend(Box::new(backend));
+    let empty = operations.plan(&Request::DeleteSelected { items: Vec::new() });
+    assert!(empty.problem().is_some());
+    assert_eq!(empty.steps().len(), 0);
+
+    let duplicate = operations.plan(&Request::DeleteSelected {
+        items: vec![a.identity().clone(), a.identity().clone()],
+    });
+    assert_eq!(duplicate.steps().len(), 1);
+    assert!(duplicate.problem().is_none());
+
+    let replacement =
+        trash_item_with_fingerprint("trash:///a.txt", None, None, Some("generation-2"));
+    let inconsistent = operations.plan(&Request::DeleteSelected {
+        items: vec![a.identity().clone(), replacement.identity().clone()],
+    });
+    assert!(inconsistent.problem().is_some());
+    assert_eq!(inconsistent.steps().len(), 0);
 }
 
 #[test]
@@ -685,6 +1049,20 @@ fn every_files_command_maps_to_its_request() {
     assert_eq!(
         request_for(&check("file.undo", &[])).unwrap().unwrap(),
         Request::Undo
+    );
+    assert_eq!(
+        request_for(&check(
+            "trash.delete-permanently",
+            &[("items", "trash:///a.txt"), ("items", "trash:///b.txt")]
+        ))
+        .unwrap()
+        .unwrap(),
+        Request::DeleteSelected {
+            items: vec![
+                TrashIdentity::new(TrashUri::parse("trash:///a.txt").unwrap(), None, None, None),
+                TrashIdentity::new(TrashUri::parse("trash:///b.txt").unwrap(), None, None, None),
+            ],
+        }
     );
 }
 
@@ -1498,7 +1876,7 @@ fn trashinfo_reports_a_missing_key_header_or_bad_value() {
 #[test]
 fn empty_refuses_a_reused_uri_with_unknown_metadata() {
     let _scratch = Scratch::new("review-empty-reuse");
-    let item = trash_item_with_revision("trash:///a.txt", None, None, None);
+    let item = trash_item_with_fingerprint("trash:///a.txt", None, None, None);
     let backend = TestTrash::with(vec![item]);
     let mut operations = FileOperations::with_trash_backend(Box::new(backend.clone()));
     let plan = operations.plan(&Request::EmptyTrash);
@@ -1507,7 +1885,7 @@ fn empty_refuses_a_reused_uri_with_unknown_metadata() {
     // A later object at the same URI with the same (missing) metadata and no
     // object evidence, exactly like a backend that cannot prove sameness.
     backend.state.lock().unwrap().items[0] =
-        trash_item_with_revision("trash:///a.txt", None, None, None);
+        trash_item_with_fingerprint("trash:///a.txt", None, None, None);
 
     let report = operations
         .execute_empty(&plan, confirmation, &gio::Cancellable::new(), |_| {})
@@ -1545,10 +1923,10 @@ fn restore_conflicts_with_same_original_need_separate_answers() {
 }
 
 #[test]
-fn a_new_object_with_the_same_uri_and_metadata_survives_empty() {
+fn same_uri_original_and_date_with_a_different_identity_is_refused() {
     let scratch = Scratch::new("empty-same-metadata-new-object");
     let original = scratch.join("same.txt");
-    let item = trash_item_with_revision(
+    let item = trash_item_with_fingerprint(
         "trash:///same.txt",
         Some(&original),
         Some(1_700_000_000),
@@ -1559,7 +1937,7 @@ fn a_new_object_with_the_same_uri_and_metadata_survives_empty() {
     let plan = operations.plan(&Request::EmptyTrash);
     let confirmation = EmptyConfirmation::for_plan(&plan).unwrap();
 
-    backend.state.lock().unwrap().items[0] = trash_item_with_revision(
+    backend.state.lock().unwrap().items[0] = trash_item_with_fingerprint(
         "trash:///same.txt",
         Some(&original),
         Some(1_700_000_000),
@@ -1577,10 +1955,10 @@ fn a_new_object_with_the_same_uri_and_metadata_survives_empty() {
 }
 
 #[test]
-fn a_lost_object_token_is_refused_before_permanent_deletion() {
+fn a_lost_identity_is_refused_before_permanent_deletion() {
     let scratch = Scratch::new("empty-token-loss");
     let original = scratch.join("a.txt");
-    let item = trash_item_with_revision(
+    let item = trash_item_with_fingerprint(
         "trash:///a.txt",
         Some(&original),
         None,
@@ -1592,21 +1970,21 @@ fn a_lost_object_token_is_refused_before_permanent_deletion() {
     let confirmation = EmptyConfirmation::for_plan(&plan).unwrap();
 
     backend.state.lock().unwrap().items[0] =
-        trash_item_with_revision("trash:///a.txt", Some(&original), None, None);
+        trash_item_with_fingerprint("trash:///a.txt", Some(&original), None, None);
     let report = operations
         .execute_empty(&plan, confirmation, &gio::Cancellable::new(), |_| {})
         .unwrap();
     assert_eq!(
         report.items[0].outcome,
-        ItemOutcome::Refused("the item changed in the trash".to_string())
+        ItemOutcome::Refused("Cannot verify this Trash item is unchanged".to_string())
     );
     assert!(backend.deleted().is_empty());
 }
 
 #[test]
-fn a_missing_display_date_with_a_stable_token_still_deletes() {
+fn a_missing_display_date_with_a_stable_fingerprint_still_deletes() {
     let scratch = Scratch::new("empty-missing-date");
-    let item = trash_item_with_revision(
+    let item = trash_item_with_fingerprint(
         "trash:///a.txt",
         Some(&scratch.join("a.txt")),
         None,
@@ -1627,7 +2005,7 @@ fn a_missing_display_date_with_a_stable_token_still_deletes() {
 fn a_confirmation_for_an_older_plan_is_refused() {
     let scratch = Scratch::new("empty-stale-confirmation");
     let original = scratch.join("a.txt");
-    let item = trash_item_with_revision(
+    let item = trash_item_with_fingerprint(
         "trash:///a.txt",
         Some(&original),
         Some(1_700_000_000),
@@ -1638,7 +2016,7 @@ fn a_confirmation_for_an_older_plan_is_refused() {
     let old_plan = operations.plan(&Request::EmptyTrash);
     let old_confirmation = EmptyConfirmation::for_plan(&old_plan).unwrap();
 
-    backend.state.lock().unwrap().items[0] = trash_item_with_revision(
+    backend.state.lock().unwrap().items[0] = trash_item_with_fingerprint(
         "trash:///a.txt",
         Some(&original),
         Some(1_700_000_000),
@@ -1794,4 +2172,21 @@ fn trashinfo_keeps_the_first_occurrence_of_a_key() {
     .unwrap();
     assert_eq!(parsed.path, PathBuf::from("/tmp/first"));
     assert_eq!(parsed.deletion_date.year, 2026);
+}
+
+#[test]
+fn cancellation_during_the_last_empty_item_is_not_a_failure() {
+    let item = trash_item("trash:///cancelled.txt", None, None);
+    let backend = TestTrash::with(vec![item]);
+    backend.state.lock().unwrap().cancel_during_delete = true;
+    let mut operations = FileOperations::with_trash_backend(Box::new(backend.clone()));
+    let plan = operations.plan(&Request::EmptyTrash);
+    let confirmation = EmptyConfirmation::for_plan(&plan).unwrap();
+    let report = operations
+        .execute_empty(&plan, confirmation, &gio::Cancellable::new(), |_| {})
+        .unwrap();
+    assert!(report.cancelled);
+    assert_eq!(report.items[0].outcome, ItemOutcome::Cancelled);
+    assert!(backend.deleted().is_empty());
+    assert_eq!(backend.remaining(), vec!["trash:///cancelled.txt"]);
 }

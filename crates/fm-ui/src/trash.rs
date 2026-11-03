@@ -2,12 +2,12 @@
 //! The Trash page: one expanding widget in the central content stack.
 //!
 //! The page lists the GIO `trash:///` namespace in a virtualised `ListView`,
-//! keeps selection by validated URI, and sends `trash.restore` or
-//! `trash.empty` through the window's command path. Listing happens on a
-//! short-lived thread and a `GFileMonitor` refreshes the page when the backend
-//! changes. The page is transient UI state: it is not a tab, never enters the
-//! workspace model, and shows the unchanged folder or split page again when
-//! the user chooses Back to Files or another tab.
+//! keeps selection by validated URI, and sends `trash.restore`, `trash.empty`
+//! or the selected `trash.delete-permanently` through the window's command
+//! path. Listing happens on a short-lived thread and a `GFileMonitor` refreshes
+//! the page when the backend changes. The page is transient UI state: it is not
+//! a tab, never enters the workspace model, and shows the unchanged folder or
+//! split page again when the user chooses Back to Files or another tab.
 
 use std::cell::{Cell, RefCell};
 use std::path::Path;
@@ -118,13 +118,36 @@ pub fn route_on_trash_page(command: &str, trash_active: bool) -> PageRoute {
         "app.disk-usage" => PageRoute::Refuse("Disk usage is unavailable while Trash is shown."),
         // Restore and Empty Trash carry explicit Trash identities. Undo is the
         // established global worker operation and stays available.
-        "trash.open" | "trash.restore" | "trash.empty" | "file.undo" => PageRoute::Files,
+        "trash.open"
+        | "trash.restore"
+        | "trash.empty"
+        | "trash.delete-permanently"
+        | "file.undo" => PageRoute::Files,
         _ => PageRoute::Files,
     }
 }
 
-/// A reply to the Empty Trash confirmation. The job id is part of the answer:
-/// a dialog for one job must never confirm or cancel another window's job.
+/// The operation a destructive confirmation belongs to. The kind is part of
+/// the pending state, so an Empty Trash dialog can never authorise selected
+/// deletion, or the reverse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfirmationKind {
+    Empty,
+    Selected,
+}
+
+impl ConfirmationKind {
+    pub fn response(self) -> &'static str {
+        match self {
+            ConfirmationKind::Empty => "empty",
+            ConfirmationKind::Selected => "delete",
+        }
+    }
+}
+
+/// A reply to a destructive Trash confirmation. The job id and operation kind
+/// are part of the answer: a dialog for one job must never confirm or cancel
+/// another window's job, or a different operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfirmationAction {
     Confirm,
@@ -133,15 +156,16 @@ pub enum ConfirmationAction {
 }
 
 pub fn confirmation_action(
-    pending: Option<u64>,
+    pending: Option<(u64, ConfirmationKind)>,
     job: u64,
+    kind: ConfirmationKind,
     response: Option<&str>,
 ) -> ConfirmationAction {
-    if pending != Some(job) {
+    if pending != Some((job, kind)) {
         return ConfirmationAction::Ignore;
     }
     match response {
-        Some(response) if empty_response(response) => ConfirmationAction::Confirm,
+        Some(response) if response == kind.response() => ConfirmationAction::Confirm,
         // Cancel, Escape and a close without a response all cancel this job.
         _ => ConfirmationAction::Cancel,
     }
@@ -150,11 +174,12 @@ pub fn confirmation_action(
 /// Claim only the confirmation this reply belongs to. A stale callback must
 /// not clear the pending state of a newer confirmation.
 fn claim_confirmation(
-    pending: &Cell<Option<u64>>,
+    pending: &Cell<Option<(u64, ConfirmationKind)>>,
     job: u64,
+    kind: ConfirmationKind,
     response: Option<&str>,
 ) -> ConfirmationAction {
-    let action = confirmation_action(pending.get(), job, response);
+    let action = confirmation_action(pending.get(), job, kind, response);
     if action != ConfirmationAction::Ignore {
         pending.set(None);
     }
@@ -184,6 +209,79 @@ pub fn controls(
         empty: idle && total > 0,
         refresh: !loading && !confirming && !busy,
     }
+}
+
+/// What the item menu may do for the current state. The destructive action is
+/// available only for a valid selection and never while busy, confirming or
+/// while the listing is unavailable. Missing original location or deletion
+/// date is display metadata and does not disable deletion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ItemMenuState {
+    pub restore: bool,
+    pub delete: bool,
+}
+
+pub fn item_menu(
+    selected: usize,
+    restorable: usize,
+    loading: bool,
+    unavailable: bool,
+    confirming: bool,
+    busy: bool,
+) -> ItemMenuState {
+    let idle = !loading && !unavailable && !confirming && !busy;
+    ItemMenuState {
+        restore: idle && restorable > 0,
+        delete: idle && selected > 0,
+    }
+}
+
+/// A right-click inside the selection acts on the whole selected set; a
+/// right-click on an unselected row acts on that row alone. Pure so the menu
+/// scope is testable without a display.
+pub fn menu_positions(selection: &[u32], clicked: u32, clicked_selected: bool) -> Vec<u32> {
+    if clicked_selected {
+        selection.to_vec()
+    } else {
+        vec![clicked]
+    }
+}
+
+/// Freeze the identities at the click. Positions are read once; later
+/// selection changes cannot alter the returned vector. Duplicate URIs collapse
+/// to one item, matching the registry's deduplicated `items` set.
+pub fn delete_snapshot(items: &[TrashItem], positions: &[u32]) -> Vec<TrashIdentity> {
+    let mut selected = Vec::new();
+    for position in positions {
+        let Some(item) = items.get(*position as usize) else {
+            continue;
+        };
+        let identity = item.identity().clone();
+        if selected
+            .iter()
+            .any(|candidate: &TrashIdentity| candidate.uri() == identity.uri())
+        {
+            continue;
+        }
+        selected.push(identity);
+    }
+    selected
+}
+
+/// The destructive selected-deletion dialog's exact title and body.
+pub fn delete_confirmation_text(count: usize, name: Option<&str>) -> (String, String) {
+    let title = if count == 1 {
+        "Permanently delete this item?".to_string()
+    } else {
+        format!("Permanently delete {count} items?")
+    };
+    let body = match (count, name) {
+        (1, Some(name)) => {
+            format!("{name}\nThese items will be permanently deleted. This cannot be undone.")
+        }
+        _ => "These items will be permanently deleted. This cannot be undone.".to_string(),
+    };
+    (title, body)
 }
 
 /// How many selected identities still name an item whose original location is
@@ -230,12 +328,6 @@ pub fn date_text(deleted_at: Option<i64>) -> String {
         .unwrap_or_else(|_| "Unknown".to_string())
 }
 
-/// Only the destructive response authorises emptying. A close, Escape or
-/// Cancel is not an answer.
-pub fn empty_response(response: &str) -> bool {
-    response == "empty"
-}
-
 pub struct TrashBrowser {
     ui: Weak<WindowUi>,
     root: gtk::Box,
@@ -247,6 +339,8 @@ pub struct TrashBrowser {
     scroller: gtk::ScrolledWindow,
     placeholder: gtk::Label,
     status: gtk::Label,
+    details_button: gtk::Button,
+    details: RefCell<Option<String>>,
     progress: gtk::Box,
     progress_label: gtk::Label,
     progress_bar: gtk::ProgressBar,
@@ -258,10 +352,11 @@ pub struct TrashBrowser {
     confirming: Cell<bool>,
     busy: Cell<bool>,
     status_is_summary: Cell<bool>,
-    pending: Cell<bool>,
+    pending_refresh: Cell<bool>,
     generation: Cell<u64>,
-    /// The worker job whose Empty Trash confirmation this page owns, if any.
-    pending_job: Cell<Option<u64>>,
+    /// The worker job and operation kind whose destructive confirmation this
+    /// page owns, if any.
+    pending: Cell<Option<(u64, ConfirmationKind)>>,
     /// Present only while that confirmation is on screen.
     confirmation: RefCell<Option<adw::AlertDialog>>,
     receiver: RefCell<Option<Receiver<ListResult>>>,
@@ -336,8 +431,16 @@ impl TrashBrowser {
         let status = gtk::Label::new(None);
         status.add_css_class("gl-trash-status");
         status.set_xalign(0.0);
+        status.set_hexpand(true);
         status.set_ellipsize(pango::EllipsizeMode::End);
-        root.append(&status);
+        let details_button = gtk::Button::with_label("Details");
+        details_button.add_css_class("gl-trash-action");
+        details_button.set_tooltip_text(Some("Show per-item results"));
+        details_button.set_visible(false);
+        let status_row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        status_row.append(&status);
+        status_row.append(&details_button);
+        root.append(&status_row);
 
         let progress = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         progress.add_css_class("gl-progress");
@@ -370,6 +473,8 @@ impl TrashBrowser {
             scroller,
             placeholder,
             status,
+            details_button,
+            details: RefCell::new(None),
             progress,
             progress_label,
             progress_bar,
@@ -381,9 +486,9 @@ impl TrashBrowser {
             confirming: Cell::new(false),
             busy: Cell::new(false),
             status_is_summary: Cell::new(false),
-            pending: Cell::new(false),
+            pending_refresh: Cell::new(false),
             generation: Cell::new(0),
-            pending_job: Cell::new(None),
+            pending: Cell::new(None),
             confirmation: RefCell::new(None),
             receiver: RefCell::new(None),
             poll: RefCell::new(None),
@@ -406,6 +511,8 @@ impl TrashBrowser {
 
     pub fn job_started(&self) {
         self.busy.set(true);
+        *self.details.borrow_mut() = None;
+        self.details_button.set_visible(false);
         self.update_controls();
     }
 
@@ -430,12 +537,24 @@ impl TrashBrowser {
         self.set_progress(None);
         self.status_is_summary.set(true);
         self.status.set_text(summary);
-        if let Some(details) = details {
-            crate::log!("trash", "job details: {details}");
+        match details {
+            Some(details) => {
+                crate::log!("trash", "job details: {details}");
+                *self.details.borrow_mut() = Some(details);
+                self.details_button.set_visible(true);
+            }
+            None => {
+                *self.details.borrow_mut() = None;
+                self.details_button.set_visible(false);
+            }
         }
         if matches!(
             request,
-            Request::Trash { .. } | Request::Restore { .. } | Request::EmptyTrash | Request::Undo
+            Request::Trash { .. }
+                | Request::Restore { .. }
+                | Request::EmptyTrash
+                | Request::DeleteSelected { .. }
+                | Request::Undo
         ) {
             self.refresh();
         } else {
@@ -444,9 +563,13 @@ impl TrashBrowser {
     }
 
     pub fn show_dry_run(&self, request: &Request, lines: &[String]) {
+        self.clear_details();
         if matches!(
             request,
-            Request::EmptyTrash | Request::Restore { .. } | Request::Undo
+            Request::EmptyTrash
+                | Request::DeleteSelected { .. }
+                | Request::Restore { .. }
+                | Request::Undo
         ) {
             self.busy.set(false);
             self.confirming.set(false);
@@ -461,6 +584,7 @@ impl TrashBrowser {
     }
 
     pub fn refused(&self, request: &Request, message: &str) {
+        self.clear_details();
         self.status_is_summary.set(true);
         match request {
             Request::EmptyTrash => {
@@ -468,6 +592,12 @@ impl TrashBrowser {
                 self.busy.set(false);
                 self.status
                     .set_text(&format!("Could not empty the Trash: {message}"));
+            }
+            Request::DeleteSelected { .. } => {
+                self.confirming.set(false);
+                self.busy.set(false);
+                self.status
+                    .set_text(&format!("Could not delete permanently: {message}"));
             }
             Request::Restore { .. } => {
                 self.busy.set(false);
@@ -484,8 +614,14 @@ impl TrashBrowser {
     }
 
     pub fn set_status(&self, text: &str) {
+        self.clear_details();
         self.status_is_summary.set(true);
         self.status.set_text(text);
+    }
+
+    fn clear_details(&self) {
+        *self.details.borrow_mut() = None;
+        self.details_button.set_visible(false);
     }
 
     pub fn select_all(&self) {
@@ -512,7 +648,7 @@ impl TrashBrowser {
     }
 
     fn cancel_pending_confirmation(&self) {
-        let job = self.pending_job.take();
+        let job = self.pending.take().map(|(job, _)| job);
         let dialog = self.confirmation.borrow_mut().take();
         self.confirming.set(false);
         if let Some(job) = job
@@ -533,37 +669,65 @@ impl TrashBrowser {
         }
     }
 
+    /// Show the main-context confirmation for either permanent Trash
+    /// operation. The plan kind picks the exact title, wording, response and
+    /// worker approval; the two operations share this dialog lifecycle but
+    /// never each other's authorisation.
     pub fn confirm_empty(self: &Rc<Self>, ui: &Rc<WindowUi>, id: u64, plan: &Plan) {
+        let kind = match plan.request() {
+            Request::EmptyTrash => ConfirmationKind::Empty,
+            Request::DeleteSelected { .. } => ConfirmationKind::Selected,
+            _ => return,
+        };
         if plan.steps().is_empty() {
             self.confirming.set(false);
             self.update_controls();
             return;
         }
-        if self.pending_job.get().is_some() {
+        if let Some((pending, pending_kind)) = self.pending.get() {
             crate::log!(
                 "trash",
-                "ignored a second empty confirmation while job {} is pending",
-                self.pending_job.get().unwrap_or_default()
+                "ignored a second confirmation while job {pending} ({pending_kind:?}) is pending"
             );
             return;
         }
-        self.pending_job.set(Some(id));
+        self.pending.set(Some((id, kind)));
         self.confirming.set(true);
         self.status_is_summary.set(false);
         self.update_controls();
 
         let count = plan.steps().len();
-        let dialog = adw::AlertDialog::new(
-            Some("Empty Trash?"),
-            Some(&format!(
-                "{} item(s)\nThese items will be permanently deleted. This cannot be undone.",
-                count
-            )),
-        );
+        let (title, body, confirm_label) = match kind {
+            ConfirmationKind::Empty => (
+                "Empty Trash?".to_string(),
+                format!(
+                    "{} item(s)\nThese items will be permanently deleted. This cannot be undone.",
+                    count
+                ),
+                "Empty Trash",
+            ),
+            ConfirmationKind::Selected => {
+                let name = (count == 1).then(|| {
+                    let uri = plan.steps()[0].trash.as_ref().map(|trash| trash.uri());
+                    uri.and_then(|uri| {
+                        self.items
+                            .borrow()
+                            .iter()
+                            .find(|item| item.uri() == uri)
+                            .map(|item| item.display_name().to_string())
+                    })
+                    .or_else(|| uri.map(|uri| uri.name().to_string_lossy().into_owned()))
+                    .unwrap_or_else(|| "this item".to_string())
+                });
+                let (title, body) = delete_confirmation_text(count, name.as_deref());
+                (title, body, "Delete Permanently")
+            }
+        };
+        let dialog = adw::AlertDialog::new(Some(&title), Some(&body));
         dialog.add_css_class("gimbal-look");
         dialog.add_response("cancel", "Cancel");
-        dialog.add_response("empty", "Empty Trash");
-        dialog.set_response_appearance("empty", adw::ResponseAppearance::Destructive);
+        dialog.add_response(kind.response(), confirm_label);
+        dialog.set_response_appearance(kind.response(), adw::ResponseAppearance::Destructive);
         dialog.set_default_response(Some("cancel"));
         dialog.set_close_response("cancel");
 
@@ -576,7 +740,7 @@ impl TrashBrowser {
             let Some(browser) = weak_browser.upgrade() else {
                 return;
             };
-            let action = claim_confirmation(&browser.pending_job, id, Some(response));
+            let action = claim_confirmation(&browser.pending, id, kind, Some(response));
             if action == ConfirmationAction::Ignore {
                 crate::log!("trash", "ignored a reply for another confirmation job");
                 return;
@@ -590,7 +754,10 @@ impl TrashBrowser {
                         .and_then(|ui| ui.process_upgrade())
                         .and_then(|process| process.fileops())
                     {
-                        fileops.confirm_empty(id);
+                        match kind {
+                            ConfirmationKind::Empty => fileops.confirm_empty(id),
+                            ConfirmationKind::Selected => fileops.confirm_selected(id),
+                        }
                     }
                 }
                 ConfirmationAction::Cancel => {
@@ -599,7 +766,7 @@ impl TrashBrowser {
                         .and_then(|ui| ui.process_upgrade())
                         .and_then(|process| process.fileops())
                     {
-                        crate::log!("trash", "empty trash dismissed; nothing is deleted");
+                        crate::log!("trash", "confirmation dismissed; nothing is deleted");
                         fileops.cancel_job(id);
                     }
                 }
@@ -621,7 +788,7 @@ impl TrashBrowser {
             let Some(browser) = weak_closed_browser.upgrade() else {
                 return;
             };
-            if browser.pending_job.get() != Some(id) {
+            if browser.pending.get() != Some((id, kind)) {
                 return;
             }
             browser.confirming.set(false);
@@ -640,11 +807,14 @@ impl TrashBrowser {
                 let Some(browser) = weak_idle_browser.upgrade() else {
                     return;
                 };
-                let action = claim_confirmation(&browser.pending_job, id, None);
+                let action = claim_confirmation(&browser.pending, id, kind, None);
                 if action != ConfirmationAction::Cancel {
                     return;
                 }
-                crate::log!("trash", "empty trash closed without a response; cancelling");
+                crate::log!(
+                    "trash",
+                    "confirmation closed without a response; cancelling"
+                );
                 if let Some(fileops) = weak_idle_ui
                     .upgrade()
                     .and_then(|ui| ui.process_upgrade())
@@ -657,7 +827,7 @@ impl TrashBrowser {
 
         *self.confirmation.borrow_mut() = Some(dialog.clone());
         dialog.choose(Some(ui.window()), None::<&gio::Cancellable>, |_| {});
-        crate::log!("trash", "showing empty confirmation for {count} item(s)");
+        crate::log!("trash", "showing {kind:?} confirmation for {count} item(s)");
     }
 
     fn wire_buttons(self: &Rc<Self>, back: &gtk::Button) {
@@ -705,6 +875,18 @@ impl TrashBrowser {
                         ui.process_upgrade().and_then(|process| process.fileops())
                 {
                     fileops.cancel_current();
+                }
+            });
+        }
+        {
+            let weak = Rc::downgrade(self);
+            self.details_button.connect_clicked(move |_| {
+                let Some(browser) = weak.upgrade() else {
+                    return;
+                };
+                let details = browser.details.borrow().clone();
+                if let (Some(details), Some(ui)) = (details, browser.ui.upgrade()) {
+                    crate::fileops::dialogs::show_details(&ui, &details);
                 }
             });
         }
@@ -823,15 +1005,44 @@ impl TrashBrowser {
     }
 
     fn right_click(self: &Rc<Self>, position: u32, anchor: &gtk::Widget) {
-        if !self.selection.selection().contains(position) {
+        // A right-click on an unselected row selects only that row. A
+        // right-click inside the selection uses the whole selected set. Then
+        // the action snapshot is built once, before the menu exists.
+        let clicked_selected = self.selection.selection().contains(position);
+        if !clicked_selected {
             self.selection.select_item(position, true);
         }
+        self.capture_selection();
+        let selected = self.selected.borrow().clone();
+        let positions = menu_positions(&self.selected_positions(), position, clicked_selected);
+        let (restorable, loading, unavailable, confirming, busy) = {
+            let items = self.items.borrow();
+            (
+                restorable_selection(&selected, &items),
+                self.loading.get(),
+                self.unavailable.get(),
+                self.confirming.get(),
+                self.busy.get(),
+            )
+        };
+        let state = item_menu(
+            selected.len(),
+            restorable,
+            loading,
+            unavailable,
+            confirming,
+            busy,
+        );
+        let snapshot = delete_snapshot(&self.items.borrow(), &positions);
+
         let popover = gtk::Popover::new();
         popover.set_parent(anchor);
         let menu = gtk::Box::new(gtk::Orientation::Vertical, 0);
         menu.add_css_class("gl-menu");
+
         let restore = gtk::Button::new();
         restore.add_css_class("gl-menu-item");
+        restore.set_sensitive(state.restore);
         restore.set_child(Some(
             &gtk::Label::builder()
                 .label("Restore")
@@ -840,17 +1051,43 @@ impl TrashBrowser {
                 .build(),
         ));
         let browser = Rc::downgrade(self);
-        let popover_click = popover.clone();
+        let popover_restore = popover.clone();
         restore.connect_clicked(move |_| {
-            popover_click.popdown();
-            if popover_click.parent().is_some() {
-                popover_click.unparent();
+            popover_restore.popdown();
+            if popover_restore.parent().is_some() {
+                popover_restore.unparent();
             }
             if let Some(browser) = browser.upgrade() {
                 browser.restore_selected();
             }
         });
         menu.append(&restore);
+
+        let delete = gtk::Button::new();
+        delete.add_css_class("gl-menu-item");
+        delete.add_css_class("destructive-action");
+        delete.set_sensitive(state.delete);
+        delete.set_tooltip_text(Some("Permanently delete only the selected items"));
+        delete.set_child(Some(
+            &gtk::Label::builder()
+                .label("Delete Permanently")
+                .halign(gtk::Align::Start)
+                .hexpand(true)
+                .build(),
+        ));
+        let browser = Rc::downgrade(self);
+        let popover_delete = popover.clone();
+        delete.connect_clicked(move |_| {
+            popover_delete.popdown();
+            if popover_delete.parent().is_some() {
+                popover_delete.unparent();
+            }
+            if let Some(browser) = browser.upgrade() {
+                browser.delete_selected(snapshot.clone());
+            }
+        });
+        menu.append(&delete);
+
         popover.set_child(Some(&menu));
         popover.connect_closed(|popover| {
             if popover.parent().is_some() {
@@ -858,6 +1095,13 @@ impl TrashBrowser {
             }
         });
         popover.popup();
+    }
+
+    fn selected_positions(&self) -> Vec<u32> {
+        let bitset = self.selection.selection();
+        (0..bitset.size())
+            .map(|index| bitset.nth(index as u32))
+            .collect()
     }
 
     fn capture_selection(&self) {
@@ -904,6 +1148,33 @@ impl TrashBrowser {
         }
     }
 
+    /// Delete only the frozen selected identities. The snapshot is staged
+    /// before the registry dispatch; the worker never re-reads the current
+    /// selection or the current listing.
+    fn delete_selected(self: &Rc<Self>, selected: Vec<TrashIdentity>) {
+        if selected.is_empty() {
+            return;
+        }
+        if self.loading.get() || self.unavailable.get() || self.confirming.get() || self.busy.get()
+        {
+            return;
+        }
+        let Some(ui) = self.ui.upgrade() else {
+            return;
+        };
+        if let Some(process) = ui.process_upgrade() {
+            process.stage_trash_delete(selected.clone());
+        }
+        let arguments: Vec<(String, String)> = selected
+            .iter()
+            .map(|identity| ("items".to_string(), identity.uri().as_str().to_string()))
+            .collect();
+        ui.dispatch(
+            Caller::Ui,
+            Invocation::new("trash.delete-permanently", arguments),
+        );
+    }
+
     fn empty_clicked(self: &Rc<Self>) {
         if self.items.borrow().is_empty() || self.confirming.get() {
             return;
@@ -938,7 +1209,7 @@ impl TrashBrowser {
 
     fn schedule_refresh(self: &Rc<Self>) {
         if self.loading.get() {
-            self.pending.set(true);
+            self.pending_refresh.set(true);
             return;
         }
         if let Some(source) = self.refresh_source.borrow_mut().take() {
@@ -959,7 +1230,7 @@ impl TrashBrowser {
 
     fn refresh(self: &Rc<Self>) {
         if self.loading.get() {
-            self.pending.set(true);
+            self.pending_refresh.set(true);
             return;
         }
         self.loading.set(true);
@@ -1063,6 +1334,7 @@ impl TrashBrowser {
                 );
             }
             Err(error) => {
+                self.clear_details();
                 self.unavailable.set(true);
                 self.status_is_summary.set(false);
                 self.store.remove_all();
@@ -1076,7 +1348,7 @@ impl TrashBrowser {
             }
         }
         self.update_controls();
-        if self.pending.replace(false) {
+        if self.pending_refresh.replace(false) {
             self.refresh();
         }
     }
@@ -1115,15 +1387,30 @@ impl Drop for TrashBrowser {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fm_core::fileops::{TrashRevision, TrashUri};
+    use fm_core::fileops::{TrashFingerprint, TrashUri};
+    use gtk::glib::translate::IntoGlib;
     use std::path::PathBuf;
 
-    fn identity(uri: &str, original: Option<&str>, revision: &str) -> TrashIdentity {
+    fn fingerprint(generation: &str) -> TrashFingerprint {
+        let info = gio::FileInfo::new();
+        info.set_attribute_string(gio::FILE_ATTRIBUTE_ID_FILE.as_str(), generation);
+        info.set_attribute_string(gio::FILE_ATTRIBUTE_ID_FILESYSTEM.as_str(), "l1");
+        info.set_attribute_uint32(
+            gio::FILE_ATTRIBUTE_STANDARD_TYPE.as_str(),
+            u32::try_from(gio::FileType::Regular.into_glib()).unwrap(),
+        );
+        info.set_attribute_uint64(gio::FILE_ATTRIBUTE_TIME_CHANGED.as_str(), 1_700_000_000);
+        info.set_attribute_uint32("time::changed-nsec", 1);
+        info.set_attribute_string(gio::FILE_ATTRIBUTE_ETAG_VALUE.as_str(), generation);
+        TrashFingerprint::from_file_info(&info)
+    }
+
+    fn identity(uri: &str, original: Option<&str>, generation: &str) -> TrashIdentity {
         TrashIdentity::new(
             TrashUri::parse(uri).unwrap(),
             original.map(PathBuf::from),
             None,
-            Some(TrashRevision::new(revision)),
+            Some(fingerprint(generation)),
         )
     }
 
@@ -1185,19 +1472,37 @@ mod tests {
 
     #[test]
     fn a_closed_or_cancelled_empty_confirmation_does_not_delete() {
-        assert!(!empty_response("cancel"));
-        assert!(!empty_response("close"));
-        assert!(!empty_response(""));
-        assert!(empty_response("empty"));
+        assert_eq!(ConfirmationKind::Empty.response(), "empty");
+        assert_eq!(ConfirmationKind::Selected.response(), "delete");
+        assert_ne!(
+            ConfirmationKind::Empty.response(),
+            ConfirmationKind::Selected.response()
+        );
+        assert_eq!(
+            confirmation_action(
+                Some((3, ConfirmationKind::Empty)),
+                3,
+                ConfirmationKind::Empty,
+                Some("cancel")
+            ),
+            ConfirmationAction::Cancel
+        );
+        assert_eq!(
+            confirmation_action(
+                Some((3, ConfirmationKind::Empty)),
+                3,
+                ConfirmationKind::Empty,
+                None
+            ),
+            ConfirmationAction::Cancel
+        );
     }
 
     #[test]
-    fn missing_metadata_reads_unknown_and_only_empty_is_authorised() {
+    fn missing_metadata_reads_unknown_and_does_not_block_selected_deletion() {
         assert_eq!(original_text(None), "Unknown");
         assert_eq!(date_text(None), "Unknown");
-        assert!(!empty_response("cancel"));
-        assert!(!empty_response(""));
-        assert!(empty_response("empty"));
+        assert!(item_menu(1, 0, false, false, false, false).delete);
     }
 
     #[test]
@@ -1272,53 +1577,168 @@ mod tests {
         // worker operation. Both remain available on the visible page.
         assert_eq!(route_on_trash_page("trash.restore", true), PageRoute::Files);
         assert_eq!(route_on_trash_page("trash.empty", true), PageRoute::Files);
+        assert_eq!(
+            route_on_trash_page("trash.delete-permanently", true),
+            PageRoute::Files
+        );
         assert_eq!(route_on_trash_page("file.undo", true), PageRoute::Files);
     }
 
     #[test]
-    fn confirmation_replies_are_scoped_to_the_job_id() {
+    fn the_item_menu_scope_follows_selection_and_busy_state() {
+        assert!(!item_menu(0, 0, false, false, false, false).delete);
+        assert!(!item_menu(1, 1, true, false, false, false).delete);
+        assert!(!item_menu(1, 1, false, true, false, false).delete);
+        assert!(!item_menu(1, 1, false, false, true, false).delete);
+        assert!(!item_menu(1, 1, false, false, false, true).delete);
+        assert!(item_menu(1, 0, false, false, false, false).delete);
+        assert!(item_menu(3, 3, false, false, false, false).delete);
+        // A known original is needed for Restore, never for deletion.
+        assert!(!item_menu(1, 0, false, false, false, false).restore);
+        assert!(item_menu(1, 1, false, false, false, false).restore);
+        assert!(!item_menu(0, 0, false, false, false, false).restore);
+    }
+
+    #[test]
+    fn a_right_click_uses_the_selection_or_only_the_unselected_row() {
+        assert_eq!(menu_positions(&[0, 2], 1, false), vec![1]);
+        assert_eq!(menu_positions(&[0, 2], 2, true), vec![0, 2]);
+        assert_eq!(menu_positions(&[], 4, false), vec![4]);
+    }
+
+    #[test]
+    fn a_click_snapshot_survives_later_selection_changes() {
+        let items = vec![
+            item("trash:///a.txt", None),
+            item("trash:///b.txt", None),
+            item("trash:///c.txt", None),
+        ];
+        let first = delete_snapshot(&items, &[0, 2]);
+        assert_eq!(
+            first
+                .iter()
+                .map(|identity| identity.uri().as_str())
+                .collect::<Vec<_>>(),
+            vec!["trash:///a.txt", "trash:///c.txt"]
+        );
+        // The browser selection or listing changing later produces a different
+        // snapshot and cannot mutate the one already taken.
+        let later = delete_snapshot(&items[1..], &[0, 1]);
+        assert_eq!(
+            later
+                .iter()
+                .map(|identity| identity.uri().as_str())
+                .collect::<Vec<_>>(),
+            vec!["trash:///b.txt", "trash:///c.txt"]
+        );
+        assert_eq!(first.len(), 2);
+        // The registry's URI set is deduplicated in the same way.
+        assert_eq!(delete_snapshot(&items, &[0, 0, 2, 2]).len(), 2);
+    }
+
+    #[test]
+    fn selected_delete_confirmation_names_one_and_counts_many() {
+        let (title, body) = delete_confirmation_text(1, Some("a.txt"));
+        assert_eq!(title, "Permanently delete this item?");
+        assert!(body.contains("a.txt"));
+        assert!(body.contains("These items will be permanently deleted. This cannot be undone."));
+
+        let (title, body) = delete_confirmation_text(3, None);
+        assert_eq!(title, "Permanently delete 3 items?");
+        assert_eq!(
+            body,
+            "These items will be permanently deleted. This cannot be undone."
+        );
+    }
+
+    #[test]
+    fn confirmation_replies_are_scoped_to_job_and_operation_kind() {
         // Exercise the same state mutation the response and idle callbacks use.
-        let pending = Cell::new(Some(7));
+        let pending = Cell::new(Some((7, ConfirmationKind::Empty)));
         assert_eq!(
-            claim_confirmation(&pending, 8, Some("empty")),
+            claim_confirmation(&pending, 8, ConfirmationKind::Empty, Some("empty")),
             ConfirmationAction::Ignore
         );
-        assert_eq!(pending.get(), Some(7));
+        assert_eq!(pending.get(), Some((7, ConfirmationKind::Empty)));
         assert_eq!(
-            claim_confirmation(&pending, 8, None),
+            claim_confirmation(&pending, 8, ConfirmationKind::Empty, None),
             ConfirmationAction::Ignore
         );
-        assert_eq!(pending.get(), Some(7));
+        assert_eq!(pending.get(), Some((7, ConfirmationKind::Empty)));
         assert_eq!(
-            claim_confirmation(&pending, 7, Some("cancel")),
+            claim_confirmation(&pending, 7, ConfirmationKind::Empty, Some("cancel")),
             ConfirmationAction::Cancel
         );
         assert_eq!(pending.get(), None);
-        pending.set(Some(9));
+
+        pending.set(Some((9, ConfirmationKind::Selected)));
         assert_eq!(
-            claim_confirmation(&pending, 9, Some("empty")),
+            claim_confirmation(&pending, 9, ConfirmationKind::Empty, Some("empty")),
+            ConfirmationAction::Ignore,
+            "an Empty Trash reply cannot claim a selected confirmation"
+        );
+        assert_eq!(
+            claim_confirmation(&pending, 9, ConfirmationKind::Selected, Some("delete")),
             ConfirmationAction::Confirm
         );
         assert_eq!(pending.get(), None);
+
         assert_eq!(
-            confirmation_action(Some(7), 7, Some("empty")),
+            confirmation_action(
+                Some((7, ConfirmationKind::Empty)),
+                7,
+                ConfirmationKind::Empty,
+                Some("empty")
+            ),
             ConfirmationAction::Confirm
         );
         assert_eq!(
-            confirmation_action(Some(7), 8, Some("empty")),
+            confirmation_action(
+                Some((7, ConfirmationKind::Selected)),
+                7,
+                ConfirmationKind::Selected,
+                Some("empty")
+            ),
+            ConfirmationAction::Cancel,
+            "the selected dialog only accepts its own Delete Permanently response"
+        );
+        assert_eq!(
+            confirmation_action(
+                Some((7, ConfirmationKind::Empty)),
+                7,
+                ConfirmationKind::Selected,
+                Some("delete")
+            ),
+            ConfirmationAction::Ignore,
+            "operation kinds never cross"
+        );
+    }
+
+    #[test]
+    fn stale_or_missing_job_replies_never_delete() {
+        // A reply for an old job, a reply after the page forgot its job, and a
+        // reply for a job that never owned the dialog are all ignored.
+        assert_eq!(
+            confirmation_action(
+                Some((21, ConfirmationKind::Selected)),
+                20,
+                ConfirmationKind::Selected,
+                Some("delete")
+            ),
             ConfirmationAction::Ignore
         );
         assert_eq!(
-            confirmation_action(None, 7, None),
+            confirmation_action(None, 21, ConfirmationKind::Selected, Some("delete")),
             ConfirmationAction::Ignore
         );
         assert_eq!(
-            confirmation_action(Some(7), 7, None),
-            ConfirmationAction::Cancel
-        );
-        assert_eq!(
-            confirmation_action(Some(7), 7, Some("cancel")),
-            ConfirmationAction::Cancel
+            claim_confirmation(
+                &Cell::new(Some((21, ConfirmationKind::Selected))),
+                20,
+                ConfirmationKind::Selected,
+                Some("delete")
+            ),
+            ConfirmationAction::Ignore
         );
     }
 
@@ -1327,17 +1747,27 @@ mod tests {
         // Escape or a close without a response cancels only the job whose
         // confirmation this page owns.
         assert_eq!(
-            confirmation_action(Some(11), 11, None),
+            confirmation_action(
+                Some((11, ConfirmationKind::Selected)),
+                11,
+                ConfirmationKind::Selected,
+                None
+            ),
             ConfirmationAction::Cancel
         );
         assert_eq!(
-            confirmation_action(Some(11), 12, None),
+            confirmation_action(
+                Some((11, ConfirmationKind::Selected)),
+                12,
+                ConfirmationKind::Selected,
+                None
+            ),
             ConfirmationAction::Ignore
         );
         // Once the page left and cleared its pending id, a late close or reply
         // must not cancel whichever job is current then.
         assert_eq!(
-            confirmation_action(None, 11, Some("empty")),
+            confirmation_action(None, 11, ConfirmationKind::Selected, Some("delete")),
             ConfirmationAction::Ignore
         );
     }
