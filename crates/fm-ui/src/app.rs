@@ -17,7 +17,7 @@ use fm_core::workspace::{Event, Heights, TabId, WindowId, Workspace};
 use gtk::gio;
 use gtk::glib;
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -34,9 +34,9 @@ use crate::save::{Debounce, SAVE_DELAY_MS, Saver};
 use crate::trash::{PageRoute, back_consumes_history, route_on_trash_page};
 
 pub struct Process {
-    application: adw::Application,
+    application: Option<adw::Application>,
     pub config: Rc<RefCell<ConfigFile>>,
-    pub look: Rc<Look>,
+    pub look: Option<Rc<Look>>,
     workspace: RefCell<Workspace>,
     windows: RefCell<BTreeMap<WindowId, Rc<WindowUi>>>,
     session_path: Option<PathBuf>,
@@ -55,6 +55,35 @@ pub struct Process {
     /// was clicked. It is taken once, before the worker starts.
     pending_trash_delete: RefCell<Option<Vec<TrashIdentity>>>,
     quit: RefCell<QuitCoordinator>,
+    /// The local automation listener and its bounded job history. The Settings
+    /// switch is the only path that changes it; agents cannot.
+    pub(crate) agent: RefCell<crate::agent::AgentRuntime>,
+    agent_poll: RefCell<Option<glib::SourceId>>,
+    /// The file-job id the handler just queued, read by the socket bridge.
+    command_job: Cell<Option<u64>>,
+    /// A bridge job token reserved before an asynchronous handler (clipboard
+    /// paste) starts. The handler binds it once the file-op worker accepts.
+    reserved_job: RefCell<Option<String>>,
+    /// Authorization for exactly the handler dispatch now running. The bridge
+    /// sets it from the accepted generation, never from job history.
+    pending_authorization: RefCell<Option<crate::agent::JobAuthorization>>,
+    /// Socket runs parked on the bounded filesystem pool.
+    pending_runs: RefCell<HashMap<u64, crate::agent::PendingRun>>,
+    next_work_id: Cell<u64>,
+    /// The filesystem worker's resolved `nav.go` target, consumed by the real
+    /// command handler instead of a GTK-thread `exists()` call.
+    pending_nav_target: RefCell<Option<(PathBuf, Option<OsString>)>>,
+    /// The first real model failure in the current command dispatch.
+    last_failure: RefCell<Option<String>>,
+    /// The injectable clipboard reader. Production uses the GTK clipboard;
+    /// tests can pause or fail a read without touching Kyle's clipboard.
+    clipboard_reader: Rc<dyn crate::fileops::clipboard::Reader>,
+    /// Headless bridge tests skip GTK window construction and session saves.
+    headless: bool,
+    /// Test seam for the Trash page's contextual refusal. Production always
+    /// reads the real window's page state.
+    #[cfg(test)]
+    trash_pages: RefCell<BTreeSet<WindowId>>,
 }
 
 /// One active Quit request. Every window with an unsaved buffer or an active
@@ -185,10 +214,18 @@ impl Process {
 
         let look = Look::new(scale, opacity, font);
         let workspace = Workspace::with_home(config.home.clone());
+        let process_tag = format!(
+            "{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|time| time.as_nanos())
+                .unwrap_or(0)
+        );
         let process = Rc::new(Self {
-            application: application.clone(),
+            application: Some(application.clone()),
             config: Rc::new(RefCell::new(config_file)),
-            look,
+            look: Some(look),
             workspace: RefCell::new(workspace),
             windows: RefCell::new(BTreeMap::new()),
             session_path: session::default_session_path(),
@@ -201,11 +238,224 @@ impl Process {
             suppress_header: Cell::new(false),
             pending_trash_delete: RefCell::new(None),
             quit: RefCell::new(QuitCoordinator::default()),
+            agent: RefCell::new(crate::agent::AgentRuntime::new(process_tag)),
+            agent_poll: RefCell::new(None),
+            command_job: Cell::new(None),
+            reserved_job: RefCell::new(None),
+            pending_authorization: RefCell::new(None),
+            pending_runs: RefCell::new(HashMap::new()),
+            next_work_id: Cell::new(0),
+            pending_nav_target: RefCell::new(None),
+            last_failure: RefCell::new(None),
+            clipboard_reader: Rc::new(crate::fileops::clipboard::SystemReader),
+            headless: false,
+            #[cfg(test)]
+            trash_pages: RefCell::new(BTreeSet::new()),
         });
         let fileops = FileOps::new(&process);
         *process.fileops.borrow_mut() = Some(fileops);
         process.restore_session();
+        crate::agent::start_if_enabled(&process);
+        let weak = Rc::downgrade(&process);
+        let poll = glib::timeout_add_local(crate::agent::POLL, move || match weak.upgrade() {
+            Some(process) => crate::agent::poll(&process),
+            None => glib::ControlFlow::Break,
+        });
+        *process.agent_poll.borrow_mut() = Some(poll);
         process
+    }
+
+    /// A headless process for bridge tests: no GTK windows, no session file
+    /// and an injected clipboard reader. Production routing, the registry and
+    /// the real file-op worker remain the same.
+    #[cfg(test)]
+    pub(crate) fn headless(
+        config_path: PathBuf,
+        home: PathBuf,
+        clipboard_reader: Rc<dyn crate::fileops::clipboard::Reader>,
+    ) -> Rc<Self> {
+        let (config_file, _problems) = ConfigFile::load(&config_path);
+        let process = Rc::new(Self {
+            application: None,
+            config: Rc::new(RefCell::new(config_file)),
+            look: None,
+            workspace: RefCell::new(Workspace::with_home(home)),
+            windows: RefCell::new(BTreeMap::new()),
+            session_path: None,
+            saver: Saver::new(),
+            save_source: RefCell::new(None),
+            debounce: Cell::new(Debounce::new(SAVE_DELAY_MS)),
+            preserve_bad: Cell::new(false),
+            fileops: RefCell::new(None),
+            fresh_home: Cell::new(false),
+            suppress_header: Cell::new(false),
+            pending_trash_delete: RefCell::new(None),
+            quit: RefCell::new(QuitCoordinator::default()),
+            agent: RefCell::new(crate::agent::AgentRuntime::new("test".to_string())),
+            agent_poll: RefCell::new(None),
+            command_job: Cell::new(None),
+            reserved_job: RefCell::new(None),
+            pending_authorization: RefCell::new(None),
+            pending_runs: RefCell::new(HashMap::new()),
+            next_work_id: Cell::new(0),
+            pending_nav_target: RefCell::new(None),
+            last_failure: RefCell::new(None),
+            clipboard_reader,
+            headless: true,
+            trash_pages: RefCell::new(BTreeSet::new()),
+        });
+        let fileops = FileOps::new_manual(&process);
+        *process.fileops.borrow_mut() = Some(fileops);
+        process
+    }
+
+    #[cfg(test)]
+    pub(crate) fn seed_window(self: &Rc<Self>, folder: PathBuf) -> WindowId {
+        let events = self
+            .workspace
+            .borrow_mut()
+            .window_new(Some(folder))
+            .expect("test window");
+        let id = events
+            .iter()
+            .find_map(|event| match event {
+                Event::WindowOpened(id) => Some(*id),
+                _ => None,
+            })
+            .expect("window id");
+        self.apply_events(&events);
+        id
+    }
+
+    #[cfg(test)]
+    pub(crate) fn focus_window_for_tests(self: &Rc<Self>, id: WindowId) {
+        let events = self.workspace.borrow_mut().focus_window(id).expect("focus");
+        self.apply_events(&events);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn mark_trash_for_tests(&self, id: WindowId) {
+        self.trash_pages.borrow_mut().insert(id);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn close_window_for_tests(self: &Rc<Self>, id: WindowId) {
+        let _ = self.workspace.borrow_mut().focus_window(id);
+        let result = self.workspace.borrow_mut().window_close();
+        if let Ok(events) = result {
+            self.apply_events(&events);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_fileops_with_pause(self: &Rc<Self>, pause: crate::fileops::WorkerPause) {
+        *self.fileops.borrow_mut() = Some(FileOps::with_pause(self, pause));
+    }
+
+    /// The config file this process reads and saves.
+    pub fn config_path(&self) -> PathBuf {
+        self.config.borrow().path().to_path_buf()
+    }
+
+    pub fn agent_status(&self) -> crate::agent::AgentStatus {
+        crate::agent::status(self)
+    }
+
+    #[cfg(test)]
+    fn trash_active_for_test(&self, window: WindowId) -> bool {
+        self.trash_pages.borrow().contains(&window)
+    }
+
+    #[cfg(not(test))]
+    fn trash_active_for_test(&self, _window: WindowId) -> bool {
+        false
+    }
+
+    /// Whether a dirty/saving preview or close prompt needs a human answer.
+    /// Socket clients cannot answer it in V1.
+    pub fn user_prompt_pending(&self) -> bool {
+        prompt_pending(
+            self.windows
+                .borrow()
+                .values()
+                .map(|ui| (ui.header().dialogs_open(), ui.preview().activity())),
+        )
+    }
+
+    /// Push the shared listener state into every open Settings submenu.
+    pub fn refresh_agent_status_all(&self) {
+        let status = self.agent_status();
+        for ui in self.windows.borrow().values() {
+            ui.header().refresh_agent_status(&status);
+        }
+    }
+
+    pub fn set_agent_enabled(self: &Rc<Self>, enabled: bool) -> Outcome {
+        crate::agent::set_enabled(self, enabled)
+    }
+
+    pub fn clear_command_job(&self) {
+        self.command_job.set(None);
+    }
+
+    pub fn take_command_job(&self) -> Option<u64> {
+        self.command_job.take()
+    }
+
+    pub(crate) fn set_reserved_job(&self, token: Option<String>) {
+        *self.reserved_job.borrow_mut() = token;
+    }
+
+    pub(crate) fn take_reserved_job(&self) -> Option<String> {
+        self.reserved_job.borrow_mut().take()
+    }
+
+    pub(crate) fn set_pending_authorization(&self, auth: Option<crate::agent::JobAuthorization>) {
+        *self.pending_authorization.borrow_mut() = auth;
+    }
+
+    pub(crate) fn take_pending_authorization(&self) -> Option<crate::agent::JobAuthorization> {
+        self.pending_authorization.borrow_mut().take()
+    }
+
+    pub(crate) fn next_work_id(&self) -> u64 {
+        let id = self.next_work_id.get().wrapping_add(1);
+        self.next_work_id.set(id);
+        id
+    }
+
+    pub(crate) fn store_pending_run(&self, pending: crate::agent::PendingRun) {
+        self.pending_runs
+            .borrow_mut()
+            .insert(pending.work_id, pending);
+    }
+
+    pub(crate) fn take_pending_run(&self, work_id: u64) -> Option<crate::agent::PendingRun> {
+        self.pending_runs.borrow_mut().remove(&work_id)
+    }
+
+    pub(crate) fn clear_agent_pending(&self) {
+        self.pending_runs.borrow_mut().clear();
+        self.pending_authorization.borrow_mut().take();
+        self.pending_nav_target.borrow_mut().take();
+        self.reserved_job.borrow_mut().take();
+    }
+
+    pub(crate) fn set_pending_nav_target(&self, target: Option<(PathBuf, Option<OsString>)>) {
+        *self.pending_nav_target.borrow_mut() = target;
+    }
+
+    fn take_pending_nav_target(&self) -> Option<(PathBuf, Option<OsString>)> {
+        self.pending_nav_target.borrow_mut().take()
+    }
+
+    pub(crate) fn clipboard_reader(&self) -> Rc<dyn crate::fileops::clipboard::Reader> {
+        self.clipboard_reader.clone()
+    }
+
+    /// Every model window, cloned for a read-only agent projection.
+    pub fn windows_snapshot(&self) -> Vec<fm_core::workspace::Window> {
+        self.workspace.borrow().windows.clone()
     }
 
     pub fn fileops(&self) -> Option<Rc<FileOps>> {
@@ -357,7 +607,13 @@ impl Process {
         if self.windows.borrow().contains_key(&id) {
             return;
         }
-        let ui = WindowUi::new(self, &self.application, id);
+        if self.headless {
+            return;
+        }
+        let Some(application) = &self.application else {
+            return;
+        };
+        let ui = WindowUi::new(self, application, id);
         self.windows.borrow_mut().insert(id, ui.clone());
         ui.present();
         crate::log!("window", "opened model window {id}");
@@ -386,6 +642,44 @@ impl Process {
         }
     }
 
+    /// Whether the exact window/tab pair still exists and belongs together.
+    /// Used by the socket bridge after asynchronous evidence returns.
+    pub(crate) fn execution_target_valid(&self, target: crate::agent::ExecutionTarget) -> bool {
+        self.window_snapshot(target.window)
+            .and_then(|window| window.tab(target.tab).map(|_| ()))
+            .is_some()
+    }
+
+    /// Bind a validated socket target immediately before its effect. This is
+    /// intentionally not the UI's pre-validation focus wrapper: callers run
+    /// registry validation first, and a refused command never reaches here.
+    /// It also does not leave the Trash page; `handle_command` still decides
+    /// that per command.
+    pub(crate) fn bind_execution_target(
+        self: &Rc<Self>,
+        target: crate::agent::ExecutionTarget,
+    ) -> bool {
+        let focused_window = self.workspace.borrow_mut().focus_window(target.window);
+        match focused_window {
+            Ok(events) => {
+                if !events.is_empty() {
+                    self.apply_events(&events);
+                }
+            }
+            Err(_) => return false,
+        }
+        let focused_tab = self.workspace.borrow_mut().focus_tab(target.tab);
+        match focused_tab {
+            Ok(events) => {
+                if !events.is_empty() {
+                    self.apply_events(&events);
+                }
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
     /// A tab, group or sidebar destination was chosen. That is explicit
     /// navigation, unlike a job or monitor refresh, so Trash steps aside.
     fn leave_trash_for_navigation(self: &Rc<Self>, window: WindowId) {
@@ -411,6 +705,7 @@ impl Process {
         let outcome = Registry::new().dispatch(caller, &invocation, &mut handler);
         match outcome {
             Outcome::Error(error) => crate::log!("command", "{error}"),
+            Outcome::Failed(message) => crate::log!("command", "{}: {message}", invocation.name()),
             Outcome::DryRun(lines) => crate::log!(
                 "command",
                 "{} dry run: {} lines",
@@ -531,7 +826,7 @@ impl Process {
         self.fresh_home.set(false);
     }
 
-    fn focused_window_id(&self) -> Option<WindowId> {
+    pub(crate) fn focused_window_id(&self) -> Option<WindowId> {
         self.workspace.borrow().focused_window
     }
 
@@ -683,7 +978,7 @@ impl Process {
             }
         };
         if let Some(fileops) = self.fileops() {
-            let id = fileops.submit(window, request, false);
+            let id = fileops.submit(window, request, false, None);
             crate::log!(
                 "dnd",
                 "drop {count} item(s) into {}: source {}, selected {}, target preference {}, filesystem {}, modifiers {}, final {} -> job {id}",
@@ -706,7 +1001,7 @@ impl Process {
         }
         let count = paths.len();
         if let Some(fileops) = self.fileops() {
-            let id = fileops.submit(window, Request::Trash { paths }, false);
+            let id = fileops.submit(window, Request::Trash { paths }, false, None);
             crate::log!("dnd", "drop {count} item(s) on the Trash -> job {id}");
         }
     }
@@ -933,7 +1228,7 @@ impl Process {
                         Invocation::new("file.open", vec![("paths".to_string(), path.to_string())]),
                     );
                 } else {
-                    self.launch_file(&path);
+                    let _ = self.launch_file(&path);
                 }
             }
             OpenDecision::Missing => {
@@ -942,13 +1237,19 @@ impl Process {
         }
     }
 
-    /// The one launch path, shared by `file.open` and a double-click. A failure
-    /// is logged, never a panic.
-    pub fn launch_file(&self, path: &Path) {
+    /// The one launch path, shared by `file.open` and a double-click. The
+    /// command bridge reports the real error; a double-click only logs it.
+    pub fn launch_file(&self, path: &Path) -> Result<(), String> {
         let uri = gio::File::for_path(path).uri().to_string();
         match gio::AppInfo::launch_default_for_uri(&uri, None::<&gio::AppLaunchContext>) {
-            Ok(()) => crate::log!("open", "launched {}", path.display()),
-            Err(error) => crate::log!("open", "could not launch {}: {error}", path.display()),
+            Ok(()) => {
+                crate::log!("open", "launched {}", path.display());
+                Ok(())
+            }
+            Err(error) => {
+                crate::log!("open", "could not launch {}: {error}", path.display());
+                Err(format!("could not launch {}: {error}", path.display()))
+            }
         }
     }
 
@@ -972,7 +1273,9 @@ impl Process {
         // still exist; setting a flag after `application.quit` is too late.
         crate::folder::size::shutdown();
         crate::pdf::shutdown();
-        self.application.quit();
+        if let Some(application) = &self.application {
+            application.quit();
+        }
     }
 
     /// Quit rechecks every current model window before the application leaves.
@@ -1063,21 +1366,36 @@ impl Process {
         }
     }
 
-    fn finish(self: &Rc<Self>, result: Result<Vec<Event>, fm_core::workspace::WorkspaceError>) {
+    fn finish(
+        self: &Rc<Self>,
+        result: Result<Vec<Event>, fm_core::workspace::WorkspaceError>,
+    ) -> Outcome {
         match result {
             Ok(events) => {
-                if events.is_empty() {
-                    return;
+                if !events.is_empty() {
+                    self.apply_events(&events);
+                    self.schedule_save();
                 }
-                self.apply_events(&events);
-                self.schedule_save();
+                Outcome::Done
             }
-            Err(error) => crate::log!("workspace", "{error}"),
+            Err(error) => {
+                crate::log!("workspace", "{error}");
+                let message = error.to_string();
+                *self.last_failure.borrow_mut() = Some(message.clone());
+                Outcome::Failed(message)
+            }
         }
     }
 
     /// Model events drive the UI: one function per event kind.
     pub fn apply_events(self: &Rc<Self>, events: &[Event]) {
+        // Headless tests have no widgets to reborrow the workspace during a
+        // refresh. Enforce the same reentrant delivery contract there.
+        #[cfg(test)]
+        assert!(
+            self.workspace.try_borrow_mut().is_ok(),
+            "release the workspace borrow before delivering model events"
+        );
         for event in events {
             crate::log!("model", "{event:?}");
             self.on_event(event);
@@ -1189,6 +1507,17 @@ impl Process {
     }
 
     fn settings_change(self: &Rc<Self>, window: WindowId, command: &CheckedCommand) -> Outcome {
+        // The one Settings key with a runtime side effect. The registry has
+        // already refused every caller but Ui before this handler is reached.
+        if command.name() == "agent.set-enabled" {
+            let Some(Value::Bool(enabled)) = command.get("enabled") else {
+                return Outcome::Failed("agent.set-enabled needs a boolean".to_string());
+            };
+            let outcome = self.set_agent_enabled(*enabled);
+            self.refresh_agent_status_all();
+            return outcome;
+        }
+
         let current = self
             .window_snapshot(window)
             .and_then(|window| window.tab(window.focused_tab).map(|tab| tab.folder.clone()))
@@ -1198,27 +1527,32 @@ impl Process {
             config::change_for(command, config.config(), &current)
         };
         let Some(change) = change else {
-            crate::log!(
-                "command",
+            return Outcome::Failed(format!(
                 "{}: no config change could be made",
                 command.name()
-            );
-            return Outcome::Done;
+            ));
         };
         let applied = self.config.borrow_mut().apply(change.clone());
-        match &applied {
-            Ok(()) => crate::log!("command", "{} applied", command.name()),
-            Err(error) => crate::log!("config", "{error}"),
+        match applied {
+            Ok(()) => {
+                crate::log!("command", "{} applied", command.name());
+                self.after_change(window, &change);
+                Outcome::Done
+            }
+            Err(error) => {
+                crate::log!("config", "{error}");
+                Outcome::Failed(error.to_string())
+            }
         }
-        self.after_change(window, &change);
-        Outcome::Done
     }
 
     fn after_change(self: &Rc<Self>, window: WindowId, change: &Change) {
         match change {
             Change::SetScale(_) => self.apply_scale_all(),
             Change::SetOpacity(opacity) => {
-                self.look.set_opacity(*opacity);
+                if let Some(look) = &self.look {
+                    look.set_opacity(*opacity);
+                }
                 for ui in self.windows.borrow().values() {
                     ui.set_opacity(*opacity);
                 }
@@ -1265,7 +1599,9 @@ impl Process {
 
     fn apply_scale_all(self: &Rc<Self>) {
         let scale = self.scale();
-        self.look.set_scale(scale);
+        if let Some(look) = &self.look {
+            look.set_scale(scale);
+        }
         let windows: Vec<Rc<WindowUi>> = self.windows.borrow().values().cloned().collect();
         for ui in windows {
             ui.apply_scale();
@@ -1278,6 +1614,7 @@ impl Process {
         caller: Caller,
         command: &CheckedCommand,
     ) -> Outcome {
+        self.last_failure.borrow_mut().take();
         crate::log!(
             "command",
             "{} via {caller} ({})",
@@ -1313,21 +1650,39 @@ impl Process {
                     ui.leave_trash();
                 }
                 PageRoute::Refuse(message) => {
+                    // Keep the visible explanation, but never report a
+                    // synchronous refusal as a successful completion.
                     ui.trash_status(message);
                     crate::log!("trash", "refused {message}");
-                    return Outcome::Done;
+                    return Outcome::Failed(format!("refused: {message}"));
                 }
             }
+        }
+        // Headless bridge tests have no GTK page; the same route still makes
+        // the contextual refusal a typed failure.
+        if self.trash_active_for_test(window)
+            && let PageRoute::Refuse(message) = route_on_trash_page(command.name(), true)
+        {
+            crate::log!("trash", "refused {message}");
+            return Outcome::Failed(format!("refused: {message}"));
         }
 
         match command.name() {
             "file.cut" => {
-                self.put_on_clipboard(window, caller, command, clipboard::ClipboardMode::Cut);
-                return Outcome::Done;
+                return self.put_on_clipboard(
+                    window,
+                    caller,
+                    command,
+                    clipboard::ClipboardMode::Cut,
+                );
             }
             "file.copy-to-clipboard" => {
-                self.put_on_clipboard(window, caller, command, clipboard::ClipboardMode::Copy);
-                return Outcome::Done;
+                return self.put_on_clipboard(
+                    window,
+                    caller,
+                    command,
+                    clipboard::ClipboardMode::Copy,
+                );
             }
             "file.paste" => {
                 self.paste(window, caller, command);
@@ -1335,10 +1690,13 @@ impl Process {
             }
             "app.disk-usage" => {
                 let path = argument_path(command, "path").or_else(|| self.current_folder(window));
-                if let Some(path) = path {
-                    self.launch_disk_usage(&path);
-                }
-                return Outcome::Done;
+                let Some(path) = path else {
+                    return Outcome::Failed("app.disk-usage needs a folder".to_string());
+                };
+                return match self.launch_disk_usage(&path) {
+                    Ok(()) => Outcome::Done,
+                    Err(error) => Outcome::Failed(error),
+                };
             }
             _ => {}
         }
@@ -1358,20 +1716,28 @@ impl Process {
                 .filter(|paths| !paths.is_empty())
                 .unwrap_or_else(|| self.selected_paths(window));
             if paths.is_empty() {
-                crate::log!("open", "file.open has nothing selected");
-            } else {
-                for path in paths {
-                    self.launch_file(&path);
+                return Outcome::Failed("file.open has nothing selected".to_string());
+            }
+            let mut failures = Vec::new();
+            for path in paths {
+                if let Err(error) = self.launch_file(&path) {
+                    failures.push(error);
                 }
             }
-            return Outcome::Done;
+            return if failures.is_empty() {
+                Outcome::Done
+            } else {
+                Outcome::Failed(failures.join("; "))
+            };
         }
         match command.effect() {
             Effect::Settings => return self.settings_change(window, command),
             Effect::View => {}
             _ => {
-                crate::log!("command", "{} not built yet", command.name());
-                return Outcome::Done;
+                return Outcome::Failed(format!(
+                    "{} is not implemented by this version",
+                    command.name()
+                ));
             }
         }
 
@@ -1481,22 +1847,23 @@ impl Process {
                 self.finish(result);
             }
             "nav.go" => {
-                let Some(path) = path else {
-                    crate::log!("command", "nav.go needs a path");
-                    return Outcome::Done;
-                };
-                let (folder, select) = if path.is_dir() {
-                    (path, None)
-                } else if path.is_file() {
-                    let parent = path
-                        .parent()
-                        .map(Path::to_path_buf)
-                        .unwrap_or_else(|| PathBuf::from("/"));
-                    let name = path.file_name().map(std::ffi::OsString::from);
-                    (parent, name)
-                } else {
-                    crate::log!("path", "{} does not exist", path.display());
-                    return Outcome::Done;
+                let target = self.take_pending_nav_target().or_else(|| {
+                    let path = path?;
+                    if path.is_dir() {
+                        Some((path, None))
+                    } else if path.is_file() {
+                        let parent = path
+                            .parent()
+                            .map(Path::to_path_buf)
+                            .unwrap_or_else(|| PathBuf::from("/"));
+                        let name = path.file_name().map(std::ffi::OsString::from);
+                        Some((parent, name))
+                    } else {
+                        None
+                    }
+                });
+                let Some((folder, select)) = target else {
+                    return Outcome::Failed("the navigation target does not exist".to_string());
                 };
                 let result = self.workspace.borrow_mut().nav_go(folder, select);
                 self.finish(result);
@@ -1567,9 +1934,17 @@ impl Process {
                     ui.open_trash();
                 }
             }
-            _ => crate::log!("command", "{} not built yet", command.name()),
+            _ => {
+                return Outcome::Failed(format!(
+                    "{} is not implemented by this version",
+                    command.name()
+                ));
+            }
         }
-        Outcome::Done
+        match self.last_failure.borrow_mut().take() {
+            Some(message) => Outcome::Failed(message),
+            None => Outcome::Done,
+        }
     }
 
     fn preview_command(self: &Rc<Self>, window: WindowId, command: &CheckedCommand) -> Outcome {
@@ -1687,7 +2062,7 @@ impl Process {
                     if let Some(ui) = self.window(window) {
                         ui.trash_status(&format!("Could not delete permanently: {error}"));
                     }
-                    return Some(Outcome::Done);
+                    return Some(Outcome::Failed(error));
                 }
             }
         } else {
@@ -1696,36 +2071,34 @@ impl Process {
                 Ok(None) => return None,
                 Err(error) => {
                     crate::log!("fileops", "{}: {error}", command.name());
-                    return Some(Outcome::Done);
+                    return Some(Outcome::Failed(error));
                 }
             }
         };
 
         if command.dry_run() {
-            if matches!(
-                request,
-                Request::EmptyTrash | Request::Restore { .. } | Request::DeleteSelected { .. }
-            ) && let Some(fileops) = self.fileops()
-            {
-                let id = fileops.submit_dry_run(window, request);
+            // Every plan is built on the worker. The UI only logs the eventual
+            // result through `fileop_dry_run`; GTK never plans a file request.
+            if let Some(fileops) = self.fileops() {
+                let id = fileops.submit_dry_run(window, request, None);
+                self.command_job.set(Some(id));
                 crate::log!("fileops", "{} dry run queued as job {id}", command.name());
                 return Some(Outcome::Done);
             }
-            let lines = self
-                .fileops()
-                .map(|fileops| fileops.plan_lines(&request))
-                .unwrap_or_default();
-            crate::log!(
-                "fileops",
-                "{} dry run: {}",
-                command.name(),
-                lines.join(" | ")
-            );
-            return Some(Outcome::DryRun(lines));
+            return Some(Outcome::Failed(
+                "the file-operation worker is unavailable".to_string(),
+            ));
         }
 
         if let Some(fileops) = self.fileops() {
-            let id = fileops.submit(window, request, false);
+            if !fileops.can_accept() {
+                return Some(Outcome::Failed(
+                    "too many file jobs are already waiting".to_string(),
+                ));
+            }
+            let authorization = self.take_pending_authorization();
+            let id = fileops.submit(window, request, false, authorization);
+            self.command_job.set(Some(id));
             crate::log!("fileops", "{} queued as job {id}", command.name());
         }
         Some(Outcome::Done)
@@ -1737,7 +2110,7 @@ impl Process {
         caller: Caller,
         command: &CheckedCommand,
         mode: clipboard::ClipboardMode,
-    ) {
+    ) -> Outcome {
         let paths = argument_paths(command, "paths")
             .filter(|paths| !paths.is_empty())
             .unwrap_or_else(|| {
@@ -1748,24 +2121,46 @@ impl Process {
                 }
             });
         if paths.is_empty() {
-            crate::log!("fileops", "{} has nothing selected", command.name());
-            return;
+            return Outcome::Failed(format!("{} has nothing selected", command.name()));
         }
         let Some(ui) = self.window(window) else {
-            return;
+            return Outcome::Failed("the target window is gone".to_string());
         };
         match clipboard::write(&ui.display(), mode, &paths) {
-            Ok(()) => crate::log!(
-                "fileops",
-                "{} put {} item(s) on the clipboard",
-                mode.as_str(),
-                paths.len()
-            ),
-            Err(error) => crate::log!("fileops", "clipboard: {error}"),
+            Ok(()) => {
+                crate::log!(
+                    "fileops",
+                    "{} put {} item(s) on the clipboard",
+                    mode.as_str(),
+                    paths.len()
+                );
+                Outcome::Done
+            }
+            Err(error) => {
+                crate::log!("fileops", "clipboard: {error}");
+                Outcome::Failed(error)
+            }
         }
     }
 
     fn paste(self: &Rc<Self>, window: WindowId, caller: Caller, command: &CheckedCommand) {
+        let authorization = if caller == Caller::Agent {
+            self.take_pending_authorization()
+        } else {
+            None
+        };
+        let reserved = if caller == Caller::Agent {
+            self.take_reserved_job()
+        } else {
+            None
+        };
+        let fail = |message: String| {
+            if let Some(token) = &reserved {
+                crate::agent::fail_job(self, token, message.clone());
+            }
+            crate::log!("fileops", "paste: {message}");
+        };
+
         let folder = argument_path(command, "in").or_else(|| {
             if matches!(caller, Caller::Ui | Caller::Hotkey) {
                 self.current_folder(window)
@@ -1774,57 +2169,97 @@ impl Process {
             }
         });
         let Some(folder) = folder else {
-            crate::log!("fileops", "file.paste has no folder");
+            fail("file.paste has no folder".to_string());
             return;
         };
+        if caller == Caller::Agent && authorization.is_none() {
+            fail("local automation is off".to_string());
+            return;
+        }
         let dry_run = command.dry_run();
-        let Some(ui) = self.window(window) else {
-            return;
-        };
+        // A headless bridge test injects a reader; production passes the real
+        // window display. The paste effect targets the command's explicit
+        // folder, not a focused tab.
+        let display = self.window(window).map(|ui| ui.display());
+        let reader = self.clipboard_reader();
         let weak = Rc::downgrade(self);
-        clipboard::read(&ui.display(), move |result| {
-            let Some(process) = weak.upgrade() else {
-                return;
-            };
-            let payload = match result {
-                Ok(payload) => payload,
-                Err(error) => {
-                    crate::log!("fileops", "paste: {error}");
+        reader.read(
+            display.as_ref(),
+            Box::new(move |result| {
+                let Some(process) = weak.upgrade() else {
+                    return;
+                };
+                let fail = |message: String| {
+                    if let Some(token) = &reserved {
+                        crate::agent::fail_job(&process, token, message.clone());
+                    }
+                    crate::log!("fileops", "paste: {message}");
+                };
+                // A callback from an earlier enable cycle has no authority,
+                // even if it arrived after another On.
+                if !crate::agent::clipboard_callback_allowed(&authorization) {
+                    fail(
+                        "local automation was turned off before the clipboard read finished"
+                            .to_string(),
+                    );
                     return;
                 }
-            };
-            let paths: Vec<PathBuf> = payload
-                .uris
-                .iter()
-                .filter_map(|uri| gio::File::for_uri(uri).path())
-                .collect();
-            if paths.is_empty() {
-                crate::log!("fileops", "paste: the clipboard has no local files");
-                return;
-            }
-            let request = match payload.mode {
-                clipboard::ClipboardMode::Cut => Request::Move {
-                    paths,
-                    to: folder.clone(),
-                },
-                clipboard::ClipboardMode::Copy => Request::Copy {
-                    paths,
-                    to: folder.clone(),
-                },
-            };
-            if dry_run {
-                let lines = process
-                    .fileops()
-                    .map(|fileops| fileops.plan_lines(&request))
-                    .unwrap_or_default();
-                crate::log!("fileops", "paste dry run: {}", lines.join(" | "));
-                return;
-            }
-            if let Some(fileops) = process.fileops() {
-                let id = fileops.submit(window, request, clipboard::clear_after_cut(payload.mode));
+                let payload = match result {
+                    Ok(payload) => payload,
+                    Err(error) => {
+                        fail(error);
+                        return;
+                    }
+                };
+                let paths: Vec<PathBuf> = payload
+                    .uris
+                    .iter()
+                    .filter_map(|uri| gio::File::for_uri(uri).path())
+                    .collect();
+                if paths.is_empty() {
+                    fail("the clipboard has no local files".to_string());
+                    return;
+                }
+                let request = match payload.mode {
+                    clipboard::ClipboardMode::Cut => Request::Move {
+                        paths,
+                        to: folder.clone(),
+                    },
+                    clipboard::ClipboardMode::Copy => Request::Copy {
+                        paths,
+                        to: folder.clone(),
+                    },
+                };
+                let Some(fileops) = process.fileops() else {
+                    fail("the file-operation worker is unavailable".to_string());
+                    return;
+                };
+                if !fileops.can_accept() {
+                    fail("too many file jobs are already waiting".to_string());
+                    return;
+                }
+                if dry_run {
+                    let id = fileops.submit_dry_run(window, request, authorization.clone());
+                    if let Some(token) = &reserved {
+                        let running = fileops.current_id() == Some(id);
+                        crate::agent::attach_fileops(&process, token, id, running);
+                    }
+                    crate::log!("fileops", "paste dry run queued as job {id}");
+                    return;
+                }
+                let id = fileops.submit(
+                    window,
+                    request,
+                    clipboard::clear_after_cut(payload.mode),
+                    authorization.clone(),
+                );
+                if let Some(token) = &reserved {
+                    let running = fileops.current_id() == Some(id);
+                    crate::agent::attach_fileops(&process, token, id, running);
+                }
                 crate::log!("fileops", "paste ({}): job {id}", payload.mode.as_str());
-            }
-        });
+            }),
+        );
     }
 
     fn current_folder(&self, window: WindowId) -> Option<PathBuf> {
@@ -1904,21 +2339,24 @@ impl Process {
         }
     }
 
-    pub fn fileop_started(&self, window: WindowId) {
+    pub fn fileop_started(&self, window: WindowId, id: u64) {
+        crate::agent::job_started(self, id);
         if let Some(ui) = self.window(window) {
             ui.fileop_started();
             ui.trash_job_started();
         }
     }
 
-    pub fn fileop_progress(&self, window: WindowId, view: Option<ProgressView>) {
+    pub fn fileop_progress(&self, window: WindowId, id: u64, view: Option<ProgressView>) {
+        crate::agent::job_started(self, id);
         if let Some(ui) = self.window(window) {
             ui.fileop_progress(view.clone());
             ui.trash_progress(view);
         }
     }
 
-    pub fn fileop_dry_run(&self, window: WindowId, request: &Request, lines: &[String]) {
+    pub fn fileop_dry_run(&self, window: WindowId, id: u64, request: &Request, lines: &[String]) {
+        crate::agent::job_dry_run(self, id, lines.to_vec());
         crate::log!("fileops", "dry run: {}", lines.join(" | "));
         if let Some(ui) = self.window(window) {
             ui.fileop_progress(None);
@@ -1926,7 +2364,20 @@ impl Process {
         }
     }
 
+    /// A revoked agent job never reached execution. The socket result is
+    /// terminal, while the UI simply stops showing a job it must not run.
+    pub fn fileop_revoked(&self, window: WindowId, id: u64, request: &Request, message: &str) {
+        crate::agent::job_revoked(self, id, message.to_string());
+        crate::log!("fileops", "job {id} revoked before execution: {message}");
+        if let Some(ui) = self.window(window) {
+            ui.fileop_progress(None);
+            ui.trash_progress(None);
+            let _ = request;
+        }
+    }
+
     pub fn fileop_empty_confirmation(&self, window: WindowId, id: u64, plan: Plan) {
+        crate::agent::job_waiting(self, id);
         if let Some(ui) = self.window(window)
             && ui.trash_visible()
         {
@@ -1943,6 +2394,7 @@ impl Process {
     pub fn fileop_finished(
         &self,
         window: WindowId,
+        id: u64,
         request: &Request,
         plan: &Plan,
         report: &Report,
@@ -1956,6 +2408,14 @@ impl Process {
             progress::summary(request, report)
         };
         let failures = progress::failure_lines(report);
+        crate::agent::job_finished(
+            self,
+            id,
+            summary.clone(),
+            report.lines(),
+            failures.clone(),
+            report.cancelled,
+        );
         let details = (!failures.is_empty()).then(|| failures.join("\n"));
         crate::log!("fileops", "summary: {summary}");
         for line in report.lines() {
@@ -1967,7 +2427,8 @@ impl Process {
         }
     }
 
-    pub fn fileop_refused(&self, window: WindowId, request: &Request, message: &str) {
+    pub fn fileop_refused(&self, window: WindowId, id: u64, request: &Request, message: &str) {
+        crate::agent::job_failed(self, id, message.to_string());
         crate::log!("fileops", "refused: {message}");
         if let Some(ui) = self.window(window) {
             if matches!(request, Request::Undo) && message.contains("nothing to undo") {
@@ -1989,31 +2450,38 @@ impl Process {
     pub fn fileop_conflicts(
         &self,
         window: WindowId,
+        id: u64,
         flow: fileops::conflict::ConflictFlow,
         done: Box<dyn Fn(Decisions)>,
     ) {
+        crate::agent::job_waiting(self, id);
         if let Some(ui) = self.window(window) {
             dialogs::show_conflicts(&ui, flow, Rc::from(done));
         }
     }
 
-    fn launch_disk_usage(&self, path: &Path) {
+    fn launch_disk_usage(&self, path: &Path) -> Result<(), String> {
         let Some(executable) = menus::find_on_path("baobab", std::env::var_os("PATH").as_deref())
         else {
-            crate::log!("disk-usage", "baobab is not on PATH");
-            return;
+            return Err("the disk-usage analyser (baobab) is not on PATH".to_string());
         };
         match std::process::Command::new(executable).arg(path).spawn() {
-            Ok(_) => crate::log!("disk-usage", "launched baobab for {}", path.display()),
-            Err(error) => crate::log!(
-                "disk-usage",
-                "could not launch baobab for {}: {error}",
-                path.display()
-            ),
+            Ok(_) => {
+                crate::log!("disk-usage", "launched baobab for {}", path.display());
+                Ok(())
+            }
+            Err(error) => {
+                let message = format!("could not launch baobab for {}: {error}", path.display());
+                crate::log!("disk-usage", "{message}");
+                Err(message)
+            }
         }
     }
 
     pub fn schedule_save(self: &Rc<Self>) {
+        if self.headless {
+            return;
+        }
         let now = crate::save::now_ms();
         let mut debounce = self.debounce.get();
         debounce.change(now);
@@ -2062,6 +2530,17 @@ impl Process {
         self.window(window)
             .is_some_and(|ui| ui.header().dialogs_open())
     }
+}
+
+/// A window needs a human answer when a dialog owns it, or when the preview
+/// has unsaved edits or an active save. The preview close bypass flag is not a
+/// prompt predicate: it starts false in every clean window.
+pub fn prompt_pending(
+    windows: impl IntoIterator<Item = (bool, Option<fm_core::preview::EditorActivity>)>,
+) -> bool {
+    windows.into_iter().any(|(dialog, activity)| {
+        dialog || activity.is_some_and(|activity| activity.dirty || activity.saving)
+    })
 }
 
 fn utf8_path(path: &Path) -> Result<String, String> {
@@ -2136,6 +2615,27 @@ mod tests {
             dirty,
             saving,
         }
+    }
+
+    #[test]
+    fn clean_close_and_quit_need_no_human_prompt() {
+        assert!(!prompt_pending([]));
+        assert!(!prompt_pending([(false, None)]));
+        assert!(!prompt_pending([(
+            false,
+            Some(activity(1, 2, false, false))
+        )]));
+    }
+
+    #[test]
+    fn dirty_or_saving_or_dialog_windows_block_close_and_quit() {
+        assert!(prompt_pending([(false, Some(activity(1, 2, true, false)))]));
+        assert!(prompt_pending([(false, Some(activity(1, 2, false, true)))]));
+        assert!(prompt_pending([(true, None)]));
+        assert!(!prompt_pending([
+            (false, Some(activity(1, 2, false, false))),
+            (false, None),
+        ]));
     }
 
     fn window(number: u64) -> WindowId {

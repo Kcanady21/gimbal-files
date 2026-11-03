@@ -5,6 +5,7 @@
 //! one GTK window and header. A second launch hands its folders to the running
 //! instance through GApplication's open signal.
 
+mod agent;
 mod app;
 mod cli;
 mod commands;

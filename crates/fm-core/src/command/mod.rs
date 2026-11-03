@@ -315,10 +315,18 @@ pub const PREVIEW_EDITING_COMMANDS: &[&str] = &[
     "preview.save-as",
 ];
 
+/// The one user-only control that is not a file effect: enabling or disabling
+/// the local automation socket. It never comes from a hotkey, the CLI or the
+/// agent, even when the value is unchanged.
+pub const UI_ONLY_SETTINGS_COMMANDS: &[&str] = &["agent.set-enabled"];
+
 /// Whether this caller may run this command at all. The two approved permanent
 /// deletions are explicitly clicked UI operations; the preview commands may
-/// also come from a hotkey.
+/// also come from a hotkey. `agent.set-enabled` is only the Settings switch.
 pub fn caller_allowed(name: &str, effect: Effect, caller: Caller) -> bool {
+    if UI_ONLY_SETTINGS_COMMANDS.contains(&name) {
+        return caller == Caller::Ui;
+    }
     if PREVIEW_EDITING_COMMANDS.contains(&name) {
         return matches!(caller, Caller::Ui | Caller::Hotkey);
     }
@@ -440,6 +448,9 @@ pub enum Outcome {
     DryRun(Vec<String>),
     /// The command was unknown, invalid, or forbidden for this caller.
     Error(CommandError),
+    /// The command was accepted but the real handler or its effect failed.
+    /// Unlike `Done`, this must never be reported as success.
+    Failed(String),
 }
 
 /// What a handler does with a checked command.

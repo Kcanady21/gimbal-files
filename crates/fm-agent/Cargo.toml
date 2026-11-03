@@ -10,6 +10,11 @@ repository.workspace = true
 
 [dependencies]
 fm-core.workspace = true
+# The transport reads peer credentials through the safe gio::Socket::from_fd
+# (also pinned for the app); toml_edit is the existing wire codec. No new
+# external crate or version is introduced.
+gio.workspace = true
+toml_edit.workspace = true
 
 [lints]
 workspace = true

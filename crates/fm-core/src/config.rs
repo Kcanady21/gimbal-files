@@ -44,7 +44,9 @@ pub const DEFAULT_RIGHT_WIDTH: u32 = 648;
 pub const MIN_LEFT_WIDTH: u32 = 300;
 pub const MIN_RIGHT_WIDTH: u32 = 360;
 
-const KNOWN_TOP_LEVEL: &[&str] = &["look", "sidebars", "sections", "pins", "sort", "hotkeys"];
+const KNOWN_TOP_LEVEL: &[&str] = &[
+    "look", "sidebars", "sections", "pins", "sort", "hotkeys", "agent",
+];
 
 /// The config path as a pure function of `XDG_CONFIG_HOME` and the home
 /// folder. A relative or missing XDG directory falls back to `~/.config`.
@@ -470,8 +472,18 @@ pub struct Config {
     pub pins: Vec<PathBuf>,
     pub sort: Sort,
     pub hotkeys: BTreeMap<String, Hotkey>,
+    /// The local automation socket. Off unless the user's own Settings switch
+    /// saved `true`; a missing or bad value is always Off.
+    pub agent: Agent,
     /// Runtime context: home for `~` expansion. Not written to the file.
     pub home: PathBuf,
+}
+
+/// The local automation switch. It defaults Off for old and missing configs
+/// and is changed only by the UI's `agent.set-enabled` command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Agent {
+    pub enabled: bool,
 }
 
 impl Default for Config {
@@ -492,6 +504,7 @@ impl Config {
             pins: default_pins(&home, special),
             sort: Sort::default(),
             hotkeys: default_hotkeys(),
+            agent: Agent::default(),
             home,
         }
     }
@@ -587,6 +600,7 @@ pub enum Change {
         by: SortBy,
         order: SortOrder,
     },
+    SetAgentEnabled(bool),
 }
 
 /// What went wrong while loading the config.
@@ -828,6 +842,40 @@ impl ConfigFile {
         let text = document.to_string();
         crate::fsutil::save_atomic(path, &text).map_err(ApplyError::Io)
     }
+
+    /// Save the automation switch without the ordinary `apply` behavior of
+    /// changing the live config before the write. If the write fails, neither
+    /// the in-memory value nor the parsed document changes, so a later save
+    /// cannot quietly write a preference the user never got.
+    pub fn apply_agent_enabled(&mut self, enabled: bool) -> Result<(), ApplyError> {
+        let previous = self.config.agent.enabled;
+        self.config.agent.enabled = enabled;
+
+        let Self {
+            path,
+            config,
+            document,
+        } = self;
+
+        let Some(existing) = document.as_ref() else {
+            config.agent.enabled = previous;
+            return Err(ApplyError::Unparsable { path: path.clone() });
+        };
+
+        let mut next = existing.clone();
+        apply_to_document(&mut next, &Change::SetAgentEnabled(enabled), config);
+        let text = next.to_string();
+        match crate::fsutil::save_atomic(path, &text) {
+            Ok(()) => {
+                *document = Some(next);
+                Ok(())
+            }
+            Err(error) => {
+                config.agent.enabled = previous;
+                Err(ApplyError::Io(error))
+            }
+        }
+    }
 }
 
 /// Load just the typed settings and the problems, without keeping the document.
@@ -918,6 +966,10 @@ pub fn change_for(
             from: integer_argument(command, "from")? as usize,
             to: integer_argument(command, "to")? as usize,
         }),
+        "agent.set-enabled" => match command.get("enabled") {
+            Some(CommandValue::Bool(enabled)) => Some(Change::SetAgentEnabled(*enabled)),
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -1022,6 +1074,7 @@ impl Loader<'_> {
         self.read_pins(root, config);
         self.read_sort(root, config);
         self.read_hotkeys(root, config);
+        self.read_agent(root, config);
     }
 
     fn unknown_entry(&mut self, table: &dyn TableLike, prefix: &str, key: &str, item: &Item) {
@@ -1372,6 +1425,43 @@ impl Loader<'_> {
                 _ => self.wrong_type(key, item, "a command name or an inline table"),
             }
         }
+    }
+
+    /// `[agent] enabled = true|false`. The default is Off. The whole section
+    /// must be valid before its bool applies: a wrong shape, an unknown key, a
+    /// wrong type or a section that did not parse leaves it Off and keeps the
+    /// existing readable diagnostics.
+    fn read_agent(&mut self, root: &Table, config: &mut Config) {
+        let Some(item) = root.get("agent") else {
+            return;
+        };
+        let Some(table) = table_like(item) else {
+            self.wrong_type("agent", item, "a table");
+            config.agent.enabled = false;
+            return;
+        };
+
+        let mut valid = true;
+        for (key, value) in table.iter() {
+            if key != "enabled" {
+                self.unknown_entry(table, "agent", key, value);
+                valid = false;
+            }
+        }
+
+        let enabled = match table.get("enabled") {
+            Some(item) => match self.read_bool(item, "agent.enabled") {
+                Some(value) => value,
+                None => {
+                    valid = false;
+                    false
+                }
+            },
+            None => false,
+        };
+        // Any defect anywhere in the section wins over the typed bool, even
+        // when `enabled` itself came first and parsed cleanly.
+        config.agent.enabled = valid && enabled;
     }
 
     fn read_inline_hotkey(&mut self, inline: &InlineTable, key: &str) -> Option<Hotkey> {
@@ -1746,6 +1836,7 @@ fn apply_to_config(config: &mut Config, change: &Change) {
                 }
             }
         }
+        Change::SetAgentEnabled(enabled) => config.agent.enabled = *enabled,
     }
 }
 
@@ -1882,6 +1973,9 @@ fn apply_to_document(document: &mut DocumentMut, change: &Change, config: &Confi
                 }
                 _ => {}
             }
+        }
+        Change::SetAgentEnabled(enabled) => {
+            set_root_value(document, "agent", "enabled", Value::from(*enabled));
         }
     }
 }
@@ -2778,6 +2872,7 @@ folders-first = true
             ("pins.add", &["pins.add", "path=/tmp"]),
             ("pins.remove", &["pins.remove", "path=/tmp"]),
             ("pins.move", &["pins.move", "from=0", "to=1"]),
+            ("agent.set-enabled", &["agent.set-enabled", "enabled=true"]),
         ];
 
         let settings: Vec<&str> = Registry::new()
@@ -2922,5 +3017,183 @@ answer = 42
         }
 
         assert_eq!(problems.len(), 5);
+    }
+
+    // ---------------------------------------------------------------------
+    // P2n: the local automation switch
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn automation_defaults_off_for_missing_and_old_configs() {
+        let temp = TempDir::new("agent-default");
+        let home = temp.path();
+        let path = temp.write("config.toml", "[look]\nscale = 1.0\n");
+        let (file, problems) = ConfigFile::load_with(&path, home, &SpecialFolders::default());
+        assert!(problems.is_empty(), "{problems:?}");
+        assert!(!file.config().agent.enabled);
+
+        let missing = temp.path().join("absent.toml");
+        let (file, problems) = ConfigFile::load_with(&missing, home, &SpecialFolders::default());
+        assert!(problems.is_empty());
+        assert!(!file.config().agent.enabled);
+    }
+
+    #[test]
+    fn automation_reads_true_and_wrong_types_leave_it_off_with_a_problem() {
+        let temp = TempDir::new("agent-load");
+        let home = temp.path();
+        let path = temp.write("config.toml", "[agent]\nenabled = true\n");
+        let (file, problems) = ConfigFile::load_with(&path, home, &SpecialFolders::default());
+        assert!(problems.is_empty());
+        assert!(file.config().agent.enabled);
+
+        let bad = temp.write("bad.toml", "[agent]\nenabled = \"yes\"\n");
+        let (file, problems) = ConfigFile::load_with(&bad, home, &SpecialFolders::default());
+        assert!(!file.config().agent.enabled);
+        assert_eq!(problems.len(), 1);
+        assert_eq!(problems[0].kind, ConfigProblemKind::WrongType);
+
+        let unknown = temp.write("unknown.toml", "[agent]\nenabled = true\nextra = 1\n");
+        let (file, problems) = ConfigFile::load_with(&unknown, home, &SpecialFolders::default());
+        assert!(!file.config().agent.enabled);
+        assert_eq!(problems.len(), 1);
+        assert!(problems[0].is_warning());
+
+        let parse = temp.write("parse.toml", "[agent\nenabled = true\n");
+        let (file, problems) = ConfigFile::load_with(&parse, home, &SpecialFolders::default());
+        assert!(!file.config().agent.enabled);
+        assert_eq!(problems[0].kind, ConfigProblemKind::Parse);
+    }
+
+    #[test]
+    fn an_invalid_agent_section_is_off_in_every_key_order() {
+        let temp = TempDir::new("agent-invalid-order");
+        let home = temp.path();
+        let cases = [
+            (
+                "key-first",
+                "[agent]\nunrecognized = true\nenabled = true\n",
+            ),
+            (
+                "enabled-first",
+                "[agent]\nenabled = true\nunrecognized = true\n",
+            ),
+            ("wrong-shape", "agent = true\n"),
+            ("array-shape", "agent = [true]\n"),
+            (
+                "mixed-type",
+                "[agent]\nenabled = true\nnested = { value = 1 }\n",
+            ),
+            ("enabled-string", "[agent]\nenabled = \"true\"\nextra = 1\n"),
+        ];
+        for (name, text) in cases {
+            let path = temp.write(&format!("{name}.toml"), text);
+            let (file, problems) = ConfigFile::load_with(&path, home, &SpecialFolders::default());
+            assert!(
+                !file.config().agent.enabled,
+                "{name} enabled automation despite a problem: {problems:?}"
+            );
+            assert!(!problems.is_empty(), "{name} was not diagnosed");
+        }
+    }
+
+    #[test]
+    fn automation_saves_one_key_and_preserves_comments_and_other_settings() {
+        let temp = TempDir::new("agent-save");
+        let home = temp.path();
+        let path = temp.write(
+            "config.toml",
+            "# keep this comment\n[look]\nscale = 0.9\n\n[pins]\nfolders = []\n",
+        );
+        let (mut file, problems) = ConfigFile::load_with(&path, home, &SpecialFolders::default());
+        assert!(problems.is_empty());
+        file.apply(Change::SetAgentEnabled(true)).expect("saves");
+
+        let text = fs::read_to_string(&path).expect("read");
+        assert!(text.contains("# keep this comment"), "{text}");
+        assert!(text.contains("scale = 0.9"), "{text}");
+        assert!(text.contains("[agent]"), "{text}");
+        assert!(text.contains("enabled = true"), "{text}");
+
+        let (file, problems) = ConfigFile::load_with(&path, home, &SpecialFolders::default());
+        assert!(problems.is_empty());
+        assert!(file.config().agent.enabled);
+    }
+
+    #[test]
+    fn automation_save_on_an_unparsable_file_reports_and_does_not_overwrite() {
+        let temp = TempDir::new("agent-unparsable");
+        let home = temp.path();
+        let path = temp.write("config.toml", "[agent\nenabled = true\n");
+        let original = fs::read_to_string(&path).expect("read");
+        let (mut file, _problems) = ConfigFile::load_with(&path, home, &SpecialFolders::default());
+        assert!(!file.is_writable());
+        let error = file.apply(Change::SetAgentEnabled(true)).unwrap_err();
+        assert!(matches!(error, ApplyError::Unparsable { .. }));
+        assert_eq!(fs::read_to_string(&path).expect("read"), original);
+    }
+
+    #[test]
+    fn a_failed_automation_save_leaves_memory_and_the_document_unchanged() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new("agent-write-fail");
+        let home = temp.path();
+        let folder = home.join("locked");
+        fs::create_dir_all(&folder).expect("folder");
+        let path = folder.join("config.toml");
+        fs::write(&path, "[agent]\nenabled = false\n").expect("file");
+        let (mut file, problems) = ConfigFile::load_with(&path, home, &SpecialFolders::default());
+        assert!(problems.is_empty());
+        assert!(!file.config().agent.enabled);
+
+        fs::set_permissions(&folder, fs::Permissions::from_mode(0o555)).expect("read-only");
+        let error = file.apply_agent_enabled(true).unwrap_err();
+        assert!(matches!(error, ApplyError::Io(_)));
+        assert!(!file.config().agent.enabled);
+        assert_eq!(
+            fs::read_to_string(&path).expect("read"),
+            "[agent]\nenabled = false\n"
+        );
+
+        // Once writable, the ordinary save still writes only false.
+        fs::set_permissions(&folder, fs::Permissions::from_mode(0o755)).expect("writable");
+        file.apply_agent_enabled(false).expect("saves false");
+        assert_eq!(
+            fs::read_to_string(&path).expect("read"),
+            "[agent]\nenabled = false\n"
+        );
+    }
+
+    #[test]
+    fn automation_cannot_be_bound_to_a_hotkey() {
+        let temp = TempDir::new("agent-hotkey");
+        let home = temp.path();
+        let path = temp.write(
+            "config.toml",
+            "[hotkeys]\n\"<Control>j\" = \"agent.set-enabled\"\n",
+        );
+        let (file, problems) = ConfigFile::load_with(&path, home, &SpecialFolders::default());
+        assert!(!file.config().agent.enabled);
+        assert!(!file.config().hotkeys.contains_key("<Control>j"));
+        assert_eq!(problems.len(), 1);
+        assert_eq!(problems[0].kind, ConfigProblemKind::InvalidHotkeyArguments);
+        assert!(problems[0].message.contains("may not run"));
+    }
+
+    #[test]
+    fn automation_change_comes_from_the_typed_bool_argument() {
+        let home = Path::new("/tmp/home");
+        let config = default_config(home);
+        let enabled = check("agent.set-enabled", &["agent.set-enabled", "enabled=true"]);
+        assert_eq!(
+            change_for(&enabled, &config, home),
+            Some(Change::SetAgentEnabled(true))
+        );
+        let disabled = check("agent.set-enabled", &["agent.set-enabled", "enabled=false"]);
+        assert_eq!(
+            change_for(&disabled, &config, home),
+            Some(Change::SetAgentEnabled(false))
+        );
     }
 }

@@ -205,6 +205,33 @@ where
     );
 }
 
+/// An injectable clipboard source. Production uses the live GTK clipboard;
+/// tests can pause, fail or return payloads without touching the desktop.
+pub trait Reader {
+    fn read(
+        &self,
+        display: Option<&gdk::Display>,
+        done: Box<dyn FnOnce(Result<ClipboardPayload, String>)>,
+    );
+}
+
+/// The real clipboard, read asynchronously through GTK.
+pub struct SystemReader;
+
+impl Reader for SystemReader {
+    fn read(
+        &self,
+        display: Option<&gdk::Display>,
+        done: Box<dyn FnOnce(Result<ClipboardPayload, String>)>,
+    ) {
+        let Some(display) = display else {
+            done(Err("the window has no display".to_string()));
+            return;
+        };
+        read(display, done);
+    }
+}
+
 /// Read the clipboard's files and cut/copy intent, without blocking the main
 /// loop. The callback runs on the main context.
 pub fn read<F>(display: &gdk::Display, done: F)
@@ -335,6 +362,50 @@ mod tests {
         assert!(formats_have_files(["image/png", URI_LIST]));
         assert!(!formats_have_files(["text/plain"]));
         assert!(!formats_have_files(std::iter::empty()));
+    }
+
+    struct FakeReader {
+        result: Result<ClipboardPayload, String>,
+    }
+
+    impl Reader for FakeReader {
+        fn read(
+            &self,
+            _display: Option<&gdk::Display>,
+            done: Box<dyn FnOnce(Result<ClipboardPayload, String>)>,
+        ) {
+            done(self.result.clone());
+        }
+    }
+
+    #[test]
+    fn the_injected_reader_delivers_success_and_failure_without_gtk() {
+        let reader = FakeReader {
+            result: Ok(ClipboardPayload {
+                mode: ClipboardMode::Cut,
+                uris: vec![ONE.to_string()],
+            }),
+        };
+        let seen = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let slot = std::rc::Rc::clone(&seen);
+        reader.read(
+            None,
+            Box::new(move |result| *slot.borrow_mut() = Some(result)),
+        );
+        let payload = seen.borrow_mut().take().expect("result").expect("payload");
+        assert_eq!(payload.mode, ClipboardMode::Cut);
+        assert_eq!(payload.uris, [ONE]);
+
+        let reader = FakeReader {
+            result: Err("the clipboard could not be read".to_string()),
+        };
+        let seen = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let slot = std::rc::Rc::clone(&seen);
+        reader.read(
+            None,
+            Box::new(move |result| *slot.borrow_mut() = Some(result)),
+        );
+        assert!(seen.borrow_mut().take().expect("result").is_err());
     }
 
     #[test]

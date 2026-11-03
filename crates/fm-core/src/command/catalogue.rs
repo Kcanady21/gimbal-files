@@ -518,6 +518,21 @@ pub const COMMANDS: &[CommandSpec] = &[
             },
         ],
     },
+    // Kyle approved one Settings key for local automation on Nov 3. It is a
+    // UI-only switch: the registry refuses Agent, Cli and Hotkey before any
+    // handler or config write. The switch itself is the only caller.
+    CommandSpec {
+        name: "agent.set-enabled",
+        summary: "Allow local scripts and AI agents to control Gimbal.",
+        effect: Effect::Settings,
+        undo: false,
+        arguments: &[ArgSpec {
+            name: "enabled",
+            kind: ArgKind::Bool,
+            presence: Presence::Required,
+            default: None,
+        }],
+    },
     CommandSpec {
         name: "pins.add",
         summary: "Pin a folder.",

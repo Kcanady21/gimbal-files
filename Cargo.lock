@@ -115,6 +115,8 @@ name = "fm-agent"
 version = "0.1.0"
 dependencies = [
  "fm-core",
+ "gio",
+ "toml_edit",
 ]
 
 [[package]]
@@ -138,6 +140,7 @@ dependencies = [
 name = "fm-ui"
 version = "0.1.0"
 dependencies = [
+ "fm-agent",
  "fm-core",
  "gdk4-wayland",
  "gtk4",

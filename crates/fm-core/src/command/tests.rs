@@ -72,6 +72,7 @@ fn the_v1_catalogue_has_every_reviewed_command_in_order() {
         "view.toggle-sidebar",
         "view.toggle-section",
         "view.set-sort",
+        "agent.set-enabled",
         "pins.add",
         "pins.remove",
         "pins.move",
@@ -197,6 +198,53 @@ fn exactly_the_two_approved_permanent_commands_delete_permanently() {
     for caller in [Caller::Ui, Caller::Hotkey, Caller::Cli, Caller::Agent] {
         assert!(caller_allowed("file.trash", Effect::Files, caller));
     }
+}
+
+#[test]
+fn the_automation_switch_is_ui_only_and_the_denied_handler_is_never_reached() {
+    let spec = Registry::new()
+        .command("agent.set-enabled")
+        .expect("the approved switch exists");
+    assert_eq!(spec.effect, Effect::Settings);
+    assert!(!spec.undo);
+    let argument = spec.argument("enabled").expect("a required bool");
+    assert_eq!(argument.kind, ArgKind::Bool);
+    assert_eq!(argument.presence, Presence::Required);
+    assert!(argument.default.is_none());
+
+    assert!(caller_allowed(
+        "agent.set-enabled",
+        Effect::Settings,
+        Caller::Ui
+    ));
+    for caller in [Caller::Hotkey, Caller::Cli, Caller::Agent] {
+        assert!(!caller_allowed(
+            "agent.set-enabled",
+            Effect::Settings,
+            caller
+        ));
+        for value in ["true", "false"] {
+            let mut handler = Recorder::new(Outcome::Done);
+            let outcome = Registry::new().dispatch(
+                caller,
+                &parse_invocation(&["agent.set-enabled", &format!("enabled={value}")]),
+                &mut handler,
+            );
+            assert!(matches!(outcome, Outcome::Error(_)), "{caller} {value}");
+            assert!(handler.seen.is_empty(), "{caller} reached a handler");
+        }
+    }
+
+    let mut handler = Recorder::new(Outcome::Done);
+    let outcome = Registry::new().dispatch(
+        Caller::Ui,
+        &parse_invocation(&["agent.set-enabled", "enabled=false"]),
+        &mut handler,
+    );
+    assert_eq!(outcome, Outcome::Done);
+    assert_eq!(handler.seen.len(), 1);
+    assert!(check(Caller::Ui, &["agent.set-enabled"]).is_err());
+    assert!(check(Caller::Ui, &["agent.set-enabled", "enabled=maybe"]).is_err());
 }
 
 #[test]

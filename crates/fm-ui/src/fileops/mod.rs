@@ -19,10 +19,14 @@ mod worker;
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::rc::{Rc, Weak};
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::time::{Duration, Instant};
 
-use fm_core::fileops::{Decisions, FileOperations, Plan, Progress, Request};
+use crate::agent::{GenerationTicket, JobAuthorization};
+
+use fm_core::fileops::{Decisions, Plan, Progress, Request};
 use fm_core::workspace::WindowId;
 use gtk::gio;
 use gtk::glib;
@@ -34,9 +38,12 @@ use crate::fileops::progress::OpKind;
 
 pub use menu::ItemInfo;
 pub use progress::ProgressView;
+pub use worker::PauseHook as WorkerPause;
 
 /// How often the main context checks the worker's channel.
 const POLL_MS: u64 = 30;
+/// The file-op client queue is bounded even for ordinary UI work.
+pub const MAX_QUEUED_JOBS: usize = 64;
 
 struct Queued {
     id: u64,
@@ -44,6 +51,7 @@ struct Queued {
     window: WindowId,
     clear_clipboard: bool,
     dry_run: bool,
+    authorization: Option<JobAuthorization>,
 }
 
 struct Current {
@@ -59,6 +67,11 @@ struct Current {
     /// True while the conflict dialog owns the job; the progress row stays
     /// hidden until the decisions are in.
     answering: bool,
+    authorization: Option<JobAuthorization>,
+    /// Set by the worker immediately before it calls execute. Revocation may
+    /// cancel planning/waiting work, but never pretends to roll back a file
+    /// operation that has already begun.
+    executing: Arc<AtomicBool>,
 }
 
 pub struct FileOps {
@@ -72,13 +85,35 @@ pub struct FileOps {
     process: RefCell<Weak<Process>>,
     undo_summary: RefCell<Option<String>>,
     undo_lines: RefCell<Option<Vec<String>>>,
+    undo_steps: RefCell<Vec<(std::path::PathBuf, Option<std::path::PathBuf>)>>,
     baobab: Cell<bool>,
+    /// Headless tests drive `poll_once` themselves; adding a GLib source on a
+    /// test thread would let another test's main-context iteration touch its
+    /// thread-guarded callback.
+    manual_poll: bool,
 }
 
 impl FileOps {
     pub fn new(process: &Rc<Process>) -> Rc<Self> {
+        Self::build(process, None, false)
+    }
+
+    /// The production worker plus a deterministic test gate at named
+    /// boundaries. No second executor or scheduler is introduced.
+    #[cfg(test)]
+    pub fn with_pause(process: &Rc<Process>, pause: WorkerPause) -> Rc<Self> {
+        Self::build(process, Some(pause), true)
+    }
+
+    /// A headless test instance whose poll loop is driven by `poll_for_tests`.
+    #[cfg(test)]
+    pub fn new_manual(process: &Rc<Process>) -> Rc<Self> {
+        Self::build(process, None, true)
+    }
+
+    fn build(process: &Rc<Process>, pause: Option<WorkerPause>, manual_poll: bool) -> Rc<Self> {
         let (event_tx, event_rx) = std::sync::mpsc::channel();
-        let senders = worker::spawn(event_tx);
+        let senders = worker::spawn_with_pause(event_tx, pause);
         let baobab = menu::find_on_path("baobab", std::env::var_os("PATH").as_deref()).is_some();
         Rc::new(Self {
             jobs: senders.jobs,
@@ -91,7 +126,9 @@ impl FileOps {
             process: RefCell::new(Rc::downgrade(process)),
             undo_summary: RefCell::new(None),
             undo_lines: RefCell::new(None),
+            undo_steps: RefCell::new(Vec::new()),
             baobab: Cell::new(baobab),
+            manual_poll,
         })
     }
 
@@ -102,6 +139,7 @@ impl FileOps {
         window: WindowId,
         request: Request,
         clear_clipboard: bool,
+        authorization: Option<JobAuthorization>,
     ) -> u64 {
         let id = self.next_id.get() + 1;
         self.next_id.set(id);
@@ -111,6 +149,7 @@ impl FileOps {
             window,
             clear_clipboard,
             dry_run: false,
+            authorization,
         };
         let idle = self.current.borrow().is_none();
         if idle {
@@ -129,7 +168,12 @@ impl FileOps {
 
     /// Queue a read-only dry run on the worker. `trash.empty` planning lists
     /// the trash, so it must not run on the GTK main thread.
-    pub fn submit_dry_run(self: &Rc<Self>, window: WindowId, request: Request) -> u64 {
+    pub fn submit_dry_run(
+        self: &Rc<Self>,
+        window: WindowId,
+        request: Request,
+        authorization: Option<JobAuthorization>,
+    ) -> u64 {
         let id = self.next_id.get() + 1;
         self.next_id.set(id);
         let job = Queued {
@@ -138,6 +182,7 @@ impl FileOps {
             window,
             clear_clipboard: false,
             dry_run: true,
+            authorization,
         };
         let idle = self.current.borrow().is_none();
         if idle {
@@ -151,6 +196,7 @@ impl FileOps {
 
     fn start(self: &Rc<Self>, job: Queued) {
         let cancellable = gio::Cancellable::new();
+        let executing = Arc::new(AtomicBool::new(false));
         if self
             .jobs
             .send(worker::WorkerMsg::Start {
@@ -158,6 +204,8 @@ impl FileOps {
                 request: job.request.clone(),
                 cancellable: cancellable.clone(),
                 dry_run: job.dry_run,
+                authorization: job.authorization.clone(),
+                executing: Arc::clone(&executing),
             })
             .is_err()
         {
@@ -175,9 +223,11 @@ impl FileOps {
             plan: None,
             clear_clipboard: job.clear_clipboard,
             answering: false,
+            authorization: job.authorization,
+            executing,
         });
         if let Some(process) = self.process.borrow().upgrade() {
-            process.fileop_started(job.window);
+            process.fileop_started(job.window, job.id);
         }
         crate::log!(
             "fileops",
@@ -188,7 +238,7 @@ impl FileOps {
     }
 
     fn ensure_poll(self: &Rc<Self>) {
-        if self.poll.borrow().is_some() {
+        if self.manual_poll || self.poll.borrow().is_some() {
             return;
         }
         let weak = Rc::downgrade(self);
@@ -199,6 +249,19 @@ impl FileOps {
             fileops.poll_once()
         });
         *self.poll.borrow_mut() = Some(source);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn poll_for_tests(self: &Rc<Self>) -> glib::ControlFlow {
+        self.poll_once()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn current_answering(&self) -> bool {
+        self.current
+            .borrow()
+            .as_ref()
+            .is_some_and(|current| current.answering)
     }
 
     fn poll_once(self: &Rc<Self>) -> glib::ControlFlow {
@@ -253,14 +316,14 @@ impl FileOps {
         }
         let view = ProgressView::new(OpKind::from_request(&request), &progress, self.waiting());
         if let Some(process) = self.process.borrow().upgrade() {
-            process.fileop_progress(window, Some(view));
+            process.fileop_progress(window, id, Some(view));
         }
     }
 
     fn handle(self: &Rc<Self>, event: worker::WorkerEvent) {
         match event {
             worker::WorkerEvent::Planned { id, plan } => {
-                let window = {
+                let (window, revoked) = {
                     let mut current = self.current.borrow_mut();
                     let Some(current) = current.as_mut() else {
                         return;
@@ -269,8 +332,19 @@ impl FileOps {
                         return;
                     }
                     current.plan = Some(plan.clone());
-                    current.window
+                    let revoked = current
+                        .authorization
+                        .as_ref()
+                        .is_some_and(|authorization| !authorization.is_active());
+                    (current.window, revoked)
                 };
+                if revoked {
+                    // Off can arrive while planning is paused. Never present a
+                    // stale conflict/approval prompt for revoked agent work.
+                    crate::log!("fileops", "dropping late plan for revoked job {id}");
+                    self.cancel_job(id);
+                    return;
+                }
                 let conflicts = plan.decisions().count();
                 if plan.request().needs_permanent_confirmation() {
                     if plan.steps().is_empty() {
@@ -302,12 +376,47 @@ impl FileOps {
                     let fileops = self.clone();
                     process.fileop_conflicts(
                         window,
+                        id,
                         ConflictFlow::from_plan(&plan),
                         Box::new(move |decisions| fileops.answer(id, decisions)),
                     );
                 } else {
                     self.answer(id, Decisions::new(Vec::new()));
                 }
+            }
+            worker::WorkerEvent::Executing { id } => {
+                if let Some(current) = self.current.borrow_mut().as_mut()
+                    && current.id == id
+                {
+                    current
+                        .executing
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+            worker::WorkerEvent::Revoked {
+                id,
+                request,
+                message,
+            } => {
+                let current = {
+                    let mut slot = self.current.borrow_mut();
+                    match slot.as_ref() {
+                        Some(current) if current.id == id => slot.take(),
+                        _ => None,
+                    }
+                };
+                let Some(current) = current else {
+                    return;
+                };
+                crate::log!(
+                    "fileops",
+                    "revoked job {id} ({}): {message}",
+                    request.summary()
+                );
+                if let Some(process) = self.process.borrow().upgrade() {
+                    process.fileop_revoked(current.window, id, &request, &message);
+                }
+                self.start_next();
             }
             worker::WorkerEvent::Progress { id, progress } => {
                 let (window, request, shown) = {
@@ -339,7 +448,7 @@ impl FileOps {
                         self.waiting(),
                     );
                     if let Some(process) = self.process.borrow().upgrade() {
-                        process.fileop_progress(window, Some(view));
+                        process.fileop_progress(window, id, Some(view));
                     }
                 } else {
                     self.maybe_reveal();
@@ -368,7 +477,7 @@ impl FileOps {
                     report.lines().join(" | ")
                 );
                 if let Some(process) = self.process.borrow().upgrade() {
-                    process.fileop_finished(current.window, &request, &plan, &report);
+                    process.fileop_finished(current.window, id, &request, &plan, &report);
                     let moved = progress::counts(&report).done > 0;
                     if current.clear_clipboard && moved {
                         process.fileop_clear_clipboard(current.window);
@@ -397,7 +506,7 @@ impl FileOps {
                     request.summary()
                 );
                 if let Some(process) = self.process.borrow().upgrade() {
-                    process.fileop_refused(current.window, &request, &message);
+                    process.fileop_refused(current.window, id, &request, &message);
                 }
                 self.start_next();
             }
@@ -414,11 +523,15 @@ impl FileOps {
                 };
                 if let Some(process) = self.process.borrow().upgrade() {
                     crate::log!("fileops", "dry run job {id}: {}", lines.join(" | "));
-                    process.fileop_dry_run(current.window, &request, &lines);
+                    process.fileop_dry_run(current.window, id, &request, &lines);
                 }
                 self.start_next();
             }
-            worker::WorkerEvent::UndoState { summary, lines } => {
+            worker::WorkerEvent::UndoState {
+                summary,
+                lines,
+                steps,
+            } => {
                 crate::log!(
                     "fileops",
                     "undo stack: {}",
@@ -426,6 +539,7 @@ impl FileOps {
                 );
                 *self.undo_summary.borrow_mut() = summary;
                 *self.undo_lines.borrow_mut() = Some(lines);
+                *self.undo_steps.borrow_mut() = steps;
             }
         }
     }
@@ -535,8 +649,68 @@ impl FileOps {
         let _ = self.control.send(worker::WorkerMsg::Cancel { id });
     }
 
+    /// Drop queued agent work for one revoked generation and cancel the
+    /// planning/waiting current job. A job whose worker already published the
+    /// execution boundary is left to finish under its original policy.
+    pub fn revoke_agent_work(&self, ticket: &Arc<GenerationTicket>) {
+        let mut dropped = 0usize;
+        {
+            let mut queue = self.queue.borrow_mut();
+            let before = queue.len();
+            queue.retain(|job| {
+                let revoked = job
+                    .authorization
+                    .as_ref()
+                    .is_some_and(|auth| auth.same_cycle(ticket));
+                if !revoked {
+                    return true;
+                }
+                dropped += 1;
+                false
+            });
+            if dropped > 0 {
+                crate::log!(
+                    "fileops",
+                    "dropped {dropped} revoked queued job(s); {} remain",
+                    before - dropped
+                );
+            }
+        }
+        let cancel = {
+            let current = self.current.borrow();
+            current.as_ref().and_then(|current| {
+                let revoked = current
+                    .authorization
+                    .as_ref()
+                    .is_some_and(|auth| auth.same_cycle(ticket));
+                (revoked && !current.executing.load(std::sync::atomic::Ordering::SeqCst))
+                    .then_some(current.id)
+            })
+        };
+        if let Some(id) = cancel {
+            crate::log!("fileops", "cancelling revoked job {id} before execution");
+            let _ = self.control.send(worker::WorkerMsg::Cancel { id });
+        }
+    }
+
     pub fn waiting(&self) -> usize {
         self.queue.borrow().len()
+    }
+
+    /// Whether another request may be queued without growing bookkeeping
+    /// without bound. Agent callers turn a refusal into their own typed busy
+    /// result rather than silently dropping work.
+    pub fn can_accept(&self) -> bool {
+        self.current.borrow().is_none() || self.waiting() < MAX_QUEUED_JOBS
+    }
+
+    /// The job the worker is running, if any.
+    pub fn current_id(&self) -> Option<u64> {
+        self.current.borrow().as_ref().map(|current| current.id)
+    }
+
+    pub fn undo_lines(&self) -> Vec<String> {
+        self.undo_lines.borrow().clone().unwrap_or_default()
     }
 
     pub fn undo_summary(&self) -> Option<String> {
@@ -545,19 +719,6 @@ impl FileOps {
 
     pub fn baobab_available(&self) -> bool {
         self.baobab.get()
-    }
-
-    /// The `dry-run=true` lines. A normal plan is read-only, so it is safe to
-    /// build here. Undo uses the worker's latest record, sent with every
-    /// finished job, because only the worker owns the undo stack.
-    pub fn plan_lines(&self, request: &Request) -> Vec<String> {
-        if matches!(request, Request::Undo)
-            && let Some(lines) = self.undo_lines.borrow().clone()
-            && !lines.is_empty()
-        {
-            return lines;
-        }
-        FileOperations::new().plan(request).lines()
     }
 }
 

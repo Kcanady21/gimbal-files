@@ -143,6 +143,8 @@ struct DragState {
     to: usize,
 }
 
+type AgentWidgets = (gtk::Switch, gtk::Label, Rc<Cell<bool>>);
+
 pub struct Header {
     window_id: WindowId,
     handle: gtk::WindowHandle,
@@ -173,6 +175,9 @@ pub struct Header {
     animate_group: Cell<Option<usize>>,
     /// Non-zero while an `adw::AlertDialog` owns the keyboard.
     dialogs: Cell<u32>,
+    /// The open Settings switch and status label, so every window shows the
+    /// shared listener state. The flag guards programmatic switch updates.
+    agent_widgets: RefCell<Option<AgentWidgets>>,
     ui: RefCell<Weak<WindowUi>>,
 }
 
@@ -291,6 +296,7 @@ impl Header {
             search_open: Cell::new(false),
             animate_group: Cell::new(None),
             dialogs: Cell::new(0),
+            agent_widgets: RefCell::new(None),
             ui: RefCell::new(Weak::new()),
         });
         let weak = Rc::downgrade(&header);
@@ -311,6 +317,21 @@ impl Header {
 
     pub fn widget(&self) -> &gtk::WindowHandle {
         &self.handle
+    }
+
+    /// Sync the open Settings switch and status label with the shared runtime.
+    pub fn refresh_agent_status(&self, status: &crate::agent::AgentStatus) {
+        let widgets = self
+            .agent_widgets
+            .borrow()
+            .as_ref()
+            .map(|(switch, label, guard)| (switch.clone(), label.clone(), guard.clone()));
+        if let Some((switch, label, guard)) = widgets {
+            guard.set(true);
+            switch.set_active(status.state == crate::agent::AgentState::On);
+            guard.set(false);
+            label.set_text(&agent_status_text(status));
+        }
     }
 
     pub fn dialogs_open(&self) -> bool {
@@ -1263,6 +1284,11 @@ fn open_main_menu(ui: &Rc<WindowUi>, anchor: &gtk::Button) {
     menu_item(&popover, &menu, "New Window", true, move || {
         ui_new.dispatch(Caller::Ui, Invocation::new("window.new", Vec::new()));
     });
+    let ui_settings = ui.clone();
+    let settings_anchor = anchor.clone();
+    menu_item(&popover, &menu, "Settings", true, move || {
+        open_settings_menu(&ui_settings, &settings_anchor);
+    });
     let ui_quit = ui.clone();
     menu_item(&popover, &menu, "Quit", true, move || {
         ui_quit.dispatch(Caller::Ui, Invocation::new("app.quit", Vec::new()));
@@ -1270,6 +1296,122 @@ fn open_main_menu(ui: &Rc<WindowUi>, anchor: &gtk::Button) {
     popover.set_child(Some(&menu));
     close_on_closed(&popover);
     popover.popup();
+}
+
+/// The Settings submenu. The switch is the only path to `agent.set-enabled`
+/// and it dispatches as `Caller::Ui`; the command's registry row refuses every
+/// other caller before a handler or config write.
+fn open_settings_menu(ui: &Rc<WindowUi>, anchor: &gtk::Button) {
+    let popover = gtk::Popover::new();
+    popover.set_parent(anchor);
+    let menu = vbox(&["gl-menu"]);
+
+    let heading = gtk::Label::builder()
+        .label("Settings")
+        .halign(gtk::Align::Start)
+        .build();
+    heading.add_css_class("gl-menu-item");
+    menu.append(&heading);
+
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+    row.add_css_class("gl-menu-item");
+    let label = gtk::Label::builder()
+        .label("Allow local automation")
+        .halign(gtk::Align::Start)
+        .hexpand(true)
+        .build();
+    let switch = gtk::Switch::new();
+    switch.update_property(&[gtk::accessible::Property::Label("Allow local automation")]);
+    switch.update_property(&[gtk::accessible::Property::Description(
+        "Allows local scripts and AI agents to control Gimbal.",
+    )]);
+    let status = ui
+        .process_upgrade()
+        .map(|process| process.agent_status())
+        .unwrap_or(crate::agent::AgentStatus {
+            state: crate::agent::AgentState::Off,
+            detail: None,
+            path: None,
+            generation: 0,
+            instance: None,
+        });
+    let syncing = Rc::new(Cell::new(false));
+    syncing.set(true);
+    switch.set_active(status.state == crate::agent::AgentState::On);
+    syncing.set(false);
+    row.append(&label);
+    row.append(&switch);
+    menu.append(&row);
+
+    let explanation = gtk::Label::builder()
+        .label("Allows local scripts and AI agents to control Gimbal. Off is the default.")
+        .wrap(true)
+        .xalign(0.0)
+        .halign(gtk::Align::Start)
+        .build();
+    explanation.add_css_class("dim-label");
+    menu.append(&explanation);
+
+    let status_label = gtk::Label::builder()
+        .label(agent_status_text(&status))
+        .wrap(true)
+        .xalign(0.0)
+        .halign(gtk::Align::Start)
+        .build();
+    status_label.add_css_class("dim-label");
+    menu.append(&status_label);
+    *ui.header().agent_widgets.borrow_mut() =
+        Some((switch.clone(), status_label.clone(), syncing.clone()));
+
+    let ui_switch = ui.clone();
+    let switch_widget = switch.clone();
+    let switch_syncing = syncing.clone();
+    switch.connect_active_notify(move |_| {
+        if switch_syncing.get() {
+            return;
+        }
+        let requested = switch_widget.is_active();
+        ui_switch.dispatch(
+            Caller::Ui,
+            Invocation::new(
+                "agent.set-enabled",
+                vec![("enabled".to_string(), requested.to_string())],
+            ),
+        );
+        if let Some(process) = ui_switch.process_upgrade() {
+            let status = process.agent_status();
+            ui_switch.header().refresh_agent_status(&status);
+            // The dispatch already refreshed every window; this also covers a
+            // second open submenu in another window.
+            process.refresh_agent_status_all();
+            let actual = status.state == crate::agent::AgentState::On;
+            if actual != requested {
+                switch_syncing.set(true);
+                switch_widget.set_active(actual);
+                switch_syncing.set(false);
+            }
+        }
+    });
+
+    popover.set_child(Some(&menu));
+    close_on_closed(&popover);
+    popover.popup();
+}
+
+fn agent_status_text(status: &crate::agent::AgentStatus) -> String {
+    let mut text = match status.state {
+        crate::agent::AgentState::Off => "Off".to_string(),
+        crate::agent::AgentState::On => match &status.path {
+            Some(path) => format!("On — {}", path.display()),
+            None => "On".to_string(),
+        },
+        crate::agent::AgentState::Unavailable => "Unavailable".to_string(),
+    };
+    if let Some(detail) = &status.detail {
+        text.push_str(" — ");
+        text.push_str(detail);
+    }
+    text
 }
 
 fn menu_item(

@@ -19,6 +19,8 @@ gdk4-wayland.workspace = true
 wayland-client.workspace = true
 wayland-protocols.workspace = true
 fm-core.workspace = true
+# The UI owns the main-thread bridge to the already-pinned local transport.
+fm-agent.workspace = true
 
 [lints]
 workspace = true
