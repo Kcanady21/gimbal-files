@@ -29,6 +29,7 @@ use crate::frame::WindowUi;
 use crate::look::Look;
 use crate::open::{OpenDecision, decision};
 use crate::save::{Debounce, SAVE_DELAY_MS, Saver};
+use crate::trash::{PageRoute, back_consumes_history, route_on_trash_page};
 
 pub struct Process {
     application: adw::Application,
@@ -244,6 +245,14 @@ impl Process {
         }
     }
 
+    /// A tab, group or sidebar destination was chosen. That is explicit
+    /// navigation, unlike a job or monitor refresh, so Trash steps aside.
+    fn leave_trash_for_navigation(self: &Rc<Self>, window: WindowId) {
+        if let Some(ui) = self.window(window) {
+            ui.leave_trash();
+        }
+    }
+
     /// The one command path. Validation happens in `Registry`; the handler
     /// knows which window and caller ran it.
     pub fn dispatch_for_window(
@@ -302,6 +311,7 @@ impl Process {
         index: usize,
         modifiers: gtk::gdk::ModifierType,
     ) {
+        self.leave_trash_for_navigation(window);
         self.focus_model_window(window);
         let result = {
             let mut workspace = self.workspace.borrow_mut();
@@ -317,6 +327,7 @@ impl Process {
     }
 
     pub fn focus_pill(self: &Rc<Self>, window: WindowId, index: usize) {
+        self.leave_trash_for_navigation(window);
         self.focus_model_window(window);
         let result = self.workspace.borrow_mut().pill_click(index);
         self.finish(result);
@@ -324,6 +335,7 @@ impl Process {
 
     /// Focus one split tile's tab, used by every click that lands in a tile.
     pub fn focus_tab(self: &Rc<Self>, window: WindowId, tab: TabId) {
+        self.leave_trash_for_navigation(window);
         self.focus_model_window(window);
         let result = self.workspace.borrow_mut().focus_tab(tab);
         self.finish(result);
@@ -337,6 +349,7 @@ impl Process {
         tab: TabId,
         invocation: Invocation,
     ) {
+        self.leave_trash_for_navigation(window);
         self.focus_model_window(window);
         let focus = self.workspace.borrow_mut().focus_tab(tab);
         let mut handler = commands::UiHandler {
@@ -364,6 +377,11 @@ impl Process {
 
     pub fn open_request(self: &Rc<Self>, paths: &[PathBuf]) {
         crate::log!("launch", "open request: {paths:?}");
+        if !paths.is_empty()
+            && let Some(window) = self.focused_window_id()
+        {
+            self.leave_trash_for_navigation(window);
+        }
         let result = self.workspace.borrow_mut().open_request(paths);
         self.finish(result);
     }
@@ -452,6 +470,7 @@ impl Process {
     /// 700 ms over a header pill focuses its tab without rebuilding the header
     /// (which would remove the pill under the drag).
     pub fn spring_focus_pill(self: &Rc<Self>, window: WindowId, index: usize) {
+        self.leave_trash_for_navigation(window);
         self.suppress_header.set(true);
         self.focus_model_window(window);
         let result = self.workspace.borrow_mut().pill_click(index);
@@ -465,6 +484,7 @@ impl Process {
 
     /// The same for a split tile's pill.
     pub fn spring_focus_tab(self: &Rc<Self>, window: WindowId, tab: TabId) {
+        self.leave_trash_for_navigation(window);
         self.suppress_header.set(true);
         self.focus_model_window(window);
         let result = self.workspace.borrow_mut().focus_tab(tab);
@@ -610,12 +630,24 @@ impl Process {
     }
 
     pub fn selection_all(self: &Rc<Self>, window: WindowId, names: &[OsString]) {
+        if let Some(ui) = self.window(window)
+            && ui.trash_active()
+        {
+            ui.trash_select_all();
+            return;
+        }
         self.focus_model_window(window);
         let result = self.workspace.borrow_mut().selection_all(names);
         self.finish(result);
     }
 
     pub fn selection_none(self: &Rc<Self>, window: WindowId) {
+        if let Some(ui) = self.window(window)
+            && ui.trash_active()
+        {
+            ui.trash_select_none();
+            return;
+        }
         self.focus_model_window(window);
         let result = self.workspace.borrow_mut().selection_none();
         self.finish(result);
@@ -695,6 +727,7 @@ impl Process {
     /// Navigate the focused tab to `path` without going through a string
     /// command, so a non-UTF-8 folder name survives.
     pub fn nav_go_path(self: &Rc<Self>, window: WindowId, path: PathBuf) {
+        self.leave_trash_for_navigation(window);
         self.focus_model_window(window);
         let result = self.workspace.borrow_mut().nav_go(path, None);
         self.finish(result);
@@ -703,6 +736,7 @@ impl Process {
     /// The command line's file form: `nav_go(folder, select)` picks the first
     /// name, then `selection_all` adds the rest of the group.
     fn nav_go_select(self: &Rc<Self>, window: WindowId, path: PathBuf, names: &[OsString]) {
+        self.leave_trash_for_navigation(window);
         self.focus_model_window(window);
         let result = self
             .workspace
@@ -991,6 +1025,42 @@ impl Process {
             command.name(),
             command.effect()
         );
+
+        // The visible page owns these keys and actions. Nothing here may fall
+        // back to the hidden folder's selection or current folder.
+        if let Some(ui) = self.window(window) {
+            match route_on_trash_page(command.name(), ui.trash_active()) {
+                PageRoute::Files => {}
+                PageRoute::SelectAll => {
+                    ui.trash_select_all();
+                    return Outcome::Done;
+                }
+                PageRoute::SelectNone => {
+                    ui.trash_select_none();
+                    return Outcome::Done;
+                }
+                PageRoute::RefreshTrash => {
+                    ui.trash_refresh();
+                    crate::log!("trash", "nav.refresh reloaded the Trash page");
+                    return Outcome::Done;
+                }
+                PageRoute::BackToFiles => {
+                    ui.leave_trash();
+                    return Outcome::Done;
+                }
+                PageRoute::LeaveTrash => {
+                    // An explicit destination was requested. Leave the
+                    // transient page, then let this command navigate normally.
+                    ui.leave_trash();
+                }
+                PageRoute::Refuse(message) => {
+                    ui.trash_status(message);
+                    crate::log!("trash", "refused {message}");
+                    return Outcome::Done;
+                }
+            }
+        }
+
         match command.name() {
             "file.cut" => {
                 self.put_on_clipboard(window, caller, command, clipboard::ClipboardMode::Cut);
@@ -1152,6 +1222,13 @@ impl Process {
                 self.finish(result);
             }
             "nav.back" => {
+                let trash_active = self.window(window).is_some_and(|ui| ui.trash_active());
+                if !back_consumes_history(trash_active) {
+                    if let Some(ui) = self.window(window) {
+                        ui.leave_trash();
+                    }
+                    return Outcome::Done;
+                }
                 if let Some(ui) = self.window(window) {
                     ui.arm_anchor_restore();
                 }
@@ -1205,10 +1282,11 @@ impl Process {
             "selection.none" => {
                 self.selection_none(window);
             }
-            "trash.open" => crate::log!(
-                "trash",
-                "not built yet: the Trash view needs the folder view"
-            ),
+            "trash.open" => {
+                if let Some(ui) = self.window(window) {
+                    ui.open_trash();
+                }
+            }
             "preview.edit" | "preview.discard" | "preview.save" | "preview.save-as" => {
                 crate::log!("command", "{} not built yet", command.name())
             }
@@ -1232,6 +1310,11 @@ impl Process {
                 Value::Paths(paths) => {
                     for path in paths {
                         arguments.push((argument.name.to_string(), utf8_path(path)?));
+                    }
+                }
+                Value::TrashItems(items) => {
+                    for item in items {
+                        arguments.push((argument.name.to_string(), item.as_str().to_string()));
                     }
                 }
                 value => arguments.push((argument.name.to_string(), value.to_string())),
@@ -1301,6 +1384,13 @@ impl Process {
         };
 
         if command.dry_run() {
+            if matches!(request, Request::EmptyTrash | Request::Restore { .. })
+                && let Some(fileops) = self.fileops()
+            {
+                let id = fileops.submit_dry_run(window, request);
+                crate::log!("fileops", "{} dry run queued as job {id}", command.name());
+                return Some(Outcome::Done);
+            }
             let lines = self
                 .fileops()
                 .map(|fileops| fileops.plan_lines(&request))
@@ -1497,12 +1587,36 @@ impl Process {
     pub fn fileop_started(&self, window: WindowId) {
         if let Some(ui) = self.window(window) {
             ui.fileop_started();
+            ui.trash_job_started();
         }
     }
 
     pub fn fileop_progress(&self, window: WindowId, view: Option<ProgressView>) {
         if let Some(ui) = self.window(window) {
-            ui.fileop_progress(view);
+            ui.fileop_progress(view.clone());
+            ui.trash_progress(view);
+        }
+    }
+
+    pub fn fileop_dry_run(&self, window: WindowId, request: &Request, lines: &[String]) {
+        crate::log!("fileops", "dry run: {}", lines.join(" | "));
+        if let Some(ui) = self.window(window) {
+            ui.fileop_progress(None);
+            ui.trash_dry_run(request, lines);
+        }
+    }
+
+    pub fn fileop_empty_confirmation(&self, window: WindowId, id: u64, plan: Plan) {
+        if let Some(ui) = self.window(window)
+            && ui.trash_visible()
+        {
+            ui.confirm_empty_trash(id, &plan);
+        } else if let Some(fileops) = self.fileops() {
+            crate::log!(
+                "fileops",
+                "no visible Trash page for the empty confirmation; cancelling job {id}"
+            );
+            fileops.cancel_job(id);
         }
     }
 
@@ -1525,7 +1639,8 @@ impl Process {
             crate::log!("fileops", "item: {line}");
         }
         if let Some(ui) = self.window(window) {
-            ui.show_summary(&summary, details);
+            ui.show_summary(&summary, details.clone());
+            ui.trash_job_finished(request, &summary, details);
         }
     }
 
@@ -1537,6 +1652,7 @@ impl Process {
             } else {
                 ui.show_summary(&format!("{}: {message}", request.summary()), None);
             }
+            ui.trash_refused(request, message);
         }
     }
 

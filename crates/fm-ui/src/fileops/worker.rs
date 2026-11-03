@@ -10,8 +10,8 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::time::{Duration, Instant};
 
 use fm_core::fileops::{
-    Decisions, ExecuteError, FileOperations, ItemOutcome, ItemResult, Plan, Progress, Report,
-    Request,
+    Decisions, EmptyConfirmation, ExecuteError, FileOperations, ItemOutcome, ItemResult, Plan,
+    Progress, Report, Request,
 };
 use gtk::gio;
 use gtk::gio::prelude::*;
@@ -22,10 +22,15 @@ pub enum WorkerMsg {
         id: u64,
         request: Request,
         cancellable: gio::Cancellable,
+        dry_run: bool,
     },
     Answer {
         id: u64,
         decisions: Decisions,
+    },
+    /// The destructive Empty Trash dialog returned Empty Trash.
+    ConfirmEmpty {
+        id: u64,
     },
     Cancel {
         id: u64,
@@ -58,6 +63,12 @@ pub enum WorkerEvent {
     /// `dry-run=true` lines.
     UndoState {
         summary: Option<String>,
+        lines: Vec<String>,
+    },
+    /// A worker-built dry run, used where planning itself lists the trash.
+    DryRunReady {
+        id: u64,
+        request: Request,
         lines: Vec<String>,
     },
 }
@@ -94,10 +105,30 @@ fn run(jobs: Receiver<WorkerMsg>, control: Receiver<WorkerMsg>, events: Sender<W
         id,
         request,
         cancellable,
+        dry_run,
     }) = jobs.recv()
     {
         let plan = operations.plan(&request);
         log_plan(id, &plan);
+
+        if let Some(problem) = plan.problem() {
+            let _ = events.send(WorkerEvent::Refused {
+                id,
+                request,
+                message: problem.to_string(),
+            });
+            continue;
+        }
+
+        if dry_run {
+            let _ = events.send(WorkerEvent::DryRunReady {
+                id,
+                request,
+                lines: plan.lines(),
+            });
+            continue;
+        }
+
         let _ = events.send(WorkerEvent::Planned {
             id,
             plan: plan.clone(),
@@ -108,24 +139,54 @@ fn run(jobs: Receiver<WorkerMsg>, control: Receiver<WorkerMsg>, events: Sender<W
             continue;
         }
 
-        let decisions = match wait_for_answer(&control, id, &cancellable) {
-            Some(decisions) => decisions,
-            None => {
+        if request == Request::EmptyTrash {
+            if wait_for_empty_confirmation(&control, id, &cancellable).is_none() {
                 finish_cancelled(id, request, plan, &events);
                 continue;
             }
-        };
+        } else {
+            let decisions = match wait_for_answer(&control, id, &cancellable) {
+                Some(decisions) => decisions,
+                None => {
+                    finish_cancelled(id, request, plan, &events);
+                    continue;
+                }
+            };
 
-        if decisions.is_cancelled() || cancellable.is_cancelled() {
-            finish_cancelled(id, request, plan, &events);
+            if decisions.is_cancelled() || cancellable.is_cancelled() {
+                finish_cancelled(id, request, plan, &events);
+                continue;
+            }
+
+            let sender = events.clone();
+            let mut last = Instant::now();
+            let result = operations.execute(
+                &plan,
+                &decisions,
+                &cancellable,
+                move |progress: Progress| {
+                    if last.elapsed() >= Duration::from_millis(PROGRESS_MS)
+                        || progress.items_done == progress.items_total
+                    {
+                        last = Instant::now();
+                        let _ = sender.send(WorkerEvent::Progress { id, progress });
+                    }
+                },
+            );
+
+            finish_operation(id, request, plan, result, &mut operations, &events);
             continue;
         }
 
         let sender = events.clone();
         let mut last = Instant::now();
-        let result = operations.execute(
+        let Some(confirmation) = EmptyConfirmation::for_plan(&plan) else {
+            finish_cancelled(id, request, plan, &events);
+            continue;
+        };
+        let result = operations.execute_empty(
             &plan,
-            &decisions,
+            confirmation,
             &cancellable,
             move |progress: Progress| {
                 if last.elapsed() >= Duration::from_millis(PROGRESS_MS)
@@ -136,34 +197,62 @@ fn run(jobs: Receiver<WorkerMsg>, control: Receiver<WorkerMsg>, events: Sender<W
                 }
             },
         );
+        finish_operation(id, request, plan, result, &mut operations, &events);
+    }
+}
 
-        // The undo state goes before the final event, so the client's poll
-        // sees it before it can decide the worker is idle.
-        send_undo_state(&operations, &events);
+fn finish_operation(
+    id: u64,
+    request: Request,
+    plan: Plan,
+    result: Result<Report, ExecuteError>,
+    operations: &mut FileOperations,
+    events: &Sender<WorkerEvent>,
+) {
+    // The undo state goes before the final event, so the client's poll
+    // sees it before it can decide the worker is idle.
+    send_undo_state(operations, events);
 
-        match result {
-            Ok(report) => {
-                crate::log!(
-                    "fileops",
-                    "report {}: {}",
-                    request.summary(),
-                    report.lines().join(" | ")
-                );
-                let _ = events.send(WorkerEvent::Finished {
-                    id,
-                    request,
-                    plan,
-                    report,
-                });
+    match result {
+        Ok(report) => {
+            crate::log!(
+                "fileops",
+                "report {}: {}",
+                request.summary(),
+                report.lines().join(" | ")
+            );
+            let _ = events.send(WorkerEvent::Finished {
+                id,
+                request,
+                plan,
+                report,
+            });
+        }
+        Err(error) => {
+            crate::log!("fileops", "refused {}: {error}", request.summary());
+            let _ = events.send(WorkerEvent::Refused {
+                id,
+                request,
+                message: error_message(&error),
+            });
+        }
+    }
+}
+
+fn wait_for_empty_confirmation(
+    control: &Receiver<WorkerMsg>,
+    id: u64,
+    cancellable: &gio::Cancellable,
+) -> Option<()> {
+    loop {
+        match control.recv() {
+            Ok(WorkerMsg::ConfirmEmpty { id: confirm_id }) if confirm_id == id => return Some(()),
+            Ok(WorkerMsg::Cancel { id: cancel_id }) if cancel_id == id => {
+                cancellable.cancel();
+                return None;
             }
-            Err(error) => {
-                crate::log!("fileops", "refused {}: {error}", request.summary());
-                let _ = events.send(WorkerEvent::Refused {
-                    id,
-                    request,
-                    message: error_message(&error),
-                });
-            }
+            Ok(WorkerMsg::Shutdown) | Err(_) => return None,
+            Ok(_) => continue,
         }
     }
 }
@@ -204,6 +293,7 @@ fn finish_cancelled(id: u64, request: Request, plan: Plan, events: &Sender<Worke
                     .or_else(|| step.target.clone())
                     .unwrap_or_default(),
                 target: step.target.clone(),
+                trash: step.trash.clone(),
                 outcome: ItemOutcome::Cancelled,
             })
             .collect(),

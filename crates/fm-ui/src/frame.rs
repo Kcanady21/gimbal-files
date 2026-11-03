@@ -22,6 +22,7 @@ use crate::look::blur::Blur;
 use crate::look::motion;
 use crate::look::tokens::*;
 use crate::sidebar::Sidebar;
+use crate::trash::TrashBrowser;
 
 pub struct WindowUi {
     pub id: WindowId,
@@ -64,6 +65,8 @@ pub struct WindowUi {
     expected_right: Cell<i32>,
     /// True while a rename or new-folder popover owns a text entry.
     editing: Cell<bool>,
+    /// The one Trash dialog owned by this window. Opening it again presents it.
+    trash: RefCell<Option<Rc<TrashBrowser>>>,
 }
 
 struct SideAnim {
@@ -174,6 +177,7 @@ impl WindowUi {
             expected_left: Cell::new(0),
             expected_right: Cell::new(0),
             editing: Cell::new(false),
+            trash: RefCell::new(None),
         });
         header.wire(&ui);
         ui.wire();
@@ -288,6 +292,12 @@ impl WindowUi {
     }
 
     pub fn update_content(&self) {
+        if self.content.trash_active() {
+            // Do not present the hidden folder as the current view. The header
+            // says Trash and the sidebar has no current-folder highlight.
+            self.sidebar.set_current_folder(None);
+            return;
+        }
         let Some(window) = self.workspace_window() else {
             self.content.show_placeholder("No window");
             self.sidebar.set_current_folder(None);
@@ -335,11 +345,15 @@ impl WindowUi {
     }
 
     pub fn fileop_started(&self) {
-        self.content.begin_fileop();
+        if !self.content.trash_active() {
+            self.content.begin_fileop();
+        }
     }
 
     pub fn fileop_progress(&self, view: Option<crate::fileops::ProgressView>) {
-        self.content.set_progress(view);
+        if !self.content.trash_active() {
+            self.content.set_progress(view);
+        }
     }
 
     pub fn show_summary(&self, text: &str, failures: Option<String>) {
@@ -352,6 +366,144 @@ impl WindowUi {
 
     pub fn reload_folder(&self) {
         self.content.reload();
+    }
+
+    /// Open the one Trash page, or present the page this window already owns.
+    /// The page lives in the central stack; opening it never creates a tab,
+    /// model window or folder-history entry.
+    pub fn open_trash(self: &Rc<Self>) {
+        let action = crate::trash::open_action(self.trash.borrow().is_some());
+        match action {
+            crate::trash::OpenAction::ShowExisting => {
+                self.content.show_trash();
+                self.refresh_header(false);
+                crate::log!(
+                    "trash",
+                    "presented the existing Trash page for window {}",
+                    self.id
+                );
+            }
+            crate::trash::OpenAction::CreatePage => {
+                let browser = TrashBrowser::new(self);
+                self.content.add_trash_page(browser.widget());
+                *self.trash.borrow_mut() = Some(browser);
+                self.content.show_trash();
+                self.refresh_header(false);
+                crate::log!("trash", "opened the Trash page for window {}", self.id);
+            }
+        }
+        self.update_content();
+    }
+
+    /// Return to the unchanged folder or split page. Any Empty Trash
+    /// confirmation this page owned is cancelled for its exact job.
+    pub fn leave_trash(self: &Rc<Self>) -> bool {
+        if !crate::trash::leaves_trash_page(
+            self.content.trash_active(),
+            crate::trash::RefreshCause::Navigation,
+        ) {
+            return false;
+        }
+        let browser = self.trash.borrow().clone();
+        if let Some(browser) = browser {
+            browser.leave_page();
+        }
+        self.content.hide_trash();
+        self.refresh_header(false);
+        self.update_content();
+        crate::log!("trash", "returned to files for window {}", self.id);
+        true
+    }
+
+    pub fn trash_active(&self) -> bool {
+        self.content.trash_active()
+    }
+
+    pub fn trash_visible(&self) -> bool {
+        self.content.trash_active() && self.trash.borrow().is_some()
+    }
+
+    pub fn trash_status(&self, text: &str) {
+        let browser = self.trash.borrow().clone();
+        if let Some(browser) = browser {
+            browser.set_status(text);
+        }
+    }
+
+    pub fn trash_select_all(&self) {
+        let browser = self.trash.borrow().clone();
+        if let Some(browser) = browser {
+            browser.select_all();
+        }
+    }
+
+    pub fn trash_select_none(&self) {
+        let browser = self.trash.borrow().clone();
+        if let Some(browser) = browser {
+            browser.select_none();
+        }
+    }
+
+    pub fn trash_refresh(&self) {
+        let browser = self.trash.borrow().clone();
+        if let Some(browser) = browser {
+            browser.refresh_now();
+        }
+    }
+
+    pub fn trash_closed(&self) {
+        let browser = self.trash.borrow_mut().take();
+        if let Some(browser) = browser {
+            browser.leave_page();
+        }
+        crate::log!("trash", "closed the Trash page for window {}", self.id);
+    }
+
+    pub fn trash_job_started(&self) {
+        let browser = self.trash.borrow().clone();
+        if let Some(browser) = browser {
+            browser.job_started();
+        }
+    }
+
+    pub fn trash_progress(&self, view: Option<crate::fileops::ProgressView>) {
+        let browser = self.trash.borrow().clone();
+        if let Some(browser) = browser {
+            browser.set_progress(view);
+        }
+    }
+
+    pub fn trash_dry_run(&self, request: &fm_core::fileops::Request, lines: &[String]) {
+        let browser = self.trash.borrow().clone();
+        if let Some(browser) = browser {
+            browser.show_dry_run(request, lines);
+        }
+    }
+
+    pub fn trash_job_finished(
+        &self,
+        request: &fm_core::fileops::Request,
+        summary: &str,
+        details: Option<String>,
+    ) {
+        let browser = self.trash.borrow().clone();
+        if let Some(browser) = browser {
+            browser.job_finished(request, summary, details);
+        }
+    }
+
+    pub fn trash_refused(&self, request: &fm_core::fileops::Request, message: &str) {
+        let browser = self.trash.borrow().clone();
+        if let Some(browser) = browser {
+            browser.refused(request, message);
+        }
+    }
+
+    pub fn confirm_empty_trash(self: &Rc<Self>, id: u64, plan: &fm_core::fileops::Plan) {
+        let browser = self.trash.borrow().clone();
+        if let Some(browser) = browser {
+            browser.confirm_empty(self, id, plan);
+        }
     }
 
     pub fn reload_sidebar(&self) {
@@ -537,10 +689,11 @@ impl WindowUi {
 
         let weak = Rc::downgrade(self);
         self.window.connect_destroy(move |_| {
-            if let Some(ui) = weak.upgrade()
-                && let Some(process) = ui.process.upgrade()
-            {
-                process.forget_window(ui.id);
+            if let Some(ui) = weak.upgrade() {
+                ui.trash_closed();
+                if let Some(process) = ui.process.upgrade() {
+                    process.forget_window(ui.id);
+                }
             }
         });
 

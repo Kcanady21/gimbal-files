@@ -16,6 +16,7 @@ mod tests;
 use std::fmt;
 use std::path::PathBuf;
 
+use crate::fileops::TrashUri;
 pub use catalogue::COMMANDS;
 pub use check::{CheckedArgument, CheckedCommand, CommandError, CommandErrorKind, Invocation};
 
@@ -128,6 +129,9 @@ pub enum ArgKind {
     Path,
     /// One or more absolute paths; the invocation repeats the key.
     Paths,
+    /// One or more validated GIO trash item URIs; the invocation repeats the
+    /// key. The root, foreign schemes and traversal are refused.
+    TrashItems,
     /// An integer in an inclusive range.
     Int {
         min: i64,
@@ -154,6 +158,7 @@ impl ArgKind {
         match self {
             ArgKind::Path => "path".to_string(),
             ArgKind::Paths => "paths".to_string(),
+            ArgKind::TrashItems => "trash item URIs".to_string(),
             ArgKind::Int { min, max } => {
                 if *max == i64::MAX {
                     format!("int, {min} or more")
@@ -295,6 +300,13 @@ pub fn must_supply(caller: Caller, effect: Effect, argument: &ArgSpec) -> bool {
     }
 }
 
+/// Whether this caller may run this command at all. Emptying the trash is the
+/// one explicitly clicked UI operation: hotkeys, the CLI and the agent are
+/// refused before a handler or even a dry run can see it.
+pub fn caller_allowed(name: &str, effect: Effect, caller: Caller) -> bool {
+    !(name == "trash.empty" && effect == Effect::Files) || caller == Caller::Ui
+}
+
 /// Whether the name is `area.verb` in lowercase kebab case.
 pub fn is_well_formed_name(name: &str) -> bool {
     let parts: Vec<&str> = name.split('.').collect();
@@ -369,6 +381,7 @@ impl fmt::Display for Number {
 pub enum Value {
     Path(PathBuf),
     Paths(Vec<PathBuf>),
+    TrashItems(Vec<TrashUri>),
     Int(i64),
     Number(Number),
     Bool(bool),
@@ -385,6 +398,10 @@ impl fmt::Display for Value {
                     .iter()
                     .map(|path| path.display().to_string())
                     .collect();
+                f.write_str(&rendered.join(" "))
+            }
+            Value::TrashItems(items) => {
+                let rendered: Vec<&str> = items.iter().map(TrashUri::as_str).collect();
                 f.write_str(&rendered.join(" "))
             }
             Value::Int(value) => write!(f, "{value}"),

@@ -23,6 +23,7 @@ mod platform;
 mod save;
 mod sidebar;
 mod split;
+mod trash;
 
 use std::cell::RefCell;
 use std::path::PathBuf;

@@ -5,6 +5,7 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 
 use super::*;
+use crate::fileops::TrashUri;
 
 fn parse_invocation(tokens: &[&str]) -> Invocation {
     let tokens: Vec<String> = tokens.iter().map(|token| token.to_string()).collect();
@@ -57,6 +58,8 @@ fn the_v1_catalogue_has_every_reviewed_command_in_order() {
         "file.copy-to-clipboard",
         "file.paste",
         "trash.open",
+        "trash.restore",
+        "trash.empty",
         "preview.edit",
         "preview.discard",
         "preview.save",
@@ -117,20 +120,45 @@ fn summaries_are_one_non_empty_line() {
 }
 
 #[test]
-fn no_command_deletes_permanently() {
+fn only_the_approved_trash_empty_deletes_permanently() {
     for spec in COMMANDS {
-        assert!(
-            !permanently_deletes(spec.name, spec.effect),
-            "{} would delete permanently",
-            spec.name
-        );
+        let permanent = permanently_deletes(spec.name, spec.effect);
+        if permanent {
+            assert_eq!(
+                spec.name, "trash.empty",
+                "{} is a permanent-delete command outside the one approved exception",
+                spec.name
+            );
+        }
     }
 
+    assert!(permanently_deletes("trash.empty", Effect::Files));
     assert!(permanently_deletes("file.delete", Effect::Files));
     assert!(permanently_deletes("file.remove", Effect::Files));
-    assert!(permanently_deletes("trash.empty", Effect::Files));
     assert!(!permanently_deletes("file.trash", Effect::Files));
     assert!(!permanently_deletes("pins.remove", Effect::Settings));
+
+    // The exception is also the only caller-restricted command.
+    assert!(caller_allowed("trash.empty", Effect::Files, Caller::Ui));
+    for caller in [Caller::Hotkey, Caller::Cli, Caller::Agent] {
+        assert!(!caller_allowed("trash.empty", Effect::Files, caller));
+        let error = check(caller, &["trash.empty"]).expect_err("only the UI may empty");
+        assert_eq!(error.command(), Some("trash.empty"));
+        assert_eq!(error.argument(), None);
+        assert!(matches!(
+            error.kind(),
+            CommandErrorKind::ForbiddenCaller { caller: actual } if *actual == caller
+        ));
+        assert!(error.to_string().contains("may not run this command"));
+        let dry = check(caller, &["trash.empty", "dry-run=true"]).expect_err("even a dry run");
+        assert!(matches!(
+            dry.kind(),
+            CommandErrorKind::ForbiddenCaller { .. }
+        ));
+    }
+    for caller in [Caller::Ui, Caller::Hotkey, Caller::Cli, Caller::Agent] {
+        assert!(caller_allowed("file.trash", Effect::Files, caller));
+    }
 }
 
 #[test]
@@ -204,7 +232,11 @@ fn argument_kinds_are_sane() {
                         assert!(seen.insert(value), "{} repeats choice {}", spec.name, value);
                     }
                 }
-                ArgKind::Path | ArgKind::Paths | ArgKind::Bool | ArgKind::Text => {}
+                ArgKind::Path
+                | ArgKind::Paths
+                | ArgKind::TrashItems
+                | ArgKind::Bool
+                | ArgKind::Text => {}
             }
         }
     }
@@ -248,6 +280,53 @@ fn repeated_paths_keys_make_a_list_in_input_order() {
             PathBuf::from("/tmp/b")
         ]))
     );
+}
+
+#[test]
+fn trash_restore_takes_repeated_validated_item_uris() {
+    let command = check(
+        Caller::Cli,
+        &[
+            "trash.restore",
+            "items=trash:///one.txt",
+            "items=trash:///a%20b.txt",
+        ],
+    )
+    .expect("the CLI may name explicit trash items");
+    assert_eq!(
+        command.get("items"),
+        Some(&Value::TrashItems(vec![
+            TrashUri::parse("trash:///one.txt").unwrap(),
+            TrashUri::parse("trash:///a%20b.txt").unwrap(),
+        ]))
+    );
+    assert_eq!(
+        command.to_string(),
+        "trash.restore items=trash:///one.txt items=trash:///a%20b.txt dry-run=false"
+    );
+
+    for bad in [
+        "items=trash:///",
+        "items=file:///tmp/a",
+        "items=trash:///../a",
+        "items=trash:///a%2Fb",
+        "items=trash:///a%zz",
+    ] {
+        let error = check(Caller::Ui, &["trash.restore", bad]).expect_err("invalid item URI");
+        assert_eq!(error.argument(), Some("items"));
+        assert!(
+            matches!(error.kind(), CommandErrorKind::BadValue { .. }),
+            "{bad}"
+        );
+    }
+}
+
+#[test]
+fn an_empty_trash_takes_only_its_registry_dry_run() {
+    let command = check(Caller::Ui, &["trash.empty", "dry-run=true"]).expect("UI dry run");
+    assert!(command.dry_run());
+    let error = check(Caller::Ui, &["trash.empty", "path=/"]).expect_err("no path argument");
+    assert!(matches!(error.kind(), CommandErrorKind::UnknownArgument));
 }
 
 #[test]

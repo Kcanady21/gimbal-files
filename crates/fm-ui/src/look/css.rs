@@ -169,6 +169,22 @@ dnd .gl-drag-badge, .gl-drag-badge {{ min-width: {tsmall}px; min-height: {tsmall
 .gl-menu-item:hover {{ background-color: {HOVER}; }}
 .gl-menu-item:disabled {{ color: alpha({FG}, 0.45); }}
 .gl-menu-item:focus-visible {{ box-shadow: 0 0 0 {thin}px {FOCUS_RING}; }}
+.gl-trash-view {{ padding: {gm}px; color: {FG}; }}
+.gl-trash-actions {{ min-height: {ch}px; margin-bottom: {gm}px; }}
+.gl-trash-title {{ font-size: {tt}px; color: {FG}; }}
+.gl-trash-action {{ min-height: {ch}px; margin-left: {gs}px; padding: 0 {gm}px; border: {mid}px solid {OUTLINE}; border-radius: {r}px; background-color: {pill_bg}; color: {FG}; font-size: {tc}px; }}
+.gl-trash-action:hover {{ background-color: {HOVER}; }}
+.gl-trash-action:active {{ background-color: {ACTIVE}; }}
+.gl-trash-action:disabled {{ color: alpha({FG}, 0.45); }}
+.gl-trash-action:focus-visible {{ box-shadow: 0 0 0 {thin}px {FOCUS_RING}; }}
+.gl-trash-list {{ background-color: transparent; }}
+.gl-trash-row {{ min-height: {dirrow}px; padding: {gs}px {gm}px; }}
+.gl-trash-icon {{ -gtk-icon-size: {igrid}px; margin-right: {gm}px; color: {FG}; -gtk-icon-palette: {folder_palette}; }}
+.gl-trash-name {{ font-size: {titem}px; color: {FG}; }}
+.gl-trash-meta {{ font-size: {tsmall}px; color: alpha({FG}, 0.75); }}
+.gl-trash-empty {{ font-size: {tt}px; color: alpha({FG}, 0.75); }}
+.gl-trash-status {{ min-height: {statush}px; padding: 0 {gm}px; font-size: {tsmall}px; color: alpha({FG}, 0.75); }}
+.gl-trash-progress {{ border-top: {hair}px solid {RULE}; }}
 window.gimbal-look .gl-frame gridview, window.gimbal-look .gl-frame listview, window.gimbal-look .gl-frame textview, window.gimbal-look .gl-frame textview > text, window.gimbal-look .gl-frame scrolledwindow, window.gimbal-look .gl-frame viewport, window.gimbal-look .gl-frame gridview > child, window.gimbal-look windowhandle {{ background-color: transparent; }}
 window.gimbal-look .gl-frame gridview > child:selected {{ background-color: alpha(@accent_bg_color, 0.45); border-radius: {r}px; }}",
         pinrow = p(PIN_ROW_H),
@@ -509,6 +525,27 @@ mod tests {
         assert!(!full.contains(".gl-icon-button.close { -gtk-icon-palette"));
         let half = css(0.5, None, PLAIN);
         assert!(half.contains(".gl-icon-button.close image { -gtk-icon-size: 16px; }"));
+    }
+
+    #[test]
+    fn the_trash_browser_uses_the_shared_tokens() {
+        let plain = css(1.0, None, PLAIN);
+        for rule in [
+            ".gl-trash-view {",
+            ".gl-trash-actions {",
+            ".gl-trash-row { min-height: 32px;",
+            ".gl-trash-name { font-size: 22px;",
+            ".gl-trash-meta { font-size: 14px;",
+            ".gl-trash-status { min-height: 64px;",
+        ] {
+            assert!(plain.contains(rule), "missing {rule:?}");
+        }
+        for line in plain.lines().filter(|line| line.contains(".gl-trash")) {
+            assert!(
+                !line.contains('#') && !line.contains("rgb("),
+                "a fixed colour in {line}"
+            );
+        }
     }
 
     #[test]

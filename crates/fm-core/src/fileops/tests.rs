@@ -7,6 +7,7 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use super::*;
 use crate::command::{Caller, Invocation, Registry};
@@ -46,6 +47,10 @@ fn read(path: &Path) -> String {
     fs::read_to_string(path).unwrap()
 }
 
+fn key(path: impl Into<PathBuf>) -> ItemKey {
+    ItemKey::path(path)
+}
+
 fn symlink(target: &Path, link: &Path) {
     std::os::unix::fs::symlink(target, link).unwrap();
 }
@@ -71,6 +76,149 @@ fn run(
     operations
         .execute(&plan, decisions, cancellable, |_| {})
         .unwrap()
+}
+
+#[derive(Default)]
+struct TestTrashState {
+    items: Vec<TrashItem>,
+    deleted: Vec<String>,
+    fail_restore: Vec<String>,
+    fail_delete: Vec<String>,
+}
+
+#[derive(Clone, Default)]
+struct TestTrash {
+    state: Arc<Mutex<TestTrashState>>,
+}
+
+impl TestTrash {
+    fn with(items: Vec<TrashItem>) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(TestTrashState {
+                items,
+                ..TestTrashState::default()
+            })),
+        }
+    }
+
+    fn add(&self, item: TrashItem) {
+        self.state.lock().unwrap().items.push(item);
+    }
+
+    fn deleted(&self) -> Vec<String> {
+        self.state.lock().unwrap().deleted.clone()
+    }
+
+    fn remaining(&self) -> Vec<String> {
+        self.state
+            .lock()
+            .unwrap()
+            .items
+            .iter()
+            .map(|item| item.uri().as_str().to_string())
+            .collect()
+    }
+}
+
+impl TrashBackend for TestTrash {
+    fn list(&self) -> Result<Vec<TrashItem>, TrashError> {
+        Ok(self.state.lock().unwrap().items.clone())
+    }
+
+    fn revalidate(&self, item: &TrashIdentity) -> Result<TrashItem, TrashError> {
+        let state = self.state.lock().unwrap();
+        let Some(fresh) = state
+            .items
+            .iter()
+            .find(|candidate| candidate.uri() == item.uri())
+        else {
+            return Err(TrashError::Missing);
+        };
+        if !item.agrees_with(fresh.identity()) {
+            return Err(TrashError::Changed);
+        }
+        Ok(fresh.clone())
+    }
+
+    fn restore(
+        &self,
+        item: &TrashIdentity,
+        target: &Path,
+        _cancellable: &gio::Cancellable,
+    ) -> Result<(), String> {
+        let mut state = self.state.lock().unwrap();
+        if state
+            .fail_restore
+            .iter()
+            .any(|uri| uri == item.uri().as_str())
+        {
+            return Err("the test backend refused this restore".to_string());
+        }
+        let Some(index) = state
+            .items
+            .iter()
+            .position(|candidate| candidate.uri() == item.uri())
+        else {
+            return Err("missing".to_string());
+        };
+        let fresh = state.items[index].clone();
+        if !item.agrees_with(fresh.identity()) {
+            return Err("the item changed in the trash".to_string());
+        }
+        fs::write(target, format!("restored {}", fresh.display_name()))
+            .map_err(|error| error.to_string())?;
+        state.items.remove(index);
+        Ok(())
+    }
+
+    fn delete(&self, item: &TrashIdentity, _cancellable: &gio::Cancellable) -> Result<(), String> {
+        let mut state = self.state.lock().unwrap();
+        if state
+            .fail_delete
+            .iter()
+            .any(|uri| uri == item.uri().as_str())
+        {
+            return Err("the test backend refused this deletion".to_string());
+        }
+        let Some(index) = state
+            .items
+            .iter()
+            .position(|candidate| candidate.uri() == item.uri())
+        else {
+            return Err("missing".to_string());
+        };
+        if !item.same_object(state.items[index].identity()) {
+            return Err("the item changed in the trash".to_string());
+        }
+        state.items.remove(index);
+        state.deleted.push(item.uri().as_str().to_string());
+        Ok(())
+    }
+}
+
+fn trash_item(uri: &str, original: Option<&Path>, deleted_at: Option<i64>) -> TrashItem {
+    trash_item_with_revision(uri, original, deleted_at, Some("generation-1"))
+}
+
+fn trash_item_with_revision(
+    uri: &str,
+    original: Option<&Path>,
+    deleted_at: Option<i64>,
+    revision: Option<&str>,
+) -> TrashItem {
+    let uri = TrashUri::parse(uri).unwrap();
+    let display = uri.name().to_string_lossy().into_owned();
+    TrashItem::new(
+        TrashIdentity::new(
+            uri,
+            original.map(Path::to_path_buf),
+            deleted_at,
+            revision.map(TrashRevision::new),
+        ),
+        display,
+        false,
+        None,
+    )
 }
 
 fn snapshot(root: &Path) -> Vec<(PathBuf, String)> {
@@ -103,6 +251,353 @@ fn snapshot(root: &Path) -> Vec<(PathBuf, String)> {
 // ---------------------------------------------------------------------------
 // Names
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Restore and empty trash
+// ---------------------------------------------------------------------------
+
+fn restored_operations(_scratch: &Scratch, items: Vec<TrashItem>) -> (FileOperations, TestTrash) {
+    for item in &items {
+        if let Some(original) = item.original()
+            && let Some(parent) = original.parent()
+        {
+            fs::create_dir_all(parent).unwrap();
+        }
+    }
+    let backend = TestTrash::with(items);
+    (
+        FileOperations::with_trash_backend(Box::new(backend.clone())),
+        backend,
+    )
+}
+
+#[test]
+fn missing_dates_restore_but_missing_locations_do_not() {
+    let scratch = Scratch::new("restore-metadata");
+    let original = scratch.join("a.txt");
+    let with_date = trash_item("trash:///a.txt", Some(&original), Some(1_700_000_000));
+    let without_date = trash_item("trash:///b.txt", Some(&scratch.join("b.txt")), None);
+    let no_original = trash_item("trash:///c.txt", None, None);
+    let (operations, _) =
+        restored_operations(&scratch, vec![with_date, without_date.clone(), no_original]);
+
+    let plan = operations.plan(&Request::Restore {
+        items: vec![
+            without_date.identity().clone(),
+            trash_item("trash:///c.txt", None, None).identity().clone(),
+        ],
+    });
+    assert_eq!(plan.steps().len(), 2);
+    assert_eq!(plan.steps()[0].conflict, None);
+    assert_eq!(plan.steps()[0].target, Some(scratch.join("b.txt")));
+    assert_eq!(plan.steps()[1].conflict, Some(Conflict::MissingOriginal));
+    assert_eq!(
+        plan.steps()[1]
+            .trash
+            .as_ref()
+            .map(|item| item.uri().as_str()),
+        Some("trash:///c.txt")
+    );
+}
+
+#[test]
+fn a_missing_original_parent_is_refused_with_its_own_message() {
+    let scratch = Scratch::new("restore-parent");
+    let missing = scratch.join("gone").join("a.txt");
+    let item = trash_item("trash:///a.txt", Some(&missing), None);
+    let mut operations =
+        FileOperations::with_trash_backend(Box::new(TestTrash::with(vec![item.clone()])));
+    let plan = operations.plan(&Request::Restore {
+        items: vec![item.identity().clone()],
+    });
+    assert_eq!(plan.steps()[0].conflict, Some(Conflict::MissingParent));
+    assert_eq!(
+        Conflict::MissingParent.text(),
+        "Original folder no longer exists"
+    );
+
+    let report = operations
+        .execute(
+            &plan,
+            &Decisions::new(Vec::new()),
+            &gio::Cancellable::new(),
+            |_| {},
+        )
+        .unwrap();
+    assert_eq!(
+        report.items[0].outcome,
+        ItemOutcome::Refused("Original folder no longer exists".to_string())
+    );
+}
+
+#[test]
+fn restore_conflicts_take_apply_to_all_and_a_cancel_runs_nothing() {
+    let scratch = Scratch::new("restore-conflicts");
+    let folder_a = scratch.join("a");
+    let folder_b = scratch.join("b");
+    fs::create_dir_all(&folder_a).unwrap();
+    fs::create_dir_all(&folder_b).unwrap();
+    let target_a = folder_a.join("one.txt");
+    let target_b = folder_b.join("two.txt");
+    write(&target_a, "old");
+    let a = trash_item("trash:///one.txt", Some(&target_a), None);
+    let b = trash_item("trash:///two.txt", Some(&target_b), None);
+    let (mut operations, backend) = restored_operations(&scratch, vec![a.clone(), b.clone()]);
+
+    let plan = operations.plan(&Request::Restore {
+        items: vec![a.identity().clone(), b.identity().clone()],
+    });
+    assert_eq!(plan.decisions().count(), 1);
+    let mut decisions = Decisions::from_plan(&plan);
+    decisions.answer(
+        ItemKey::Trash(a.identity().uri().clone()),
+        Decision::KeepBoth,
+        true,
+    );
+    let report = operations
+        .execute(&plan, &decisions, &gio::Cancellable::new(), |_| {})
+        .unwrap();
+    assert!(report.all_succeeded(), "{:?}", report.lines());
+    assert_eq!(read(&target_a), "old");
+    assert_eq!(read(&folder_a.join("one (copy).txt")), "restored one.txt");
+    assert_eq!(read(&target_b), "restored two.txt");
+    assert!(backend.remaining().is_empty());
+
+    let a2 = trash_item(
+        "trash:///three.txt",
+        Some(&folder_a.join("three.txt")),
+        None,
+    );
+    write(&folder_a.join("three.txt"), "existing");
+    let (mut operations, backend) = restored_operations(&scratch, vec![a2.clone()]);
+    let plan = operations.plan(&Request::Restore {
+        items: vec![a2.identity().clone()],
+    });
+    let mut decisions = Decisions::from_plan(&plan);
+    decisions.answer(
+        ItemKey::Trash(a2.identity().uri().clone()),
+        Decision::Cancel,
+        false,
+    );
+    let report = operations
+        .execute(&plan, &decisions, &gio::Cancellable::new(), |_| {})
+        .unwrap();
+    assert!(report.cancelled);
+    assert_eq!(read(&folder_a.join("three.txt")), "existing");
+    assert_eq!(backend.remaining(), vec!["trash:///three.txt"]);
+}
+
+#[test]
+fn a_confirmed_empty_deletes_only_its_snapshot_and_refuses_changes() {
+    let scratch = Scratch::new("empty-snapshot");
+    let original = scratch.join("a.txt");
+    let first = trash_item("trash:///a.txt", Some(&original), Some(1_700_000_000));
+    let second = trash_item(
+        "trash:///b.txt",
+        Some(&scratch.join("b.txt")),
+        Some(1_700_000_100),
+    );
+    let backend = TestTrash::with(vec![first.clone(), second.clone()]);
+    let mut operations = FileOperations::with_trash_backend(Box::new(backend.clone()));
+
+    let plan = operations.plan(&Request::EmptyTrash);
+    assert_eq!(plan.steps().len(), 2);
+    let confirmation = EmptyConfirmation::for_plan(&plan).expect("an empty plan confirms");
+
+    let late = trash_item("trash:///late.txt", Some(&scratch.join("late.txt")), None);
+    backend.add(late);
+    let report = operations
+        .execute_empty(&plan, confirmation, &gio::Cancellable::new(), |_| {})
+        .unwrap();
+    assert!(report.all_succeeded(), "{:?}", report.lines());
+    assert_eq!(
+        backend.deleted(),
+        vec!["trash:///a.txt", "trash:///b.txt"],
+        "the later item is not in the confirmed snapshot"
+    );
+    assert_eq!(backend.remaining(), vec!["trash:///late.txt"]);
+
+    // A changed original location refuses a new deletion.
+    let changing = trash_item(
+        "trash:///change.txt",
+        Some(&scratch.join("first.txt")),
+        Some(1_700_000_200),
+    );
+    let backend = TestTrash::with(vec![changing.clone()]);
+    let mut operations = FileOperations::with_trash_backend(Box::new(backend.clone()));
+    let plan = operations.plan(&Request::EmptyTrash);
+    let confirmation = EmptyConfirmation::for_plan(&plan).unwrap();
+    {
+        let mut state = backend.state.lock().unwrap();
+        state.items[0] = trash_item(
+            "trash:///change.txt",
+            Some(&scratch.join("second.txt")),
+            Some(1_700_000_200),
+        );
+    }
+    let report = operations
+        .execute_empty(&plan, confirmation, &gio::Cancellable::new(), |_| {})
+        .unwrap();
+    assert_eq!(
+        report.items[0].outcome,
+        ItemOutcome::Refused("the item changed in the trash".to_string())
+    );
+    assert!(backend.deleted().is_empty());
+}
+
+#[test]
+fn no_confirmation_means_no_deletion() {
+    let scratch = Scratch::new("empty-no-confirmation");
+    let item = trash_item("trash:///a.txt", Some(&scratch.join("a.txt")), None);
+    let backend = TestTrash::with(vec![item]);
+    let mut operations = FileOperations::with_trash_backend(Box::new(backend.clone()));
+    let plan = operations.plan(&Request::EmptyTrash);
+    let error = operations
+        .execute(
+            &plan,
+            &Decisions::new(Vec::new()),
+            &gio::Cancellable::new(),
+            |_| {},
+        )
+        .unwrap_err();
+    assert_eq!(error, ExecuteError::ConfirmationRequired);
+    assert!(backend.deleted().is_empty());
+
+    let wrong = operations.plan(&Request::EmptyTrash);
+    let other = operations.plan(&Request::Copy {
+        paths: vec![scratch.join("a.txt")],
+        to: scratch.join("dst"),
+    });
+    let token = EmptyConfirmation::for_plan(&wrong).unwrap();
+    assert_eq!(
+        operations
+            .execute_empty(&other, token, &gio::Cancellable::new(), |_| {})
+            .unwrap_err(),
+        ExecuteError::NotAnEmptyPlan
+    );
+}
+
+#[test]
+fn a_partial_empty_and_a_cancel_report_what_was_deleted() {
+    let scratch = Scratch::new("empty-partial");
+    let a = trash_item("trash:///a.txt", Some(&scratch.join("a.txt")), None);
+    let b = trash_item("trash:///b.txt", Some(&scratch.join("b.txt")), None);
+    let c = trash_item("trash:///c.txt", Some(&scratch.join("c.txt")), None);
+    let backend = TestTrash::with(vec![a, b.clone(), c]);
+    backend
+        .state
+        .lock()
+        .unwrap()
+        .fail_delete
+        .push("trash:///b.txt".to_string());
+    let mut operations = FileOperations::with_trash_backend(Box::new(backend.clone()));
+    let plan = operations.plan(&Request::EmptyTrash);
+    let confirmation = EmptyConfirmation::for_plan(&plan).unwrap();
+    let report = operations
+        .execute_empty(&plan, confirmation, &gio::Cancellable::new(), |_| {})
+        .unwrap();
+    assert!(!report.all_succeeded());
+    assert_eq!(backend.deleted(), vec!["trash:///a.txt", "trash:///c.txt"]);
+    assert_eq!(backend.remaining(), vec!["trash:///b.txt"]);
+
+    let cancellable = gio::Cancellable::new();
+    cancellable.cancel();
+    let plan = operations.plan(&Request::EmptyTrash);
+    let confirmation = EmptyConfirmation::for_plan(&plan).unwrap();
+    let report = operations
+        .execute_empty(&plan, confirmation, &cancellable, |_| {})
+        .unwrap();
+    assert!(report.cancelled);
+    assert_eq!(
+        backend.deleted(),
+        vec!["trash:///a.txt", "trash:///c.txt"],
+        "cancel adds no deletion"
+    );
+    assert_eq!(backend.remaining(), vec!["trash:///b.txt"]);
+}
+
+#[test]
+fn trash_dry_runs_list_without_writing() {
+    let scratch = Scratch::new("trash-dry-run");
+    let item = trash_item("trash:///a.txt", Some(&scratch.join("a.txt")), None);
+    let backend = TestTrash::with(vec![item.clone()]);
+    let operations = FileOperations::with_trash_backend(Box::new(backend.clone()));
+    let restore = operations.dry_run(&Request::Restore {
+        items: vec![item.identity().clone()],
+    });
+    assert!(restore.iter().any(|line| line.contains("trash:///a.txt")));
+    assert_eq!(backend.remaining(), vec!["trash:///a.txt"]);
+
+    let empty = operations.dry_run(&Request::EmptyTrash);
+    assert!(
+        empty
+            .iter()
+            .any(|line| line.contains("delete trash:///a.txt"))
+    );
+    assert_eq!(backend.deleted(), Vec::<String>::new());
+    assert_eq!(backend.remaining(), vec!["trash:///a.txt"]);
+}
+
+#[test]
+fn a_restore_records_the_actual_path_for_undo() {
+    // The executor itself is exercised in tests/trash_browser.rs with a
+    // filesystem backend. Here the plan's destination is the actual one,
+    // including a Keep Both name.
+    let scratch = Scratch::new("restore-undo-plan");
+    let folder = scratch.join("folder");
+    fs::create_dir_all(&folder).unwrap();
+    let target = folder.join("a.txt");
+    write(&target, "old");
+    let item = trash_item("trash:///a.txt", Some(&target), None);
+    let (mut operations, _) = restored_operations(&scratch, vec![item.clone()]);
+    let plan = operations.plan(&Request::Restore {
+        items: vec![item.identity().clone()],
+    });
+    let mut decisions = Decisions::from_plan(&plan);
+    decisions.answer(
+        ItemKey::Trash(item.identity().uri().clone()),
+        Decision::KeepBoth,
+        false,
+    );
+    let report = operations
+        .execute(&plan, &decisions, &gio::Cancellable::new(), |_| {})
+        .unwrap();
+    assert!(report.all_succeeded());
+    let actual = folder.join("a (copy).txt");
+    assert_eq!(report.items[0].target.as_deref(), Some(actual.as_path()));
+
+    let undo = operations.plan(&Request::Undo);
+    assert_eq!(undo.steps().len(), 1);
+    assert_eq!(undo.steps()[0].action, Action::Trash);
+    assert_eq!(undo.steps()[0].source.as_deref(), Some(actual.as_path()));
+}
+
+#[test]
+fn topdir_relative_original_paths_resolve_against_the_mount() {
+    use crate::fileops::trashinfo::resolve_original;
+    let home = PathBuf::from("/home/kyle");
+    let home_trash = home.join(".local/share/Trash");
+    assert_eq!(
+        resolve_original(&home_trash, &home_trash, Path::new("/home/kyle/a")),
+        PathBuf::from("/home/kyle/a")
+    );
+    assert_eq!(
+        resolve_original(
+            Path::new("/media/usb/.Trash-1000"),
+            &home_trash,
+            Path::new("docs/a.txt")
+        ),
+        PathBuf::from("/media/usb/docs/a.txt")
+    );
+    assert_eq!(
+        resolve_original(
+            Path::new("/media/usb/.Trash/1000"),
+            &home_trash,
+            Path::new("docs/a.txt")
+        ),
+        PathBuf::from("/media/usb/docs/a.txt")
+    );
+}
 
 #[test]
 fn names_are_checked_against_the_rules() {
@@ -220,38 +715,38 @@ fn request_mapping_refuses_unfilled_context_paths() {
 // Decisions
 // ---------------------------------------------------------------------------
 
-fn conflicts() -> Vec<PathBuf> {
+fn conflicts() -> Vec<ItemKey> {
     vec![
-        PathBuf::from("/tmp/a"),
-        PathBuf::from("/tmp/b"),
-        PathBuf::from("/tmp/c"),
+        ItemKey::path("/tmp/a"),
+        ItemKey::path("/tmp/b"),
+        ItemKey::path("/tmp/c"),
     ]
 }
 
 #[test]
 fn three_conflicts_are_answered_one_by_one() {
     let mut decisions = Decisions::new(conflicts());
-    assert_eq!(decisions.next_unanswered(), Some(Path::new("/tmp/a")));
+    assert_eq!(decisions.next_unanswered(), Some(&ItemKey::path("/tmp/a")));
 
-    decisions.answer(Path::new("/tmp/a"), Decision::Skip, false);
-    assert_eq!(decisions.next_unanswered(), Some(Path::new("/tmp/b")));
+    decisions.answer(ItemKey::path("/tmp/a"), Decision::Skip, false);
+    assert_eq!(decisions.next_unanswered(), Some(&ItemKey::path("/tmp/b")));
 
-    decisions.answer(Path::new("/tmp/b"), Decision::KeepBoth, false);
-    assert_eq!(decisions.next_unanswered(), Some(Path::new("/tmp/c")));
+    decisions.answer(ItemKey::path("/tmp/b"), Decision::KeepBoth, false);
+    assert_eq!(decisions.next_unanswered(), Some(&ItemKey::path("/tmp/c")));
 
-    decisions.answer(Path::new("/tmp/c"), Decision::Replace, false);
+    decisions.answer(ItemKey::path("/tmp/c"), Decision::Replace, false);
     assert_eq!(decisions.next_unanswered(), None);
     assert!(decisions.is_complete());
     assert_eq!(
-        decisions.decision_for(Path::new("/tmp/a")),
+        decisions.decision_for(&ItemKey::path("/tmp/a")),
         Some(Decision::Skip)
     );
     assert_eq!(
-        decisions.decision_for(Path::new("/tmp/b")),
+        decisions.decision_for(&ItemKey::path("/tmp/b")),
         Some(Decision::KeepBoth)
     );
     assert_eq!(
-        decisions.decision_for(Path::new("/tmp/c")),
+        decisions.decision_for(&ItemKey::path("/tmp/c")),
         Some(Decision::Replace)
     );
 }
@@ -259,7 +754,7 @@ fn three_conflicts_are_answered_one_by_one() {
 #[test]
 fn the_first_answer_can_apply_to_all() {
     let mut decisions = Decisions::new(conflicts());
-    decisions.answer(Path::new("/tmp/a"), Decision::KeepBoth, true);
+    decisions.answer(ItemKey::path("/tmp/a"), Decision::KeepBoth, true);
 
     for item in conflicts() {
         assert_eq!(decisions.decision_for(&item), Some(Decision::KeepBoth));
@@ -271,19 +766,19 @@ fn the_first_answer_can_apply_to_all() {
 #[test]
 fn apply_to_all_does_not_overwrite_an_earlier_answer() {
     let mut decisions = Decisions::new(conflicts());
-    decisions.answer(Path::new("/tmp/a"), Decision::Skip, false);
-    decisions.answer(Path::new("/tmp/b"), Decision::Replace, true);
+    decisions.answer(ItemKey::path("/tmp/a"), Decision::Skip, false);
+    decisions.answer(ItemKey::path("/tmp/b"), Decision::Replace, true);
 
     assert_eq!(
-        decisions.decision_for(Path::new("/tmp/a")),
+        decisions.decision_for(&ItemKey::path("/tmp/a")),
         Some(Decision::Skip)
     );
     assert_eq!(
-        decisions.decision_for(Path::new("/tmp/b")),
+        decisions.decision_for(&ItemKey::path("/tmp/b")),
         Some(Decision::Replace)
     );
     assert_eq!(
-        decisions.decision_for(Path::new("/tmp/c")),
+        decisions.decision_for(&ItemKey::path("/tmp/c")),
         Some(Decision::Replace)
     );
 }
@@ -291,14 +786,14 @@ fn apply_to_all_does_not_overwrite_an_earlier_answer() {
 #[test]
 fn cancel_ends_the_questions_at_once() {
     let mut decisions = Decisions::new(conflicts());
-    decisions.answer(Path::new("/tmp/a"), Decision::Skip, false);
-    decisions.answer(Path::new("/tmp/b"), Decision::Cancel, false);
+    decisions.answer(ItemKey::path("/tmp/a"), Decision::Skip, false);
+    decisions.answer(ItemKey::path("/tmp/b"), Decision::Cancel, false);
 
     assert!(decisions.is_cancelled());
     assert!(decisions.is_complete());
     assert_eq!(decisions.next_unanswered(), None);
     assert_eq!(
-        decisions.decision_for(Path::new("/tmp/c")),
+        decisions.decision_for(&ItemKey::path("/tmp/c")),
         None,
         "cancel ends the questions without answering the rest"
     );
@@ -307,7 +802,7 @@ fn cancel_ends_the_questions_at_once() {
 #[test]
 fn decisions_cancel_with_apply_to_all_marks_the_run_cancelled() {
     let mut decisions = Decisions::new(conflicts());
-    decisions.answer(Path::new("/tmp/a"), Decision::Cancel, true);
+    decisions.answer(ItemKey::path("/tmp/a"), Decision::Cancel, true);
     assert!(decisions.is_cancelled());
     assert!(decisions.is_complete());
     assert_eq!(decisions.next_unanswered(), None);
@@ -557,9 +1052,9 @@ fn skip_and_keep_both_are_applied_per_item() {
     });
     assert_eq!(plan.decisions().count(), 2);
 
-    let mut decisions = Decisions::new(plan.decisions().filter_map(|step| step.source.clone()));
-    decisions.answer(&a, Decision::Skip, false);
-    decisions.answer(&b, Decision::KeepBoth, false);
+    let mut decisions = Decisions::new(plan.decisions().filter_map(Step::decision_key));
+    decisions.answer(key(&a), Decision::Skip, false);
+    decisions.answer(key(&b), Decision::KeepBoth, false);
     let report = operations
         .execute(&plan, &decisions, &cancellable, |_| {})
         .unwrap();
@@ -590,7 +1085,10 @@ fn unanswered_conflicts_refuse_the_whole_operation_and_name_the_items() {
         .execute(&plan, &Decisions::new(Vec::new()), &cancellable, |_| {})
         .unwrap_err();
 
-    assert_eq!(error, ExecuteError::UnansweredConflicts(vec![source]));
+    assert_eq!(
+        error,
+        ExecuteError::UnansweredConflicts(vec![ItemKey::path(source)])
+    );
     assert!(error.to_string().contains("/tmp/gimbal-p2f-"));
     assert_eq!(read(&destination.join("a.txt")), "old");
 }
@@ -611,7 +1109,7 @@ fn a_cancel_decision_runs_nothing() {
         to: destination.clone(),
     });
     let mut decisions = Decisions::from_plan(&plan);
-    decisions.answer(&source, Decision::Cancel, false);
+    decisions.answer(key(&source), Decision::Cancel, false);
 
     let report = operations
         .execute(&plan, &decisions, &cancellable, |_| {})
@@ -642,8 +1140,8 @@ fn a_cancel_partway_still_runs_nothing() {
         to: destination.clone(),
     });
     let mut decisions = Decisions::from_plan(&plan);
-    decisions.answer(&a, Decision::Skip, false);
-    decisions.answer(&b, Decision::Cancel, false);
+    decisions.answer(key(&a), Decision::Skip, false);
+    decisions.answer(key(&b), Decision::Cancel, false);
 
     let report = operations
         .execute(&plan, &decisions, &cancellable, |_| {})
@@ -995,6 +1493,297 @@ fn trashinfo_reports_a_missing_key_header_or_bad_value() {
         trashinfo::parse("[Trash Info]\nPath=/tmp/a\nDeletionDate=yesterday\n").unwrap_err(),
         trashinfo::TrashInfoError::BadDate(_)
     ));
+}
+
+#[test]
+fn empty_refuses_a_reused_uri_with_unknown_metadata() {
+    let _scratch = Scratch::new("review-empty-reuse");
+    let item = trash_item_with_revision("trash:///a.txt", None, None, None);
+    let backend = TestTrash::with(vec![item]);
+    let mut operations = FileOperations::with_trash_backend(Box::new(backend.clone()));
+    let plan = operations.plan(&Request::EmptyTrash);
+    let confirmation = EmptyConfirmation::for_plan(&plan).unwrap();
+
+    // A later object at the same URI with the same (missing) metadata and no
+    // object evidence, exactly like a backend that cannot prove sameness.
+    backend.state.lock().unwrap().items[0] =
+        trash_item_with_revision("trash:///a.txt", None, None, None);
+
+    let report = operations
+        .execute_empty(&plan, confirmation, &gio::Cancellable::new(), |_| {})
+        .unwrap();
+    assert_eq!(
+        report.items[0].outcome,
+        ItemOutcome::Refused("Cannot verify this Trash item is unchanged".to_string())
+    );
+    assert!(backend.deleted().is_empty());
+    assert_eq!(backend.remaining(), vec!["trash:///a.txt"]);
+}
+
+#[test]
+fn restore_conflicts_with_same_original_need_separate_answers() {
+    let scratch = Scratch::new("review-restore-same-original");
+    let folder = scratch.join("folder");
+    fs::create_dir_all(&folder).unwrap();
+    let target = folder.join("same.txt");
+    write(&target, "existing");
+    let first = trash_item("trash:///first.txt", Some(&target), None);
+    let second = trash_item("trash:///second.txt", Some(&target), None);
+    let (operations, _) = restored_operations(&scratch, vec![first.clone(), second.clone()]);
+
+    let plan = operations.plan(&Request::Restore {
+        items: vec![first.identity().clone(), second.identity().clone()],
+    });
+    assert_eq!(plan.decisions().count(), 2);
+    let mut decisions = Decisions::from_plan(&plan);
+    let first_key = decisions.next_unanswered().unwrap().clone();
+    decisions.answer(first_key, Decision::Skip, false);
+    assert!(
+        decisions.next_unanswered().is_some(),
+        "the second trashed version still needs its own answer"
+    );
+}
+
+#[test]
+fn a_new_object_with_the_same_uri_and_metadata_survives_empty() {
+    let scratch = Scratch::new("empty-same-metadata-new-object");
+    let original = scratch.join("same.txt");
+    let item = trash_item_with_revision(
+        "trash:///same.txt",
+        Some(&original),
+        Some(1_700_000_000),
+        Some("generation-1"),
+    );
+    let backend = TestTrash::with(vec![item]);
+    let mut operations = FileOperations::with_trash_backend(Box::new(backend.clone()));
+    let plan = operations.plan(&Request::EmptyTrash);
+    let confirmation = EmptyConfirmation::for_plan(&plan).unwrap();
+
+    backend.state.lock().unwrap().items[0] = trash_item_with_revision(
+        "trash:///same.txt",
+        Some(&original),
+        Some(1_700_000_000),
+        Some("generation-2"),
+    );
+    let report = operations
+        .execute_empty(&plan, confirmation, &gio::Cancellable::new(), |_| {})
+        .unwrap();
+    assert_eq!(
+        report.items[0].outcome,
+        ItemOutcome::Refused("the item changed in the trash".to_string())
+    );
+    assert!(backend.deleted().is_empty());
+    assert_eq!(backend.remaining(), vec!["trash:///same.txt"]);
+}
+
+#[test]
+fn a_lost_object_token_is_refused_before_permanent_deletion() {
+    let scratch = Scratch::new("empty-token-loss");
+    let original = scratch.join("a.txt");
+    let item = trash_item_with_revision(
+        "trash:///a.txt",
+        Some(&original),
+        None,
+        Some("generation-1"),
+    );
+    let backend = TestTrash::with(vec![item]);
+    let mut operations = FileOperations::with_trash_backend(Box::new(backend.clone()));
+    let plan = operations.plan(&Request::EmptyTrash);
+    let confirmation = EmptyConfirmation::for_plan(&plan).unwrap();
+
+    backend.state.lock().unwrap().items[0] =
+        trash_item_with_revision("trash:///a.txt", Some(&original), None, None);
+    let report = operations
+        .execute_empty(&plan, confirmation, &gio::Cancellable::new(), |_| {})
+        .unwrap();
+    assert_eq!(
+        report.items[0].outcome,
+        ItemOutcome::Refused("the item changed in the trash".to_string())
+    );
+    assert!(backend.deleted().is_empty());
+}
+
+#[test]
+fn a_missing_display_date_with_a_stable_token_still_deletes() {
+    let scratch = Scratch::new("empty-missing-date");
+    let item = trash_item_with_revision(
+        "trash:///a.txt",
+        Some(&scratch.join("a.txt")),
+        None,
+        Some("generation-1"),
+    );
+    let backend = TestTrash::with(vec![item]);
+    let mut operations = FileOperations::with_trash_backend(Box::new(backend.clone()));
+    let plan = operations.plan(&Request::EmptyTrash);
+    let confirmation = EmptyConfirmation::for_plan(&plan).unwrap();
+    let report = operations
+        .execute_empty(&plan, confirmation, &gio::Cancellable::new(), |_| {})
+        .unwrap();
+    assert!(report.all_succeeded(), "{:?}", report.lines());
+    assert_eq!(backend.deleted(), vec!["trash:///a.txt"]);
+}
+
+#[test]
+fn a_confirmation_for_an_older_plan_is_refused() {
+    let scratch = Scratch::new("empty-stale-confirmation");
+    let original = scratch.join("a.txt");
+    let item = trash_item_with_revision(
+        "trash:///a.txt",
+        Some(&original),
+        Some(1_700_000_000),
+        Some("generation-1"),
+    );
+    let backend = TestTrash::with(vec![item]);
+    let mut operations = FileOperations::with_trash_backend(Box::new(backend.clone()));
+    let old_plan = operations.plan(&Request::EmptyTrash);
+    let old_confirmation = EmptyConfirmation::for_plan(&old_plan).unwrap();
+
+    backend.state.lock().unwrap().items[0] = trash_item_with_revision(
+        "trash:///a.txt",
+        Some(&original),
+        Some(1_700_000_000),
+        Some("generation-2"),
+    );
+    let new_plan = operations.plan(&Request::EmptyTrash);
+    assert_eq!(
+        operations
+            .execute_empty(
+                &new_plan,
+                old_confirmation,
+                &gio::Cancellable::new(),
+                |_| {}
+            )
+            .unwrap_err(),
+        ExecuteError::ConfirmationMismatch
+    );
+    assert!(backend.deleted().is_empty());
+}
+
+#[test]
+fn restore_same_original_skip_then_keep_both_without_apply_all() {
+    let scratch = Scratch::new("restore-same-original-skip-keep");
+    let folder = scratch.join("folder");
+    fs::create_dir_all(&folder).unwrap();
+    let target = folder.join("same.txt");
+    write(&target, "existing");
+    let first = trash_item("trash:///first.txt", Some(&target), None);
+    let second = trash_item("trash:///second.txt", Some(&target), None);
+    let (mut operations, backend) =
+        restored_operations(&scratch, vec![first.clone(), second.clone()]);
+    let plan = operations.plan(&Request::Restore {
+        items: vec![first.identity().clone(), second.identity().clone()],
+    });
+    assert_eq!(plan.decisions().count(), 2);
+
+    let mut decisions = Decisions::from_plan(&plan);
+    let first_key = decisions.next_unanswered().unwrap().clone();
+    assert_eq!(first_key, ItemKey::Trash(first.uri().clone()));
+    decisions.answer(first_key, Decision::Skip, false);
+    let second_key = decisions.next_unanswered().unwrap().clone();
+    assert_eq!(second_key, ItemKey::Trash(second.uri().clone()));
+    decisions.answer(second_key, Decision::KeepBoth, false);
+
+    let report = operations
+        .execute(&plan, &decisions, &gio::Cancellable::new(), |_| {})
+        .unwrap();
+    assert!(report.all_succeeded(), "{:?}", report.lines());
+    assert_eq!(read(&target), "existing");
+    assert_eq!(read(&folder.join("same (copy).txt")), "restored second.txt");
+    assert_eq!(backend.remaining(), vec!["trash:///first.txt"]);
+}
+
+#[test]
+fn restore_earlier_skip_then_apply_all_keep_both_preserves_it() {
+    let scratch = Scratch::new("restore-same-original-apply-all");
+    let folder = scratch.join("folder");
+    fs::create_dir_all(&folder).unwrap();
+    let target = folder.join("same.txt");
+    write(&target, "existing");
+    let first = trash_item("trash:///first.txt", Some(&target), None);
+    let second = trash_item("trash:///second.txt", Some(&target), None);
+    let (mut operations, backend) =
+        restored_operations(&scratch, vec![first.clone(), second.clone()]);
+    let plan = operations.plan(&Request::Restore {
+        items: vec![first.identity().clone(), second.identity().clone()],
+    });
+
+    let mut decisions = Decisions::from_plan(&plan);
+    let first_key = decisions.next_unanswered().unwrap().clone();
+    decisions.answer(first_key, Decision::Skip, false);
+    let second_key = decisions.next_unanswered().unwrap().clone();
+    decisions.answer(second_key, Decision::KeepBoth, true);
+
+    let report = operations
+        .execute(&plan, &decisions, &gio::Cancellable::new(), |_| {})
+        .unwrap();
+    assert!(report.all_succeeded(), "{:?}", report.lines());
+    assert_eq!(report.items[0].outcome, ItemOutcome::Skipped);
+    assert_eq!(read(&folder.join("same (copy).txt")), "restored second.txt");
+    assert_eq!(backend.remaining(), vec!["trash:///first.txt"]);
+}
+
+#[test]
+fn restore_distinct_replace_answers_apply_to_their_own_items() {
+    let scratch = Scratch::new("restore-distinct-replace");
+    let folder = scratch.join("folder");
+    fs::create_dir_all(&folder).unwrap();
+    let first_target = folder.join("first.txt");
+    let second_target = folder.join("second.txt");
+    write(&first_target, "old first");
+    write(&second_target, "old second");
+    let first = trash_item("trash:///first.txt", Some(&first_target), None);
+    let second = trash_item("trash:///second.txt", Some(&second_target), None);
+    let (operations, _) = restored_operations(&scratch, vec![first.clone(), second.clone()]);
+    let plan = operations.plan(&Request::Restore {
+        items: vec![first.identity().clone(), second.identity().clone()],
+    });
+
+    let mut decisions = Decisions::from_plan(&plan);
+    let first_key = decisions.next_unanswered().unwrap().clone();
+    decisions.answer(first_key.clone(), Decision::Replace, false);
+    let second_key = decisions.next_unanswered().unwrap().clone();
+    decisions.answer(second_key.clone(), Decision::Skip, false);
+
+    assert_eq!(first_key, ItemKey::Trash(first.identity().uri().clone()));
+    assert_eq!(second_key, ItemKey::Trash(second.identity().uri().clone()));
+    assert_eq!(decisions.decision_for(&first_key), Some(Decision::Replace));
+    assert_eq!(decisions.decision_for(&second_key), Some(Decision::Skip));
+    assert_eq!(plan.steps()[0].target, Some(first_target));
+    assert_eq!(plan.steps()[1].target, Some(second_target));
+    // The executor's Replace path trashes the existing target through GIO,
+    // which is exercised in tests/trash_browser.rs under scratch XDG data.
+}
+
+#[test]
+fn restore_same_original_cancel_after_skip_runs_nothing() {
+    let scratch = Scratch::new("restore-same-original-cancel");
+    let folder = scratch.join("folder");
+    fs::create_dir_all(&folder).unwrap();
+    let target = folder.join("same.txt");
+    write(&target, "existing");
+    let first = trash_item("trash:///first.txt", Some(&target), None);
+    let second = trash_item("trash:///second.txt", Some(&target), None);
+    let (mut operations, backend) =
+        restored_operations(&scratch, vec![first.clone(), second.clone()]);
+    let plan = operations.plan(&Request::Restore {
+        items: vec![first.identity().clone(), second.identity().clone()],
+    });
+
+    let mut decisions = Decisions::from_plan(&plan);
+    let first_key = decisions.next_unanswered().unwrap().clone();
+    decisions.answer(first_key, Decision::Skip, false);
+    let second_key = decisions.next_unanswered().unwrap().clone();
+    decisions.answer(second_key, Decision::Cancel, false);
+
+    let report = operations
+        .execute(&plan, &decisions, &gio::Cancellable::new(), |_| {})
+        .unwrap();
+    assert!(report.cancelled);
+    assert_eq!(read(&target), "existing");
+    assert_eq!(
+        backend.remaining(),
+        vec!["trash:///first.txt", "trash:///second.txt"]
+    );
 }
 
 #[test]

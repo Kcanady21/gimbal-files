@@ -43,6 +43,7 @@ struct Queued {
     request: Request,
     window: WindowId,
     clear_clipboard: bool,
+    dry_run: bool,
 }
 
 struct Current {
@@ -109,6 +110,7 @@ impl FileOps {
             request,
             window,
             clear_clipboard,
+            dry_run: false,
         };
         let idle = self.current.borrow().is_none();
         if idle {
@@ -125,6 +127,28 @@ impl FileOps {
         id
     }
 
+    /// Queue a read-only dry run on the worker. `trash.empty` planning lists
+    /// the trash, so it must not run on the GTK main thread.
+    pub fn submit_dry_run(self: &Rc<Self>, window: WindowId, request: Request) -> u64 {
+        let id = self.next_id.get() + 1;
+        self.next_id.set(id);
+        let job = Queued {
+            id,
+            request,
+            window,
+            clear_clipboard: false,
+            dry_run: true,
+        };
+        let idle = self.current.borrow().is_none();
+        if idle {
+            self.start(job);
+        } else {
+            self.queue.borrow_mut().push_back(job);
+        }
+        self.ensure_poll();
+        id
+    }
+
     fn start(self: &Rc<Self>, job: Queued) {
         let cancellable = gio::Cancellable::new();
         if self
@@ -133,6 +157,7 @@ impl FileOps {
                 id: job.id,
                 request: job.request.clone(),
                 cancellable: cancellable.clone(),
+                dry_run: job.dry_run,
             })
             .is_err()
         {
@@ -247,7 +272,24 @@ impl FileOps {
                     current.window
                 };
                 let conflicts = plan.decisions().count();
-                if conflicts == 0 {
+                if plan.request() == &Request::EmptyTrash {
+                    if plan.steps().is_empty() {
+                        crate::log!("fileops", "empty job {id} has nothing to confirm");
+                        self.cancel_current();
+                        return;
+                    }
+                    if let Some(current) = self.current.borrow_mut().as_mut() {
+                        current.answering = true;
+                    }
+                    if let Some(process) = self.process.borrow().upgrade() {
+                        crate::log!(
+                            "fileops",
+                            "empty confirmation for job {id}: {} item(s)",
+                            plan.steps().len()
+                        );
+                        process.fileop_empty_confirmation(window, id, plan.clone());
+                    }
+                } else if conflicts == 0 {
                     self.answer(id, Decisions::from_plan(&plan));
                 } else if let Some(process) = self.process.borrow().upgrade() {
                     crate::log!("fileops", "{conflicts} conflict(s) need a decision");
@@ -356,6 +398,23 @@ impl FileOps {
                 }
                 self.start_next();
             }
+            worker::WorkerEvent::DryRunReady { id, request, lines } => {
+                let current = {
+                    let mut slot = self.current.borrow_mut();
+                    match slot.as_ref() {
+                        Some(current) if current.id == id => slot.take(),
+                        _ => None,
+                    }
+                };
+                let Some(current) = current else {
+                    return;
+                };
+                if let Some(process) = self.process.borrow().upgrade() {
+                    crate::log!("fileops", "dry run job {id}: {}", lines.join(" | "));
+                    process.fileop_dry_run(current.window, &request, &lines);
+                }
+                self.start_next();
+            }
             worker::WorkerEvent::UndoState { summary, lines } => {
                 crate::log!(
                     "fileops",
@@ -401,6 +460,21 @@ impl FileOps {
             .send(worker::WorkerMsg::Answer { id, decisions });
     }
 
+    /// The destructive dialog returned Empty Trash. The worker revalidates
+    /// the immutable plan before deleting anything.
+    pub fn confirm_empty(self: &Rc<Self>, id: u64) {
+        {
+            let mut slot = self.current.borrow_mut();
+            if let Some(current) = slot.as_mut()
+                && current.id == id
+            {
+                current.answering = false;
+            }
+        }
+        crate::log!("fileops", "confirmed empty trash job {id}");
+        let _ = self.control.send(worker::WorkerMsg::ConfirmEmpty { id });
+    }
+
     /// Cancel the running job. Whatever finished stays done; the rest is
     /// reported as cancelled.
     pub fn cancel_current(self: &Rc<Self>) {
@@ -412,6 +486,32 @@ impl FileOps {
             current.cancellable.cancel();
             current.id
         };
+        crate::log!("fileops", "cancelled job {id}");
+        let _ = self.control.send(worker::WorkerMsg::Cancel { id });
+    }
+
+    /// Cancel one exact job. A page that leaves while its confirmation is open
+    /// uses this so it never cancels another window's current job. A job that
+    /// is not current is left alone rather than sending a `Cancel` the worker
+    /// would skip while waiting for that job's answer.
+    pub fn cancel_job(self: &Rc<Self>, id: u64) {
+        let cancel = {
+            let current = self.current.borrow();
+            match current.as_ref() {
+                Some(current) if current.id == id => {
+                    current.cancellable.cancel();
+                    true
+                }
+                _ => false,
+            }
+        };
+        if !cancel {
+            crate::log!(
+                "fileops",
+                "job {id} is no longer current; not cancelling it"
+            );
+            return;
+        }
         crate::log!("fileops", "cancelled job {id}");
         let _ = self.control.send(worker::WorkerMsg::Cancel { id });
     }

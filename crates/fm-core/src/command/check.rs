@@ -8,9 +8,10 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use super::{
-    ArgKind, ArgSpec, Caller, CommandSpec, Effect, Number, Registry, Value, format_hundredths,
-    must_supply,
+    ArgKind, ArgSpec, Caller, CommandSpec, Effect, Number, Registry, Value, caller_allowed,
+    format_hundredths, must_supply,
 };
+use crate::fileops::TrashUri;
 
 /// A command name and its `key=value` tokens, already split by the caller.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -122,6 +123,11 @@ impl fmt::Display for CheckedCommand {
                         write!(f, " {}={}", argument.name, path.display())?;
                     }
                 }
+                Value::TrashItems(items) => {
+                    for item in items {
+                        write!(f, " {}={}", argument.name, item.as_str())?;
+                    }
+                }
                 value => write!(f, " {}={}", argument.name, value)?,
             }
         }
@@ -141,6 +147,10 @@ pub enum CommandErrorKind {
     /// The argument may only come from context, and this caller may not use
     /// context for it.
     ForbiddenFromContext {
+        caller: Caller,
+    },
+    /// Emptying the trash is only a UI action.
+    ForbiddenCaller {
         caller: Caller,
     },
     DuplicateArgument,
@@ -224,6 +234,10 @@ impl CommandError {
             Some(argument),
             CommandErrorKind::ForbiddenFromContext { caller },
         )
+    }
+
+    fn forbidden_caller(command: &str, caller: Caller) -> Self {
+        Self::new(command, None, CommandErrorKind::ForbiddenCaller { caller })
     }
 
     fn duplicate_argument(command: &str, argument: &str) -> Self {
@@ -323,6 +337,9 @@ impl fmt::Display for CommandError {
                         f,
                         "missing; the {caller} caller may not fill a Files path from context"
                     ),
+                    CommandErrorKind::ForbiddenCaller { caller } => {
+                        write!(f, "the {caller} caller may not run this command")
+                    }
                     CommandErrorKind::DuplicateArgument => f.write_str("given more than once"),
                     CommandErrorKind::BadValue { value, reason } => {
                         write!(f, "bad value `{value}`: {reason}")
@@ -368,6 +385,10 @@ pub(super) fn validate(
 
     let defined = spec.arguments();
 
+    if !caller_allowed(spec.name, spec.effect, caller) {
+        return Err(CommandError::forbidden_caller(name, caller));
+    }
+
     for (key, _) in invocation.arguments() {
         if !defined.iter().any(|argument| argument.name == key) {
             return Err(CommandError::unknown_argument(name, key));
@@ -380,7 +401,7 @@ pub(super) fn validate(
             .iter()
             .filter(|(key, _)| key == argument.name)
             .count();
-        if count > 1 && !matches!(argument.kind, ArgKind::Paths) {
+        if count > 1 && !matches!(argument.kind, ArgKind::Paths | ArgKind::TrashItems) {
             return Err(CommandError::duplicate_argument(name, argument.name));
         }
     }
@@ -393,10 +414,23 @@ pub(super) fn validate(
             .filter(|(key, _)| key == argument.name)
             .map(|(_, value)| value.as_str());
 
-        let value = if matches!(argument.kind, ArgKind::Paths) {
+        let value = if matches!(argument.kind, ArgKind::Paths | ArgKind::TrashItems) {
             let values: Vec<&str> = supplied.collect();
             if values.is_empty() {
                 None
+            } else if argument.kind == ArgKind::TrashItems {
+                let mut items = Vec::with_capacity(values.len());
+                for value in values {
+                    items.push(TrashUri::parse(value).map_err(|error| {
+                        CommandError::bad_value(
+                            name,
+                            argument.name,
+                            value,
+                            format!("expected a trash item URI: {error}"),
+                        )
+                    })?);
+                }
+                Some(Value::TrashItems(items))
             } else {
                 let mut paths = Vec::with_capacity(values.len());
                 for value in values {
@@ -458,6 +492,16 @@ fn parse_value(command: &str, argument: &ArgSpec, text: &str) -> Result<Value, C
     match argument.kind {
         ArgKind::Path => parse_path(command, argument, text).map(Value::Path),
         ArgKind::Paths => parse_path(command, argument, text).map(|path| Value::Paths(vec![path])),
+        ArgKind::TrashItems => TrashUri::parse(text)
+            .map(|uri| Value::TrashItems(vec![uri]))
+            .map_err(|error| {
+                CommandError::bad_value(
+                    command,
+                    argument.name,
+                    text,
+                    format!("expected a trash item URI: {error}"),
+                )
+            }),
         ArgKind::Int { min, max } => {
             let value: i64 = text.parse().map_err(|_| {
                 CommandError::bad_value(command, argument.name, text, "expected an integer")

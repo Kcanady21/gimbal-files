@@ -83,6 +83,13 @@ const REQUIRED_DESTINATION: ArgSpec = ArgSpec {
     default: None,
 };
 
+const TRASH_ITEMS: ArgSpec = ArgSpec {
+    name: "items",
+    kind: ArgKind::TrashItems,
+    presence: Presence::Required,
+    default: None,
+};
+
 /// The V1 catalogue, in the order menus and `gimbal-files-cli commands` show
 /// it. Do not add or drop commands here without Kyle's review.
 pub const COMMANDS: &[CommandSpec] = &[
@@ -357,6 +364,22 @@ pub const COMMANDS: &[CommandSpec] = &[
         name: "trash.open",
         summary: "Open the trash.",
         effect: Effect::View,
+        undo: false,
+        arguments: &[],
+    },
+    CommandSpec {
+        name: "trash.restore",
+        summary: "Restore trash items to their original locations.",
+        effect: Effect::Files,
+        undo: true,
+        arguments: &[TRASH_ITEMS],
+    },
+    // Kyle approved permanent emptying on Nov 2. It stays an explicitly
+    // clicked UI operation: the registry refuses every other caller.
+    CommandSpec {
+        name: "trash.empty",
+        summary: "Permanently delete the confirmed trash snapshot.",
+        effect: Effect::Files,
         undo: false,
         arguments: &[],
     },

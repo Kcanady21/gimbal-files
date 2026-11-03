@@ -24,6 +24,8 @@ pub enum OpKind {
     Move,
     Rename,
     NewFolder,
+    Restore,
+    EmptyTrash,
     Undo,
 }
 
@@ -35,6 +37,8 @@ impl OpKind {
             Request::Move { .. } => OpKind::Move,
             Request::Rename { .. } => OpKind::Rename,
             Request::NewFolder { .. } => OpKind::NewFolder,
+            Request::Restore { .. } => OpKind::Restore,
+            Request::EmptyTrash => OpKind::EmptyTrash,
             Request::Undo => OpKind::Undo,
         }
     }
@@ -46,6 +50,8 @@ impl OpKind {
             OpKind::Move => "Moving",
             OpKind::Rename => "Renaming",
             OpKind::NewFolder => "Creating a folder",
+            OpKind::Restore => "Restoring",
+            OpKind::EmptyTrash => "Deleting",
             OpKind::Undo => "Undoing",
         }
     }
@@ -213,15 +219,41 @@ pub fn summary(request: &Request, report: &Report) -> String {
                 format!("Created 0 of 1 folder{}", tail(counts))
             }
         }
+        Request::Restore { .. } => {
+            if counts.not_done() == 0 {
+                format!("Restored {}", items(counts.done))
+            } else {
+                format!("Restored {} of {}{}", counts.done, total, tail(counts))
+            }
+        }
+        Request::EmptyTrash => {
+            if counts.done == 0 && report.cancelled {
+                "Emptying Trash cancelled".to_string()
+            } else if counts.not_done() == 0 {
+                format!("Emptied Trash: {} permanently deleted", items(counts.done))
+            } else {
+                format!("Deleted {} of {}{}", counts.done, total, tail(counts))
+            }
+        }
         Request::Undo => "Undid the last file operation".to_string(),
     }
 }
 
 fn name_of(item: &fm_core::fileops::ItemResult) -> String {
+    if let Some(trash) = &item.trash {
+        return trash.uri().as_str().to_string();
+    }
     item.source
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| item.source.display().to_string())
+}
+
+fn subject_of(item: &fm_core::fileops::ItemResult) -> String {
+    if let Some(trash) = &item.trash {
+        return trash.uri().as_str().to_string();
+    }
+    item.source.display().to_string()
 }
 
 /// One line per item that did not succeed, for the details dialog.
@@ -231,7 +263,7 @@ pub fn failure_lines(report: &Report) -> Vec<String> {
         .iter()
         .filter_map(|item| match &item.outcome {
             ItemOutcome::Failed(reason) | ItemOutcome::Refused(reason) => {
-                Some(format!("{}: {reason}", item.source.display()))
+                Some(format!("{}: {reason}", subject_of(item)))
             }
             _ => None,
         })
@@ -254,7 +286,7 @@ pub fn undo_summary(plan: &Plan) -> Option<String> {
             Action::Trash => trash += 1,
             Action::Move => moves += 1,
             Action::Rename => renames += 1,
-            Action::Copy | Action::NewFolder => {}
+            Action::Copy | Action::NewFolder | Action::Empty => {}
         }
     }
 
@@ -322,6 +354,7 @@ mod tests {
                     target: Some(std::path::PathBuf::from(format!(
                         "/tmp/dst/file{index}.txt"
                     ))),
+                    trash: None,
                     outcome: outcome.clone(),
                 })
                 .collect(),
@@ -431,6 +464,46 @@ mod tests {
             "Copied 2 items"
         );
 
+        let restore = Request::Restore { items: Vec::new() };
+        assert_eq!(
+            summary(
+                &restore,
+                &report(&[ItemOutcome::Done, ItemOutcome::Done, ItemOutcome::Done])
+            ),
+            "Restored 3 items"
+        );
+        assert_eq!(
+            summary(
+                &restore,
+                &report(&[
+                    ItemOutcome::Done,
+                    ItemOutcome::Done,
+                    ItemOutcome::Failed("the original path is taken".into())
+                ])
+            ),
+            "Restored 2 of 3: 1 failed"
+        );
+
+        let empty = Request::EmptyTrash;
+        assert_eq!(
+            summary(
+                &empty,
+                &report(&[ItemOutcome::Done, ItemOutcome::Done, ItemOutcome::Done])
+            ),
+            "Emptied Trash: 3 items permanently deleted"
+        );
+        assert_eq!(
+            summary(
+                &empty,
+                &report(&[
+                    ItemOutcome::Done,
+                    ItemOutcome::Done,
+                    ItemOutcome::Failed("no permission".into())
+                ])
+            ),
+            "Deleted 2 of 3: 1 failed"
+        );
+
         let rename = Request::Rename {
             path: std::path::PathBuf::from("/tmp/a"),
             name: "b".into(),
@@ -457,6 +530,7 @@ mod tests {
                 action: Action::NewFolder,
                 source: std::path::PathBuf::from("/tmp"),
                 target: Some(std::path::PathBuf::from("/tmp/new")),
+                trash: None,
                 outcome: ItemOutcome::Done,
             }],
         };

@@ -12,7 +12,7 @@
 use std::ffi::OsString;
 use std::fmt;
 use std::os::unix::ffi::OsStringExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// One parsed `.trashinfo` file.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -80,6 +80,29 @@ impl fmt::Display for TrashInfoError {
 }
 
 impl std::error::Error for TrashInfoError {}
+
+/// Resolve a `.trashinfo` `Path` against its trash directory. A top-directory
+/// trash stores the original path relative to the mount's top directory; the
+/// home trash stores it absolute. The `$topdir/.Trash/$uid` form has one extra
+/// path component, so its top directory is two levels up, not one.
+pub fn resolve_original(trash_dir: &Path, home_trash: &Path, path: &Path) -> PathBuf {
+    if path.is_absolute() || trash_dir == home_trash {
+        return path.to_path_buf();
+    }
+
+    let under_dot_trash = trash_dir.file_name().and_then(|name| name.to_str()) == Some(".Trash")
+        || trash_dir
+            .parent()
+            .and_then(Path::file_name)
+            .and_then(|name| name.to_str())
+            == Some(".Trash");
+    let topdir = if under_dot_trash {
+        trash_dir.parent().and_then(Path::parent)
+    } else {
+        trash_dir.parent()
+    };
+    topdir.map_or_else(|| path.to_path_buf(), |topdir| topdir.join(path))
+}
 
 /// Parse one `.trashinfo` file.
 pub fn parse(text: &str) -> Result<TrashInfo, TrashInfoError> {

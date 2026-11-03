@@ -345,7 +345,16 @@ impl Header {
         let Some(window) = ui.workspace_window() else {
             return;
         };
-        let view = view(&window);
+        let mut view = view(&window);
+        let trash = ui.trash_active();
+        if trash {
+            // The hidden folder is not the current view. Back remains useful
+            // as Back to Files; path, Up and Forward are unsupported here.
+            view.folder = PathBuf::from("Trash");
+            view.can_back = true;
+            view.can_forward = false;
+            view.can_up = false;
+        }
         let collapsed = self.update_layout(&view);
 
         let groups: Vec<_> = window.pills.clone();
@@ -379,7 +388,7 @@ impl Header {
             self.strip.put(&widget, index as f64 * pitch, 0.0);
             self.pills.borrow_mut().push(widget);
         }
-        self.update_text(&view);
+        self.update_text(&view, trash);
         self.animate_group.set(None);
         crate::log!(
             "header",
@@ -426,22 +435,36 @@ impl Header {
             return;
         };
         let view = view(&window);
+        let trash = ui.trash_active();
         let was = self.overflow.get();
         let now = self.update_layout(&view);
         if was != now {
             self.rebuild(&ui, false);
         } else {
-            self.update_text(&view);
+            self.update_text(&view, trash);
         }
     }
 
-    fn update_text(&self, view: &HeaderView) {
-        if !self.path_entry.has_focus() && !self.path.has_css_class("invalid") {
-            self.path_entry.set_text(&view.folder.display().to_string());
+    fn update_text(&self, view: &HeaderView, trash: bool) {
+        let shown = if trash {
+            "Trash".to_string()
+        } else {
+            view.folder.display().to_string()
+        };
+        if trash {
+            self.path.remove_css_class("invalid");
+            self.path_entry.set_text(&shown);
+        } else if !self.path_entry.has_focus() && !self.path.has_css_class("invalid") {
+            self.path_entry.set_text(&shown);
         }
-        self.back.set_sensitive(view.can_back);
-        self.forward.set_sensitive(view.can_forward);
-        self.up.set_sensitive(view.can_up);
+        self.path_entry.set_editable(!trash);
+        self.path_entry.set_can_focus(!trash);
+        self.back
+            .set_tooltip_text(Some(if trash { "Back to Files" } else { "Back" }));
+        self.back
+            .set_sensitive(if trash { true } else { view.can_back });
+        self.forward.set_sensitive(view.can_forward && !trash);
+        self.up.set_sensitive(view.can_up && !trash);
     }
 
     pub fn dismiss_empty_search(self: &Rc<Self>) {
@@ -451,6 +474,14 @@ impl Header {
     }
 
     pub fn focus_path(&self) {
+        if self
+            .ui
+            .borrow()
+            .upgrade()
+            .is_some_and(|ui| ui.trash_active())
+        {
+            return;
+        }
         self.path_entry.grab_focus();
         self.path_entry.select_region(0, -1);
     }
@@ -519,6 +550,10 @@ impl Header {
             && window.selection.selected.iter().any(|selected| *selected)
         {
             ui.clear_pill_selection();
+            return glib::Propagation::Stop;
+        }
+        if ui.trash_active() {
+            ui.dispatch(Caller::Ui, Invocation::new("nav.back", Vec::new()));
             return glib::Propagation::Stop;
         }
         glib::Propagation::Proceed
@@ -954,6 +989,10 @@ impl Header {
     }
 
     fn path_enter(self: &Rc<Self>, ui: &Rc<WindowUi>) {
+        if ui.trash_active() {
+            self.path_entry.set_text("Trash");
+            return;
+        }
         let raw = self.path_entry.text().to_string();
         let text = raw.trim();
         if text.is_empty() {
@@ -994,6 +1033,10 @@ impl Header {
 
     fn sync_path(&self, ui: &Rc<WindowUi>) {
         if self.path.has_css_class("invalid") {
+            return;
+        }
+        if ui.trash_active() {
+            self.path_entry.set_text("Trash");
             return;
         }
         if let Some(window) = ui.workspace_window() {
@@ -1168,7 +1211,12 @@ impl Header {
         let header_trash = self.clone();
         self.trash.connect_clicked(move |_| {
             if let Some(ui) = header_trash.window_ui() {
-                ui.dispatch(Caller::Ui, Invocation::new("trash.open", Vec::new()));
+                let command = if ui.trash_active() {
+                    "nav.back"
+                } else {
+                    "trash.open"
+                };
+                ui.dispatch(Caller::Ui, Invocation::new(command, Vec::new()));
             }
         });
         if let Some(process) = ui.process_upgrade() {

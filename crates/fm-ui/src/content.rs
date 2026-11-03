@@ -30,6 +30,7 @@ pub struct Content {
     placeholder: gtk::Label,
     folder: Rc<FolderView>,
     split: SplitView,
+    rule: gtk::Box,
     status: Rc<StatusLine>,
     progress_row: gtk::Box,
     progress_label: gtk::Label,
@@ -40,6 +41,9 @@ pub struct Content {
     /// Set by nav.back/forward so the next folder change restores its anchor.
     restore_anchor: Cell<bool>,
     split_shown: Cell<bool>,
+    /// Transient presentation state. This is deliberately not in the model:
+    /// a session restore always comes back to an ordinary folder page.
+    trash_active: Cell<bool>,
     summary_gen: Rc<Cell<u64>>,
     last_failures: Rc<RefCell<Option<String>>>,
 }
@@ -134,6 +138,7 @@ impl Content {
             placeholder,
             folder,
             split,
+            rule,
             status,
             progress_row,
             progress_label,
@@ -143,6 +148,7 @@ impl Content {
             displayed_tab: Cell::new(None),
             restore_anchor: Cell::new(false),
             split_shown: Cell::new(false),
+            trash_active: Cell::new(false),
             summary_gen: Rc::new(Cell::new(0)),
             last_failures,
         });
@@ -152,6 +158,38 @@ impl Content {
 
     pub fn widget(&self) -> &gtk::Box {
         &self.root
+    }
+
+    /// Install the one Trash page in this window's central stack. The normal
+    /// folder and split pages stay parented below it, so switching back does
+    /// not rebuild their focus, scroll or selection.
+    pub fn add_trash_page(&self, page: &impl IsA<gtk::Widget>) {
+        if self.stack.child_by_name("trash").is_none() {
+            self.stack.add_named(page, Some("trash"));
+        }
+    }
+
+    pub fn show_trash(&self) {
+        self.trash_active.set(true);
+        self.folder.set_status_gate(false);
+        if self.split_shown.get() {
+            self.split.blur();
+        }
+        self.rule.set_visible(false);
+        self.progress_row.set_visible(false);
+        self.status.widget().set_visible(false);
+        self.stack.set_visible_child_name("trash");
+    }
+
+    pub fn hide_trash(&self) {
+        self.trash_active.set(false);
+        self.rule.set_visible(true);
+        self.status.widget().set_visible(true);
+        self.progress_row.set_visible(false);
+    }
+
+    pub fn trash_active(&self) -> bool {
+        self.trash_active.get()
     }
 
     pub fn arm_anchor_restore(&self) {
@@ -167,6 +205,11 @@ impl Content {
     }
 
     pub fn listed_names(&self) -> Vec<OsString> {
+        // The hidden folder page must never supply names while Trash is the
+        // visible page; selection.all is routed to the Trash list instead.
+        if self.trash_active.get() {
+            return Vec::new();
+        }
         if self.on_split_page() {
             return self.split.listed_names();
         }
@@ -177,6 +220,9 @@ impl Content {
     }
 
     pub fn reload(&self) {
+        if self.trash_active.get() {
+            return;
+        }
         if self.on_split_page() {
             self.split.reload_focused();
         } else {
@@ -209,6 +255,9 @@ impl Content {
     }
 
     pub fn set_progress(&self, view: Option<ProgressView>) {
+        if self.trash_active.get() {
+            return;
+        }
         match view {
             Some(view) => {
                 self.progress_label.set_text(&view.label);
@@ -223,6 +272,9 @@ impl Content {
 
     /// Hold the status line for a few seconds, then go back to the counts.
     pub fn show_summary(&self, text: &str, failures: Option<String>) {
+        if self.trash_active.get() {
+            return;
+        }
         self.progress_row.set_visible(false);
         *self.last_failures.borrow_mut() = failures;
         self.status.show_summary(text);
@@ -270,6 +322,15 @@ impl Content {
     /// Reflect the focused tab. A normal pill shows its folder grid; a split
     /// group shows one tile per tab.
     pub fn show(&self, window: &Window) {
+        // Model events during a job or monitor refresh update the hidden pages
+        // later; they never dismiss the visible Trash page. Navigation leaves
+        // Trash explicitly before it asks for a destination.
+        if crate::trash::keeps_trash_page(
+            self.trash_active.get(),
+            crate::trash::RefreshCause::Background,
+        ) {
+            return;
+        }
         let Some(group) = window.focused_group() else {
             self.show_placeholder("No tabs");
             return;

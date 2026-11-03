@@ -11,6 +11,7 @@
 //! user about each conflict; [`FileOperations::execute`] then runs with every
 //! decision already made and never calls back to ask.
 
+pub mod trash;
 pub mod trashinfo;
 
 #[cfg(test)]
@@ -20,6 +21,7 @@ use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -28,6 +30,11 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use gio::prelude::*;
 
 use crate::command::{CheckedCommand, Outcome, Value};
+
+pub use trash::{
+    GioTrash, TrashBackend, TrashError, TrashIdentity, TrashItem, TrashRevision, TrashUri,
+    TrashUriError, list_trash, list_trash_with,
+};
 
 /// The undo stack keeps at most this many records.
 pub const MAX_UNDO: usize = 50;
@@ -51,6 +58,8 @@ pub enum Request {
     Move { paths: Vec<PathBuf>, to: PathBuf },
     Rename { path: PathBuf, name: String },
     NewFolder { name: String, in_folder: PathBuf },
+    Restore { items: Vec<TrashIdentity> },
+    EmptyTrash,
     Undo,
 }
 
@@ -76,6 +85,8 @@ impl Request {
             Request::NewFolder { name, in_folder } => {
                 format!("create folder {name} in {}", in_folder.display())
             }
+            Request::Restore { items } => format!("restore {} item(s)", items.len()),
+            Request::EmptyTrash => "empty the trash".to_string(),
             Request::Undo => "undo the last file operation".to_string(),
         }
     }
@@ -117,6 +128,13 @@ pub fn request_for(command: &CheckedCommand) -> Result<Option<Request>, RequestE
         Some(Value::Text(text)) => Ok(text.clone()),
         _ => Err(RequestError::MissingArgument(name)),
     };
+    let trash_items = || match command.get("items") {
+        Some(Value::TrashItems(items)) if !items.is_empty() => Ok(items
+            .iter()
+            .map(|uri| TrashIdentity::new(uri.clone(), None, None, None))
+            .collect()),
+        _ => Err(RequestError::MissingArgument("items")),
+    };
 
     let request = match command.name() {
         "file.trash" => Request::Trash { paths: paths()? },
@@ -136,6 +154,10 @@ pub fn request_for(command: &CheckedCommand) -> Result<Option<Request>, RequestE
             name: text("name")?,
             in_folder: path("in")?,
         },
+        "trash.restore" => Request::Restore {
+            items: trash_items()?,
+        },
+        "trash.empty" => Request::EmptyTrash,
         "file.undo" => Request::Undo,
         _ => return Ok(None),
     };
@@ -210,6 +232,7 @@ pub enum Action {
     Rename,
     NewFolder,
     Restore,
+    Empty,
 }
 
 impl Action {
@@ -221,6 +244,7 @@ impl Action {
             Action::Rename => "rename",
             Action::NewFolder => "new-folder",
             Action::Restore => "restore",
+            Action::Empty => "delete",
         }
     }
 
@@ -232,6 +256,7 @@ impl Action {
             Action::Rename => "renamed",
             Action::NewFolder => "created",
             Action::Restore => "restored",
+            Action::Empty => "deleted",
         }
     }
 }
@@ -259,6 +284,14 @@ pub enum Conflict {
     NameTaken,
     /// The destination folder is missing or is not a folder.
     MissingDestination,
+    /// A restore's original location is not in the item's metadata.
+    MissingOriginal,
+    /// A restore's original parent folder is gone or is not a folder.
+    MissingParent,
+    /// A restore's original parent folder exists but is not writable.
+    ParentNotWritable,
+    /// An undo item or a trash entry changed under its identity.
+    Changed,
     /// An undo folder is no longer empty.
     NotEmpty,
 }
@@ -281,8 +314,91 @@ impl Conflict {
             Conflict::InvalidName => "the name is invalid",
             Conflict::NameTaken => "the name is taken",
             Conflict::MissingDestination => "the destination folder is missing",
+            Conflict::MissingOriginal => "the original location is unknown",
+            Conflict::MissingParent => "Original folder no longer exists",
+            Conflict::ParentNotWritable => "the original folder is not writable",
+            Conflict::Changed => "the item changed",
             Conflict::NotEmpty => "the folder is not empty",
         }
+    }
+}
+
+/// The unique key for one plan item in the conflict menu.
+///
+/// A restore's original destination is not unique: several trashed versions
+/// can share one original path. Its key is therefore the typed trash URI,
+/// while the destination stays in `Step::target` for display. Ordinary
+/// copy, move, rename and undo items keep their path key.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ItemKey {
+    Path(PathBuf),
+    Trash(TrashUri),
+}
+
+impl ItemKey {
+    pub fn path(path: impl Into<PathBuf>) -> Self {
+        Self::Path(path.into())
+    }
+
+    pub fn trash(uri: TrashUri) -> Self {
+        Self::Trash(uri)
+    }
+
+    pub fn as_path(&self) -> Option<&Path> {
+        match self {
+            ItemKey::Path(path) => Some(path),
+            ItemKey::Trash(_) => None,
+        }
+    }
+
+    /// The name the conflict dialog shows when a step has no destination.
+    pub fn display_name(&self) -> String {
+        match self {
+            ItemKey::Path(path) => path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.display().to_string()),
+            ItemKey::Trash(uri) => uri.name().to_string_lossy().into_owned(),
+        }
+    }
+}
+
+impl fmt::Display for ItemKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ItemKey::Path(path) => f.write_str(&path.display().to_string()),
+            ItemKey::Trash(uri) => f.write_str(uri.as_str()),
+        }
+    }
+}
+
+impl From<PathBuf> for ItemKey {
+    fn from(path: PathBuf) -> Self {
+        ItemKey::Path(path)
+    }
+}
+
+impl From<&PathBuf> for ItemKey {
+    fn from(path: &PathBuf) -> Self {
+        ItemKey::Path(path.clone())
+    }
+}
+
+impl From<&Path> for ItemKey {
+    fn from(path: &Path) -> Self {
+        ItemKey::Path(path.to_path_buf())
+    }
+}
+
+impl From<&ItemKey> for ItemKey {
+    fn from(key: &ItemKey) -> Self {
+        key.clone()
+    }
+}
+
+impl From<TrashUri> for ItemKey {
+    fn from(uri: TrashUri) -> Self {
+        ItemKey::Trash(uri)
     }
 }
 
@@ -294,12 +410,31 @@ pub struct Step {
     /// renamed, the containing folder of a new folder, or the trash entry
     /// being restored.
     pub source: Option<PathBuf>,
-    /// Where the item goes, when it goes anywhere.
+    /// Where the item goes, when it goes anywhere. For a restore this is the
+    /// original destination used for display; the decision key is separate.
     pub target: Option<PathBuf>,
     pub conflict: Option<Conflict>,
     /// A copy into its own folder always gets a `(copy)` name and is not a
     /// conflict.
     pub keep_both: bool,
+    /// A restore or permanent-deletion step is identified by its trash URI,
+    /// never by a `PathBuf` containing `trash:///`.
+    pub trash: Option<TrashIdentity>,
+}
+
+impl Step {
+    /// The unique key for the conflict menu. A restore uses its trash URI, so
+    /// two versions of the same original path still get two questions. Every
+    /// other step uses its source path (or the target of an undo restore).
+    pub fn decision_key(&self) -> Option<ItemKey> {
+        if self.action == Action::Restore {
+            if let Some(trash) = &self.trash {
+                return Some(ItemKey::Trash(trash.uri().clone()));
+            }
+            return self.target.clone().map(ItemKey::Path);
+        }
+        self.source.clone().map(ItemKey::Path)
+    }
 }
 
 /// A read-only plan for one request.
@@ -308,6 +443,7 @@ pub struct Plan {
     request: Request,
     steps: Vec<Step>,
     undo: Option<UndoRecord>,
+    problem: Option<String>,
 }
 
 impl Plan {
@@ -317,6 +453,19 @@ impl Plan {
 
     pub fn steps(&self) -> &[Step] {
         &self.steps
+    }
+
+    /// A read-only plan could not be built, for example because the trash
+    /// backend is unavailable. A handler refuses the whole request.
+    pub fn problem(&self) -> Option<&str> {
+        self.problem.as_deref()
+    }
+
+    /// The immutable snapshot a `trash.empty` confirmation covers.
+    pub fn empty_confirmation(&self) -> Option<EmptyConfirmation> {
+        (self.request == Request::EmptyTrash).then(|| EmptyConfirmation {
+            fingerprint: empty_fingerprint(self),
+        })
     }
 
     /// The steps whose conflict needs a menu answer, in plan order.
@@ -330,12 +479,18 @@ impl Plan {
     /// step. Nothing is written by producing it.
     pub fn lines(&self) -> Vec<String> {
         let mut lines = vec![format!("dry run: {}", self.request.summary())];
+        if let Some(problem) = &self.problem {
+            lines.push(format!("cannot plan: {problem}"));
+        }
         if self.steps.is_empty() {
             lines.push("nothing to do".to_string());
         }
         for step in &self.steps {
             let mut line = step.action.as_str().to_string();
-            if let Some(source) = &step.source {
+            if let Some(trash) = &step.trash {
+                line.push(' ');
+                line.push_str(trash.uri().as_str());
+            } else if let Some(source) = &step.source {
                 line.push(' ');
                 line.push_str(&source.display().to_string());
             }
@@ -380,14 +535,14 @@ pub enum Decision {
 /// finished `Decisions` to a worker thread.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Decisions {
-    items: Vec<PathBuf>,
-    answers: BTreeMap<PathBuf, Decision>,
+    items: Vec<ItemKey>,
+    answers: BTreeMap<ItemKey, Decision>,
     cancelled: bool,
 }
 
 impl Decisions {
     /// An empty set of answers for these conflicting items.
-    pub fn new(items: impl IntoIterator<Item = PathBuf>) -> Self {
+    pub fn new(items: impl IntoIterator<Item = ItemKey>) -> Self {
         let mut unique = Vec::new();
         for item in items {
             if !unique.contains(&item) {
@@ -403,17 +558,18 @@ impl Decisions {
 
     /// The answers needed by a plan.
     pub fn from_plan(plan: &Plan) -> Self {
-        Self::new(plan.decisions().filter_map(|step| step.source.clone()))
+        Self::new(plan.decisions().filter_map(Step::decision_key))
     }
 
     /// Record one answer. With `apply_to_all`, the decision also covers every
     /// conflict that has no answer yet; an earlier, different answer stays.
-    pub fn answer(&mut self, item: &Path, decision: Decision, apply_to_all: bool) {
-        if !self.items.iter().any(|candidate| candidate == item) {
+    pub fn answer(&mut self, item: impl Into<ItemKey>, decision: Decision, apply_to_all: bool) {
+        let item = item.into();
+        if !self.items.iter().any(|candidate| candidate == &item) {
             return;
         }
 
-        self.answers.insert(item.to_path_buf(), decision);
+        self.answers.insert(item.clone(), decision);
         if decision == Decision::Cancel {
             self.cancelled = true;
             return;
@@ -428,17 +584,16 @@ impl Decisions {
 
     /// The next conflict the menu should show, or `None` when every item has
     /// an answer or the user cancelled.
-    pub fn next_unanswered(&self) -> Option<&Path> {
+    pub fn next_unanswered(&self) -> Option<&ItemKey> {
         if self.cancelled {
             return None;
         }
         self.items
             .iter()
             .find(|item| !self.answers.contains_key(*item))
-            .map(PathBuf::as_path)
     }
 
-    pub fn decision_for(&self, item: &Path) -> Option<Decision> {
+    pub fn decision_for(&self, item: &ItemKey) -> Option<Decision> {
         self.answers.get(item).copied()
     }
 
@@ -454,6 +609,34 @@ impl Decisions {
                 .iter()
                 .all(|item| self.answers.contains_key(item))
     }
+}
+
+/// The result of the human confirmation for one immutable empty plan. The
+/// worker creates it only after the destructive dialog's response; `execute`
+/// never builds one on its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EmptyConfirmation {
+    fingerprint: u64,
+}
+
+impl EmptyConfirmation {
+    /// Bind a confirmation to exactly this plan. The plan is the snapshot; a
+    /// fresh listing that has gained items is a different plan.
+    pub fn for_plan(plan: &Plan) -> Option<Self> {
+        plan.empty_confirmation()
+    }
+
+    fn matches(self, plan: &Plan) -> bool {
+        plan.request == Request::EmptyTrash && self.fingerprint == empty_fingerprint(plan)
+    }
+}
+
+fn empty_fingerprint(plan: &Plan) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    for step in &plan.steps {
+        step.trash.hash(&mut hasher);
+    }
+    hasher.finish()
 }
 
 // ---------------------------------------------------------------------------
@@ -487,14 +670,21 @@ pub struct ItemResult {
     pub action: Action,
     pub source: PathBuf,
     pub target: Option<PathBuf>,
+    /// The trash identity for a restore or permanent deletion. This is never
+    /// folded into `source` as a `trash:///` path.
+    pub trash: Option<TrashIdentity>,
     pub outcome: ItemOutcome,
 }
 
 impl ItemResult {
     fn line(&self) -> String {
-        let subject = match &self.target {
-            Some(target) => format!("{} -> {}", self.source.display(), target.display()),
-            None => self.source.display().to_string(),
+        let subject = match (&self.trash, &self.target) {
+            (Some(trash), Some(target)) => {
+                format!("{} -> {}", trash.uri().as_str(), target.display())
+            }
+            (Some(trash), None) => trash.uri().as_str().to_string(),
+            (None, Some(target)) => format!("{} -> {}", self.source.display(), target.display()),
+            (None, None) => self.source.display().to_string(),
         };
         match &self.outcome {
             ItemOutcome::Done => format!("{} {subject}", self.action.past()),
@@ -534,19 +724,22 @@ impl Report {
 pub enum ExecuteError {
     /// Conflicts remain with no menu answer (the CLI and agents always get
     /// this when a conflict exists).
-    UnansweredConflicts(Vec<PathBuf>),
+    UnansweredConflicts(Vec<ItemKey>),
     /// `file.undo` with an empty stack.
     NothingToUndo,
+    /// `trash.empty` reached `execute` without the human confirmation.
+    ConfirmationRequired,
+    /// A confirmation token was not made for this exact plan.
+    ConfirmationMismatch,
+    /// `execute` is not the path for an empty plan.
+    NotAnEmptyPlan,
 }
 
 impl fmt::Display for ExecuteError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ExecuteError::UnansweredConflicts(items) => {
-                let names: Vec<String> = items
-                    .iter()
-                    .map(|item| item.display().to_string())
-                    .collect();
+                let names: Vec<String> = items.iter().map(|item| item.to_string()).collect();
                 write!(
                     f,
                     "the operation has conflicts with no decision: {}",
@@ -554,6 +747,13 @@ impl fmt::Display for ExecuteError {
                 )
             }
             ExecuteError::NothingToUndo => f.write_str("there is nothing to undo"),
+            ExecuteError::ConfirmationRequired => {
+                f.write_str("emptying the trash needs the human confirmation step")
+            }
+            ExecuteError::ConfirmationMismatch => {
+                f.write_str("the trash confirmation is for a different snapshot")
+            }
+            ExecuteError::NotAnEmptyPlan => f.write_str("this is not an empty-trash plan"),
         }
     }
 }
@@ -572,6 +772,27 @@ struct Trashed {
     /// The `files/<name>` path discovered just after trashing. The undo
     /// still verifies the `.trashinfo` when the path is gone.
     entry: Option<PathBuf>,
+    /// The device and inode of that entry when it was recorded. A later
+    /// replacement at the same name must not make this record act on it.
+    entry_dev: Option<u64>,
+    entry_ino: Option<u64>,
+}
+
+/// One item a restore put back, with the identity of the restored object so
+/// an undo refuses a replacement with the same name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Restored {
+    path: PathBuf,
+    dev: u64,
+    ino: u64,
+}
+
+impl Restored {
+    fn is_still_there(&self) -> bool {
+        fs::symlink_metadata(&self.path)
+            .map(|metadata| metadata.dev() == self.dev && metadata.ino() == self.ino)
+            .unwrap_or(false)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -594,6 +815,10 @@ enum RecordKind {
     NewFolder {
         path: PathBuf,
     },
+    Restore {
+        items: Vec<Restored>,
+        replaced: Vec<Trashed>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -601,19 +826,109 @@ struct UndoRecord {
     kind: RecordKind,
 }
 
+impl RecordKind {
+    fn is_empty(&self) -> bool {
+        match self {
+            RecordKind::Trash { items } => items.is_empty(),
+            RecordKind::Copy { copies, replaced } => copies.is_empty() && replaced.is_empty(),
+            RecordKind::Move { pairs, replaced } => pairs.is_empty() && replaced.is_empty(),
+            RecordKind::Restore { items, replaced } => items.is_empty() && replaced.is_empty(),
+            RecordKind::Rename { .. } | RecordKind::NewFolder { .. } => false,
+        }
+    }
+
+    /// Drop `Trashed` entries that an earlier restore or empty deleted. A
+    /// recorded entry path is checked by device and inode, so a replacement
+    /// with the same name is not mistaken for the recorded object. Only a
+    /// record without an entry path falls back to the metadata heuristic.
+    fn retain_live(&mut self, identities: &[TrashIdentity]) {
+        let identity_matches = |trashed: &Trashed| {
+            !identities.is_empty()
+                && identities.iter().any(|identity| {
+                    let original_matches = match identity.original() {
+                        Some(original) => trashed.original == original,
+                        None => true,
+                    };
+                    let date_matches = match identity.deleted_at() {
+                        Some(date) => {
+                            (unix_seconds(trashed.at) - date).abs() <= TRASH_TIME_EPSILON_SECS
+                        }
+                        None => true,
+                    };
+                    (original_matches && date_matches)
+                        && (identity.original().is_some() || identity.deleted_at().is_some())
+                })
+        };
+        let is_live = |trashed: &Trashed| {
+            if let Some(entry) = &trashed.entry {
+                return match fs::symlink_metadata(entry) {
+                    Err(_) => false,
+                    Ok(metadata) => match (trashed.entry_dev, trashed.entry_ino) {
+                        (Some(dev), Some(ino)) => metadata.dev() == dev && metadata.ino() == ino,
+                        _ => true,
+                    },
+                };
+            }
+            !identity_matches(trashed)
+        };
+
+        match self {
+            RecordKind::Trash { items } => items.retain(is_live),
+            RecordKind::Copy { replaced, .. } => replaced.retain(is_live),
+            RecordKind::Move { replaced, .. } => replaced.retain(is_live),
+            RecordKind::Restore { replaced, .. } => replaced.retain(is_live),
+            RecordKind::Rename { .. } | RecordKind::NewFolder { .. } => {}
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The operations object
 // ---------------------------------------------------------------------------
 
-/// Owns the in-memory undo stack (at most [`MAX_UNDO`] records).
-#[derive(Debug, Default)]
+/// Owns the in-memory undo stack (at most [`MAX_UNDO`] records) and the trash
+/// backend used for listing, restore and permanent deletion.
 pub struct FileOperations {
     undo: VecDeque<UndoRecord>,
+    trash: Box<dyn TrashBackend>,
+}
+
+impl fmt::Debug for FileOperations {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FileOperations")
+            .field("undo", &self.undo)
+            .field("trash", &"trash backend")
+            .finish()
+    }
+}
+
+impl Default for FileOperations {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl FileOperations {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            undo: VecDeque::new(),
+            trash: Box::new(GioTrash::new()),
+        }
+    }
+
+    /// Build an operations object with an injected trash backend. The same
+    /// plans and executor run; only listing, revalidation, restore and delete
+    /// go to the backend.
+    pub fn with_trash_backend(trash: Box<dyn TrashBackend>) -> Self {
+        Self {
+            undo: VecDeque::new(),
+            trash,
+        }
+    }
+
+    /// List the trash through the operations' backend.
+    pub fn list_trash(&self) -> Result<Vec<TrashItem>, TrashError> {
+        self.trash.list()
     }
 
     /// How many records the undo stack holds.
@@ -630,6 +945,8 @@ impl FileOperations {
             Request::Move { paths, to } => plan_copy_or_move(paths, to, true),
             Request::Rename { path, name } => plan_rename(path, name),
             Request::NewFolder { name, in_folder } => plan_new_folder(name, in_folder),
+            Request::Restore { items } => plan_restore(self.trash.as_ref(), items),
+            Request::EmptyTrash => plan_empty(self.trash.as_ref()),
             Request::Undo => plan_undo(self.undo.back()),
         }
     }
@@ -658,14 +975,17 @@ impl FileOperations {
             });
         }
 
-        let unanswered: Vec<PathBuf> = plan
+        if plan.request == Request::EmptyTrash {
+            return Err(ExecuteError::ConfirmationRequired);
+        }
+
+        let unanswered: Vec<ItemKey> = plan
             .decisions()
             .filter(|step| {
-                step.source
-                    .as_deref()
-                    .is_none_or(|source| decisions.decision_for(source).is_none())
+                step.decision_key()
+                    .is_none_or(|key| decisions.decision_for(&key).is_none())
             })
-            .filter_map(|step| step.source.clone())
+            .filter_map(Step::decision_key)
             .collect();
         if !unanswered.is_empty() {
             return Err(ExecuteError::UnansweredConflicts(unanswered));
@@ -708,15 +1028,14 @@ impl FileOperations {
                 continue;
             }
 
-            let Some(source) = step.source.clone() else {
-                report
-                    .items
-                    .push(failed_result(step, "the plan has no source"));
-                reporter.item_finished();
-                continue;
-            };
-
             if step.action == Action::Trash {
+                let Some(source) = step.source.clone() else {
+                    report
+                        .items
+                        .push(failed_result(step, "the plan has no source"));
+                    reporter.item_finished();
+                    continue;
+                };
                 match trash_and_record(&source) {
                     Ok(trashed) => {
                         builder.trashed.push(trashed);
@@ -735,10 +1054,186 @@ impl FileOperations {
                 continue;
             }
 
+            if step.action == Action::Restore {
+                let Some(identity) = step.trash.clone() else {
+                    report
+                        .items
+                        .push(failed_result(step, "the plan has no trash item"));
+                    reporter.item_finished();
+                    continue;
+                };
+                let Some(mut target) = step.target.clone() else {
+                    report
+                        .items
+                        .push(failed_result(step, "the plan has no original path"));
+                    reporter.item_finished();
+                    continue;
+                };
+                let original = target.clone();
+
+                let mut decision = None;
+                if let Some(conflict) = step.conflict {
+                    if conflict.needs_decision() {
+                        let key = step
+                            .decision_key()
+                            .unwrap_or_else(|| ItemKey::Trash(identity.uri().clone()));
+                        decision = decisions.decision_for(&key);
+                        match decision {
+                            Some(Decision::Skip) => {
+                                report.items.push(result(step, None, ItemOutcome::Skipped));
+                                reporter.item_finished();
+                                continue;
+                            }
+                            Some(Decision::Cancel) | None => {
+                                report.cancelled = true;
+                                report.items.push(cancelled_result(step));
+                                continue;
+                            }
+                            Some(Decision::KeepBoth) => match free_copy_name(&target, &claimed) {
+                                Ok(free) => target = free,
+                                Err(error) => {
+                                    report.items.push(failed_result(step, &error));
+                                    reporter.item_finished();
+                                    continue;
+                                }
+                            },
+                            Some(Decision::Replace) => {}
+                        }
+                    } else {
+                        report.items.push(result(
+                            step,
+                            None,
+                            ItemOutcome::Refused(conflict.text().to_string()),
+                        ));
+                        reporter.item_finished();
+                        continue;
+                    }
+                }
+                claimed.insert(target.clone());
+
+                // Revalidate the exact identity after the human made any
+                // target decision. A changed item is refused, never deleted or
+                // written over.
+                match self.trash.revalidate(&identity) {
+                    Ok(fresh) if fresh.original() == Some(original.as_path()) => {}
+                    Ok(_) => {
+                        report.items.push(result(
+                            step,
+                            None,
+                            ItemOutcome::Refused(Conflict::Changed.text().to_string()),
+                        ));
+                        reporter.item_finished();
+                        continue;
+                    }
+                    Err(error) => {
+                        let outcome = match error {
+                            TrashError::Missing
+                            | TrashError::Changed
+                            | TrashError::Unverifiable => ItemOutcome::Refused(error.to_string()),
+                            _ => ItemOutcome::Failed(error.to_string()),
+                        };
+                        report.items.push(result(step, None, outcome));
+                        reporter.item_finished();
+                        continue;
+                    }
+                }
+
+                let Some(parent) = target.parent() else {
+                    report.items.push(result(
+                        step,
+                        None,
+                        ItemOutcome::Refused(Conflict::MissingParent.text().to_string()),
+                    ));
+                    reporter.item_finished();
+                    continue;
+                };
+                if !parent.is_dir() {
+                    report.items.push(result(
+                        step,
+                        None,
+                        ItemOutcome::Refused(Conflict::MissingParent.text().to_string()),
+                    ));
+                    reporter.item_finished();
+                    continue;
+                }
+                if !parent_is_writable(parent) {
+                    report.items.push(result(
+                        step,
+                        None,
+                        ItemOutcome::Refused(Conflict::ParentNotWritable.text().to_string()),
+                    ));
+                    reporter.item_finished();
+                    continue;
+                }
+
+                if decision == Some(Decision::Replace) && fs::symlink_metadata(&target).is_ok() {
+                    match trash_and_record(&target) {
+                        Ok(trashed) => builder.replaced.push(trashed),
+                        Err(error) => {
+                            report.items.push(failed_result(
+                                step,
+                                &format!("could not trash the existing target: {error}"),
+                            ));
+                            reporter.item_finished();
+                            continue;
+                        }
+                    }
+                }
+
+                match self.trash.restore(&identity, &target, cancellable) {
+                    Ok(()) => {
+                        match fs::symlink_metadata(&target) {
+                            Ok(metadata) => builder.restored.push(Restored {
+                                path: target.clone(),
+                                dev: metadata.dev(),
+                                ino: metadata.ino(),
+                            }),
+                            Err(error) => {
+                                report.items.push(result(
+                                    step,
+                                    Some(target.clone()),
+                                    ItemOutcome::Failed(format!(
+                                        "restored but its new identity could not be read: {error}"
+                                    )),
+                                ));
+                                reporter.item_finished();
+                                continue;
+                            }
+                        }
+                        report.items.push(done_result(step, Some(target)));
+                    }
+                    Err(error) => {
+                        report
+                            .items
+                            .push(result(step, Some(target), ItemOutcome::Failed(error)));
+                    }
+                }
+                reporter.item_finished();
+                log_event(
+                    &report
+                        .items
+                        .last()
+                        .map(ItemResult::line)
+                        .unwrap_or_default(),
+                );
+                continue;
+            }
+
+            let Some(source) = step.source.clone() else {
+                report
+                    .items
+                    .push(failed_result(step, "the plan has no source"));
+                reporter.item_finished();
+                continue;
+            };
+
             let mut decision = None;
             if let Some(conflict) = step.conflict {
                 if conflict.needs_decision() {
-                    decision = decisions.decision_for(&source);
+                    let key = step
+                        .decision_key()
+                        .unwrap_or_else(|| ItemKey::Path(source.clone()));
+                    decision = decisions.decision_for(&key);
                     match decision {
                         Some(Decision::Skip) => {
                             report.items.push(result(step, None, ItemOutcome::Skipped));
@@ -834,7 +1329,7 @@ impl FileOperations {
                 Action::NewFolder => make_folder(&target).map(|()| {
                     builder.new_folder = Some(target.clone());
                 }),
-                Action::Trash | Action::Restore => {
+                Action::Trash | Action::Restore | Action::Empty => {
                     Err("the plan has a step that cannot run here".to_string())
                 }
             };
@@ -858,12 +1353,116 @@ impl FileOperations {
             );
         }
 
+        if matches!(plan.request, Request::Restore { .. }) {
+            let restored: Vec<TrashIdentity> = report
+                .items
+                .iter()
+                .filter(|item| item.outcome == ItemOutcome::Done)
+                .filter_map(|item| item.trash.clone())
+                .collect();
+            self.invalidate_trash_entries(&restored);
+        }
+
         if let Some(record) = builder.into_record(&plan.request) {
             self.push_undo(record);
         }
 
         log_event(&format!("finished {}", plan.request.summary()));
         Ok(report)
+    }
+
+    /// Permanently delete exactly the entries in a confirmed, immutable empty
+    /// plan. `execute` cannot reach this path; only the worker calls it after
+    /// the destructive dialog's response. Each identity is revalidated first,
+    /// and the plan's snapshot is the only deletion set.
+    pub fn execute_empty<P: FnMut(Progress)>(
+        &mut self,
+        plan: &Plan,
+        confirmation: EmptyConfirmation,
+        cancellable: &gio::Cancellable,
+        mut progress: P,
+    ) -> Result<Report, ExecuteError> {
+        if plan.request != Request::EmptyTrash {
+            return Err(ExecuteError::NotAnEmptyPlan);
+        }
+        if !confirmation.matches(plan) {
+            return Err(ExecuteError::ConfirmationMismatch);
+        }
+
+        log_event("starting confirmed empty trash");
+        let mut reporter = Reporter {
+            progress: &mut progress,
+            items_total: plan.steps.len(),
+            items_done: 0,
+            bytes_done: 0,
+            bytes_total: None,
+        };
+        let mut report = Report::default();
+        let mut deleted = Vec::new();
+
+        for step in &plan.steps {
+            if cancellable.is_cancelled() {
+                report.cancelled = true;
+                report.items.push(cancelled_result(step));
+                continue;
+            }
+
+            let Some(identity) = step.trash.clone() else {
+                report
+                    .items
+                    .push(failed_result(step, "the plan has no trash item"));
+                reporter.item_finished();
+                continue;
+            };
+
+            match self.trash.revalidate_object(&identity) {
+                Ok(_) => match self.trash.delete(&identity, cancellable) {
+                    Ok(()) => {
+                        deleted.push(identity.clone());
+                        report.items.push(done_result(step, None));
+                    }
+                    Err(error) => report.items.push(result(
+                        step,
+                        None,
+                        ItemOutcome::Failed(error.to_string()),
+                    )),
+                },
+                Err(error) => {
+                    let outcome = match error {
+                        TrashError::Missing | TrashError::Changed | TrashError::Unverifiable => {
+                            ItemOutcome::Refused(error.to_string())
+                        }
+                        _ => ItemOutcome::Failed(error.to_string()),
+                    };
+                    report.items.push(result(step, None, outcome));
+                }
+            }
+
+            reporter.item_finished();
+            log_event(
+                &report
+                    .items
+                    .last()
+                    .map(ItemResult::line)
+                    .unwrap_or_default(),
+            );
+        }
+
+        self.invalidate_trash_entries(&deleted);
+        log_event("finished confirmed empty trash");
+        Ok(report)
+    }
+
+    /// Remove undo entries for trash identities that no longer exist, so a
+    /// later item with the same name is never mistaken for the old one.
+    fn invalidate_trash_entries(&mut self, identities: &[TrashIdentity]) {
+        if identities.is_empty() {
+            return;
+        }
+        for record in &mut self.undo {
+            record.kind.retain_live(identities);
+        }
+        self.undo.retain(|record| !record.kind.is_empty());
     }
 
     fn push_undo(&mut self, record: UndoRecord) {
@@ -996,6 +1595,7 @@ fn plan_trash(paths: &[PathBuf]) -> Plan {
             source: Some(path),
             target: None,
             keep_both: false,
+            trash: None,
         })
         .collect();
 
@@ -1005,6 +1605,7 @@ fn plan_trash(paths: &[PathBuf]) -> Plan {
         },
         steps,
         undo: None,
+        problem: None,
     }
 }
 
@@ -1055,6 +1656,7 @@ fn plan_copy_or_move(paths: &[PathBuf], to: &Path, is_move: bool) -> Plan {
             target: Some(target),
             conflict,
             keep_both,
+            trash: None,
         });
     }
 
@@ -1074,6 +1676,7 @@ fn plan_copy_or_move(paths: &[PathBuf], to: &Path, is_move: bool) -> Plan {
         request,
         steps,
         undo: None,
+        problem: None,
     }
 }
 
@@ -1102,8 +1705,10 @@ fn plan_rename(path: &Path, name: &str) -> Plan {
             target: Some(target),
             conflict,
             keep_both: false,
+            trash: None,
         }],
         undo: None,
+        problem: None,
     }
 }
 
@@ -1131,9 +1736,149 @@ fn plan_new_folder(name: &str, in_folder: &Path) -> Plan {
             target: Some(target),
             conflict,
             keep_both: false,
+            trash: None,
         }],
         undo: None,
+        problem: None,
     }
+}
+
+fn plan_restore(backend: &dyn TrashBackend, items: &[TrashIdentity]) -> Plan {
+    let request = Request::Restore {
+        items: items.to_vec(),
+    };
+    let mut unique: Vec<TrashIdentity> = Vec::new();
+    for item in items {
+        if !unique.iter().any(|seen| seen.uri() == item.uri()) {
+            unique.push(item.clone());
+        }
+    }
+
+    let listed = match backend.list() {
+        Ok(listed) => listed,
+        Err(error) => {
+            return Plan {
+                request,
+                steps: Vec::new(),
+                undo: None,
+                problem: Some(error.to_string()),
+            };
+        }
+    };
+
+    let mut reserved = HashSet::new();
+    let mut steps = Vec::new();
+    for requested in unique {
+        let Some(item) = listed
+            .iter()
+            .find(|candidate| candidate.uri() == requested.uri())
+        else {
+            steps.push(Step {
+                action: Action::Restore,
+                source: None,
+                target: None,
+                conflict: Some(Conflict::MissingSource),
+                keep_both: false,
+                trash: Some(requested),
+            });
+            continue;
+        };
+
+        let identity = item.identity().clone();
+        if !requested.agrees_with(&identity) {
+            steps.push(Step {
+                action: Action::Restore,
+                source: None,
+                target: identity.original().map(Path::to_path_buf),
+                conflict: Some(Conflict::Changed),
+                keep_both: false,
+                trash: Some(identity),
+            });
+            continue;
+        }
+
+        let Some(original) = identity.original().map(Path::to_path_buf) else {
+            steps.push(Step {
+                action: Action::Restore,
+                source: None,
+                target: None,
+                conflict: Some(Conflict::MissingOriginal),
+                keep_both: false,
+                trash: Some(identity),
+            });
+            continue;
+        };
+
+        let conflict = match original.parent() {
+            None => Some(Conflict::MissingParent),
+            Some(parent) if !parent.is_dir() => Some(Conflict::MissingParent),
+            Some(parent) if !parent_is_writable(parent) => Some(Conflict::ParentNotWritable),
+            Some(_) if fs::symlink_metadata(&original).is_ok() || reserved.contains(&original) => {
+                Some(Conflict::TargetExists)
+            }
+            Some(_) => None,
+        };
+
+        if conflict.is_none() {
+            reserved.insert(original.clone());
+        }
+        steps.push(Step {
+            action: Action::Restore,
+            source: None,
+            target: Some(original),
+            conflict,
+            keep_both: false,
+            trash: Some(identity),
+        });
+    }
+
+    Plan {
+        request,
+        steps,
+        undo: None,
+        problem: None,
+    }
+}
+
+fn plan_empty(backend: &dyn TrashBackend) -> Plan {
+    let request = Request::EmptyTrash;
+    match backend.list() {
+        Ok(items) => Plan {
+            request,
+            steps: items
+                .into_iter()
+                .map(|item| Step {
+                    action: Action::Empty,
+                    source: None,
+                    target: None,
+                    conflict: None,
+                    keep_both: false,
+                    trash: Some(item.identity().clone()),
+                })
+                .collect(),
+            undo: None,
+            problem: None,
+        },
+        Err(error) => Plan {
+            request,
+            steps: Vec::new(),
+            undo: None,
+            problem: Some(error.to_string()),
+        },
+    }
+}
+
+/// Whether the original parent's access metadata says this process may write
+/// there. A failed query is a refusal, never an optimistic guess.
+fn parent_is_writable(path: &Path) -> bool {
+    gio::File::for_path(path)
+        .query_info(
+            gio::FILE_ATTRIBUTE_ACCESS_CAN_WRITE.as_str(),
+            gio::FileQueryInfoFlags::NOFOLLOW_SYMLINKS,
+            gio::Cancellable::NONE,
+        )
+        .map(|info| info.boolean(gio::FILE_ATTRIBUTE_ACCESS_CAN_WRITE.as_str()))
+        .unwrap_or(false)
 }
 
 fn plan_undo(record: Option<&UndoRecord>) -> Plan {
@@ -1160,6 +1905,7 @@ fn plan_undo(record: Option<&UndoRecord>) -> Plan {
                         target: None,
                         conflict,
                         keep_both: false,
+                        trash: None,
                     });
                 }
                 steps.extend(replaced.iter().map(|trashed| restore_step(trashed, &freed)));
@@ -1179,6 +1925,7 @@ fn plan_undo(record: Option<&UndoRecord>) -> Plan {
                         target: Some(source.clone()),
                         conflict,
                         keep_both: false,
+                        trash: None,
                     }
                 }));
                 steps.extend(
@@ -1201,6 +1948,7 @@ fn plan_undo(record: Option<&UndoRecord>) -> Plan {
                     target: Some(from.clone()),
                     conflict,
                     keep_both: false,
+                    trash: None,
                 });
             }
             RecordKind::NewFolder { path } => {
@@ -1217,7 +1965,30 @@ fn plan_undo(record: Option<&UndoRecord>) -> Plan {
                     target: None,
                     conflict,
                     keep_both: false,
+                    trash: None,
                 });
+            }
+            RecordKind::Restore { items, replaced } => {
+                let mut freed = HashSet::new();
+                for restored in items {
+                    let conflict = if fs::symlink_metadata(&restored.path).is_err() {
+                        Some(Conflict::MissingSource)
+                    } else if !restored.is_still_there() {
+                        Some(Conflict::Changed)
+                    } else {
+                        freed.insert(restored.path.clone());
+                        None
+                    };
+                    steps.push(Step {
+                        action: Action::Trash,
+                        source: Some(restored.path.clone()),
+                        target: None,
+                        conflict,
+                        keep_both: false,
+                        trash: None,
+                    });
+                }
+                steps.extend(replaced.iter().map(|trashed| restore_step(trashed, &freed)));
             }
         }
     }
@@ -1226,15 +1997,26 @@ fn plan_undo(record: Option<&UndoRecord>) -> Plan {
         request: Request::Undo,
         steps,
         undo: record.cloned(),
+        problem: None,
     }
 }
 
 fn restore_step(trashed: &Trashed, freed: &HashSet<PathBuf>) -> Step {
-    let entry = trashed
-        .entry
-        .clone()
-        .filter(|files| fs::symlink_metadata(files).is_ok())
-        .or_else(|| find_trash_entry(&trashed.original, trashed.at).map(|entry| entry.files));
+    let entry = match &trashed.entry {
+        Some(files) => {
+            let still_recorded = fs::symlink_metadata(files).is_ok_and(|metadata| {
+                match (trashed.entry_dev, trashed.entry_ino) {
+                    (Some(dev), Some(ino)) => metadata.dev() == dev && metadata.ino() == ino,
+                    _ => true,
+                }
+            });
+            still_recorded.then(|| files.clone())
+        }
+        // Only an older record without a discovered entry path may search by
+        // the original/date metadata. A recorded path that is gone or now
+        // names another inode is not silently replaced.
+        None => find_trash_entry(&trashed.original, trashed.at).map(|entry| entry.files),
+    };
 
     match entry {
         Some(files) => Step {
@@ -1245,6 +2027,7 @@ fn restore_step(trashed: &Trashed, freed: &HashSet<PathBuf>) -> Step {
                 && !freed.contains(&trashed.original))
             .then_some(Conflict::TargetExists),
             keep_both: false,
+            trash: None,
         },
         None => Step {
             action: Action::Restore,
@@ -1252,6 +2035,7 @@ fn restore_step(trashed: &Trashed, freed: &HashSet<PathBuf>) -> Step {
             target: Some(trashed.original.clone()),
             conflict: Some(Conflict::MissingSource),
             keep_both: false,
+            trash: None,
         },
     }
 }
@@ -1268,6 +2052,7 @@ struct RecordBuilder {
     replaced: Vec<Trashed>,
     rename: Option<(PathBuf, PathBuf)>,
     new_folder: Option<PathBuf>,
+    restored: Vec<Restored>,
 }
 
 impl RecordBuilder {
@@ -1295,6 +2080,12 @@ impl RecordBuilder {
             Request::NewFolder { .. } => RecordKind::NewFolder {
                 path: self.new_folder?,
             },
+            Request::Restore { .. } if !self.restored.is_empty() || !self.replaced.is_empty() => {
+                RecordKind::Restore {
+                    items: self.restored,
+                    replaced: self.replaced,
+                }
+            }
             _ => return None,
         };
 
@@ -1490,16 +2281,20 @@ fn is_empty_dir(path: &Path) -> bool {
 #[derive(Debug, Clone)]
 struct TrashEntry {
     files: PathBuf,
+    dev: u64,
+    ino: u64,
 }
 
 fn trash_and_record(path: &Path) -> Result<Trashed, String> {
     let at = SystemTime::now();
     trash_path(path)?;
-    let entry = find_trash_entry(path, at).map(|entry| entry.files);
+    let entry = find_trash_entry(path, at);
     Ok(Trashed {
         original: path.to_path_buf(),
         at,
-        entry,
+        entry: entry.as_ref().map(|entry| entry.files.clone()),
+        entry_dev: entry.as_ref().map(|entry| entry.dev),
+        entry_ino: entry.as_ref().map(|entry| entry.ino),
     })
 }
 
@@ -1507,6 +2302,7 @@ fn trash_and_record(path: &Path) -> Result<Trashed, String> {
 /// `DeletionDate` is within Nautilus's two-second epsilon of `at`.
 fn find_trash_entry(original: &Path, at: SystemTime) -> Option<TrashEntry> {
     let wanted = unix_seconds(at);
+    let home_trash = glib::user_data_dir().join("Trash");
     let mut best: Option<(SystemTime, TrashEntry)> = None;
 
     for trash in trash_dirs(original) {
@@ -1527,7 +2323,8 @@ fn find_trash_entry(original: &Path, at: SystemTime) -> Option<TrashEntry> {
             let Ok(parsed) = trashinfo::parse(&text) else {
                 continue;
             };
-            if parsed.path != original {
+            let parsed_path = trashinfo::resolve_original(&trash, &home_trash, &parsed.path);
+            if parsed_path != original {
                 continue;
             }
             let Some(deletion) = parsed.deletion_date.to_unix() else {
@@ -1541,9 +2338,9 @@ fn find_trash_entry(original: &Path, at: SystemTime) -> Option<TrashEntry> {
                 continue;
             };
             let files_path = files_dir.join(name);
-            if fs::symlink_metadata(&files_path).is_err() {
+            let Ok(files_metadata) = fs::symlink_metadata(&files_path) else {
                 continue;
-            }
+            };
             let modified = fs::metadata(&info_path)
                 .and_then(|metadata| metadata.modified())
                 .unwrap_or(UNIX_EPOCH);
@@ -1552,7 +2349,14 @@ fn find_trash_entry(original: &Path, at: SystemTime) -> Option<TrashEntry> {
                 .as_ref()
                 .is_none_or(|(best_time, _)| modified > *best_time)
             {
-                best = Some((modified, TrashEntry { files: files_path }));
+                best = Some((
+                    modified,
+                    TrashEntry {
+                        files: files_path,
+                        dev: files_metadata.dev(),
+                        ino: files_metadata.ino(),
+                    },
+                ));
             }
         }
     }
@@ -1668,6 +2472,7 @@ fn result(step: &Step, target: Option<PathBuf>, outcome: ItemOutcome) -> ItemRes
             .or_else(|| step.target.clone())
             .unwrap_or_default(),
         target,
+        trash: step.trash.clone(),
         outcome,
     }
 }
