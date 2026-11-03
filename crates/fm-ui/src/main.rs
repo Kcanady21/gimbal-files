@@ -15,14 +15,18 @@ mod fileops;
 mod folder;
 mod frame;
 mod header;
+mod image;
 mod layout;
 mod log;
 mod look;
 mod open;
+mod pdf;
 mod platform;
+mod preview;
 mod save;
 mod sidebar;
 mod split;
+mod thumbs;
 mod trash;
 
 use std::cell::RefCell;

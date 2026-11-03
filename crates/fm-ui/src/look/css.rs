@@ -13,10 +13,32 @@ use crate::look::tokens::*;
 
 /// One rule per line, so the stylesheet can be read and diffed live.
 pub fn css(scale: f64, font: Option<&str>, opacity: f64) -> String {
+    css_impl(scale, font, None, opacity, false)
+}
+
+/// The shared stylesheet with the desktop's monospace family. `None` falls
+/// back to the generic `monospace` family, never a hard-coded face.
+pub fn css_with_mono(scale: f64, font: Option<&str>, mono: Option<&str>, opacity: f64) -> String {
+    css_impl(scale, font, mono, opacity, true)
+}
+
+fn css_impl(
+    scale: f64,
+    font: Option<&str>,
+    mono: Option<&str>,
+    opacity: f64,
+    use_mono: bool,
+) -> String {
     let p = |token: f64| scaled(token, scale);
     let font = font
         .map(|family| format!("font-family: \"{}\";", family.replace(['"', '\\', ';'], "")))
         .unwrap_or_default();
+    let mono = if use_mono {
+        mono.map(|family| format!("\"{}\"", family.replace(['"', '\\', ';'], "")))
+            .unwrap_or_else(|| "monospace".to_string())
+    } else {
+        String::new()
+    };
     // The config allows 0.0–1.0. Do not clamp to the old spike range: a very
     // low value is a very see-through window, by the config's choice.
     let o = opacity.clamp(0.0, 1.0);
@@ -159,6 +181,11 @@ dnd .gl-drag-badge, .gl-drag-badge {{ min-width: {tsmall}px; min-height: {tsmall
 .gl-conflict-apply {{ margin-top: {gm}px; font-size: {trow}px; }}
 .gl-num {{ font-size: {tmono}px; }}
 .gl-pline {{ font-size: {tmono}px; margin-left: {gm}px; }}
+.gl-mono, .gl-text {{ {mono_family} }}
+.gl-text {{ font-size: {tmono}px; }}
+.gl-preview-note {{ font-size: {tsmall}px; color: alpha({FG}, 0.75); }}
+.gl-preview-notice {{ font-size: {titem}px; color: {FG}; background-color: alpha(@warning_color, 0.18); border: {thin}px solid alpha(@warning_color, 0.55); border-radius: {r}px; padding: {gs}px {gm}px; }}
+.gl-preview-warning {{ color: @error_color; }}
 .gl-action-row .gl-icon-button {{ margin-left: {gm}px; }}
 .gl-action-row image {{ color: {FG}; -gtk-icon-palette: {save_as_palette}; }}
 .gl-trash {{ all: unset; min-width: {trash_inner}px; min-height: {trash_inner}px; -gtk-icon-size: {iwin}px; border: {thin}px solid {OUTLINE}; border-radius: {r}px; color: {FG}; margin-left: {gl}px; }}
@@ -186,7 +213,9 @@ dnd .gl-drag-badge, .gl-drag-badge {{ min-width: {tsmall}px; min-height: {tsmall
 .gl-trash-status {{ min-height: {statush}px; padding: 0 {gm}px; font-size: {tsmall}px; color: alpha({FG}, 0.75); }}
 .gl-trash-progress {{ border-top: {hair}px solid {RULE}; }}
 window.gimbal-look .gl-frame gridview, window.gimbal-look .gl-frame listview, window.gimbal-look .gl-frame textview, window.gimbal-look .gl-frame textview > text, window.gimbal-look .gl-frame scrolledwindow, window.gimbal-look .gl-frame viewport, window.gimbal-look .gl-frame gridview > child, window.gimbal-look windowhandle {{ background-color: transparent; }}
-window.gimbal-look .gl-frame gridview > child:selected {{ background-color: alpha(@accent_bg_color, 0.45); border-radius: {r}px; }}",
+window.gimbal-look .gl-frame gridview > child:selected {{ background-color: alpha(@accent_bg_color, 0.45); border-radius: {r}px; }}
+window.gimbal-look .gl-frame gridview > child:hover {{ background-color: alpha({FG}, 0.10); border-radius: {r}px; }}
+window.gimbal-look .gl-frame gridview > child:selected:hover {{ background-color: alpha(@accent_bg_color, 0.58); border-radius: {r}px; }}",
         pinrow = p(PIN_ROW_H),
         dirrow = p(DIR_ROW_H),
         barw = p(BAR_W),
@@ -201,6 +230,11 @@ window.gimbal-look .gl-frame gridview > child:selected {{ background-color: alph
         folder_palette = FOLDER_PALETTE,
         save_as_palette = SAVE_AS_PALETTE,
         float_palette = FLOAT_PALETTE,
+        mono_family = if use_mono {
+            format!("font-family: {mono};")
+        } else {
+            String::new()
+        },
     )
 }
 
@@ -447,6 +481,14 @@ mod tests {
         assert!(css(1.0, None, 0.2).contains("alpha(@window_bg_color, 0.20)"));
         assert!(css(1.0, None, 0.0).contains("alpha(@window_bg_color, 0.00)"));
         assert!(css(1.0, None, 1.5).contains("alpha(@window_bg_color, 1.00)"));
+    }
+
+    #[test]
+    fn the_preview_monospace_family_comes_from_the_shared_look() {
+        let mono = css_with_mono(1.0, None, Some("Fira Code"), PLAIN);
+        assert!(mono.contains(".gl-mono, .gl-text { font-family: \"Fira Code\"; }"));
+        assert!(mono.contains(".gl-text { font-size:"));
+        assert!(!css(1.0, None, PLAIN).contains("font-family"));
     }
 
     #[test]

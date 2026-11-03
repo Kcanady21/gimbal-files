@@ -46,6 +46,7 @@ pub const SIDEBAR_W: f64 = 348.0;
 pub const SIDEBAR_MIN: f64 = 300.0;
 pub const PREVIEW_W: f64 = 648.0;
 pub const PREVIEW_MIN: f64 = 360.0;
+pub const PREVIEW_GUTTER: f64 = 64.0;
 
 // The header's controls.
 pub const PILL_W: f64 = 270.0;
@@ -153,6 +154,7 @@ mod tests {
             SIDEBAR_MIN,
             PREVIEW_W,
             PREVIEW_MIN,
+            PREVIEW_GUTTER,
             TEXT_ITEM,
             TEXT_MONO_ISH,
             TEXT_SMALL,

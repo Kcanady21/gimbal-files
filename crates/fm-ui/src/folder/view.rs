@@ -16,17 +16,22 @@ use gtk::glib;
 use gtk::prelude::*;
 
 use fm_core::config::{SortBy, SortOrder, SortRule};
+use fm_core::preview::{self as core_preview, FileRevision};
 use fm_core::workspace::{FileSelection, TabId, WindowId};
 
 use crate::app::Process;
 use crate::dnd::{self, DragItem};
-use crate::folder::{ClickRequest, StatusLine, click_request, is_hidden_name, sort};
+use crate::folder::{
+    ClickRequest, GridKey, KeyboardFocus, NavMode, SelectionEntry, StatusLine, click_request,
+    details_text, is_hidden_name, keyboard_move, nav_mode, sort, visible_page_rows,
+};
 use crate::look::icons::{self, MockupIcon};
 use crate::look::tokens::*;
+use crate::thumbs::{self, ThumbKey, ThumbKind, Thumbnailer};
 
-const LABEL_CHARS: i32 = 9;
 const MAX_COLUMNS: u32 = 64;
 const ANCHOR_DEBOUNCE_MS: u64 = 300;
+const THUMB_POLL_MS: u64 = 30;
 
 /// The `max-columns` cap for a grid viewport `view_w` wide: how many columns fit
 /// at the minimum cell width, plus one. A cap one above what fits never binds,
@@ -82,6 +87,20 @@ pub struct FolderView {
     /// Set by a right press on a cell so the scroller's background gesture
     /// does not open a second menu for the same press.
     context_on_item: Rc<Cell<bool>>,
+    /// The keyboard's place in the visible order. It is a file name and
+    /// separate from the model's selection, so applying a model selection never
+    /// looks like a new user move and a re-sort never moves it to another file.
+    cursor: RefCell<KeyboardFocus>,
+    thumbnails: Rc<RefCell<Thumbnailer>>,
+    thumb_bindings: RefCell<HashMap<u64, ThumbBinding>>,
+    thumb_poll: RefCell<Option<glib::SourceId>>,
+}
+
+struct ThumbBinding {
+    cell: glib::WeakRef<gtk::Widget>,
+    item: glib::WeakRef<gtk::ListItem>,
+    name: OsString,
+    revision: FileRevision,
 }
 
 impl FolderView {
@@ -180,6 +199,10 @@ impl FolderView {
             settle_pending: Rc::new(Cell::new(false)),
             cap_pending: Rc::new(Cell::new(false)),
             context_on_item: Rc::new(Cell::new(false)),
+            cursor: RefCell::new(KeyboardFocus::default()),
+            thumbnails: Rc::new(RefCell::new(Thumbnailer::new())),
+            thumb_bindings: RefCell::new(HashMap::new()),
+            thumb_poll: RefCell::new(None),
         });
 
         this.wire_factory(&factory);
@@ -230,7 +253,10 @@ impl FolderView {
                         .current_event()
                         .map(|event| event.modifier_state())
                         .unwrap_or(gdk::ModifierType::empty());
-                    view.click_item(info.name().into_os_string(), modifiers);
+                    let name = info.name().into_os_string();
+                    view.cursor.borrow_mut().set(name.clone());
+                    view.grid.grab_focus();
+                    view.click_item(name, modifiers);
                 });
                 cell.add_controller(click);
 
@@ -273,26 +299,35 @@ impl FolderView {
                     return;
                 };
                 cell.set_size_request(scaled(CELL_W, scale.get()), -1);
+                let details = details_for(&info);
+                cell.set_tooltip_text(Some(&details));
+                cell.update_property(&[gtk::accessible::Property::Description(&details)]);
+                // Reset every recycled cell before its own binding is
+                // validated. A thumbnail from A must never remain under B.
                 if let Some(image) = cell.first_child().and_downcast::<gtk::Image>() {
-                    if info.file_type() == gio::FileType::Directory {
-                        image.set_paintable(Some(&icons::svg(MockupIcon::Folder)));
-                    } else if let Some(icon) = info.icon() {
-                        image.set_from_gicon(&icon);
-                    } else {
-                        image.set_icon_name(Some("text-x-generic"));
-                    }
+                    show_type_icon(&image, &info);
                 }
                 if let Some(label) = cell.last_child().and_downcast::<gtk::Label>() {
                     label.set_text(&info.display_name());
+                    label.set_tooltip_text(Some(&details));
+                    label.update_property(&[
+                        gtk::accessible::Property::Label(&info.display_name()),
+                        gtk::accessible::Property::Description(&details),
+                    ]);
                 }
-                if let Some(view) = weak.upgrade() {
-                    let widget: gtk::Widget = cell.upcast();
-                    view.map_cell(&widget, item.position());
-                }
+                let Some(view) = weak.upgrade() else {
+                    return;
+                };
+                let name = info.name().into_os_string();
+                let widget: gtk::Widget = cell.clone().upcast();
+                view.map_cell(&widget, item.position());
+                view.update_label_mode(&widget, &name);
+                view.request_thumbnail(&info, &widget, item, view.scale.get());
             });
         }
         {
             let positions = self.cell_positions.clone();
+            let weak = Rc::downgrade(self);
             factory.connect_unbind(move |_, object| {
                 let Some(item) = object.downcast_ref::<gtk::ListItem>() else {
                     return;
@@ -300,10 +335,20 @@ impl FolderView {
                 let Some(cell) = item.child().and_downcast::<gtk::Box>() else {
                     return;
                 };
-                let widget: gtk::Widget = cell.upcast();
+                let widget: gtk::Widget = cell.clone().upcast();
                 positions
                     .borrow_mut()
                     .retain(|(candidate, _)| candidate != &widget);
+                if let Some(view) = weak.upgrade() {
+                    view.cancel_thumbnail_for(&widget);
+                }
+                if let Some(image) = cell.first_child().and_downcast::<gtk::Image>() {
+                    image.set_paintable(None::<&gdk::Paintable>);
+                }
+                cell.set_tooltip_text(None);
+                if let Some(label) = cell.last_child().and_downcast::<gtk::Label>() {
+                    label.set_tooltip_text(None);
+                }
             });
         }
     }
@@ -316,6 +361,18 @@ impl FolderView {
                     view.open_position(position);
                 }
             });
+        }
+        {
+            let key = gtk::EventControllerKey::new();
+            key.set_propagation_phase(gtk::PropagationPhase::Capture);
+            let weak = Rc::downgrade(self);
+            key.connect_key_pressed(move |_, key, _, modifiers| {
+                let Some(view) = weak.upgrade() else {
+                    return glib::Propagation::Proceed;
+                };
+                view.key_pressed(key, modifiers)
+            });
+            self.grid.add_controller(key);
         }
         {
             let weak = Rc::downgrade(self);
@@ -421,6 +478,9 @@ impl FolderView {
             })
             .flatten();
         *self.current.borrow_mut() = Some(folder.clone());
+        self.cancel_all_thumbnails();
+        self.cell_positions.borrow_mut().clear();
+        self.cursor.borrow_mut().reset();
         self.sort_rule.set(rule);
         self.started.set(Instant::now());
         self.first_logged.set(false);
@@ -568,6 +628,21 @@ impl FolderView {
             }
         }
         self.schedule_cap();
+        let items = self.grid.observe_children();
+        for position in 0..items.n_items() {
+            if let Some(item) = items.item(position).and_downcast::<gtk::ListItem>()
+                && let Some(info) = item.item().and_downcast::<gio::FileInfo>()
+                && let Some(cell) = item.child()
+            {
+                self.request_thumbnail(&info, &cell, &item, scale);
+            }
+        }
+    }
+
+    /// Give the grid keyboard focus after a tile-frame click. The cell click
+    /// already does this; the empty part of a split tile needs the same.
+    pub fn grab_grid_focus(&self) {
+        self.grid.grab_focus();
     }
 
     pub fn listed_names(&self) -> Vec<OsString> {
@@ -582,6 +657,16 @@ impl FolderView {
     }
 
     fn info_for_name(&self, name: &OsString) -> Option<gio::FileInfo> {
+        let indexed = self.index.borrow().get(name.as_os_str()).copied();
+        if let Some(position) = indexed
+            && let Some(info) = self
+                .selection
+                .item(position)
+                .and_downcast::<gio::FileInfo>()
+            && info.name().as_os_str() == name.as_os_str()
+        {
+            return Some(info);
+        }
         (0..self.selection.n_items())
             .filter_map(|position| self.selection.item(position))
             .filter_map(|object| object.downcast::<gio::FileInfo>().ok())
@@ -1008,6 +1093,15 @@ impl FolderView {
     }
 
     fn position_of_name(&self, name: &OsString) -> Option<u32> {
+        if let Some(position) = self.index.borrow().get(name.as_os_str()).copied()
+            && self
+                .selection
+                .item(position)
+                .and_downcast::<gio::FileInfo>()
+                .is_some_and(|info| info.name().as_os_str() == name.as_os_str())
+        {
+            return Some(position);
+        }
         (0..self.selection.n_items()).find(|position| {
             self.selection
                 .item(*position)
@@ -1091,37 +1185,76 @@ impl FolderView {
         let total = self.selection.n_items();
         if names.is_empty() {
             self.selection.unselect_all();
+            self.cursor.borrow_mut().reset();
+            self.update_all_label_modes();
             return;
         }
         if total > 0 && names.len() == total as usize {
             self.selection.select_all();
-            return;
-        }
-        self.selection.unselect_all();
-        let index = self.index.borrow();
-        if !index.is_empty() {
-            for name in &names {
-                if let Some(position) = index.get(name.as_os_str()) {
-                    self.selection.select_item(*position, false);
+        } else {
+            self.selection.unselect_all();
+            let index = self.index.borrow();
+            if !index.is_empty() {
+                for name in &names {
+                    if let Some(position) = index.get(name.as_os_str()) {
+                        self.selection.select_item(*position, false);
+                    }
+                }
+                drop(index);
+            } else {
+                drop(index);
+                for position in 0..total {
+                    let Some(info) = self
+                        .selection
+                        .item(position)
+                        .and_downcast::<gio::FileInfo>()
+                    else {
+                        continue;
+                    };
+                    if names
+                        .iter()
+                        .any(|name| name.as_os_str() == info.name().as_os_str())
+                    {
+                        self.selection.select_item(position, false);
+                    }
                 }
             }
-            return;
         }
-        for position in 0..total {
-            let Some(info) = self
+        // Applying a passive/model selection must not reset an explicit cursor.
+        // Keep it by name while the file is still listed; a removed item falls
+        // back to the first selected item in visible order (never a name-sorted
+        // set's arbitrary first name).
+        let fallback = self.first_selected_name();
+        let mut cursor = self.cursor.borrow_mut();
+        cursor.reapply(|listed| self.is_listed(listed), fallback);
+        drop(cursor);
+        self.update_all_label_modes();
+    }
+
+    fn first_selected_name(&self) -> Option<OsString> {
+        let wanted = self.wanted.borrow();
+        (0..self.selection.n_items()).find_map(|position| {
+            let info = self
                 .selection
                 .item(position)
-                .and_downcast::<gio::FileInfo>()
-            else {
-                continue;
-            };
-            if names
+                .and_downcast::<gio::FileInfo>()?;
+            wanted
                 .iter()
                 .any(|name| name.as_os_str() == info.name().as_os_str())
-            {
-                self.selection.select_item(position, false);
-            }
+                .then(|| info.name().into_os_string())
+        })
+    }
+
+    fn is_listed(&self, name: &std::ffi::OsStr) -> bool {
+        if self.index.borrow().contains_key(name) {
+            return true;
         }
+        (0..self.selection.n_items()).any(|position| {
+            self.selection
+                .item(position)
+                .and_downcast::<gio::FileInfo>()
+                .is_some_and(|info| info.name().as_os_str() == name)
+        })
     }
 
     fn count_listed(&self) {
@@ -1146,11 +1279,374 @@ impl FolderView {
             return;
         }
         let (files, folders) = self.counts.get();
-        self.status.set_counts(crate::folder::status_text(
+        self.status.set_status(crate::folder::selection_status(
             files,
             folders,
-            self.selected.get(),
+            &self.selection_entries(),
         ));
+        let tooltip = self
+            .wanted
+            .borrow()
+            .first()
+            .and_then(|name| self.info_for_name(name))
+            .map(|info| details_for(&info));
+        self.grid.set_tooltip_text(tooltip.as_deref());
+    }
+
+    fn selection_entries(&self) -> Vec<SelectionEntry> {
+        self.wanted
+            .borrow()
+            .iter()
+            .map(|name| {
+                let info = self.info_for_name(name);
+                SelectionEntry {
+                    name: info
+                        .as_ref()
+                        .map(|info| info.display_name().to_string())
+                        .unwrap_or_else(|| name.to_string_lossy().into_owned()),
+                    is_folder: info
+                        .as_ref()
+                        .is_some_and(|info| info.file_type() == gio::FileType::Directory),
+                    size: info.as_ref().and_then(|info| {
+                        (info.file_type() != gio::FileType::Directory && info.size() >= 0)
+                            .then_some(info.size() as u64)
+                    }),
+                }
+            })
+            .collect()
+    }
+
+    fn update_label_mode(&self, cell: &gtk::Widget, name: &OsString) {
+        let Some(label) = cell.last_child().and_downcast::<gtk::Label>() else {
+            return;
+        };
+        let selected = self
+            .wanted
+            .borrow()
+            .iter()
+            .any(|candidate| candidate.as_os_str() == name.as_os_str());
+        let (lines, ellipsize) = label_mode(selected);
+        label.set_lines(lines);
+        label.set_ellipsize(ellipsize);
+    }
+
+    fn update_all_label_modes(&self) {
+        let cells = self.cell_positions.borrow().clone();
+        for (cell, position) in cells {
+            if let Some(name) = self.name_at(position) {
+                self.update_label_mode(&cell, &name);
+            }
+        }
+    }
+
+    fn key_pressed(&self, key: gdk::Key, modifiers: gdk::ModifierType) -> glib::Propagation {
+        let count = self.selection.n_items();
+        if count == 0 {
+            return glib::Propagation::Proceed;
+        }
+        let position = self
+            .cursor_position()
+            .or_else(|| self.selected_position())
+            .unwrap_or(0)
+            .min(count - 1);
+        let columns = self.column_count().max(1);
+        // Page moves use the visible viewport, not the grid's full scrollable
+        // height, and the realised row pitch, which grows when a selected name
+        // wraps to several lines.
+        let rows = visible_page_rows(
+            self.scroller.vadjustment().page_size(),
+            self.measured_row_height(),
+        );
+        let move_key = match key {
+            gdk::Key::Left => Some(GridKey::Left),
+            gdk::Key::Right => Some(GridKey::Right),
+            gdk::Key::Up => Some(GridKey::Up),
+            gdk::Key::Down => Some(GridKey::Down),
+            gdk::Key::Home => Some(GridKey::Home),
+            gdk::Key::End => Some(GridKey::End),
+            gdk::Key::Page_Up => Some(GridKey::PageUp),
+            gdk::Key::Page_Down => Some(GridKey::PageDown),
+            _ => None,
+        };
+        if let Some(key) = move_key {
+            let Some(target) = keyboard_move(Some(position), columns, count, key, rows) else {
+                return glib::Propagation::Stop;
+            };
+            let Some(name) = self.name_at(target) else {
+                return glib::Propagation::Stop;
+            };
+            // Set the explicit keyboard focus before the synchronous model
+            // refresh reaches apply_selection; it is retained by name.
+            self.cursor.borrow_mut().set(name.clone());
+            match nav_mode(
+                modifiers.contains(gdk::ModifierType::CONTROL_MASK),
+                modifiers.contains(gdk::ModifierType::SHIFT_MASK),
+            ) {
+                NavMode::Plain => {
+                    if let Some(process) = self.process.upgrade() {
+                        process.file_click_tab(self.window, self.tab, ClickRequest::Plain(name));
+                    }
+                }
+                NavMode::Extend => {
+                    // Only a range operation needs the visible order. A plain
+                    // arrow reads its target entry directly.
+                    let order = self.listed_names();
+                    if let Some(process) = self.process.upgrade() {
+                        process.file_click_tab(
+                            self.window,
+                            self.tab,
+                            ClickRequest::Shift { name, order },
+                        );
+                    }
+                }
+                NavMode::Focus => {}
+            }
+            self.scroll_to_item(target);
+            self.grid.grab_focus();
+            return glib::Propagation::Stop;
+        }
+        if matches!(key, gdk::Key::Return | gdk::Key::KP_Enter) {
+            self.open_position(position);
+            return glib::Propagation::Stop;
+        }
+        glib::Propagation::Proceed
+    }
+
+    fn cursor_position(&self) -> Option<u32> {
+        let name = self
+            .cursor
+            .borrow()
+            .name()
+            .map(std::ffi::OsStr::to_os_string)?;
+        self.position_of_name(&name)
+    }
+
+    /// The realised row pitch. A selected multi-line label can make the first
+    /// row taller; the distance between row tops is then the correct page step.
+    fn measured_row_height(&self) -> f64 {
+        let cells = self.cell_positions.borrow();
+        let mut rows: Vec<(i32, f64)> = Vec::new();
+        for (cell, _) in cells.iter() {
+            if let Some(bounds) = cell.compute_bounds(&self.grid) {
+                let top = bounds.y().round() as i32;
+                if !rows.iter().any(|(candidate, _)| *candidate == top) {
+                    rows.push((top, f64::from(bounds.height())));
+                }
+            }
+        }
+        rows.sort_by_key(|(top, _)| *top);
+        if rows.len() >= 2 {
+            (f64::from(rows[1].0 - rows[0].0)).max(1.0)
+        } else {
+            rows.first()
+                .map(|(_, height)| (*height).max(1.0))
+                .unwrap_or_else(|| f64::from(scaled(CELL_H, self.scale.get())).max(1.0))
+        }
+    }
+
+    fn selected_position(&self) -> Option<u32> {
+        let wanted = self.wanted.borrow();
+        (0..self.selection.n_items()).find(|position| {
+            self.name_at(*position).is_some_and(|name| {
+                wanted
+                    .iter()
+                    .any(|candidate| candidate.as_os_str() == name.as_os_str())
+            })
+        })
+    }
+
+    /// The real number of columns in the visible grid. GTK exposes only the
+    /// cap, so measure the realised first row; the arithmetic fallback is used
+    /// only before GTK has allocated any cell.
+    fn column_count(&self) -> u32 {
+        let cells = self.cell_positions.borrow();
+        let mut rows: Vec<(i32, Vec<i32>)> = Vec::new();
+        for (cell, _) in cells.iter() {
+            if let Some(bounds) = cell.compute_bounds(&self.grid) {
+                let y = bounds.y().round() as i32;
+                let x = bounds.x().round() as i32;
+                if let Some((_, xs)) = rows.iter_mut().find(|(row, _)| *row == y) {
+                    xs.push(x);
+                } else {
+                    rows.push((y, vec![x]));
+                }
+            }
+        }
+        let Some((_, xs)) = rows.into_iter().min_by_key(|(y, _)| *y) else {
+            return max_columns(
+                self.scroller.hadjustment().page_size() as i32,
+                self.scale.get(),
+            )
+            .max(1) as u32;
+        };
+        let mut xs = xs;
+        xs.sort_unstable();
+        xs.dedup();
+        (xs.len() as u32).max(1)
+    }
+
+    fn request_thumbnail(
+        self: &Rc<Self>,
+        info: &gio::FileInfo,
+        cell: &gtk::Widget,
+        item: &gtk::ListItem,
+        scale: f64,
+    ) {
+        self.cancel_thumbnail_for(cell);
+        let Some(kind) = thumb_kind(info) else {
+            return;
+        };
+        let Some(folder) = self.current.borrow().clone() else {
+            return;
+        };
+        let name = info.name().into_os_string();
+        let path = folder.join(&name);
+        let revision = revision_from_info(info);
+        let device = f64::from(cell.scale_factor().max(1));
+        let edge = (f64::from(scaled(ICON_GRID, scale)) * device)
+            .round()
+            .max(64.0) as i32;
+        let target = core_preview::render_plan(edge, edge, 1.0).size;
+        let key = ThumbKey {
+            path: path.clone(),
+            revision: revision.clone(),
+            width: target.width,
+            height: target.height,
+            kind,
+        };
+        crate::log!(
+            "thumb",
+            "request {:?} {}x{} for {}",
+            kind,
+            target.width,
+            target.height,
+            path.display()
+        );
+        let Some(image) = cell.first_child().and_downcast::<gtk::Image>() else {
+            return;
+        };
+        if let Some(texture) = thumbs::cached(&key) {
+            image.set_paintable(Some(&texture));
+            return;
+        }
+        let candidates = if kind == ThumbKind::Video {
+            core_preview::thumbnail_candidates_unchecked(info)
+        } else {
+            Vec::new()
+        };
+        if kind == ThumbKind::Video && candidates.is_empty() {
+            return;
+        }
+        let token = {
+            let mut thumbnailer = self.thumbnails.borrow_mut();
+            thumbnailer.request(key, path, candidates)
+        };
+        let Ok((token, _scheduled)) = token else {
+            return;
+        };
+        self.thumb_bindings.borrow_mut().insert(
+            token,
+            ThumbBinding {
+                cell: cell.downgrade(),
+                item: item.downgrade(),
+                name,
+                revision,
+            },
+        );
+        self.ensure_thumb_poll();
+    }
+
+    fn cancel_thumbnail_for(&self, cell: &gtk::Widget) {
+        let mut remove = Vec::new();
+        for (token, binding) in self.thumb_bindings.borrow().iter() {
+            if binding
+                .cell
+                .upgrade()
+                .is_some_and(|candidate| candidate == *cell)
+            {
+                remove.push(*token);
+            }
+        }
+        for token in remove {
+            self.thumbnails.borrow().cancel(token);
+            self.thumb_bindings.borrow_mut().remove(&token);
+        }
+    }
+
+    fn cancel_all_thumbnails(&self) {
+        let tokens: Vec<u64> = self.thumb_bindings.borrow().keys().copied().collect();
+        for token in tokens {
+            self.thumbnails.borrow().cancel(token);
+        }
+        self.thumb_bindings.borrow_mut().clear();
+    }
+
+    fn ensure_thumb_poll(self: &Rc<Self>) {
+        if self.thumb_poll.borrow().is_some() {
+            return;
+        }
+        let weak = Rc::downgrade(self);
+        let source = glib::timeout_add_local(Duration::from_millis(THUMB_POLL_MS), move || {
+            let Some(view) = weak.upgrade() else {
+                return glib::ControlFlow::Break;
+            };
+            view.poll_thumbnails()
+        });
+        *self.thumb_poll.borrow_mut() = Some(source);
+    }
+
+    fn poll_thumbnails(self: &Rc<Self>) -> glib::ControlFlow {
+        while let Some(event) = self.thumbnails.borrow().try_next() {
+            let Some(binding) = self.thumb_bindings.borrow_mut().remove(&event.token) else {
+                continue;
+            };
+            if event.key.revision != binding.revision {
+                continue;
+            }
+            let Some(item) = binding.item.upgrade() else {
+                continue;
+            };
+            let Some(info) = item.item().and_downcast::<gio::FileInfo>() else {
+                continue;
+            };
+            if !thumbnail_binding_matches(
+                binding.name.as_os_str(),
+                &binding.revision,
+                info.name().as_os_str(),
+                &revision_from_info(&info),
+            ) {
+                continue;
+            }
+            let Some(cell) = binding.cell.upgrade() else {
+                continue;
+            };
+            let Some(image) = cell.first_child().and_downcast::<gtk::Image>() else {
+                continue;
+            };
+            if let Some(failure) = &event.failure {
+                crate::log!("thumb", "no thumbnail for {:?}: {failure}", binding.name);
+            }
+            if let Some(image_data) = event.image {
+                let key = event.key.clone();
+                thumbs::insert(key.clone(), &image_data);
+                if let Some(texture) = thumbs::cached(&key) {
+                    image.set_paintable(Some(&texture));
+                }
+            }
+        }
+        // Queue pressure is temporary: retry visible deferred demand whenever
+        // a poll runs, without requiring an unbind/rebind. Pending work is the
+        // live/deferred token state, not a separately decremented counter.
+        self.thumbnails.borrow().retry_deferred();
+        if self.thumbnails.borrow().has_work() {
+            glib::ControlFlow::Continue
+        } else {
+            // A stopped worker or a cancelled batch cannot leave the view
+            // polling forever. Any leftover binding has no live token.
+            self.thumb_bindings.borrow_mut().clear();
+            *self.thumb_poll.borrow_mut() = None;
+            glib::ControlFlow::Break
+        }
     }
 
     fn map_cell(&self, cell: &gtk::Widget, position: u32) {
@@ -1163,6 +1659,26 @@ impl FolderView {
     }
 }
 
+fn label_mode(selected: bool) -> (i32, gtk::pango::EllipsizeMode) {
+    if selected {
+        (0, gtk::pango::EllipsizeMode::None)
+    } else {
+        (3, gtk::pango::EllipsizeMode::End)
+    }
+}
+
+/// A recycled GTK cell may be rebound to A then B while A's thumbnail is still
+/// in flight. Apply a result only when both the exact name and revision still
+/// match the binding that requested it.
+fn thumbnail_binding_matches(
+    binding_name: &std::ffi::OsStr,
+    binding_revision: &FileRevision,
+    current_name: &std::ffi::OsStr,
+    current_revision: &FileRevision,
+) -> bool {
+    binding_name == current_name && binding_revision == current_revision
+}
+
 fn make_cell(scale: f64) -> gtk::Box {
     let cell = gtk::Box::new(gtk::Orientation::Vertical, 0);
     cell.add_css_class("gl-cell");
@@ -1172,15 +1688,106 @@ fn make_cell(scale: f64) -> gtk::Box {
     label.set_justify(gtk::Justification::Center);
     label.set_wrap(true);
     // WordChar wraps ordinary names at word boundaries and still breaks a
-    // long unbroken run, so no name can widen the column (P1e).
+    // long unbroken run. The width belongs to the cell; no character-count
+    // truncation hides an ordinary name (Kyle, Nov 3).
     label.set_wrap_mode(gtk::pango::WrapMode::WordChar);
-    label.set_lines(2);
+    label.set_lines(3);
     label.set_ellipsize(gtk::pango::EllipsizeMode::End);
-    label.set_width_chars(LABEL_CHARS);
-    label.set_max_width_chars(LABEL_CHARS);
+    // One character is a width floor, not a text limit: the label is
+    // allocated the cell's width and wraps/ellipsizes there, so a long
+    // unbroken name cannot widen the grid column or hide ordinary names.
+    label.set_width_chars(1);
+    label.set_max_width_chars(1);
     cell.append(&icon);
     cell.append(&label);
     cell
+}
+
+fn show_type_icon(image: &gtk::Image, info: &gio::FileInfo) {
+    image.set_paintable(None::<&gdk::Paintable>);
+    if info.file_type() == gio::FileType::Directory {
+        image.set_paintable(Some(&icons::svg(MockupIcon::Folder)));
+    } else if let Some(icon) = info.icon() {
+        image.set_from_gicon(&icon);
+    } else {
+        image.set_icon_name(Some("text-x-generic"));
+    }
+}
+
+fn revision_from_info(info: &gio::FileInfo) -> FileRevision {
+    FileRevision {
+        device: u64::from(info.attribute_uint32("unix::device")),
+        inode: info.attribute_uint64("unix::inode"),
+        size: info.size().max(0) as u64,
+        modified_sec: info.attribute_uint64("time::modified") as i64,
+        modified_nsec: (info.attribute_uint32("time::modified-usec") as i64) * 1_000,
+        changed_sec: 0,
+        changed_nsec: 0,
+        etag: info
+            .attribute_string("etag::value")
+            .map(|value| value.to_string())
+            .filter(|value| !value.is_empty()),
+    }
+}
+
+fn thumb_kind(info: &gio::FileInfo) -> Option<ThumbKind> {
+    if info.file_type() == gio::FileType::Directory {
+        return None;
+    }
+    let mime = info.content_type().unwrap_or_default();
+    if mime == "application/pdf" {
+        return Some(ThumbKind::Pdf);
+    }
+    if mime.starts_with("image/") {
+        return Some(ThumbKind::Image);
+    }
+    if mime.starts_with("video/") {
+        return Some(ThumbKind::Video);
+    }
+    let extension = info
+        .name()
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| extension.to_ascii_lowercase())?;
+    if extension == "pdf" {
+        Some(ThumbKind::Pdf)
+    } else if matches!(
+        extension.as_str(),
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "tif" | "tiff" | "ico" | "avif" | "jxl"
+    ) {
+        Some(ThumbKind::Image)
+    } else if matches!(
+        extension.as_str(),
+        "mp4" | "m4v" | "webm" | "mkv" | "mov" | "avi" | "ogv" | "ogg"
+    ) {
+        Some(ThumbKind::Video)
+    } else {
+        None
+    }
+}
+
+fn details_for(info: &gio::FileInfo) -> String {
+    let folder = info.file_type() == gio::FileType::Directory;
+    let kind = if folder {
+        "Folder".to_string()
+    } else {
+        info.content_type()
+            .map(|mime| mime.to_string())
+            .unwrap_or_else(|| "File".to_string())
+    };
+    let modified = info
+        .modification_date_time()
+        .and_then(|date| date.format("%Y-%m-%d %H:%M").ok())
+        .map(|date| date.to_string());
+    if folder {
+        return format!(
+            "{}\nType: Folder\nSize: Folder\nModified: {}",
+            info.display_name(),
+            modified.as_deref().unwrap_or("Unavailable")
+        );
+    }
+    let size = (info.size() >= 0).then_some(info.size() as u64);
+    details_text(&info.display_name(), &kind, size, modified.as_deref())
 }
 
 fn compare_objects(a: &glib::Object, b: &glib::Object, rule: SortRule) -> gtk::Ordering {
@@ -1246,5 +1853,42 @@ mod tests {
         assert_eq!(max_columns(0, 1.0), 2);
         assert!(max_columns(1544, 0.5) >= 2 * 11);
         assert!(max_columns(100_000, 1.0) <= 64);
+    }
+
+    #[test]
+    fn selected_names_get_more_lines_and_a_recycled_binding_rejects_old_data() {
+        assert_eq!(label_mode(true), (0, gtk::pango::EllipsizeMode::None));
+        assert_eq!(label_mode(false), (3, gtk::pango::EllipsizeMode::End));
+
+        let revision = FileRevision {
+            device: 1,
+            inode: 2,
+            size: 3,
+            modified_sec: 4,
+            modified_nsec: 0,
+            changed_sec: 0,
+            changed_nsec: 0,
+            etag: None,
+        };
+        assert!(thumbnail_binding_matches(
+            std::ffi::OsStr::new("a.png"),
+            &revision,
+            std::ffi::OsStr::new("a.png"),
+            &revision
+        ));
+        assert!(!thumbnail_binding_matches(
+            std::ffi::OsStr::new("a.png"),
+            &revision,
+            std::ffi::OsStr::new("b.png"),
+            &revision
+        ));
+        let mut newer = revision.clone();
+        newer.size = 4;
+        assert!(!thumbnail_binding_matches(
+            std::ffi::OsStr::new("a.png"),
+            &revision,
+            std::ffi::OsStr::new("a.png"),
+            &newer
+        ));
     }
 }

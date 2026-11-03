@@ -82,6 +82,11 @@ pub fn install_hotkeys(app: &std::rc::Rc<WindowUi>, window: &gtk::Window) {
             if app.text_entry_focused() && crate::fileops::keys::entry_owns_key(key, modifiers) {
                 return gtk::glib::Propagation::Proceed;
             }
+            if app.preview_text_focused()
+                && crate::fileops::keys::text_view_owns_key(key, modifiers)
+            {
+                return gtk::glib::Propagation::Proceed;
+            }
             app.dispatch(Caller::Hotkey, invocation.clone());
             gtk::glib::Propagation::Stop
         });

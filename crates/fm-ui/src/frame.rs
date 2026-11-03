@@ -10,6 +10,7 @@ use std::rc::{Rc, Weak};
 use adw::prelude::*;
 use fm_core::command::{Caller, Invocation};
 use fm_core::config::{Change, Section, SectionState, Side};
+use fm_core::preview::Selection;
 use fm_core::workspace::{Window, WindowId};
 
 use crate::app::Process;
@@ -21,6 +22,7 @@ use crate::layout;
 use crate::look::blur::Blur;
 use crate::look::motion;
 use crate::look::tokens::*;
+use crate::preview::PreviewPanel;
 use crate::sidebar::Sidebar;
 use crate::trash::TrashBrowser;
 
@@ -33,6 +35,7 @@ pub struct WindowUi {
     content_frame: gtk::Box,
     content: Rc<Content>,
     sidebar: Rc<Sidebar>,
+    preview: Rc<PreviewPanel>,
 
     /// Left sidebar | (content | preview): two nested horizontal Paneds.
     outer: gtk::Paned,
@@ -128,11 +131,15 @@ impl WindowUi {
         // P2h's placeholder until P2j.
         let content = Content::new(process, id, scale);
 
-        let (left_root, left_button) = panel("Pinned Folders", "sidebar-show-symbolic", true);
+        let (left_root, left_button, _left_title) =
+            panel("Pinned Folders", "sidebar-show-symbolic", true);
         let sidebar = Sidebar::new(process, id, scale);
         left_root.append(sidebar.widget());
         let (left_host, left_clip, left_outline) = sidebar_host(&left_root, &left_button, true);
-        let (right_root, right_button) = panel("File Name", "sidebar-show-right-symbolic", false);
+        let (right_root, right_button, right_title) =
+            panel("File Name", "sidebar-show-right-symbolic", false);
+        let preview = PreviewPanel::new(process, id, scale, &right_title);
+        right_root.append(preview.widget());
         let (right_host, right_clip, right_outline) =
             sidebar_host(&right_root, &right_button, false);
 
@@ -151,6 +158,7 @@ impl WindowUi {
             content_frame: frame,
             content,
             sidebar,
+            preview,
             outer: outer.clone(),
             inner: inner.clone(),
             left_root,
@@ -209,6 +217,10 @@ impl WindowUi {
 
     pub fn header(&self) -> &Rc<Header> {
         &self.header
+    }
+
+    pub fn preview(&self) -> &Rc<PreviewPanel> {
+        &self.preview
     }
 
     pub fn home(&self) -> PathBuf {
@@ -296,15 +308,22 @@ impl WindowUi {
             // Do not present the hidden folder as the current view. The header
             // says Trash and the sidebar has no current-folder highlight.
             self.sidebar.set_current_folder(None);
+            self.preview.apply_model_selection(Selection::Trash);
             return;
         }
         let Some(window) = self.workspace_window() else {
             self.content.show_placeholder("No window");
             self.sidebar.set_current_folder(None);
+            self.preview.apply_model_selection(Selection::None);
             return;
         };
         let folder = window.tab(window.focused_tab).map(|tab| tab.folder.clone());
         self.sidebar.set_current_folder(folder.as_deref());
+        let selection = window
+            .tab(window.focused_tab)
+            .map(|tab| Selection::from_names(&tab.folder, &tab.selection.names))
+            .unwrap_or(Selection::None);
+        self.preview.apply_model_selection(selection);
         self.content.show(&window);
     }
 
@@ -342,6 +361,18 @@ impl WindowUi {
     /// field, or a rename/new-folder popover.
     pub fn text_entry_focused(&self) -> bool {
         self.editing.get() || self.header.text_focused()
+    }
+
+    /// A text preview owns the editing keys while its text view has focus.
+    pub fn preview_text_focused(&self) -> bool {
+        self.preview.text_focused()
+    }
+
+    /// Close after a preview guard has finished. The guard flag prevents the
+    /// same close from asking twice.
+    pub fn close_now(&self) {
+        self.preview.allow_close();
+        self.dispatch(Caller::Ui, Invocation::new("window.close", Vec::new()));
     }
 
     pub fn fileop_started(&self) {
@@ -543,6 +574,7 @@ impl WindowUi {
         self.header.set_scale(self, scale);
         self.content.apply_scale(scale);
         self.sidebar.set_scale(scale);
+        self.preview.apply_scale(scale);
         let px = |token: f64| scaled(token, scale);
         if !self.animating(true) {
             self.left_root.set_width_request(px(SIDEBAR_MIN));
@@ -1187,7 +1219,7 @@ fn rule() -> gtk::Box {
     rule
 }
 
-fn title_row(title: &str, icon: &str, button_first: bool) -> (gtk::Box, gtk::Button) {
+fn title_row(title: &str, icon: &str, button_first: bool) -> (gtk::Box, gtk::Button, gtk::Label) {
     let row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     let label = gtk::Label::new(Some(title));
     label.add_css_class("gl-title");
@@ -1204,7 +1236,7 @@ fn title_row(title: &str, icon: &str, button_first: bool) -> (gtk::Box, gtk::But
     if !button_first {
         row.append(&slot);
     }
-    (row, button)
+    (row, button, label)
 }
 
 fn icon_button(icon: &str) -> gtk::Button {
@@ -1214,14 +1246,14 @@ fn icon_button(icon: &str) -> gtk::Button {
     button
 }
 
-fn panel(title: &str, icon: &str, button_first: bool) -> (gtk::Box, gtk::Button) {
+fn panel(title: &str, icon: &str, button_first: bool) -> (gtk::Box, gtk::Button, gtk::Label) {
     let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
     root.add_css_class("gl-panel");
     root.set_vexpand(true);
-    let (row, button) = title_row(title, icon, button_first);
+    let (row, button, label) = title_row(title, icon, button_first);
     root.append(&row);
     root.append(&rule());
-    (root, button)
+    (root, button, label)
 }
 
 fn sidebar_host(

@@ -96,19 +96,14 @@ fn number_run(bytes: &[u8], start: usize) -> (usize, usize) {
     (first, end)
 }
 
-/// The attributes a listing needs: name, display name, type and icon, plus the
-/// one the current sort reads. `standard::name` is also prepended by GTK
-/// itself, but keeping it here makes the list explicit.
-pub fn attributes(rule: SortRule) -> String {
-    let mut attributes =
-        String::from("standard::name,standard::display-name,standard::type,standard::icon");
-    match rule.by {
-        SortBy::Name => {}
-        SortBy::Modified => attributes.push_str(",time::modified"),
-        SortBy::Size => attributes.push_str(",standard::size"),
-        SortBy::Type => attributes.push_str(",standard::content-type"),
-    }
-    attributes
+/// The attributes a listing needs: name, display name, type, icon, size,
+/// modification time and content type for the tooltip/status, identity and
+/// ETag for thumbnail cache keys, and every valid GIO thumbnail size. The sort
+/// key is already present for name; the other sorts read the same attributes.
+pub fn attributes(_rule: SortRule) -> String {
+    String::from(
+        "standard::name,standard::display-name,standard::type,standard::icon,standard::size,standard::content-type,time::modified,time::modified-usec,unix::device,unix::inode,etag::value,thumbnail::path,thumbnail::path-normal,thumbnail::path-large,thumbnail::path-xlarge,thumbnail::path-xxlarge,thumbnail::is-valid,thumbnail::is-valid-normal,thumbnail::is-valid-large,thumbnail::is-valid-xlarge,thumbnail::is-valid-xxlarge",
+    )
 }
 
 #[cfg(test)]
@@ -212,17 +207,15 @@ mod tests {
     }
 
     #[test]
-    fn only_the_sort_attribute_is_added() {
-        let base = attributes(rule(SortBy::Name, SortOrder::Ascending, true));
-        assert!(!base.contains("size"));
-        assert!(!base.contains("time::modified"));
-        assert!(!base.contains("content-type"));
-
-        let size = attributes(rule(SortBy::Size, SortOrder::Ascending, true));
-        assert!(size.contains("standard::size"));
-        let modified = attributes(rule(SortBy::Modified, SortOrder::Ascending, true));
-        assert!(modified.contains("time::modified"));
-        let kind = attributes(rule(SortBy::Type, SortOrder::Ascending, true));
-        assert!(kind.contains("standard::content-type"));
+    fn every_listing_has_the_metadata_and_thumbnail_attributes_it_displays() {
+        for by in [SortBy::Name, SortBy::Size, SortBy::Modified, SortBy::Type] {
+            let attributes = attributes(rule(by, SortOrder::Ascending, true));
+            assert!(attributes.contains("standard::size"));
+            assert!(attributes.contains("time::modified"));
+            assert!(attributes.contains("standard::content-type"));
+            assert!(attributes.contains("thumbnail::path-xxlarge"));
+            assert!(attributes.contains("thumbnail::is-valid-large"));
+            assert!(attributes.contains("etag::value"));
+        }
     }
 }

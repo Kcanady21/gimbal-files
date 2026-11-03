@@ -43,6 +43,47 @@ pub fn entry_owns_key(key: gdk::Key, modifiers: gdk::ModifierType) -> bool {
     false
 }
 
+/// Whether a global shortcut must be left to a focused preview text view.
+/// Text Undo/Redo and Delete belong to the editor, never to file selections.
+pub fn text_view_owns_key(key: gdk::Key, modifiers: gdk::ModifierType) -> bool {
+    let ctrl = modifiers.contains(gdk::ModifierType::CONTROL_MASK);
+    let sup = modifiers.contains(gdk::ModifierType::SUPER_MASK);
+    let shift = modifiers.contains(gdk::ModifierType::SHIFT_MASK);
+
+    if sup {
+        return false;
+    }
+    // Cursor movement and character/word deletion stay in the editor with any
+    // Ctrl/Alt combination, so a configured file Delete or Undo cannot act on
+    // the folder selection behind the preview.
+    if matches!(
+        key,
+        gdk::Key::Delete
+            | gdk::Key::BackSpace
+            | gdk::Key::Left
+            | gdk::Key::Right
+            | gdk::Key::Up
+            | gdk::Key::Down
+            | gdk::Key::Home
+            | gdk::Key::End
+            | gdk::Key::Page_Up
+            | gdk::Key::Page_Down
+            | gdk::Key::Return
+            | gdk::Key::KP_Enter
+            | gdk::Key::Tab
+            | gdk::Key::ISO_Left_Tab
+    ) {
+        return true;
+    }
+    if ctrl {
+        return matches!(
+            key,
+            gdk::Key::a | gdk::Key::c | gdk::Key::x | gdk::Key::v | gdk::Key::z | gdk::Key::y
+        );
+    }
+    shift && matches!(key, gdk::Key::Insert)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -93,6 +134,53 @@ mod tests {
         ));
         assert!(!entry_owns_key(
             gdk::Key::Down,
+            modifiers(false, false, false)
+        ));
+    }
+
+    #[test]
+    fn text_view_owns_editing_and_cursor_keys() {
+        for key in [
+            gdk::Key::a,
+            gdk::Key::c,
+            gdk::Key::x,
+            gdk::Key::v,
+            gdk::Key::z,
+            gdk::Key::y,
+        ] {
+            assert!(text_view_owns_key(key, modifiers(true, false, false)));
+        }
+        for key in [
+            gdk::Key::Delete,
+            gdk::Key::BackSpace,
+            gdk::Key::Left,
+            gdk::Key::Right,
+            gdk::Key::Up,
+            gdk::Key::Down,
+            gdk::Key::Home,
+            gdk::Key::End,
+            gdk::Key::Page_Up,
+            gdk::Key::Page_Down,
+            gdk::Key::Return,
+            gdk::Key::Tab,
+        ] {
+            assert!(text_view_owns_key(key, modifiers(false, false, false)));
+            assert!(text_view_owns_key(key, modifiers(false, false, true)));
+        }
+        assert!(text_view_owns_key(
+            gdk::Key::Delete,
+            modifiers(true, false, false)
+        ));
+        assert!(text_view_owns_key(
+            gdk::Key::Left,
+            modifiers(false, true, false)
+        ));
+        assert!(!text_view_owns_key(
+            gdk::Key::z,
+            modifiers(false, false, false)
+        ));
+        assert!(!text_view_owns_key(
+            gdk::Key::F5,
             modifiers(false, false, false)
         ));
     }

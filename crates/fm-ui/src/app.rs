@@ -11,12 +11,13 @@ use adw::prelude::*;
 use fm_core::command::{Caller, CheckedCommand, Effect, Invocation, Outcome, Registry, Value};
 use fm_core::config::{self, Change, ConfigFile};
 use fm_core::fileops::{Decisions, Plan, Report, Request, TrashIdentity, TrashUri};
+use fm_core::preview::Selection;
 use fm_core::session::{self, SessionProblem};
 use fm_core::workspace::{Event, Heights, TabId, WindowId, Workspace};
 use gtk::gio;
 use gtk::glib;
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -28,13 +29,14 @@ use crate::folder::ClickRequest;
 use crate::frame::WindowUi;
 use crate::look::Look;
 use crate::open::{OpenDecision, decision};
+use crate::preview::CloseGuard;
 use crate::save::{Debounce, SAVE_DELAY_MS, Saver};
 use crate::trash::{PageRoute, back_consumes_history, route_on_trash_page};
 
 pub struct Process {
     application: adw::Application,
     pub config: Rc<RefCell<ConfigFile>>,
-    pub look: Rc<RefCell<Look>>,
+    pub look: Rc<Look>,
     workspace: RefCell<Workspace>,
     windows: RefCell<BTreeMap<WindowId, Rc<WindowUi>>>,
     session_path: Option<PathBuf>,
@@ -52,6 +54,92 @@ pub struct Process {
     /// The typed Trash identities frozen when the item-menu Delete Permanently
     /// was clicked. It is taken once, before the worker starts.
     pending_trash_delete: RefCell<Option<Vec<TrashIdentity>>>,
+    quit: RefCell<QuitCoordinator>,
+}
+
+/// One active Quit request. Every window with an unsaved buffer or an active
+/// save is rechecked before the application may leave. Each request carries an
+/// id so a callback from a cancelled or superseded attempt is a no-op.
+#[derive(Default)]
+struct QuitCoordinator {
+    active: Option<u64>,
+    next_request: u64,
+    handled: BTreeSet<(WindowId, fm_core::preview::EditorIdentity)>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum QuitStep {
+    Inactive,
+    Finish,
+    Prompt { window: WindowId },
+}
+
+impl QuitCoordinator {
+    fn begin(&mut self) -> Option<u64> {
+        if self.active.is_some() {
+            return None;
+        }
+        self.next_request = self.next_request.wrapping_add(1);
+        self.active = Some(self.next_request);
+        self.handled.clear();
+        Some(self.next_request)
+    }
+
+    fn cancel(&mut self, request: u64) {
+        if self.active == Some(request) {
+            self.active = None;
+            self.handled.clear();
+        }
+    }
+
+    fn is_active(&self, request: u64) -> bool {
+        self.active == Some(request)
+    }
+
+    /// Pick the next window that needs an answer. Saving windows are always
+    /// prompted so their continuation binds to the in-flight job. A handled
+    /// document is asked again only after its buffer identity changes.
+    fn next(
+        &mut self,
+        request: u64,
+        windows: &[(WindowId, Option<fm_core::preview::EditorActivity>)],
+    ) -> QuitStep {
+        if !self.is_active(request) {
+            return QuitStep::Inactive;
+        }
+        if let Some((id, activity)) = windows.iter().find_map(|(id, activity)| {
+            activity
+                .as_ref()
+                .filter(|activity| activity.saving)
+                .map(|activity| (*id, activity))
+        }) {
+            self.handled.insert((id, activity.identity.clone()));
+            return QuitStep::Prompt { window: id };
+        }
+        if let Some((id, activity)) = windows.iter().find_map(|(id, activity)| {
+            activity
+                .as_ref()
+                .filter(|activity| {
+                    activity.dirty && !self.handled.contains(&(*id, activity.identity.clone()))
+                })
+                .map(|activity| (*id, activity))
+        }) {
+            self.handled.insert((id, activity.identity.clone()));
+            return QuitStep::Prompt { window: id };
+        }
+        // A handled document that is still dirty was not actually resolved;
+        // ask again rather than quitting over it.
+        if let Some((id, activity)) = windows.iter().find_map(|(id, activity)| {
+            activity
+                .as_ref()
+                .filter(|activity| activity.dirty)
+                .map(|activity| (*id, activity))
+        }) {
+            self.handled.insert((id, activity.identity.clone()));
+            return QuitStep::Prompt { window: id };
+        }
+        QuitStep::Finish
+    }
 }
 
 impl Process {
@@ -100,7 +188,7 @@ impl Process {
         let process = Rc::new(Self {
             application: application.clone(),
             config: Rc::new(RefCell::new(config_file)),
-            look: Rc::new(RefCell::new(look)),
+            look,
             workspace: RefCell::new(workspace),
             windows: RefCell::new(BTreeMap::new()),
             session_path: session::default_session_path(),
@@ -112,6 +200,7 @@ impl Process {
             fresh_home: Cell::new(false),
             suppress_header: Cell::new(false),
             pending_trash_delete: RefCell::new(None),
+            quit: RefCell::new(QuitCoordinator::default()),
         });
         let fileops = FileOps::new(&process);
         *process.fileops.borrow_mut() = Some(fileops);
@@ -678,7 +767,26 @@ impl Process {
             return;
         }
         self.apply_events(&events);
+        // A pointer or keyboard selection is explicit user intent, even when
+        // it re-selects the item already selected after Save As. Apply it
+        // after the model refresh so a saved preview override is released.
+        self.sync_preview_user(window);
         self.schedule_save();
+    }
+
+    fn sync_preview_user(&self, window: WindowId) {
+        let Some(ui) = self.window(window) else {
+            return;
+        };
+        let selection = self
+            .window_snapshot(window)
+            .and_then(|window| {
+                window
+                    .tab(window.focused_tab)
+                    .map(|tab| Selection::from_names(&tab.folder, &tab.selection.names))
+            })
+            .unwrap_or(Selection::None);
+        ui.preview().set_selection_user(selection);
     }
 
     pub fn selection_all(self: &Rc<Self>, window: WindowId, names: &[OsString]) {
@@ -691,6 +799,7 @@ impl Process {
         self.focus_model_window(window);
         let result = self.workspace.borrow_mut().selection_all(names);
         self.finish(result);
+        self.sync_preview_user(window);
     }
 
     pub fn selection_none(self: &Rc<Self>, window: WindowId) {
@@ -703,6 +812,7 @@ impl Process {
         self.focus_model_window(window);
         let result = self.workspace.borrow_mut().selection_none();
         self.finish(result);
+        self.sync_preview_user(window);
     }
 
     /// A tile drop, after the UI has hit-tested it. The model decides whether
@@ -795,6 +905,7 @@ impl Process {
             .borrow_mut()
             .nav_go(path, names.first().cloned());
         self.finish(result);
+        self.sync_preview_user(window);
     }
 
     /// Open a grid item: a folder navigates, a file launches. The decision is
@@ -855,9 +966,100 @@ impl Process {
             .collect()
     }
 
-    pub fn quit(self: &Rc<Self>) {
+    pub fn quit_now(self: &Rc<Self>) {
         self.save_now(true);
+        // Owned Poppler children must be killed/reaped while their workers
+        // still exist; setting a flag after `application.quit` is too late.
+        crate::pdf::shutdown();
         self.application.quit();
+    }
+
+    /// Quit rechecks every current model window before the application leaves.
+    /// One request is active at a time; Cancel aborts the whole request. A
+    /// window that becomes dirty during another window's question, or is
+    /// created dirty meanwhile, is still asked before `quit_now`.
+    pub fn request_quit(self: &Rc<Self>) {
+        let request = match self.quit.borrow_mut().begin() {
+            Some(request) => request,
+            None => {
+                crate::log!("quit", "a quit request is already waiting for an answer");
+                return;
+            }
+        };
+        self.advance_quit(request);
+    }
+
+    fn window_activities(&self) -> Vec<(WindowId, Option<fm_core::preview::EditorActivity>)> {
+        self.windows
+            .borrow()
+            .iter()
+            .map(|(id, ui)| (*id, ui.preview().activity()))
+            .collect()
+    }
+
+    fn advance_quit(self: &Rc<Self>, request: u64) {
+        let step = self
+            .quit
+            .borrow_mut()
+            .next(request, &self.window_activities());
+        match step {
+            QuitStep::Inactive => {
+                crate::log!("quit", "a stale quit continuation was ignored");
+            }
+            QuitStep::Finish => {
+                // A callback from a cancelled or superseded request never
+                // reaches the final quit.
+                if self.quit.borrow().is_active(request) {
+                    self.quit.borrow_mut().cancel(request);
+                    self.quit_now();
+                }
+            }
+            QuitStep::Prompt { window } => {
+                let Some(ui) = self.window(window) else {
+                    // The window disappeared while the request was active.
+                    self.advance_quit(request);
+                    return;
+                };
+                let process = Rc::downgrade(self);
+                let proceed: Rc<dyn Fn()> = Rc::new(move || {
+                    if let Some(process) = process.upgrade() {
+                        process.advance_quit(request);
+                    }
+                });
+                let process = Rc::downgrade(self);
+                let cancel: Rc<dyn Fn()> = Rc::new(move || {
+                    if let Some(process) = process.upgrade() {
+                        process.cancel_quit(request);
+                    }
+                });
+                match ui.preview().guard_close(proceed, cancel) {
+                    CloseGuard::Waiting => {}
+                    CloseGuard::Free => {
+                        // The preview stopped needing attention between the
+                        // check and the dialog. Rescan every window instead of
+                        // quitting over a stale answer.
+                        self.advance_quit(request);
+                    }
+                    CloseGuard::Busy => {
+                        // An ordinary window-close dialog already owns this
+                        // panel. Leave it intact and cancel this Quit attempt;
+                        // a later Quit starts fresh once that close resolves.
+                        crate::log!(
+                            "quit",
+                            "window {window} already owns a close dialog; quit cancelled"
+                        );
+                        self.cancel_quit(request);
+                    }
+                }
+            }
+        }
+    }
+
+    fn cancel_quit(&self, request: u64) {
+        if self.quit.borrow().is_active(request) {
+            crate::log!("quit", "the pending quit was cancelled");
+            self.quit.borrow_mut().cancel(request);
+        }
     }
 
     fn finish(self: &Rc<Self>, result: Result<Vec<Event>, fm_core::workspace::WorkspaceError>) {
@@ -918,7 +1120,7 @@ impl Process {
     }
 
     fn on_last_window_closed(self: &Rc<Self>) {
-        self.quit();
+        self.quit_now();
     }
 
     fn on_tab_added(self: &Rc<Self>, id: WindowId) {
@@ -946,6 +1148,9 @@ impl Process {
     }
 
     fn on_focus_changed(self: &Rc<Self>, id: WindowId) {
+        if let Some(ui) = self.window(id) {
+            ui.preview().release_saved_override();
+        }
         self.refresh(id, false);
     }
 
@@ -964,6 +1169,7 @@ impl Process {
     fn on_navigated(self: &Rc<Self>, id: WindowId, folder: &Path) {
         if let Some(ui) = self.window(id) {
             ui.push_recent(folder);
+            ui.preview().release_saved_override();
         }
         self.refresh(id, false);
     }
@@ -1011,7 +1217,7 @@ impl Process {
         match change {
             Change::SetScale(_) => self.apply_scale_all(),
             Change::SetOpacity(opacity) => {
-                self.look.borrow_mut().set_opacity(*opacity);
+                self.look.set_opacity(*opacity);
                 for ui in self.windows.borrow().values() {
                     ui.set_opacity(*opacity);
                 }
@@ -1058,7 +1264,7 @@ impl Process {
 
     fn apply_scale_all(self: &Rc<Self>) {
         let scale = self.scale();
-        self.look.borrow_mut().set_scale(scale);
+        self.look.set_scale(scale);
         let windows: Vec<Rc<WindowUi>> = self.windows.borrow().values().cloned().collect();
         for ui in windows {
             ui.apply_scale();
@@ -1136,6 +1342,10 @@ impl Process {
             _ => {}
         }
 
+        if command.name().starts_with("preview.") {
+            return self.preview_command(window, command);
+        }
+
         if command.effect() == Effect::Files
             && let Some(outcome) = self.run_file_command(window, caller, command)
         {
@@ -1173,13 +1383,30 @@ impl Process {
 
         match command.name() {
             "app.quit" => {
-                self.quit();
+                self.request_quit();
             }
             "window.new" => {
                 let result = self.workspace.borrow_mut().window_new(path);
                 self.finish(result);
             }
             "window.close" => {
+                if let Some(ui) = self.window(window)
+                    && !ui.preview().close_allowed()
+                {
+                    let close_ui = Rc::downgrade(&ui);
+                    let proceed: Rc<dyn Fn()> = Rc::new(move || {
+                        if let Some(ui) = close_ui.upgrade() {
+                            ui.close_now();
+                        }
+                    });
+                    let cancel: Rc<dyn Fn()> = Rc::new(|| {});
+                    match ui.preview().guard_close(proceed, cancel) {
+                        // An existing dialog owns this close; a repeated
+                        // request must never fall through and close the model.
+                        CloseGuard::Waiting | CloseGuard::Busy => return Outcome::Done,
+                        CloseGuard::Free => {}
+                    }
+                }
                 self.save_now(false);
                 let result = self.workspace.borrow_mut().window_close();
                 self.finish(result);
@@ -1339,10 +1566,35 @@ impl Process {
                     ui.open_trash();
                 }
             }
-            "preview.edit" | "preview.discard" | "preview.save" | "preview.save-as" => {
-                crate::log!("command", "{} not built yet", command.name())
-            }
             _ => crate::log!("command", "{} not built yet", command.name()),
+        }
+        Outcome::Done
+    }
+
+    fn preview_command(self: &Rc<Self>, window: WindowId, command: &CheckedCommand) -> Outcome {
+        let Some(ui) = self.window(window) else {
+            return Outcome::Done;
+        };
+        match command.name() {
+            "preview.edit" => ui.preview().begin_edit(),
+            "preview.discard" => ui.preview().discard(),
+            "preview.save" => {
+                if command.dry_run() {
+                    return Outcome::DryRun(ui.preview().save_plan(None));
+                }
+                ui.preview().save();
+            }
+            "preview.save-as" => {
+                let Some(path) = argument_path(command, "path") else {
+                    crate::log!("preview", "preview.save-as needs a path");
+                    return Outcome::Done;
+                };
+                if command.dry_run() {
+                    return Outcome::DryRun(ui.preview().save_plan(Some(&path)));
+                }
+                ui.preview().save_as(path);
+            }
+            _ => return Outcome::Done,
         }
         Outcome::Done
     }
@@ -1843,5 +2095,373 @@ fn argument_index(command: &CheckedCommand, name: &str) -> Option<usize> {
     match command.get(name) {
         Some(Value::Int(value)) => usize::try_from(*value).ok(),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::preview::{CloseGuard, close_guard_decision};
+    use fm_core::preview::{
+        EditorActivity, EditorIdentity, FileRevision, LineEnding, Loaded, PreviewContent,
+        PreviewDocument, PreviewSession, SaveCompletion, Selection, TextDocument, TextEncoding,
+        WriteAccess,
+    };
+
+    fn revision() -> FileRevision {
+        FileRevision {
+            device: 1,
+            inode: 2,
+            size: 3,
+            modified_sec: 4,
+            modified_nsec: 0,
+            changed_sec: 4,
+            changed_nsec: 0,
+            etag: None,
+        }
+    }
+
+    fn activity(editor: u64, buffer: u64, dirty: bool, saving: bool) -> EditorActivity {
+        EditorActivity {
+            identity: EditorIdentity {
+                editor_id: editor,
+                path: PathBuf::from("/tmp/a.txt"),
+                revision: revision(),
+                buffer_revision: buffer,
+            },
+            dirty,
+            saving,
+        }
+    }
+
+    fn window(number: u64) -> WindowId {
+        WindowId::from_raw(number)
+    }
+
+    fn prompt(window: WindowId) -> QuitStep {
+        QuitStep::Prompt { window }
+    }
+
+    fn preview_document(path: &str, text: &str) -> PreviewDocument {
+        PreviewDocument {
+            path: PathBuf::from(path),
+            name: Path::new(path)
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+            size: text.len() as u64,
+            revision: revision(),
+            access: WriteAccess {
+                file_writable: true,
+                parent_writable: true,
+                reason: None,
+            },
+            content: PreviewContent::Text(TextDocument {
+                text: text.to_string(),
+                encoding: TextEncoding {
+                    bom: false,
+                    line_ending: Some(LineEnding::Lf),
+                },
+            }),
+        }
+    }
+
+    fn dirty_preview(path: &str) -> PreviewSession {
+        let mut session = PreviewSession::new();
+        let ticket = session.select(Selection::file(path)).unwrap();
+        session.load_finished(&ticket, Loaded::Document(preview_document(path, "A")));
+        session.begin_edit(0).unwrap();
+        session.mark_dirty(1);
+        session
+    }
+
+    #[test]
+    fn quit_rechecks_a_clean_window_dirtied_during_another_prompt() {
+        let (a, b) = (window(1), window(2));
+        let mut quit = QuitCoordinator::default();
+        let request = quit.begin().unwrap();
+        assert_eq!(
+            quit.next(request, &[(a, None), (b, None)]),
+            QuitStep::Finish
+        );
+        quit.cancel(request);
+
+        let request = quit.begin().unwrap();
+        assert_eq!(
+            quit.next(
+                request,
+                &[(a, Some(activity(1, 1, true, false))), (b, None)]
+            ),
+            prompt(a)
+        );
+        // B was clean when the request started and is dirty by the time A's
+        // question is answered.
+        assert_eq!(
+            quit.next(
+                request,
+                &[(a, None), (b, Some(activity(2, 1, true, false)))]
+            ),
+            prompt(b)
+        );
+        assert_eq!(
+            quit.next(request, &[(a, None), (b, None)]),
+            QuitStep::Finish
+        );
+        quit.cancel(request);
+    }
+
+    #[test]
+    fn a_handled_window_edited_again_is_asked_again() {
+        let a = window(1);
+        let mut quit = QuitCoordinator::default();
+        let request = quit.begin().unwrap();
+        assert_eq!(
+            quit.next(request, &[(a, Some(activity(1, 1, true, false)))]),
+            prompt(a)
+        );
+        assert_eq!(
+            quit.next(request, &[(a, Some(activity(1, 2, true, false)))]),
+            prompt(a)
+        );
+        assert_eq!(quit.next(request, &[(a, None)]), QuitStep::Finish);
+        quit.cancel(request);
+    }
+
+    #[test]
+    fn a_newly_created_dirty_window_joins_a_pending_quit() {
+        let (a, c) = (window(1), window(3));
+        let mut quit = QuitCoordinator::default();
+        let request = quit.begin().unwrap();
+        assert_eq!(
+            quit.next(request, &[(a, Some(activity(1, 1, true, false)))]),
+            prompt(a)
+        );
+        assert_eq!(
+            quit.next(
+                request,
+                &[
+                    (a, Some(activity(1, 1, true, false))),
+                    (c, Some(activity(3, 1, true, false))),
+                ]
+            ),
+            prompt(c)
+        );
+        quit.cancel(request);
+    }
+
+    #[test]
+    fn repeated_quit_and_cancel_are_scoped_to_one_request() {
+        let a = window(1);
+        let mut quit = QuitCoordinator::default();
+        let request = quit.begin().unwrap();
+        assert!(
+            quit.begin().is_none(),
+            "a second Quit must not start a dialog"
+        );
+        assert_eq!(
+            quit.next(request, &[(a, Some(activity(1, 1, true, false)))]),
+            prompt(a)
+        );
+        quit.cancel(request);
+        assert!(!quit.is_active(request));
+        assert_eq!(
+            quit.next(request, &[(a, Some(activity(1, 1, true, false)))]),
+            QuitStep::Inactive
+        );
+        let later = quit.begin().expect("a later Quit starts fresh");
+        assert_ne!(later, request);
+        quit.cancel(later);
+    }
+
+    #[test]
+    fn final_quit_requires_no_dirty_or_saving_window() {
+        let a = window(1);
+        let mut quit = QuitCoordinator::default();
+        let request = quit.begin().unwrap();
+        assert_eq!(
+            quit.next(request, &[(a, Some(activity(1, 1, true, false)))]),
+            prompt(a)
+        );
+        // Handled but still dirty: never finish silently.
+        assert_eq!(
+            quit.next(request, &[(a, Some(activity(1, 1, true, false)))]),
+            prompt(a)
+        );
+        // An active save is prompted so the continuation binds to that job.
+        assert_eq!(
+            quit.next(request, &[(a, Some(activity(1, 1, true, true)))]),
+            prompt(a)
+        );
+        // A clean editor is not a prompt.
+        assert_eq!(
+            quit.next(request, &[(a, Some(activity(1, 1, false, false)))]),
+            QuitStep::Finish
+        );
+        quit.cancel(request);
+    }
+
+    #[test]
+    fn a_save_failure_cancels_the_whole_pending_quit() {
+        let (a, b) = (window(1), window(2));
+        let mut quit = QuitCoordinator::default();
+        let request = quit.begin().unwrap();
+        assert_eq!(
+            quit.next(request, &[(a, Some(activity(1, 1, true, false)))]),
+            prompt(a)
+        );
+        // The panel calls the cancel closure when its save fails.
+        quit.cancel(request);
+        assert_eq!(
+            quit.next(
+                request,
+                &[
+                    (a, Some(activity(1, 1, true, false))),
+                    (b, Some(activity(2, 1, true, false))),
+                ]
+            ),
+            QuitStep::Inactive,
+            "a cancelled request does not keep prompting"
+        );
+    }
+
+    #[test]
+    fn a_quit_does_not_take_over_an_existing_window_close_request() {
+        let (a, b) = (window(1), window(2));
+        let session = RefCell::new(dirty_preview("/tmp/a.txt"));
+        assert_eq!(
+            close_guard_decision(&session, false),
+            CloseGuard::Waiting,
+            "A's ordinary window close owns the panel"
+        );
+
+        let mut quit = QuitCoordinator::default();
+        let request = quit.begin().unwrap();
+        assert_eq!(
+            quit.next(request, &[(a, session.borrow().activity()), (b, None)]),
+            prompt(a)
+        );
+        // Quit reaches A, but must not overwrite A's dialog or continuation.
+        assert_eq!(close_guard_decision(&session, false), CloseGuard::Busy);
+        quit.cancel(request);
+        assert!(!quit.is_active(request));
+        assert!(
+            session.borrow().has_close(),
+            "A's close request must remain intact"
+        );
+        assert!(session.borrow().is_dirty());
+    }
+
+    #[test]
+    fn quit_works_again_after_an_existing_close_is_cancelled() {
+        let (a, b) = (window(1), window(2));
+        let session = RefCell::new(dirty_preview("/tmp/a.txt"));
+        assert_eq!(close_guard_decision(&session, false), CloseGuard::Waiting);
+        session.borrow_mut().invalidate_close();
+
+        let mut quit = QuitCoordinator::default();
+        let request = quit.begin().unwrap();
+        assert_eq!(
+            quit.next(request, &[(a, session.borrow().activity()), (b, None)]),
+            prompt(a)
+        );
+        assert_eq!(
+            close_guard_decision(&session, false),
+            CloseGuard::Waiting,
+            "Quit may arm its own dialog once A's close is cancelled"
+        );
+        quit.cancel(request);
+    }
+
+    #[test]
+    fn quit_works_again_after_an_existing_close_is_saved() {
+        let (a, b) = (window(1), window(2));
+        let session = RefCell::new(dirty_preview("/tmp/a.txt"));
+        assert_eq!(close_guard_decision(&session, false), CloseGuard::Waiting);
+        let save = session.borrow_mut().begin_save_original().unwrap();
+        session.borrow_mut().bind_close_to_save(&save);
+        assert_eq!(
+            session
+                .borrow_mut()
+                .save_finished(&save, preview_document("/tmp/a.txt", "saved")),
+            SaveCompletion::Applied
+        );
+        assert!(session.borrow().has_close());
+        assert!(session.borrow_mut().take_close().is_some());
+
+        let mut quit = QuitCoordinator::default();
+        let request = quit.begin().unwrap();
+        assert_eq!(
+            quit.next(request, &[(a, None), (b, None)]),
+            QuitStep::Finish
+        );
+        quit.cancel(request);
+    }
+
+    #[test]
+    fn quit_works_again_after_an_existing_close_is_discarded() {
+        let (a, b) = (window(1), window(2));
+        let session = RefCell::new(dirty_preview("/tmp/a.txt"));
+        assert_eq!(close_guard_decision(&session, false), CloseGuard::Waiting);
+        let close = session.borrow().close_request().cloned().unwrap();
+        assert!(session.borrow_mut().discard_preserving_close().is_some());
+        assert!(session.borrow().close_ready(&close));
+        assert!(session.borrow_mut().take_close().is_some());
+
+        let mut quit = QuitCoordinator::default();
+        let request = quit.begin().unwrap();
+        assert_eq!(
+            quit.next(request, &[(a, None), (b, None)]),
+            QuitStep::Finish
+        );
+        quit.cancel(request);
+    }
+
+    #[test]
+    fn a_window_close_save_failure_clears_its_continuation_and_allows_a_new_quit() {
+        let (a, b) = (window(1), window(2));
+        let session = RefCell::new(dirty_preview("/tmp/a.txt"));
+        assert_eq!(close_guard_decision(&session, false), CloseGuard::Waiting);
+        let save = session.borrow_mut().begin_save_original().unwrap();
+        session.borrow_mut().bind_close_to_save(&save);
+        assert!(session.borrow_mut().save_failed(&save, "disk full"));
+        assert!(!session.borrow().has_close());
+
+        let mut quit = QuitCoordinator::default();
+        let request = quit.begin().unwrap();
+        assert_eq!(
+            quit.next(request, &[(a, session.borrow().activity()), (b, None)]),
+            prompt(a)
+        );
+        // A is still dirty, but its failed close no longer blocks a new Quit.
+        assert_eq!(close_guard_decision(&session, false), CloseGuard::Waiting);
+        quit.cancel(request);
+    }
+
+    #[test]
+    fn stale_quit_continuations_cannot_finish_a_cancelled_or_new_request() {
+        let a = window(1);
+        let mut quit = QuitCoordinator::default();
+        let first = quit.begin().unwrap();
+        assert_eq!(
+            quit.next(first, &[(a, Some(activity(1, 1, true, false)))]),
+            prompt(a)
+        );
+        quit.cancel(first);
+        assert_eq!(
+            quit.next(first, &[(a, None)]),
+            QuitStep::Inactive,
+            "a cancelled request's continuation is a no-op"
+        );
+
+        let second = quit.begin().unwrap();
+        assert_ne!(first, second);
+        assert_eq!(
+            quit.next(first, &[(a, None)]),
+            QuitStep::Inactive,
+            "the old request cannot finish the new one"
+        );
+        assert_eq!(quit.next(second, &[(a, None)]), QuitStep::Finish);
+        quit.cancel(second);
     }
 }

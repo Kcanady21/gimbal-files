@@ -2196,6 +2196,15 @@ fn attach_handlers(
             && let Some(process) = inner.process.upgrade()
         {
             process.focus_tab(inner.window, id);
+            let view = inner
+                .tiles
+                .borrow()
+                .iter()
+                .find(|tile| tile.id == id)
+                .map(|tile| tile.view.clone());
+            if let Some(view) = view {
+                view.grab_grid_focus();
+            }
         }
     });
     outer.add_controller(click);

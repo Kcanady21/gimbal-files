@@ -587,8 +587,10 @@ pub fn pin_slot(y: f64, row_h: i32, n: usize) -> usize {
     ((y as i32).div_euclid(row_h)).clamp(0, (n - 1) as i32) as usize
 }
 
-/// The decision at release, pure: a still pointer selects (and a double-click
-/// opens); only `moved` can reorder.
+/// The decision at release, pure: an ordinary primary click opens the pin
+/// exactly once on the first release. A double-click's second release must not
+/// navigate again; only a moved drag can reorder, and a drag returning to its
+/// own slot is not a click.
 pub fn pin_release(
     n: usize,
     row_h: i32,
@@ -602,7 +604,7 @@ pub fn pin_release(
     }
     let from = from.min(n - 1);
     if !moved {
-        return if n_press >= 2 {
+        return if n_press <= 1 {
             PinRelease::Open { slot: from }
         } else {
             PinRelease::Select { slot: from }
@@ -795,6 +797,7 @@ struct PinnedList {
     drag: RefCell<Option<PinDrag>>,
     animations: RefCell<Vec<adw::Animation>>,
     click: gtk::GestureClick,
+    last_open: RefCell<Option<(PathBuf, std::time::Instant)>>,
     process: Weak<Process>,
     window: WindowId,
     home: PathBuf,
@@ -825,6 +828,7 @@ impl PinnedList {
             drag: RefCell::new(None),
             animations: RefCell::new(Vec::new()),
             click: click.clone(),
+            last_open: RefCell::new(None),
             process: Rc::downgrade(process),
             window,
             home,
@@ -982,9 +986,34 @@ impl PinnedList {
         }
         let slot = pin_slot(y, row_h, n);
         match pin_release(n, row_h, slot, y, n_press, false) {
-            PinRelease::Open { slot } => self.open_slot(slot),
-            _ => self.select(Some(slot)),
+            PinRelease::Open { slot } => self.open_once(slot),
+            PinRelease::Select { slot } => self.select(Some(slot)),
+            PinRelease::Reorder { .. } => {}
         }
+    }
+
+    /// A rebuilt row list can reset GTK's press count between a double-click's
+    /// two releases. Keep one short per-slot guard so the second release never
+    /// produces a second history entry.
+    fn open_once(&self, slot: usize) {
+        let Some(path) = self.names.borrow().get(slot).cloned() else {
+            return;
+        };
+        let now = std::time::Instant::now();
+        {
+            let last_open = self.last_open.borrow();
+            if let Some((last, at)) = last_open.as_ref()
+                && *last == path
+                && now.duration_since(*at) < std::time::Duration::from_millis(450)
+            {
+                drop(last_open);
+                self.select(Some(slot));
+                return;
+            }
+        }
+        *self.last_open.borrow_mut() = Some((path, now));
+        self.select(Some(slot));
+        self.open_slot(slot);
     }
 
     fn open_slot(&self, slot: usize) {
@@ -1275,22 +1304,34 @@ mod tests {
     }
 
     #[test]
-    fn only_a_past_threshold_press_reorders() {
+    fn only_a_past_threshold_drag_reorders_and_a_release_opens_once() {
         let h = 44;
         assert_eq!(
             pin_release(7, h, 0, 2.0 * h as f64 + 10.0, 1, true),
             PinRelease::Reorder { from: 0, to: 2 }
         );
+        // An ordinary first release opens. A double-click's second release is
+        // not a second navigation.
         assert_eq!(
-            pin_release(7, h, 4, 4.0 * h as f64 + 10.0, 2, false),
+            pin_release(7, h, 4, 4.0 * h as f64 + 10.0, 1, false),
             PinRelease::Open { slot: 4 }
         );
         assert_eq!(
+            pin_release(7, h, 4, 4.0 * h as f64 + 10.0, 2, false),
+            PinRelease::Select { slot: 4 }
+        );
+        assert_eq!(
             pin_release(7, h, 3, 3.0 * h as f64 + 10.0, 1, false),
+            PinRelease::Open { slot: 3 }
+        );
+        // A moved drag returning to its original row never becomes a click or
+        // a reorder.
+        assert_eq!(
+            pin_release(7, h, 3, 3.0 * h as f64 + 10.0, 1, true),
             PinRelease::Select { slot: 3 }
         );
         assert_eq!(
-            pin_release(7, h, 3, 3.0 * h as f64 + 10.0, 1, true),
+            pin_release(7, h, 3, 3.0 * h as f64 + 10.0, 2, true),
             PinRelease::Select { slot: 3 }
         );
     }

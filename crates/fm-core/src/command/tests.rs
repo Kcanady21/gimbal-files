@@ -200,6 +200,43 @@ fn exactly_the_two_approved_permanent_commands_delete_permanently() {
 }
 
 #[test]
+fn preview_editing_commands_refuse_the_cli_and_agent_before_any_handler() {
+    for command in PREVIEW_EDITING_COMMANDS {
+        assert!(caller_allowed(command, Effect::View, Caller::Ui));
+        assert!(caller_allowed(command, Effect::View, Caller::Hotkey));
+        assert!(!caller_allowed(command, Effect::Files, Caller::Cli));
+        assert!(!caller_allowed(command, Effect::Files, Caller::Agent));
+
+        for caller in [Caller::Cli, Caller::Agent] {
+            let mut handler = Recorder::new(Outcome::Done);
+            let outcome =
+                Registry::new().dispatch(caller, &parse_invocation(&[command]), &mut handler);
+            assert!(
+                matches!(outcome, Outcome::Error(_)),
+                "{command} via {caller}"
+            );
+            assert!(handler.seen.is_empty(), "{command} reached a handler");
+        }
+    }
+
+    let mut handler = Recorder::new(Outcome::Done);
+    let outcome = Registry::new().dispatch(
+        Caller::Ui,
+        &parse_invocation(&["preview.edit"]),
+        &mut handler,
+    );
+    assert_eq!(outcome, Outcome::Done);
+    assert_eq!(handler.seen.len(), 1);
+
+    // Save As keeps its explicit path argument; no optional implicit variant.
+    assert!(
+        check(Caller::Ui, &["preview.save-as"]).is_err(),
+        "preview.save-as must require its path"
+    );
+    assert!(check(Caller::Ui, &["preview.save-as", "path=/tmp/new.txt"]).is_ok());
+}
+
+#[test]
 fn every_files_command_gets_exactly_one_dry_run_added_by_the_registry() {
     for spec in COMMANDS {
         let arguments = spec.arguments();

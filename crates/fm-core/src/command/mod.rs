@@ -305,9 +305,23 @@ pub fn must_supply(caller: Caller, effect: Effect, argument: &ArgSpec) -> bool {
 /// including a dry run, can see them. This is the only caller exception.
 pub const UI_ONLY_PERMANENT_COMMANDS: &[&str] = &["trash.empty", "trash.delete-permanently"];
 
+/// The existing preview commands operate on the UI's active editor context.
+/// Until a revision-aware editing API exists, only the UI and configured
+/// hotkeys may call them; the CLI and agent are refused before any handler.
+pub const PREVIEW_EDITING_COMMANDS: &[&str] = &[
+    "preview.edit",
+    "preview.discard",
+    "preview.save",
+    "preview.save-as",
+];
+
 /// Whether this caller may run this command at all. The two approved permanent
-/// deletions are explicitly clicked UI operations.
+/// deletions are explicitly clicked UI operations; the preview commands may
+/// also come from a hotkey.
 pub fn caller_allowed(name: &str, effect: Effect, caller: Caller) -> bool {
+    if PREVIEW_EDITING_COMMANDS.contains(&name) {
+        return matches!(caller, Caller::Ui | Caller::Hotkey);
+    }
     !(effect == Effect::Files && UI_ONLY_PERMANENT_COMMANDS.contains(&name)) || caller == Caller::Ui
 }
 
