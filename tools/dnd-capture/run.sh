@@ -154,6 +154,8 @@ mkdir -p "$RUNDIR"
 # only summaries (and meta/result) get committed; raw logs are gzipped and ignored
 [ -e "$CAPS/.gitignore" ] || printf '*.log.gz\n' > "$CAPS/.gitignore"
 
+# set before the reset below would have cleared it (cleanup reads it)
+SCRATCH=""
 if [ "$SOURCE_APP" = app ]; then
   SCRATCH="$(mktemp -d "${TMPDIR:-/tmp}/gimbal-dnd-app-XXXXXX")" \
     || die "could not create the app's scratch folder"
@@ -166,7 +168,7 @@ echo "Run directory: $RUNDIR"
 # PIDs of everything this script starts; cleanup only ever touches these.
 # The throwaway Zen sandbox is stopped by its flatpak INSTANCE id — never by
 # the app id, which would also stop Kyle's Zen.
-SRC_PID="" ZEN_PID="" ZEN_INSTANCE="" ZEN_INNER_PID="" DBUS_PID="" SCRATCH=""
+SRC_PID="" ZEN_PID="" ZEN_INSTANCE="" ZEN_INNER_PID="" DBUS_PID=""
 
 # Logging only: the browser process inside the sandbox, if its cmdline still
 # carries the profile flag.  Zen may re-launch itself inside the sandbox with

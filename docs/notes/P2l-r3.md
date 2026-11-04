@@ -401,3 +401,56 @@ prior passing Ctrl-copy, cross-drive Shift-move, key-release/default and regress
 checks, P2l-r3 is accepted. Final tested code gates: 356 passed, 6 ignored (see above).
 No new code changes or gate rerun for this acceptance entry. Zen's 8-row matrix
 remains a separate unverified item. No commit or push yet.
+
+## Zen matrix attempt (Kyle run, ChatGPT inspected, Nov 2)
+
+**[observed in captured files]** Only one app matrix capture exists:
+`docs/research/phase0/captures/20261102-194406-app-outside`. Its first sample.png row
+aborted before drag: the runner did not find the test Zen window within 15 seconds.
+`source_intact: yes`; no start_drag, no received offer; remaining seven rows did not run.
+The compressed Zen stderr says `bwrap: Can't find source path
+/run/user/1000/doc/by-app/app.zen_browser.zen: No such file or directory`.
+That directory is also absent at inspection. This is a Flatpak/document-portal
+launch failure, not a failing Gimbal drag. No runner, portal, config or window
+changes were made by ChatGPT. Matrix remains unverified; resolve test Zen launch
+before retrying. No pointer injection was performed by the reviewer.
+
+## Manual Zen check (Kyle, Nov 4, 2026)
+
+**[Kyle reports]** Dragging files from Gimbal into Zen worked. The manual Gimbal-to-Zen check passed. The scripted eight-row matrix is still pending.
+
+## Zen matrix (Claude, Nov 4, 2026): 8 of 8 pass
+
+`tools/dnd-capture/run-matrix-gimbal.sh app`, with Kyle's app closed and DP-3 off (one output,
+DP-2 at 2560×1440). The release build is from 07:52, which matches HEAD `c288b33`.
+
+**[observed]** Every row's drag reached Zen, and Zen opened the file. Every row reported
+`source_intact: yes`.
+
+| Location | Dragged | Zen's title |
+| --- | --- | --- |
+| outside | `sample.png` | `sample.png (PNG Image, 16 × 16 pixels)` |
+| outside | `sample-dir` | `Index of file:///run/user/1000/doc/4836a13c/sample-dir` (through the portal) |
+| outside | `sample-link.png` | `sample.png (PNG Image …)` (the link resolved) |
+| outside | `sample.png` + `sample.txt` (preselected) | `sample.png (PNG Image …)` |
+| downloads | `sample.png` | `sample.png (PNG Image …)` |
+| downloads | `sample-dir` | `Index of file:///home/kyle/Downloads/gimbal-dnd-test-gimbal/sample-dir` |
+| downloads | `sample-link.png` | `sample.png (PNG Image …)` |
+| downloads | `sample.png` + `sample.txt` (preselected) | `sample.png (PNG Image …)` |
+
+- **[observed]** Every row offered the same MIME types: `application/x-gtk-local-dnd`,
+  `text/plain;charset=utf-8`, `text/uri-list`, `application/vnd.portal.filetransfer` and
+  `application/vnd.portal.files`. Zen read `text/uri-list` and `application/vnd.portal.files`.
+- **[observed]** The 4 outside rows got there through the document portal (`/run/user/1000/doc/…`),
+  as Phase 0 found for Dolphin and Nautilus.
+- **[inferred]** The Nov 2 failure was the missing portal folder, as ChatGPT diagnosed. The folder
+  `/run/user/1000/doc/by-app/app.zen_browser.zen` exists now.
+- Captures: `docs/research/phase0/captures/20261104-0804*` and `20261104-0805*`, plus
+  `20261104-080602`.
+
+**Fix (Claude): the runner never removed the app's scratch folders.**
+- **The cause:** `run.sh` created `SCRATCH` with `mktemp`, then reset it to `""` on the line that
+  clears its PID variables. That left the cleanup trap with nothing to remove.
+- **The fix:** the reset now runs before `mktemp`. `bash -n` passes. The next matrix run will show
+  it working.
+- **Still on disk:** the 8 empty `/tmp/gimbal-dnd-app-*` folders from this run. They hold no files.

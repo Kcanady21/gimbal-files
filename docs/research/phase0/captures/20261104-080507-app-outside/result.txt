@@ -1,0 +1,13 @@
+zen_opened_file: y
+note: auto:true source=gimbal location=outside file=sample-link.png folder=/home/kyle/gimbal-dnd-test-gimbal
+auto: true
+source: gimbal
+location: outside
+file: sample-link.png
+selection: selected
+click_at: (498, 846)
+drop_at: (1910, 803)
+title_before: Zen Browser
+raw_title: sample.png (PNG Image, 16 × 16 pixels) — Zen Browser
+matched_name: sample.png
+source_intact: yes

@@ -1,0 +1,14 @@
+zen_opened_file: aborted
+note: auto:true source=gimbal location=outside file=sample.png folder=/home/kyle/gimbal-dnd-test-gimbal
+auto: true
+source: gimbal
+location: outside
+file: sample.png
+selection: n/a
+click_at: None
+drop_at: None
+title_before: None
+raw_title: None
+matched_name: None
+aborted: signal 2
+source_intact: yes
