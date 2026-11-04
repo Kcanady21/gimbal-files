@@ -51,6 +51,7 @@ pub const PREVIEW_GUTTER: f64 = 64.0;
 // The header's controls.
 pub const PILL_W: f64 = 270.0;
 pub const SEARCH_W: f64 = 496.0;
+pub const SEARCH_HINT_W: f64 = 128.0;
 pub const PATH_MIN: f64 = 320.0;
 pub const TRASH: f64 = 48.0;
 pub const DEFAULT_W: i32 = 2560;
@@ -175,6 +176,7 @@ mod tests {
             ICON_SEARCH,
             ICON_WINDOW,
             SEARCH_W,
+            SEARCH_HINT_W,
             PATH_MIN,
             TRASH,
         ] {

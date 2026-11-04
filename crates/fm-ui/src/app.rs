@@ -31,6 +31,8 @@ use crate::look::Look;
 use crate::open::{OpenDecision, decision};
 use crate::preview::CloseGuard;
 use crate::save::{Debounce, SAVE_DELAY_MS, Saver};
+#[cfg(test)]
+use crate::search::SearchView;
 use crate::trash::{PageRoute, back_consumes_history, route_on_trash_page};
 
 pub struct Process {
@@ -71,10 +73,18 @@ pub struct Process {
     pending_runs: RefCell<HashMap<u64, crate::agent::PendingRun>>,
     next_work_id: Cell<u64>,
     /// The filesystem worker's resolved `nav.go` target, consumed by the real
-    /// command handler instead of a GTK-thread `exists()` call.
-    pending_nav_target: RefCell<Option<(PathBuf, Option<OsString>)>>,
+    /// command handler instead of a GTK-thread `exists()` call. Search
+    /// activation adds the exact text the registry validated and the caller it
+    /// is trusted for, so the payload can never replace a different command.
+    pending_nav: RefCell<Option<PendingNav>>,
     /// The first real model failure in the current command dispatch.
     last_failure: RefCell<Option<String>>,
+    /// Process-wide search sessions and the fixed two-worker pool.
+    search: Rc<crate::search::SearchRuntime>,
+    search_poll: RefCell<Option<glib::SourceId>>,
+    /// True while the search timer's own callback is draining events, so a
+    /// close from inside it cannot remove the source that is currently firing.
+    search_in_poll: Cell<bool>,
     /// The injectable clipboard reader. Production uses the GTK clipboard;
     /// tests can pause or fail a read without touching Kyle's clipboard.
     clipboard_reader: Rc<dyn crate::fileops::clipboard::Reader>,
@@ -84,6 +94,33 @@ pub struct Process {
     /// reads the real window's page state.
     #[cfg(test)]
     trash_pages: RefCell<BTreeSet<WindowId>>,
+    /// Test seam: how many `nav.go` dispatches consumed trusted native-path
+    /// evidence after registry validation.
+    #[cfg(test)]
+    native_nav_evidence_uses: Cell<usize>,
+}
+
+/// Trusted out-of-band navigation evidence. `expected` and `caller` are set for
+/// search activation: the handler only uses the payload when the registry
+/// accepted exactly this text path for exactly this caller. The existing
+/// worker evidence for the agent leaves both unset, preserving its behaviour.
+struct PendingNav {
+    expected: Option<String>,
+    caller: Option<Caller>,
+    folder: PathBuf,
+    select: Option<OsString>,
+}
+
+impl PendingNav {
+    fn matches(&self, caller: Caller, command: &CheckedCommand) -> bool {
+        match (&self.expected, self.caller) {
+            (Some(expected), Some(expected_caller)) => {
+                expected_caller == caller
+                    && matches!(command.get("path"), Some(Value::Path(path)) if path.to_str() == Some(expected.as_str()))
+            }
+            _ => true,
+        }
+    }
 }
 
 /// One active Quit request. Every window with an unsaved buffer or an active
@@ -245,15 +282,26 @@ impl Process {
             pending_authorization: RefCell::new(None),
             pending_runs: RefCell::new(HashMap::new()),
             next_work_id: Cell::new(0),
-            pending_nav_target: RefCell::new(None),
+            pending_nav: RefCell::new(None),
             last_failure: RefCell::new(None),
+            search: Rc::new(crate::search::SearchRuntime::production()),
+            search_poll: RefCell::new(None),
+            search_in_poll: Cell::new(false),
             clipboard_reader: Rc::new(crate::fileops::clipboard::SystemReader),
             headless: false,
             #[cfg(test)]
             trash_pages: RefCell::new(BTreeSet::new()),
+            #[cfg(test)]
+            native_nav_evidence_uses: Cell::new(0),
         });
         let fileops = FileOps::new(&process);
         *process.fileops.borrow_mut() = Some(fileops);
+        let weak = Rc::downgrade(&process);
+        process.search.set_wake(move || {
+            if let Some(process) = weak.upgrade() {
+                process.ensure_search_poll();
+            }
+        });
         process.restore_session();
         crate::agent::start_if_enabled(&process);
         let weak = Rc::downgrade(&process);
@@ -273,6 +321,21 @@ impl Process {
         config_path: PathBuf,
         home: PathBuf,
         clipboard_reader: Rc<dyn crate::fileops::clipboard::Reader>,
+    ) -> Rc<Self> {
+        Self::headless_with_search(
+            config_path,
+            home,
+            clipboard_reader,
+            Rc::new(crate::search::SearchRuntime::production()),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn headless_with_search(
+        config_path: PathBuf,
+        home: PathBuf,
+        clipboard_reader: Rc<dyn crate::fileops::clipboard::Reader>,
+        search: Rc<crate::search::SearchRuntime>,
     ) -> Rc<Self> {
         let (config_file, _problems) = ConfigFile::load(&config_path);
         let process = Rc::new(Self {
@@ -298,14 +361,24 @@ impl Process {
             pending_authorization: RefCell::new(None),
             pending_runs: RefCell::new(HashMap::new()),
             next_work_id: Cell::new(0),
-            pending_nav_target: RefCell::new(None),
+            pending_nav: RefCell::new(None),
             last_failure: RefCell::new(None),
+            search,
+            search_poll: RefCell::new(None),
+            search_in_poll: Cell::new(false),
             clipboard_reader,
             headless: true,
             trash_pages: RefCell::new(BTreeSet::new()),
+            native_nav_evidence_uses: Cell::new(0),
         });
         let fileops = FileOps::new_manual(&process);
         *process.fileops.borrow_mut() = Some(fileops);
+        let weak = Rc::downgrade(&process);
+        process.search.set_wake(move || {
+            if let Some(process) = weak.upgrade() {
+                process.ensure_search_poll();
+            }
+        });
         process
     }
 
@@ -437,16 +510,55 @@ impl Process {
     pub(crate) fn clear_agent_pending(&self) {
         self.pending_runs.borrow_mut().clear();
         self.pending_authorization.borrow_mut().take();
-        self.pending_nav_target.borrow_mut().take();
+        self.pending_nav.borrow_mut().take();
         self.reserved_job.borrow_mut().take();
     }
 
     pub(crate) fn set_pending_nav_target(&self, target: Option<(PathBuf, Option<OsString>)>) {
-        *self.pending_nav_target.borrow_mut() = target;
+        *self.pending_nav.borrow_mut() = target.map(|(folder, select)| PendingNav {
+            expected: None,
+            caller: None,
+            folder,
+            select,
+        });
     }
 
-    fn take_pending_nav_target(&self) -> Option<(PathBuf, Option<OsString>)> {
-        self.pending_nav_target.borrow_mut().take()
+    /// Bind the exact native target to the text the registry is about to
+    /// validate. Only trusted UI code calls this, immediately around the one
+    /// `nav.go` dispatch.
+    fn set_pending_nav_evidence(
+        &self,
+        text: String,
+        folder: PathBuf,
+        select: Option<OsString>,
+        caller: Caller,
+    ) {
+        *self.pending_nav.borrow_mut() = Some(PendingNav {
+            expected: Some(text),
+            caller: Some(caller),
+            folder,
+            select,
+        });
+    }
+
+    fn take_pending_nav(&self) -> Option<PendingNav> {
+        self.pending_nav.borrow_mut().take()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_pending_nav_evidence_for_tests(
+        &self,
+        text: String,
+        folder: PathBuf,
+        select: Option<OsString>,
+        caller: Caller,
+    ) {
+        self.set_pending_nav_evidence(text, folder, select, caller);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn native_nav_evidence_uses_for_tests(&self) -> usize {
+        self.native_nav_evidence_uses.get()
     }
 
     pub(crate) fn clipboard_reader(&self) -> Rc<dyn crate::fileops::clipboard::Reader> {
@@ -600,6 +712,7 @@ impl Process {
     }
 
     pub fn forget_window(&self, id: WindowId) {
+        self.search.close(id);
         self.windows.borrow_mut().remove(&id);
     }
 
@@ -620,6 +733,8 @@ impl Process {
     }
 
     fn destroy_window(&self, id: WindowId) {
+        self.search.close(id);
+        self.stop_search_poll_if_idle();
         if let Some(ui) = self.windows.borrow_mut().remove(&id) {
             ui.window().destroy();
             crate::log!("window", "closed model window {id}");
@@ -696,24 +811,25 @@ impl Process {
         caller: Caller,
         invocation: Invocation,
     ) {
+        let outcome = self.dispatch_with_outcome(window, caller, &invocation);
+        log_outcome(&invocation, &outcome);
+    }
+
+    /// The same production path as [`Self::dispatch_for_window`], returning
+    /// the registry's outcome for a caller that must react to acceptance.
+    fn dispatch_with_outcome(
+        self: &Rc<Self>,
+        window: WindowId,
+        caller: Caller,
+        invocation: &Invocation,
+    ) -> Outcome {
         self.focus_model_window(window);
         let mut handler = commands::UiHandler {
             caller,
             window,
             process: Rc::downgrade(self),
         };
-        let outcome = Registry::new().dispatch(caller, &invocation, &mut handler);
-        match outcome {
-            Outcome::Error(error) => crate::log!("command", "{error}"),
-            Outcome::Failed(message) => crate::log!("command", "{}: {message}", invocation.name()),
-            Outcome::DryRun(lines) => crate::log!(
-                "command",
-                "{} dry run: {} lines",
-                invocation.name(),
-                lines.len()
-            ),
-            Outcome::Done => {}
-        }
+        Registry::new().dispatch(caller, invocation, &mut handler)
     }
 
     /// Focus a pill and then run a command against it. The pill-click events
@@ -1267,8 +1383,374 @@ impl Process {
             .collect()
     }
 
+    // -----------------------------------------------------------------------
+    // Search routing
+    // -----------------------------------------------------------------------
+
+    /// The exact tab and folder a new search captures. Split tiles share one
+    /// focused tab, so this is only ever the focused tile's folder.
+    fn search_target(&self, window: WindowId) -> Option<(TabId, PathBuf)> {
+        let window = self.window_snapshot(window)?;
+        let tab = window.tab(window.focused_tab)?;
+        Some((tab.id, tab.folder.clone()))
+    }
+
+    fn ensure_search_poll(self: &Rc<Self>) {
+        if self.headless || self.search_poll.borrow().is_some() {
+            return;
+        }
+        let weak = Rc::downgrade(self);
+        let source = glib::timeout_add_local(
+            std::time::Duration::from_millis(crate::search::SEARCH_POLL_MS),
+            move || {
+                let Some(process) = weak.upgrade() else {
+                    return glib::ControlFlow::Break;
+                };
+                process.search_in_poll.set(true);
+                let active = process.poll_search_all();
+                process.search_in_poll.set(false);
+                if active && process.search.needs_poll() {
+                    glib::ControlFlow::Continue
+                } else {
+                    process.search_poll.borrow_mut().take();
+                    glib::ControlFlow::Break
+                }
+            },
+        );
+        *self.search_poll.borrow_mut() = Some(source);
+    }
+
+    fn stop_search_poll_if_idle(&self) {
+        if self.search_in_poll.get() {
+            return;
+        }
+        if self.search.session_count() == 0
+            && let Some(source) = self.search_poll.borrow_mut().take()
+        {
+            source.remove();
+        }
+    }
+
+    fn poll_search_all(self: &Rc<Self>) -> bool {
+        for window in self.search.sessions() {
+            self.poll_search_window(window);
+        }
+        self.search.session_count() > 0
+    }
+
+    fn poll_search_window(self: &Rc<Self>, window: WindowId) {
+        let tick = self.search.poll(window);
+        if let Some(reason) = tick.revoked {
+            // The completed or partial root disappeared. Revoke the session
+            // (pending activation, batches and monitors are already dropped),
+            // restore ordinary content and explain the removal.
+            crate::log!(
+                "search",
+                "root lifetime revoked the page: {}",
+                reason.label()
+            );
+            self.close_search(window);
+            if let Some(ui) = self.window(window) {
+                ui.show_summary(&format!("Search unavailable — {}.", reason.label()), None);
+            }
+            return;
+        }
+        let missing_root = tick.terminal
+            && self.search.view(window).is_some_and(|view| {
+                matches!(
+                    view.phase,
+                    crate::search::SearchPhase::Unavailable(fm_core::search::RootFailure::Missing)
+                )
+            });
+        if missing_root {
+            // The root disappeared: no late batch may revive the page.
+            self.close_search(window);
+            if let Some(ui) = self.window(window) {
+                ui.show_summary("Search unavailable — the folder no longer exists.", None);
+            }
+            return;
+        }
+        if let Some(ui) = self.window(window) {
+            if !tick.alive {
+                ui.search_revoked();
+            } else {
+                // A failed root clears the retained rows; do not repaint a
+                // batch from earlier in the same tick under an unavailable page.
+                let unavailable = tick.terminal
+                    && self.search.view(window).is_some_and(|view| {
+                        matches!(view.phase, crate::search::SearchPhase::Unavailable(_))
+                    });
+                if !unavailable && !tick.changes.is_empty() {
+                    ui.search_changes(&tick.changes);
+                }
+                if tick.changed
+                    && let Some(view) = self.search.view(window)
+                {
+                    ui.search_status(&view);
+                }
+            }
+        }
+        if let Some(ready) = tick.activation {
+            self.finish_search_activation(window, ready);
+        }
+    }
+
+    /// Cancel and remove a window's session, then restore ordinary content.
+    /// This is a transient view lifecycle operation, not a new command.
+    pub fn close_search(self: &Rc<Self>, window: WindowId) {
+        let closed = self.search.close(window);
+        if let Some(ui) = self.window(window) {
+            ui.search_revoked();
+        }
+        if closed {
+            self.stop_search_poll_if_idle();
+        }
+    }
+
+    /// Clearing the entry cancels the session but leaves the entry open for a
+    /// new query. No new command is involved.
+    pub fn cancel_search(self: &Rc<Self>, window: WindowId) {
+        let closed = self.search.close(window);
+        if let Some(ui) = self.window(window) {
+            ui.search_cleared();
+        }
+        if closed {
+            self.stop_search_poll_if_idle();
+        }
+    }
+
+    fn restart_search(self: &Rc<Self>, window: WindowId) {
+        let Some(result) = self.search.restart(window) else {
+            self.close_search(window);
+            return;
+        };
+        match result {
+            Ok(view) => {
+                if let Some(ui) = self.window(window) {
+                    ui.begin_search(&view);
+                }
+                self.ensure_search_poll();
+            }
+            Err(message) => {
+                if let Some(ui) = self.window(window) {
+                    ui.show_summary(&message, None);
+                }
+                crate::log!("search", "{message}");
+            }
+        }
+    }
+
+    /// A selected result asks the existing preview for its exact path. It does
+    /// not touch the model's hidden folder selection and never enables editing.
+    pub(crate) fn search_preview(self: &Rc<Self>, window: WindowId, generation: u64, index: usize) {
+        let Some(selection) = self.search_selection(window, generation, index) else {
+            return;
+        };
+        self.search.clear_notice(window);
+        if let Some(ui) = self.window(window) {
+            if let Some(view) = self.search.view(window) {
+                ui.search_status(&view);
+            }
+            ui.preview().set_selection_user(selection);
+        }
+    }
+
+    fn search_selection(
+        &self,
+        window: WindowId,
+        generation: u64,
+        index: usize,
+    ) -> Option<Selection> {
+        let hit = self.search.result(window, generation, index)?;
+        Some(Selection::file(hit.path))
+    }
+
+    /// Enter or double-click: start a bounded worker lookup for the captured
+    /// window/tab/root/generation and exact native path. No GTK-thread metadata
+    /// lookup occurs, and no navigation starts until the worker returns.
+    pub(crate) fn search_activate(
+        self: &Rc<Self>,
+        window: WindowId,
+        generation: u64,
+        index: usize,
+    ) {
+        let Some(hit) = self.search.result(window, generation, index) else {
+            return;
+        };
+        let Some(snapshot) = self.window_snapshot(window) else {
+            self.close_search(window);
+            return;
+        };
+        match self
+            .search
+            .begin_activation(window, generation, hit.path, &snapshot)
+        {
+            crate::search::ActivationStart::Started => {
+                self.ensure_search_poll();
+            }
+            crate::search::ActivationStart::AlreadyPending => {}
+            crate::search::ActivationStart::Busy(message) => {
+                crate::log!("search", "{message}");
+                self.search.notice(window, &message);
+                if let Some(ui) = self.window(window)
+                    && let Some(view) = self.search.view(window)
+                {
+                    ui.search_status(&view);
+                }
+            }
+            crate::search::ActivationStart::Revoked => {
+                if let Some(ui) = self.window(window) {
+                    ui.search_revoked();
+                }
+                self.stop_search_poll_if_idle();
+            }
+        }
+    }
+
+    /// A worker finished the activation lookup. Revalidate the complete model
+    /// target and session, then dispatch the existing `nav.go` through the real
+    /// registry. The exact native target travels as one-shot typed evidence
+    /// bound to the validated text and `Caller::Ui`.
+    fn finish_search_activation(
+        self: &Rc<Self>,
+        window: WindowId,
+        ready: crate::search::ActivationReady,
+    ) {
+        let path = ready.path.clone();
+        let Some(snapshot) = self.window_snapshot(window) else {
+            self.close_search(window);
+            return;
+        };
+        if !self
+            .search
+            .activation_valid(window, ready.generation, &ready.path, &snapshot)
+        {
+            self.close_search(window);
+            if let Some(ui) = self.window(window) {
+                ui.search_revoked();
+            }
+            return;
+        }
+        let target = match ready.target {
+            Ok(target) => target,
+            Err(message) => {
+                let text = format!("Search result unavailable: {message}");
+                self.search.notice(window, &text);
+                if let Some(ui) = self.window(window)
+                    && let Some(view) = self.search.view(window)
+                {
+                    ui.search_status(&view);
+                }
+                return;
+            }
+        };
+        let crate::search::NativeNavTarget { folder, select } = target;
+        let same_folder = snapshot
+            .tab(snapshot.focused_tab)
+            .is_some_and(|tab| tab.folder == folder);
+        let selected_name = select.clone();
+        let text = path
+            .to_str()
+            .map(str::to_string)
+            .unwrap_or_else(|| crate::search::NATIVE_NAV_PLACEHOLDER.to_string());
+        self.set_pending_nav_evidence(text.clone(), folder.clone(), select, Caller::Ui);
+        let outcome = self.dispatch_with_outcome(
+            window,
+            Caller::Ui,
+            &Invocation::new("nav.go", vec![("path".to_string(), text)]),
+        );
+        // The handler consumes the evidence only after registry acceptance. A
+        // refusal must leave no latent target for a later command.
+        self.take_pending_nav();
+        match outcome {
+            Outcome::Done => {
+                // The model's same-folder nav.go is a no-op; select the exact
+                // file by name after the accepted navigation. A symlink that
+                // resolves to a directory navigates elsewhere, so it is not
+                // selected here.
+                let landed = self.window_snapshot(window).and_then(|window| {
+                    window.tab(window.focused_tab).map(|tab| tab.folder.clone())
+                });
+                if same_folder
+                    && let Some(name) = selected_name
+                    && landed.as_deref() == Some(folder.as_path())
+                {
+                    self.file_click_tab(
+                        window,
+                        Some(snapshot.focused_tab),
+                        ClickRequest::Plain(name),
+                    );
+                }
+                self.close_search(window);
+            }
+            Outcome::Failed(message) => {
+                let text = format!("{message}: {}", path.display());
+                self.search.notice(window, &text);
+                if let Some(ui) = self.window(window)
+                    && let Some(view) = self.search.view(window)
+                {
+                    ui.search_status(&view);
+                }
+            }
+            Outcome::Error(error) => {
+                let text = format!("Could not open {}: {error}", path.display());
+                self.search.notice(window, &text);
+                if let Some(ui) = self.window(window)
+                    && let Some(view) = self.search.view(window)
+                {
+                    ui.search_status(&view);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn search_selection_for_tests(
+        &self,
+        window: WindowId,
+        generation: u64,
+        index: usize,
+    ) -> Option<Selection> {
+        self.search_selection(window, generation, index)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn poll_search_for_tests(self: &Rc<Self>) {
+        self.poll_search_all();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn search_view_for_tests(&self, window: WindowId) -> Option<SearchView> {
+        self.search.view(window)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn search_root_event_for_tests(&self, window: WindowId) {
+        self.search.root_changed(window);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn search_monitor_count_for_tests(&self) -> usize {
+        self.search.monitor_count_for_tests()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn search_result_paths_for_tests(&self, window: WindowId) -> Vec<PathBuf> {
+        let Some(view) = self.search.view(window) else {
+            return Vec::new();
+        };
+        (0..view.rows)
+            .filter_map(|index| self.search.result(window, view.generation, index))
+            .map(|hit| hit.path)
+            .collect()
+    }
+
     pub fn quit_now(self: &Rc<Self>) {
         self.save_now(true);
+        // Revoke monitors, pending activations and root checks before the app
+        // leaves. A blocked native lookup is never joined.
+        self.search.shutdown();
         // Owned Poppler children must be killed/reaped while their workers
         // still exist; setting a flag after `application.quit` is too late.
         crate::folder::size::shutdown();
@@ -1498,11 +1980,24 @@ impl Process {
     }
 
     fn refresh(self: &Rc<Self>, id: WindowId, fade: bool) {
+        let valid = match self.window_snapshot(id) {
+            Some(window) => self.search.validate(id, &window),
+            None => {
+                self.search.close(id);
+                false
+            }
+        };
         if let Some(ui) = self.window(id) {
+            if !valid {
+                ui.search_revoked();
+            }
             if !self.suppress_header.get() {
                 ui.refresh_header(fade);
             }
             ui.update_content();
+        }
+        if !valid {
+            self.stop_search_poll_if_idle();
         }
     }
 
@@ -1621,6 +2116,18 @@ impl Process {
             command.name(),
             command.effect()
         );
+
+        // The read-only results page owns these actions. Nothing here may fall
+        // through to the hidden folder selection or a preview buffer.
+        let search_active = self.window(window).is_some_and(|ui| ui.search_active())
+            || self.search.view(window).is_some();
+        if search_active && let Some(message) = crate::search::refusal_for(command.name()) {
+            self.search.notice(window, message);
+            if let Some(ui) = self.window(window) {
+                ui.search_notice(message);
+            }
+            return Outcome::Failed(message.to_string());
+        }
 
         // The visible page owns these keys and actions. Nothing here may fall
         // back to the hidden folder's selection or current folder.
@@ -1847,8 +2354,25 @@ impl Process {
                 self.finish(result);
             }
             "nav.go" => {
-                let target = self.take_pending_nav_target().or_else(|| {
-                    let path = path?;
+                // Search activation and the agent's worker-resolved path
+                // arrive as one-shot typed evidence. Search additionally binds
+                // it to this caller and to the exact text the registry just
+                // validated; a mismatched payload fails instead of falling
+                // back to a different path or a GTK-thread lookup.
+                let target = if let Some(evidence) = self.take_pending_nav() {
+                    if !evidence.matches(caller, command) {
+                        return Outcome::Failed(
+                            "the navigation target changed before it was opened".to_string(),
+                        );
+                    }
+                    #[cfg(test)]
+                    self.native_nav_evidence_uses
+                        .set(self.native_nav_evidence_uses.get() + 1);
+                    Some((evidence.folder, evidence.select))
+                } else {
+                    let Some(path) = path else {
+                        return Outcome::Failed("the navigation target does not exist".to_string());
+                    };
                     if path.is_dir() {
                         Some((path, None))
                     } else if path.is_file() {
@@ -1861,7 +2385,7 @@ impl Process {
                     } else {
                         None
                     }
-                });
+                };
                 let Some((folder, select)) = target else {
                     return Outcome::Failed("the navigation target does not exist".to_string());
                 };
@@ -1904,7 +2428,11 @@ impl Process {
                 self.finish(result);
             }
             "nav.refresh" => {
-                if let Some(ui) = self.window(window) {
+                let search_visible = self.window(window).is_some_and(|ui| ui.search_active());
+                if search_visible || self.search.view(window).is_some() {
+                    self.restart_search(window);
+                    crate::log!("search", "nav.refresh restarted the visible query");
+                } else if let Some(ui) = self.window(window) {
                     ui.reload_folder();
                     crate::log!("folder", "nav.refresh reloaded the listing");
                 }
@@ -1915,8 +2443,44 @@ impl Process {
                 }
             }
             "search.open" => {
-                if let Some(ui) = self.window(window) {
-                    ui.open_search(text.as_deref());
+                let ui = self.window(window);
+                if let Some(query) = text {
+                    if let Some(ui) = &ui {
+                        ui.open_search(Some(&query));
+                    }
+                    let Some((tab, root)) = self.search_target(window) else {
+                        let message = "There is no folder to search.".to_string();
+                        if let Some(ui) = &ui {
+                            ui.show_summary(&message, None);
+                        }
+                        return Outcome::Failed(message);
+                    };
+                    match self.search.submit(window, tab, root, query) {
+                        Ok(view) => {
+                            crate::log!(
+                                "search",
+                                "submission generation {} window {} tab {:?} root {} query {} scalar(s)",
+                                view.generation,
+                                window,
+                                tab,
+                                view.root.display(),
+                                view.query.chars().count()
+                            );
+                            if let Some(ui) = &ui {
+                                ui.begin_search(&view);
+                            }
+                            self.ensure_search_poll();
+                        }
+                        Err(message) => {
+                            if let Some(ui) = &ui {
+                                ui.show_summary(&message, None);
+                            }
+                            crate::log!("search", "{message}");
+                            return Outcome::Failed(message);
+                        }
+                    }
+                } else if let Some(ui) = &ui {
+                    ui.open_search(None);
                 }
             }
             "selection.all" => {
@@ -1930,6 +2494,7 @@ impl Process {
                 self.selection_none(window);
             }
             "trash.open" => {
+                self.close_search(window);
                 if let Some(ui) = self.window(window) {
                     ui.open_trash();
                 }
@@ -2543,6 +3108,22 @@ pub fn prompt_pending(
     })
 }
 
+fn log_outcome(invocation: &Invocation, outcome: &Outcome) {
+    match outcome {
+        Outcome::Error(error) => crate::log!("command", "{error}"),
+        Outcome::Failed(message) => {
+            crate::log!("command", "{}: {message}", invocation.name());
+        }
+        Outcome::DryRun(lines) => crate::log!(
+            "command",
+            "{} dry run: {} lines",
+            invocation.name(),
+            lines.len()
+        ),
+        Outcome::Done => {}
+    }
+}
+
 fn utf8_path(path: &Path) -> Result<String, String> {
     path.to_str().map(str::to_string).ok_or_else(|| {
         format!(
@@ -2590,6 +3171,7 @@ mod tests {
         PreviewDocument, PreviewSession, SaveCompletion, Selection, TextDocument, TextEncoding,
         WriteAccess,
     };
+    use std::sync::Arc;
 
     fn revision() -> FileRevision {
         FileRevision {
@@ -2967,5 +3549,1371 @@ mod tests {
         );
         assert_eq!(quit.next(second, &[(a, None)]), QuitStep::Finish);
         quit.cancel(second);
+    }
+
+    // -----------------------------------------------------------------------
+    // Search routing
+    // -----------------------------------------------------------------------
+
+    struct SearchScratch {
+        root: PathBuf,
+    }
+
+    impl Drop for SearchScratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    struct NoClipboard;
+
+    impl crate::fileops::clipboard::Reader for NoClipboard {
+        fn read(
+            &self,
+            _display: Option<&gtk::gdk::Display>,
+            done: Box<dyn FnOnce(Result<crate::fileops::clipboard::ClipboardPayload, String>)>,
+        ) {
+            done(Err("the routing test has no clipboard".to_string()));
+        }
+    }
+
+    fn search_scratch(tag: &str) -> SearchScratch {
+        let root = PathBuf::from(format!(
+            "/tmp/gimbal-search-ui-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|time| time.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("home")).expect("scratch home");
+        SearchScratch { root }
+    }
+
+    fn headless_search_process(scratch: &SearchScratch) -> Rc<Process> {
+        // Each headless process owns its runtime. Production has one process
+        // and therefore one runtime, but parallel tests must not compete for a
+        // shared evidence result channel.
+        headless_search_process_with(
+            scratch,
+            Rc::new(crate::search::SearchRuntime::with_service(Arc::new(
+                crate::search::SearchService::new(),
+            ))),
+        )
+    }
+
+    /// A real GTK widget process for the entry-to-visible-results regression.
+    /// It constructs the same window, header, content stack, list store and
+    /// factory as production. The test owns the GLib context and never runs or
+    /// registers the `GApplication`.
+    fn gtk_search_process(
+        scratch: &SearchScratch,
+        application: &adw::Application,
+        runtime: Rc<crate::search::SearchRuntime>,
+    ) -> Rc<Process> {
+        let path = scratch.root.join("config.toml");
+        let (config_file, _problems) = ConfigFile::load(&path);
+        let config = config_file.config().clone();
+        let process = Rc::new(Process {
+            application: Some(application.clone()),
+            config: Rc::new(RefCell::new(config_file)),
+            look: Some(Look::new(
+                config.look.base * config.look.scale,
+                config.look.opacity,
+                Some(config.look.font.clone()).filter(|font| !font.is_empty()),
+            )),
+            workspace: RefCell::new(Workspace::with_home(scratch.root.join("home"))),
+            windows: RefCell::new(BTreeMap::new()),
+            session_path: None,
+            saver: Saver::new(),
+            save_source: RefCell::new(None),
+            debounce: Cell::new(Debounce::new(SAVE_DELAY_MS)),
+            preserve_bad: Cell::new(false),
+            fileops: RefCell::new(None),
+            fresh_home: Cell::new(false),
+            suppress_header: Cell::new(false),
+            pending_trash_delete: RefCell::new(None),
+            quit: RefCell::new(QuitCoordinator::default()),
+            agent: RefCell::new(crate::agent::AgentRuntime::new("gtk-test".to_string())),
+            agent_poll: RefCell::new(None),
+            command_job: Cell::new(None),
+            reserved_job: RefCell::new(None),
+            pending_authorization: RefCell::new(None),
+            pending_runs: RefCell::new(HashMap::new()),
+            next_work_id: Cell::new(0),
+            pending_nav: RefCell::new(None),
+            last_failure: RefCell::new(None),
+            search: runtime,
+            search_poll: RefCell::new(None),
+            search_in_poll: Cell::new(false),
+            clipboard_reader: Rc::new(NoClipboard),
+            headless: false,
+            trash_pages: RefCell::new(BTreeSet::new()),
+            native_nav_evidence_uses: Cell::new(0),
+        });
+        *process.fileops.borrow_mut() = Some(FileOps::new_manual(&process));
+        let weak = Rc::downgrade(&process);
+        process.search.set_wake(move || {
+            if let Some(process) = weak.upgrade() {
+                process.ensure_search_poll();
+            }
+        });
+        process
+    }
+
+    /// Build the real window without presenting it or dispatching through
+    /// `GApplication`. This is the production widget tree with an owned
+    /// `GMainContext`, not a headless stand-in.
+    fn seed_gtk_window(process: &Rc<Process>, folder: PathBuf) -> WindowId {
+        let events = process
+            .workspace
+            .borrow_mut()
+            .window_new(Some(folder))
+            .expect("gtk test window");
+        let id = events
+            .iter()
+            .find_map(|event| match event {
+                Event::WindowOpened(id) => Some(*id),
+                _ => None,
+            })
+            .expect("window id");
+        let application = process.application.as_ref().expect("test application");
+        let ui = WindowUi::new(process, application, id);
+        process.windows.borrow_mut().insert(id, ui.clone());
+        ui.refresh_header(false);
+        ui.update_content();
+        id
+    }
+
+    fn headless_search_process_with(
+        scratch: &SearchScratch,
+        runtime: Rc<crate::search::SearchRuntime>,
+    ) -> Rc<Process> {
+        Process::headless_with_search(
+            scratch.root.join("config.toml"),
+            scratch.root.join("home"),
+            Rc::new(NoClipboard),
+            runtime,
+        )
+    }
+
+    fn gated_search_process(
+        scratch: &SearchScratch,
+        activation_gate: Option<Arc<crate::search::test_support::Gate>>,
+        root_gate: Option<Arc<crate::search::test_support::Gate>>,
+    ) -> Rc<Process> {
+        use crate::search::{ActivationRunner, EvidencePool, RootRunner, SearchService};
+
+        let activation: ActivationRunner = Arc::new(move |path: &Path| {
+            if let Some(gate) = &activation_gate {
+                gate.block();
+            }
+            crate::search::resolve_native_navigation(path)
+        });
+        let root: RootRunner = Arc::new(move |path: &Path, expected: Option<&Path>| {
+            if let Some(gate) = &root_gate {
+                gate.block();
+            }
+            crate::search::check_root_lifetime(path, expected)
+        });
+        let runtime = Rc::new(crate::search::SearchRuntime::with_evidence(
+            Arc::new(SearchService::new()),
+            Arc::new(EvidencePool::with_runners(activation, root)),
+        ));
+        headless_search_process_with(scratch, runtime)
+    }
+
+    fn apply_workspace(
+        process: &Rc<Process>,
+        result: Result<Vec<Event>, fm_core::workspace::WorkspaceError>,
+    ) {
+        let events = result.expect("workspace operation");
+        process.apply_events(&events);
+    }
+
+    fn write_fixture(path: &Path) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("fixture parent");
+        }
+        std::fs::write(path, b"fixture").expect("fixture");
+    }
+
+    fn wait_for_search(process: &Rc<Process>, window: WindowId) -> SearchView {
+        for _ in 0..300 {
+            process.poll_search_for_tests();
+            if let Some(view) = process.search_view_for_tests(window)
+                && matches!(
+                    view.phase,
+                    crate::search::SearchPhase::Complete
+                        | crate::search::SearchPhase::Partial(_)
+                        | crate::search::SearchPhase::Unavailable(_)
+                )
+            {
+                return view;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("search did not reach a terminal phase");
+    }
+
+    fn wait_for_activation(process: &Rc<Process>, window: WindowId) {
+        for _ in 0..300 {
+            process.poll_search_for_tests();
+            match process.search_view_for_tests(window) {
+                None => return,
+                Some(view) if view.notice.is_some() => return,
+                _ => {}
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("activation neither navigated nor explained its failure");
+    }
+
+    fn activate_and_wait(process: &Rc<Process>, window: WindowId, generation: u64, index: usize) {
+        process.search_activate(window, generation, index);
+        wait_for_activation(process, window);
+    }
+
+    fn wait_for_root_revocation(process: &Rc<Process>, window: WindowId) {
+        for _ in 0..300 {
+            process.poll_search_for_tests();
+            if process.search_view_for_tests(window).is_none() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("the removed search root did not revoke its page");
+    }
+
+    fn wait_for_gate(gate: &Arc<crate::search::test_support::Gate>) {
+        for _ in 0..500 {
+            if gate.entered() > 0 {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("the blocking search worker never entered the source");
+    }
+
+    fn wait_for_gate_idle(gate: &Arc<crate::search::test_support::Gate>) {
+        for _ in 0..500 {
+            if gate.entered() == 0 {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("the blocking search worker did not leave the source");
+    }
+
+    fn start_search(process: &Rc<Process>, window: WindowId, query: &str) {
+        process.dispatch_for_window(
+            window,
+            Caller::Ui,
+            Invocation::new(
+                "search.open",
+                vec![("query".to_string(), query.to_string())],
+            ),
+        );
+    }
+
+    #[test]
+    fn split_tile_search_activates_the_exact_duplicate_in_the_focused_tile() {
+        let scratch = search_scratch("split-exact");
+        let first = scratch.root.join("first");
+        let second = scratch.root.join("second");
+        write_fixture(&first.join("report-one.txt"));
+        write_fixture(&second.join("left/report.txt"));
+        write_fixture(&second.join("right/report.txt"));
+        let process = headless_search_process(&scratch);
+        let a = process.seed_window(first.clone());
+        let b = process.seed_window(first.clone());
+        process.focus_window_for_tests(a);
+
+        let events = {
+            let mut workspace = process.workspace.borrow_mut();
+            workspace.tab_new(Some(second.clone()))
+        };
+        apply_workspace(&process, events);
+        let second_tab = process.window_snapshot(a).expect("window A").focused_tab;
+        let events = {
+            let mut workspace = process.workspace.borrow_mut();
+            let mut events = workspace.pill_ctrl_click(0).expect("select first pill");
+            events.extend(workspace.pill_ctrl_click(1).expect("select second pill"));
+            events.extend(workspace.group_split().expect("split the two tiles"));
+            events
+        };
+        process.apply_events(&events);
+        let events = {
+            let mut workspace = process.workspace.borrow_mut();
+            workspace.focus_tab(second_tab)
+        };
+        apply_workspace(&process, events);
+
+        let before_b = process.window_snapshot(b).expect("window B");
+        start_search(&process, a, "report");
+        let view = wait_for_search(&process, a);
+        assert_eq!(view.root, second);
+        assert_eq!(view.rows, 2, "only the focused tile's folder is scanned");
+        let paths = process.search_result_paths_for_tests(a);
+        assert!(paths.contains(&second.join("left/report.txt")));
+        assert!(paths.contains(&second.join("right/report.txt")));
+        assert!(paths.iter().all(|path| !path.starts_with(&first)));
+        let index = paths
+            .iter()
+            .position(|path| path == &second.join("right/report.txt"))
+            .expect("right duplicate");
+
+        activate_and_wait(&process, a, view.generation, index);
+
+        let after_a = process.window_snapshot(a).expect("window A");
+        let tab = after_a.tab(after_a.focused_tab).expect("focused tab");
+        assert_eq!(tab.folder, second.join("right"));
+        assert_eq!(
+            tab.selection.names,
+            std::collections::BTreeSet::from([OsString::from("report.txt")])
+        );
+        assert!(process.search_view_for_tests(a).is_none());
+
+        let after_b = process.window_snapshot(b).expect("window B");
+        assert_eq!(after_b.focused_tab, before_b.focused_tab);
+        assert_eq!(after_b.pills.len(), before_b.pills.len());
+        let before_tab = before_b.tab(before_b.focused_tab).expect("B tab");
+        let after_tab = after_b.tab(after_b.focused_tab).expect("B tab");
+        assert_eq!(after_tab.folder, before_tab.folder);
+        assert_eq!(after_tab.selection, before_tab.selection);
+    }
+
+    #[test]
+    fn opening_search_without_a_query_does_not_start_a_scan() {
+        let scratch = search_scratch("open-only");
+        let folder = scratch.root.join("folder");
+        write_fixture(&folder.join("report.txt"));
+        let process = headless_search_process(&scratch);
+        let window = process.seed_window(folder);
+        process.dispatch_for_window(
+            window,
+            Caller::Ui,
+            Invocation::new("search.open", Vec::new()),
+        );
+        assert!(
+            process.search_view_for_tests(window).is_none(),
+            "opening the entry must not scan until a nonempty query is submitted"
+        );
+    }
+
+    #[test]
+    fn a_removed_root_closes_the_session_with_a_search_unavailable_notice() {
+        use crate::search::test_support::TestSource;
+        use crate::search::{SearchRuntime, SearchService};
+        use fm_core::folder_size::SystemClock;
+
+        let scratch = search_scratch("root-gone");
+        let source = TestSource::new();
+        // The model still names the folder, but the injected source reports it
+        // as missing. No second search may reopen the page after this.
+        let service = Arc::new(SearchService::with_parts(
+            Arc::new(source),
+            Arc::new(SystemClock),
+        ));
+        let process =
+            headless_search_process_with(&scratch, Rc::new(SearchRuntime::with_service(service)));
+        let window = process.seed_window(PathBuf::from("/missing"));
+        start_search(&process, window, "anything");
+        for _ in 0..300 {
+            process.poll_search_for_tests();
+            if process.search_view_for_tests(window).is_none() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("a removed root left its search session open");
+    }
+
+    #[test]
+    fn activating_a_file_already_in_the_focused_folder_selects_it() {
+        let scratch = search_scratch("same-folder");
+        let folder = scratch.root.join("folder");
+        write_fixture(&folder.join("report.txt"));
+        write_fixture(&folder.join("other.txt"));
+        let process = headless_search_process(&scratch);
+        let window = process.seed_window(folder.clone());
+        start_search(&process, window, "report");
+        let view = wait_for_search(&process, window);
+        assert_eq!(view.rows, 1);
+        activate_and_wait(&process, window, view.generation, 0);
+
+        let after = process.window_snapshot(window).expect("window");
+        let tab = after.tab(after.focused_tab).expect("tab");
+        assert_eq!(tab.folder, folder);
+        assert_eq!(
+            tab.selection.names,
+            std::collections::BTreeSet::from([OsString::from("report.txt")])
+        );
+    }
+
+    #[test]
+    fn a_result_preview_never_mutates_the_hidden_selection_and_obeys_the_dirty_guard() {
+        let scratch = search_scratch("preview-guard");
+        let folder = scratch.root.join("folder");
+        write_fixture(&folder.join("kept.txt"));
+        let process = headless_search_process(&scratch);
+        let window = process.seed_window(folder.clone());
+        start_search(&process, window, "kept");
+        let view = wait_for_search(&process, window);
+        let before = process.window_snapshot(window).expect("window");
+        let before_tab = before
+            .tab(before.focused_tab)
+            .expect("tab")
+            .selection
+            .clone();
+        let selection = process
+            .search_selection_for_tests(window, view.generation, 0)
+            .expect("exact preview selection");
+        assert_eq!(selection, Selection::file(folder.join("kept.txt")));
+        let after = process.window_snapshot(window).expect("window");
+        assert_eq!(
+            after.tab(after.focused_tab).expect("tab").selection,
+            before_tab,
+            "selecting a result never changes the hidden folder selection"
+        );
+
+        let mut dirty = dirty_preview("/tmp/gimbal-search-dirty.txt");
+        let ticket = dirty.select_user(selection);
+        assert!(ticket.is_none(), "the dirty guard refuses the navigation");
+        assert!(dirty.is_dirty());
+        assert_eq!(
+            dirty.current_document().expect("dirty document").path,
+            PathBuf::from("/tmp/gimbal-search-dirty.txt")
+        );
+
+        for command in ["file.undo", "preview.edit"] {
+            let outcome = process.dispatch_with_outcome(
+                window,
+                Caller::Ui,
+                &Invocation::new(command, Vec::new()),
+            );
+            assert!(
+                matches!(outcome, Outcome::Failed(ref message)
+                    if message.contains("unavailable while search results are shown")),
+                "{command} was not refused with a readable explanation: {outcome:?}"
+            );
+        }
+
+        let before_generation = process
+            .search_view_for_tests(window)
+            .expect("active search")
+            .generation;
+        let outcome = process.dispatch_with_outcome(
+            window,
+            Caller::Ui,
+            &Invocation::new("nav.refresh", Vec::new()),
+        );
+        assert_eq!(outcome, Outcome::Done);
+        let after_generation = process
+            .search_view_for_tests(window)
+            .expect("restarted search")
+            .generation;
+        assert_ne!(before_generation, after_generation);
+    }
+
+    #[test]
+    fn tab_folder_and_window_changes_revoke_a_waiting_search() {
+        use crate::search::test_support::{Gate, TestSource};
+        use crate::search::{SearchRuntime, SearchService};
+        use fm_core::folder_size::SystemClock;
+
+        let scratch = search_scratch("revoke");
+        let gate = Arc::new(Gate::default());
+        let source = TestSource::new()
+            .with_gate(gate.clone())
+            .dir("/search/root", &["/search/root/x.txt"])
+            .file("/search/root/x.txt", 1)
+            .block("/search/root")
+            .dir("/search/other", &[]);
+        let service = Arc::new(SearchService::with_parts(
+            Arc::new(source),
+            Arc::new(SystemClock),
+        ));
+        let process =
+            headless_search_process_with(&scratch, Rc::new(SearchRuntime::with_service(service)));
+        let window = process.seed_window(PathBuf::from("/search/root"));
+
+        start_search(&process, window, "x");
+        wait_for_gate(&gate);
+        let events = {
+            let mut workspace = process.workspace.borrow_mut();
+            workspace.tab_new(Some(PathBuf::from("/search/other")))
+        };
+        apply_workspace(&process, events);
+        assert!(
+            process.search_view_for_tests(window).is_none(),
+            "a tab change revokes the waiting search"
+        );
+        gate.release();
+        wait_for_gate_idle(&gate);
+        process.poll_search_for_tests();
+        assert!(process.search_view_for_tests(window).is_none());
+
+        gate.reset();
+        let events = {
+            let mut workspace = process.workspace.borrow_mut();
+            workspace.nav_go(PathBuf::from("/search/root"), None)
+        };
+        apply_workspace(&process, events);
+        start_search(&process, window, "x");
+        wait_for_gate(&gate);
+        let events = {
+            let mut workspace = process.workspace.borrow_mut();
+            workspace.nav_go(PathBuf::from("/search/other"), None)
+        };
+        apply_workspace(&process, events);
+        assert!(
+            process.search_view_for_tests(window).is_none(),
+            "a folder change revokes the waiting search"
+        );
+        gate.release();
+
+        gate.reset();
+        let events = {
+            let mut workspace = process.workspace.borrow_mut();
+            workspace.nav_go(PathBuf::from("/search/root"), None)
+        };
+        apply_workspace(&process, events);
+        start_search(&process, window, "x");
+        wait_for_gate(&gate);
+        process.close_window_for_tests(window);
+        assert!(
+            process.search_view_for_tests(window).is_none(),
+            "closing the window revokes the waiting search"
+        );
+        gate.release();
+        wait_for_gate_idle(&gate);
+    }
+
+    #[test]
+    fn a_blocked_activation_leaves_control_responsive_and_clear_makes_it_inert() {
+        let scratch = search_scratch("activation-clear");
+        let folder = scratch.root.join("folder");
+        write_fixture(&folder.join("report.txt"));
+        let gate = Arc::new(crate::search::test_support::Gate::default());
+        let process = gated_search_process(&scratch, Some(gate.clone()), None);
+        let window = process.seed_window(folder.clone());
+        start_search(&process, window, "report");
+        let view = wait_for_search(&process, window);
+
+        process.search_activate(window, view.generation, 0);
+        wait_for_gate(&gate);
+        // The GTK/control loop still processes a normal command while the
+        // native lookup is inside the worker gate.
+        let outcome = process.dispatch_with_outcome(
+            window,
+            Caller::Ui,
+            &Invocation::new("nav.focus-path", Vec::new()),
+        );
+        assert_eq!(outcome, Outcome::Done);
+        assert_eq!(
+            process.native_nav_evidence_uses_for_tests(),
+            0,
+            "no navigation starts before the worker returns"
+        );
+        assert!(process.search_view_for_tests(window).is_some());
+
+        process.cancel_search(window);
+        gate.release();
+        wait_for_gate_idle(&gate);
+        process.poll_search_for_tests();
+        let after = process.window_snapshot(window).expect("window");
+        let tab = after.tab(after.focused_tab).expect("tab");
+        assert_eq!(tab.folder, folder);
+        assert!(tab.selection.names.is_empty());
+        assert!(process.search_view_for_tests(window).is_none());
+    }
+
+    #[test]
+    fn replacement_tab_move_and_window_close_make_late_activation_inert() {
+        // Replacement.
+        let scratch = search_scratch("activation-replace");
+        let folder = scratch.root.join("folder");
+        write_fixture(&folder.join("report.txt"));
+        write_fixture(&folder.join("other.txt"));
+        let gate = Arc::new(crate::search::test_support::Gate::default());
+        let process = gated_search_process(&scratch, Some(gate.clone()), None);
+        let window = process.seed_window(folder.clone());
+        start_search(&process, window, "report");
+        let view = wait_for_search(&process, window);
+        process.search_activate(window, view.generation, 0);
+        wait_for_gate(&gate);
+        start_search(&process, window, "other");
+        gate.release();
+        wait_for_gate_idle(&gate);
+        let replaced = wait_for_search(&process, window);
+        assert_eq!(replaced.query, "other");
+        let after = process.window_snapshot(window).expect("window");
+        let tab = after.tab(after.focused_tab).expect("tab");
+        assert_eq!(tab.folder, folder, "the old activation never navigated");
+        assert!(tab.selection.names.is_empty());
+
+        // Tab move (the moved pill takes focus, a target change).
+        gate.reset();
+        let events = {
+            let mut workspace = process.workspace.borrow_mut();
+            workspace.tab_new(Some(folder.clone()))
+        };
+        apply_workspace(&process, events);
+        let events = {
+            let mut workspace = process.workspace.borrow_mut();
+            workspace.tab_focus(0)
+        };
+        apply_workspace(&process, events);
+        start_search(&process, window, "report");
+        let view = wait_for_search(&process, window);
+        process.search_activate(window, view.generation, 0);
+        wait_for_gate(&gate);
+        let events = {
+            let mut workspace = process.workspace.borrow_mut();
+            workspace.tab_move(1, 0)
+        };
+        apply_workspace(&process, events);
+        gate.release();
+        wait_for_gate_idle(&gate);
+        process.poll_search_for_tests();
+        assert!(
+            process.search_view_for_tests(window).is_none(),
+            "a tab move revokes the activation page"
+        );
+
+        // Window close.
+        gate.reset();
+        let events = {
+            let mut workspace = process.workspace.borrow_mut();
+            workspace.tab_focus(0)
+        };
+        apply_workspace(&process, events);
+        start_search(&process, window, "report");
+        let view = wait_for_search(&process, window);
+        process.search_activate(window, view.generation, 0);
+        wait_for_gate(&gate);
+        process.close_window_for_tests(window);
+        gate.release();
+        wait_for_gate_idle(&gate);
+        process.poll_search_for_tests();
+        assert!(process.search_view_for_tests(window).is_none());
+    }
+
+    #[test]
+    fn one_pending_activation_is_deduplicated_and_a_different_result_is_busy() {
+        let scratch = search_scratch("activation-busy");
+        let folder = scratch.root.join("folder");
+        write_fixture(&folder.join("report-one.txt"));
+        write_fixture(&folder.join("report-two.txt"));
+        let gate = Arc::new(crate::search::test_support::Gate::default());
+        let process = gated_search_process(&scratch, Some(gate.clone()), None);
+        let window = process.seed_window(folder);
+        start_search(&process, window, "report");
+        let view = wait_for_search(&process, window);
+        assert_eq!(view.rows, 2);
+
+        process.search_activate(window, view.generation, 0);
+        wait_for_gate(&gate);
+        // The same result is absorbed rather than queued twice.
+        process.search_activate(window, view.generation, 0);
+        // A different result must not accumulate behind the blocked one.
+        process.search_activate(window, view.generation, 1);
+        let view = process.search_view_for_tests(window).expect("page");
+        assert!(
+            view.notice
+                .as_deref()
+                .is_some_and(|notice| notice.contains("already being checked")),
+            "{view:?}"
+        );
+        assert_eq!(gate.entered(), 1, "only one lookup entered the gate");
+        process.cancel_search(window);
+        gate.release();
+        wait_for_gate_idle(&gate);
+        process.poll_search_for_tests();
+        assert_eq!(process.native_nav_evidence_uses_for_tests(), 0);
+    }
+
+    #[test]
+    fn a_vanished_result_explains_without_navigating_or_closing_the_page() {
+        let scratch = search_scratch("activation-vanished");
+        let folder = scratch.root.join("folder");
+        let target = folder.join("report.txt");
+        write_fixture(&target);
+        let gate = Arc::new(crate::search::test_support::Gate::default());
+        let process = gated_search_process(&scratch, Some(gate.clone()), None);
+        let window = process.seed_window(folder.clone());
+        start_search(&process, window, "report");
+        let view = wait_for_search(&process, window);
+        process.search_activate(window, view.generation, 0);
+        wait_for_gate(&gate);
+        std::fs::remove_file(&target).expect("remove owned fixture");
+        gate.release();
+        wait_for_gate_idle(&gate);
+        wait_for_activation(&process, window);
+
+        let view = process
+            .search_view_for_tests(window)
+            .expect("the results page stays open");
+        assert!(
+            view.notice
+                .as_deref()
+                .is_some_and(|notice| notice.contains("no longer exists")),
+            "{view:?}"
+        );
+        let after = process.window_snapshot(window).expect("window");
+        let tab = after.tab(after.focused_tab).expect("tab");
+        assert_eq!(tab.folder, folder);
+        assert!(tab.selection.names.is_empty());
+        assert_eq!(process.native_nav_evidence_uses_for_tests(), 0);
+    }
+
+    #[test]
+    fn directory_and_symlink_results_activate_the_exact_path() {
+        let scratch = search_scratch("activation-links");
+        let root = scratch.root.join("search-root");
+        let target = root.join("target-dir");
+        std::fs::create_dir_all(&target).expect("target directory");
+        let link = root.join("link-dir");
+        std::os::unix::fs::symlink(&target, &link).expect("owned symlink");
+        let process = headless_search_process(&scratch);
+        let window = process.seed_window(root.clone());
+
+        start_search(&process, window, "target-dir");
+        let view = wait_for_search(&process, window);
+        activate_and_wait(&process, window, view.generation, 0);
+        let after = process.window_snapshot(window).expect("window");
+        assert_eq!(after.tab(after.focused_tab).expect("tab").folder, target);
+
+        let events = {
+            let mut workspace = process.workspace.borrow_mut();
+            workspace.nav_go(root.clone(), None)
+        };
+        apply_workspace(&process, events);
+        start_search(&process, window, "link-dir");
+        let view = wait_for_search(&process, window);
+        activate_and_wait(&process, window, view.generation, 0);
+        let after = process.window_snapshot(window).expect("window");
+        assert_eq!(
+            after.tab(after.focused_tab).expect("tab").folder,
+            link,
+            "a symlink result navigates through its original exact path"
+        );
+    }
+
+    #[test]
+    fn invalid_utf8_duplicate_paths_reach_nav_go_through_the_registry() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let scratch = search_scratch("native-registry");
+        let parent_a = scratch.root.join(OsStr::from_bytes(b"left-\xfd"));
+        let parent_b = scratch.root.join(OsStr::from_bytes(b"right-\xfe"));
+        let name = OsStr::from_bytes(b"report-\xff.txt");
+        write_fixture(&parent_a.join(name));
+        write_fixture(&parent_b.join(name));
+        let process = headless_search_process(&scratch);
+        let window = process.seed_window(scratch.root.clone());
+        start_search(&process, window, "report");
+        let view = wait_for_search(&process, window);
+        assert_eq!(view.rows, 2, "both native duplicate names are retained");
+        let paths = process.search_result_paths_for_tests(window);
+        let index = paths
+            .iter()
+            .position(|path| path == &parent_b.join(name))
+            .expect("the exact right duplicate");
+        let before = process.native_nav_evidence_uses_for_tests();
+        activate_and_wait(&process, window, view.generation, index);
+
+        assert_eq!(
+            process.native_nav_evidence_uses_for_tests(),
+            before + 1,
+            "the real nav.go handler consumed validated native evidence"
+        );
+        let after = process.window_snapshot(window).expect("window");
+        let tab = after.tab(after.focused_tab).expect("tab");
+        assert_eq!(tab.folder, parent_b);
+        assert_eq!(
+            tab.selection.names,
+            std::collections::BTreeSet::from([name.to_os_string()])
+        );
+    }
+
+    #[test]
+    fn native_navigation_evidence_is_bound_to_the_validated_text_and_caller() {
+        let scratch = search_scratch("native-binding");
+        let folder = scratch.root.join("folder");
+        let target = folder.join("report.txt");
+        write_fixture(&target);
+        let process = headless_search_process(&scratch);
+        let window = process.seed_window(scratch.root.clone());
+        let select = Some(std::ffi::OsString::from("report.txt"));
+        let before = process.native_nav_evidence_uses_for_tests();
+
+        // The registry refuses a relative path before any handler runs.
+        process.set_pending_nav_evidence_for_tests(
+            "relative".to_string(),
+            folder.clone(),
+            select.clone(),
+            Caller::Ui,
+        );
+        let outcome = process.dispatch_with_outcome(
+            window,
+            Caller::Ui,
+            &Invocation::new("nav.go", vec![("path".to_string(), "relative".to_string())]),
+        );
+        assert!(matches!(outcome, Outcome::Error(_)));
+        assert_eq!(process.native_nav_evidence_uses_for_tests(), before);
+        process.set_pending_nav_target(None);
+
+        // A different caller cannot consume UI-only evidence.
+        process.set_pending_nav_evidence_for_tests(
+            "/tmp/valid".to_string(),
+            folder.clone(),
+            select.clone(),
+            Caller::Ui,
+        );
+        let outcome = process.dispatch_with_outcome(
+            window,
+            Caller::Agent,
+            &Invocation::new(
+                "nav.go",
+                vec![("path".to_string(), "/tmp/valid".to_string())],
+            ),
+        );
+        assert!(matches!(outcome, Outcome::Failed(_)));
+        assert_eq!(process.native_nav_evidence_uses_for_tests(), before);
+
+        // A changed text target fails instead of falling back to the old one.
+        process.set_pending_nav_evidence_for_tests(
+            "/tmp/valid".to_string(),
+            folder.clone(),
+            select.clone(),
+            Caller::Ui,
+        );
+        let outcome = process.dispatch_with_outcome(
+            window,
+            Caller::Ui,
+            &Invocation::new(
+                "nav.go",
+                vec![("path".to_string(), "/tmp/other".to_string())],
+            ),
+        );
+        assert!(matches!(outcome, Outcome::Failed(_)));
+        assert_eq!(process.native_nav_evidence_uses_for_tests(), before);
+        let after = process.window_snapshot(window).expect("window");
+        assert_eq!(
+            after.tab(after.focused_tab).expect("tab").folder,
+            scratch.root,
+            "a refused payload never moves the hidden folder"
+        );
+
+        // The matching validated text reaches the handler with the exact
+        // native selection and is counted once.
+        process.set_pending_nav_evidence_for_tests(
+            "/tmp/valid".to_string(),
+            folder.clone(),
+            select.clone(),
+            Caller::Ui,
+        );
+        let outcome = process.dispatch_with_outcome(
+            window,
+            Caller::Ui,
+            &Invocation::new(
+                "nav.go",
+                vec![("path".to_string(), "/tmp/valid".to_string())],
+            ),
+        );
+        assert_eq!(outcome, Outcome::Done);
+        assert_eq!(process.native_nav_evidence_uses_for_tests(), before + 1);
+        let after = process.window_snapshot(window).expect("window");
+        let tab = after.tab(after.focused_tab).expect("tab");
+        assert_eq!(tab.folder, folder);
+        assert_eq!(
+            tab.selection.names,
+            std::collections::BTreeSet::from([std::ffi::OsString::from("report.txt")])
+        );
+    }
+
+    #[test]
+    fn a_completed_search_revokes_when_its_root_is_removed() {
+        let scratch = search_scratch("root-complete");
+        let root = scratch.root.join("search-root");
+        write_fixture(&root.join("report.txt"));
+        let process = headless_search_process(&scratch);
+        let window = process.seed_window(root.clone());
+        start_search(&process, window, "report");
+        let view = wait_for_search(&process, window);
+        assert_eq!(
+            view.phase,
+            crate::search::SearchPhase::Complete,
+            "the page starts completed"
+        );
+        assert_eq!(process.search_monitor_count_for_tests(), 1);
+        std::fs::remove_dir_all(&root).expect("remove owned root");
+        process.search_root_event_for_tests(window);
+        wait_for_root_revocation(&process, window);
+        assert_eq!(process.search_monitor_count_for_tests(), 0);
+    }
+
+    #[test]
+    fn a_partial_search_revokes_when_its_root_is_removed() {
+        use crate::search::{SearchRuntime, SearchService};
+        use fm_core::search::SearchLimits;
+
+        let scratch = search_scratch("root-partial");
+        let root = scratch.root.join("search-root");
+        write_fixture(&root.join("report-one.txt"));
+        write_fixture(&root.join("report-two.txt"));
+        let runtime = Rc::new(SearchRuntime::with_service(Arc::new(SearchService::new())));
+        runtime.set_limits_for_tests(SearchLimits {
+            max_visited: 1,
+            ..SearchLimits::default()
+        });
+        let process = headless_search_process_with(&scratch, runtime);
+        let window = process.seed_window(root.clone());
+        start_search(&process, window, "report");
+        let view = wait_for_search(&process, window);
+        assert!(
+            matches!(view.phase, crate::search::SearchPhase::Partial(_)),
+            "{view:?}"
+        );
+        std::fs::remove_dir_all(&root).expect("remove owned root");
+        process.search_root_event_for_tests(window);
+        wait_for_root_revocation(&process, window);
+    }
+
+    #[test]
+    fn a_removed_root_alias_revokes_its_completed_search() {
+        let scratch = search_scratch("root-alias");
+        let real = scratch.root.join("real-root");
+        write_fixture(&real.join("report.txt"));
+        let alias = scratch.root.join("alias-root");
+        std::os::unix::fs::symlink(&real, &alias).expect("owned alias");
+        let process = headless_search_process(&scratch);
+        let window = process.seed_window(alias.clone());
+        start_search(&process, window, "report");
+        let view = wait_for_search(&process, window);
+        assert_eq!(view.root, alias);
+        assert!(view.walked_root.is_some());
+        std::fs::remove_file(&alias).expect("remove owned alias");
+        process.search_root_event_for_tests(window);
+        wait_for_root_revocation(&process, window);
+    }
+
+    #[test]
+    fn a_removed_root_revokes_a_pending_activation() {
+        let scratch = search_scratch("root-activation");
+        let root = scratch.root.join("search-root");
+        write_fixture(&root.join("report.txt"));
+        let gate = Arc::new(crate::search::test_support::Gate::default());
+        let process = gated_search_process(&scratch, Some(gate.clone()), None);
+        let window = process.seed_window(root.clone());
+        start_search(&process, window, "report");
+        let view = wait_for_search(&process, window);
+        process.search_activate(window, view.generation, 0);
+        wait_for_gate(&gate);
+        std::fs::remove_dir_all(&root).expect("remove owned root");
+        process.search_root_event_for_tests(window);
+        wait_for_root_revocation(&process, window);
+        gate.release();
+        wait_for_gate_idle(&gate);
+        process.poll_search_for_tests();
+        assert!(process.search_view_for_tests(window).is_none());
+        assert_eq!(process.native_nav_evidence_uses_for_tests(), 0);
+    }
+
+    #[test]
+    fn stale_root_evidence_cannot_close_a_replacement_session() {
+        let scratch = search_scratch("root-stale");
+        let root_a = scratch.root.join("root-a");
+        let root_b = scratch.root.join("root-b");
+        write_fixture(&root_a.join("report.txt"));
+        write_fixture(&root_b.join("other.txt"));
+        let gate = Arc::new(crate::search::test_support::Gate::default());
+        let process = gated_search_process(&scratch, None, Some(gate.clone()));
+        let window = process.seed_window(root_a.clone());
+        start_search(&process, window, "report");
+        let first = wait_for_search(&process, window);
+        assert_eq!(first.root, root_a);
+        process.search_root_event_for_tests(window);
+        process.poll_search_for_tests();
+        wait_for_gate(&gate);
+        std::fs::remove_dir_all(&root_a).expect("remove owned old root");
+
+        let events = {
+            let mut workspace = process.workspace.borrow_mut();
+            workspace.nav_go(root_b.clone(), None)
+        };
+        apply_workspace(&process, events);
+        start_search(&process, window, "other");
+        let replacement = wait_for_search(&process, window);
+        assert_eq!(replacement.root, root_b);
+        assert_eq!(replacement.query, "other");
+
+        gate.release();
+        wait_for_gate_idle(&gate);
+        for _ in 0..20 {
+            process.poll_search_for_tests();
+        }
+        let still = process
+            .search_view_for_tests(window)
+            .expect("the replacement session survives the old root evidence");
+        assert_eq!(still.root, root_b);
+        assert_eq!(still.query, "other");
+    }
+
+    #[test]
+    fn search_monitors_are_torn_down_on_replacement_clear_and_window_close() {
+        let scratch = search_scratch("monitor-teardown");
+        let root_a = scratch.root.join("root-a");
+        let root_b = scratch.root.join("root-b");
+        write_fixture(&root_a.join("a.txt"));
+        write_fixture(&root_b.join("b.txt"));
+        let process = headless_search_process(&scratch);
+        let a = process.seed_window(root_a.clone());
+        let b = process.seed_window(root_b.clone());
+        start_search(&process, a, "a");
+        let _ = wait_for_search(&process, a);
+        start_search(&process, b, "b");
+        let _ = wait_for_search(&process, b);
+        assert_eq!(process.search_monitor_count_for_tests(), 2);
+
+        start_search(&process, a, "a2");
+        assert_eq!(
+            process.search_monitor_count_for_tests(),
+            2,
+            "replacement drops the old monitor before installing one"
+        );
+        process.cancel_search(a);
+        assert_eq!(process.search_monitor_count_for_tests(), 1);
+        process.close_window_for_tests(b);
+        assert_eq!(process.search_monitor_count_for_tests(), 0);
+    }
+
+    fn gtk_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// The real widget/main-loop regression runs in its own process. GTK's
+    /// `gtk::init` intentionally owns the process default main context for its
+    /// lifetime, which would starve the other in-process GLib timer tests if
+    /// this ran in the shared unit-test process.
+    #[test]
+    fn real_header_enter_shows_file_and_folder_rows_in_the_list_store() {
+        let executable = std::env::current_exe().expect("the test executable");
+        let output = std::process::Command::new(executable)
+            .args([
+                "--exact",
+                "app::tests::real_header_enter_shows_file_and_folder_rows_in_the_list_store_inner",
+                "--ignored",
+                "--nocapture",
+            ])
+            .output()
+            .expect("the owned widget regression process");
+        assert!(
+            output.status.success(),
+            "the real GTK widget regression failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    #[ignore = "runs in its own process through the subprocess widget regression"]
+    fn real_header_enter_shows_file_and_folder_rows_in_the_list_store_inner() {
+        let _guard = gtk_test_lock();
+        gtk::init().expect("the widget regression needs a GTK display");
+        adw::init().expect("libadwaita init");
+
+        let context = glib::MainContext::default();
+        let scratch = search_scratch("gtk-entry");
+        let root = scratch.root.join("tree");
+        write_fixture(&root.join("report.txt"));
+        write_fixture(&root.join("nested/report.txt"));
+        std::fs::create_dir_all(root.join("report-folder")).expect("folder fixture");
+        write_fixture(&root.join("unrelated.txt"));
+
+        let application = adw::Application::builder()
+            .application_id("org.gimbal.Files.SearchWidgetTest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        application
+            .register(None::<&gio::Cancellable>)
+            .expect("register the owned non-unique test application");
+        let runtime = Rc::new(crate::search::SearchRuntime::with_service(Arc::new(
+            crate::search::SearchService::new(),
+        )));
+        let process = gtk_search_process(&scratch, &application, runtime);
+        let window = seed_gtk_window(&process, root.clone());
+        let ui = process.window(window).expect("real window");
+        ui.window().present();
+
+        // The same header command Click Search uses, then the entry's real
+        // activate signal that Enter emits. No desktop input injection.
+        process.dispatch_for_window(
+            window,
+            Caller::Ui,
+            Invocation::new("search.open", Vec::new()),
+        );
+        assert!(ui.header().search_open_for_tests());
+        let entry = ui.header().search_entry_for_tests().clone();
+        entry.set_text("report");
+        assert!(
+            ui.header().search_hint_visible_for_tests(),
+            "typing shows the Press Enter hint before submission"
+        );
+        assert!(
+            process.search_view_for_tests(window).is_none(),
+            "typing alone must not start a scan"
+        );
+        entry.emit_by_name::<()>("activate", &[]);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut view = None;
+        while std::time::Instant::now() < deadline {
+            context.iteration(false);
+            view = process.search_view_for_tests(window);
+            let count = ui.content().search_page().store_count_for_tests();
+            if view.as_ref().is_some_and(|view| {
+                matches!(
+                    view.phase,
+                    crate::search::SearchPhase::Complete | crate::search::SearchPhase::Partial(_)
+                ) && count >= 3
+            }) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        let view = view.expect("the real entry started a search");
+        assert_eq!(view.root, root);
+        assert_eq!(view.query, "report");
+        assert!(
+            matches!(
+                view.phase,
+                crate::search::SearchPhase::Complete | crate::search::SearchPhase::Partial(_)
+            ),
+            "the real main-loop poll never finished the scan: {view:?}"
+        );
+        let page = ui.content().search_page();
+        assert_eq!(page.store_count_for_tests(), 3, "{view:?}");
+        let mut names = page.row_texts_for_tests();
+        names.sort();
+        assert_eq!(
+            names,
+            vec![
+                ("report-folder".to_string(), ".".to_string()),
+                ("report.txt".to_string(), ".".to_string()),
+                ("report.txt".to_string(), "nested".to_string()),
+            ]
+        );
+        assert!(
+            page.list_mapped_for_tests(),
+            "the result list was never mapped in the visible search page"
+        );
+        assert!(
+            !ui.header().search_hint_visible_for_tests(),
+            "the submitted page hides the pre-submission hint"
+        );
+        assert_eq!(
+            ui.content().visible_page_for_tests().as_deref(),
+            Some("search")
+        );
+
+        // The same real entry now submits exact file and folder names. Both
+        // files with the exact basename survive as separate native paths.
+        for (query, expected) in [
+            (
+                "report.txt",
+                vec![root.join("nested/report.txt"), root.join("report.txt")],
+            ),
+            ("report-folder", vec![root.join("report-folder")]),
+        ] {
+            entry.set_text(query);
+            entry.emit_by_name::<()>("activate", &[]);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                context.iteration(false);
+                if process.search_view_for_tests(window).is_some_and(|view| {
+                    matches!(
+                        view.phase,
+                        crate::search::SearchPhase::Complete
+                            | crate::search::SearchPhase::Partial(_)
+                    ) && view.query == query
+                }) {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the exact {query:?} search did not finish"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            assert_eq!(page.row_paths_for_tests(), expected, "query {query:?}");
+        }
+
+        // Reordering rows after an exact search must keep the selected native
+        // path, not the old row index. This uses the same real store/model.
+        page.begin(&SearchView {
+            generation: 99,
+            root: root.clone(),
+            walked_root: None,
+            query: "report".to_string(),
+            rows: 0,
+            total_matches: 0,
+            truncated: false,
+            visited: 0,
+            skipped: 0,
+            mounts_skipped: 0,
+            examples: Vec::new(),
+            phase: crate::search::SearchPhase::Searching { queued: false },
+            notice: None,
+        });
+        use fm_core::search::{MatchClass, MatchScore, SearchChange, SearchMatch};
+        let row = |name: &str, score: MatchScore| SearchMatch {
+            path: root.join(name),
+            name: OsString::from(name),
+            display_name: name.to_string(),
+            kind: fm_core::folder_size::EntryKind::File,
+            size: Some(1),
+            modified_sec: Some(1_700_000_000),
+            score,
+        };
+        let first = row(
+            "first-report.txt",
+            MatchScore {
+                class: MatchClass::Substring,
+                edits: 0,
+                gaps: 0,
+                start: 6,
+            },
+        );
+        let second = row(
+            "second-report.txt",
+            MatchScore {
+                class: MatchClass::Substring,
+                edits: 0,
+                gaps: 0,
+                start: 7,
+            },
+        );
+        let exact = row(
+            "report",
+            MatchScore {
+                class: MatchClass::ExactName,
+                edits: 0,
+                gaps: 0,
+                start: 0,
+            },
+        );
+        page.apply_changes(&[
+            SearchChange::Insert {
+                index: 0,
+                row: first,
+            },
+            SearchChange::Insert {
+                index: 1,
+                row: second.clone(),
+            },
+        ]);
+        page.selection_for_tests().set_selected(1);
+        assert_eq!(page.row_paths_for_tests()[1], second.path);
+        page.apply_changes(&[SearchChange::Insert {
+            index: 0,
+            row: exact.clone(),
+        }]);
+        assert_eq!(
+            page.selection_for_tests().selected(),
+            2,
+            "the selection moved with its native path"
+        );
+        assert_eq!(page.row_paths_for_tests()[2], second.path);
+        page.apply_changes(&[SearchChange::Remove {
+            index: 0,
+            path: exact.path,
+        }]);
+        assert_eq!(
+            page.selection_for_tests().selected(),
+            1,
+            "removing a row above the selection keeps the same path"
+        );
+        assert_eq!(page.row_paths_for_tests()[1], second.path);
+        assert!(page.selection_for_tests().selected_item().is_some());
+        assert_eq!(page.row_score_for_tests(1), Some(second.score));
+    }
+
+    #[test]
+    fn visible_rows_rank_exact_then_prefix_then_substring_then_fuzzy() {
+        let scratch = search_scratch("ranked");
+        let root = scratch.root.join("tree");
+        write_fixture(&root.join("report"));
+        write_fixture(&root.join("report.txt"));
+        write_fixture(&root.join("reporting.txt"));
+        write_fixture(&root.join("my-report.txt"));
+        write_fixture(&root.join("reprot.txt"));
+        let process = headless_search_process(&scratch);
+        let window = process.seed_window(root.clone());
+        start_search(&process, window, "report");
+        let view = wait_for_search(&process, window);
+        assert_eq!(view.rows, 5);
+        assert_eq!(view.total_matches, 5);
+        assert!(!view.truncated);
+        assert_eq!(
+            process.search_result_paths_for_tests(window),
+            vec![
+                root.join("report"),
+                root.join("report.txt"),
+                root.join("reporting.txt"),
+                root.join("my-report.txt"),
+                root.join("reprot.txt"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_late_exact_match_replaces_early_fuzzy_rows_and_reports_truncation() {
+        let scratch = search_scratch("late-exact");
+        let root = scratch.root.join("tree");
+        for index in 0..20 {
+            write_fixture(&root.join(format!("reprot-{index}.txt")));
+        }
+        write_fixture(&root.join("report"));
+        let runtime = Rc::new(crate::search::SearchRuntime::with_service(Arc::new(
+            crate::search::SearchService::new(),
+        )));
+        runtime.set_limits_for_tests(fm_core::search::SearchLimits {
+            max_results: 2,
+            ..fm_core::search::SearchLimits::default()
+        });
+        let process = headless_search_process_with(&scratch, runtime);
+        let window = process.seed_window(root.clone());
+        start_search(&process, window, "report");
+        let view = wait_for_search(&process, window);
+        assert_eq!(view.rows, 2, "only the best two rows are retained");
+        assert_eq!(view.total_matches, 21);
+        assert!(view.truncated);
+        assert!(
+            matches!(
+                view.phase,
+                crate::search::SearchPhase::Partial(ref reasons)
+                    if reasons.contains(&fm_core::search::PartialReason::ResultLimit)
+            ),
+            "{view:?}"
+        );
+        let paths = process.search_result_paths_for_tests(window);
+        assert_eq!(paths[0], root.join("report"), "the late exact name wins");
+        assert!(
+            paths[1]
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("reprot-")),
+            "the best fuzzy row remains: {paths:?}"
+        );
+        let status = crate::search::status_text(&view);
+        assert!(status.contains("2 best of 21 matches"), "{status}");
+        assert!(status.contains("result limit"), "{status}");
     }
 }

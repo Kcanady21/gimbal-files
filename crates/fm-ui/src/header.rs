@@ -165,6 +165,7 @@ pub struct Header {
     search: gtk::Revealer,
     search_field: gtk::Box,
     search_entry: gtk::Entry,
+    search_hint: gtk::Label,
     trash: gtk::Button,
     float: gtk::Button,
     minimize: Option<gtk::Button>,
@@ -172,6 +173,9 @@ pub struct Header {
     scale: Cell<f64>,
     overflow: Cell<bool>,
     search_open: Cell<bool>,
+    /// Set while `close_search` clears the entry programmatically, so the
+    /// changed handler does not mistake it for the user clearing search.
+    search_programmatic: Cell<bool>,
     animate_group: Cell<Option<usize>>,
     /// Non-zero while an `adw::AlertDialog` owns the keyboard.
     dialogs: Cell<u32>,
@@ -204,6 +208,10 @@ impl Header {
         let search_entry = gtk::Entry::new();
         search_entry.set_placeholder_text(Some("Search"));
         field.append(&search_entry);
+        let search_hint = gtk::Label::new(Some("Press Enter to search"));
+        search_hint.add_css_class("gl-search-hint");
+        search_hint.set_visible(false);
+        field.append(&search_hint);
         let search = gtk::Revealer::new();
         // Crossfade, not SlideRight: a slide translates the field left by
         // `width - child_width` and the revealer does not clip (P1l item 2).
@@ -287,6 +295,7 @@ impl Header {
             search,
             search_field: field,
             search_entry,
+            search_hint,
             trash,
             float,
             minimize,
@@ -294,6 +303,7 @@ impl Header {
             scale: Cell::new(scale),
             overflow: Cell::new(false),
             search_open: Cell::new(false),
+            search_programmatic: Cell::new(false),
             animate_group: Cell::new(None),
             dialogs: Cell::new(0),
             agent_widgets: RefCell::new(None),
@@ -350,6 +360,33 @@ impl Header {
     /// rename and new-folder entries report through `WindowUi::editing`.
     pub fn text_focused(&self) -> bool {
         self.path_entry.has_focus() || self.search_entry.has_focus()
+    }
+
+    pub fn search_entry_focused(&self) -> bool {
+        self.search_entry.has_focus()
+    }
+
+    /// The results page is about to open; its own status replaces the
+    /// pre-submission hint.
+    pub fn hide_search_hint(&self) {
+        self.search_hint.set_visible(false);
+    }
+
+    /// The real header entry, used by widget-level regressions that exercise
+    /// the same activate signal as Enter without synthesising desktop input.
+    #[cfg(test)]
+    pub(crate) fn search_entry_for_tests(&self) -> &gtk::Entry {
+        &self.search_entry
+    }
+
+    #[cfg(test)]
+    pub(crate) fn search_open_for_tests(&self) -> bool {
+        self.search_open.get()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn search_hint_visible_for_tests(&self) -> bool {
+        self.search_hint.get_visible()
     }
 
     fn window_ui(&self) -> Option<Rc<WindowUi>> {
@@ -490,7 +527,11 @@ impl Header {
 
     pub fn dismiss_empty_search(self: &Rc<Self>) {
         if self.search_open.get() && self.search_entry.text().is_empty() {
-            self.close_search();
+            if let Some(ui) = self.window_ui() {
+                ui.close_search();
+            } else {
+                self.close_search();
+            }
         }
     }
 
@@ -511,7 +552,14 @@ impl Header {
         if self.search_open.get() {
             self.search_entry.grab_focus();
             if let Some(query) = query {
+                // GtkEditable::set_text clears the old text before inserting
+                // the new one and can emit `changed` with an empty string in
+                // between. That is not the user clearing the search: suppress
+                // the handler so it cannot cancel the session this command
+                // just submitted.
+                self.search_programmatic.set(true);
                 self.search_entry.set_text(query);
+                self.search_programmatic.set(false);
                 self.search_entry.set_position(-1);
             }
             return;
@@ -521,7 +569,9 @@ impl Header {
         self.search_icon.set_visible(false);
         self.search.set_reveal_child(true);
         if let Some(query) = query {
+            self.search_programmatic.set(true);
             self.search_entry.set_text(query);
+            self.search_programmatic.set(false);
             self.search_entry.set_position(-1);
         }
         self.search_entry.grab_focus();
@@ -540,7 +590,10 @@ impl Header {
             return;
         }
         self.search_open.set(false);
+        self.search_hint.set_visible(false);
+        self.search_programmatic.set(true);
         self.search_entry.set_text("");
+        self.search_programmatic.set(false);
         self.search.set_reveal_child(false);
         let weak = Rc::downgrade(self);
         glib::timeout_add_local_once(
@@ -564,7 +617,7 @@ impl Header {
             return glib::Propagation::Proceed;
         }
         if self.search_open.get() {
-            self.close_search();
+            ui.close_search();
             return glib::Propagation::Stop;
         }
         if let Some(window) = ui.workspace_window()
@@ -1188,6 +1241,11 @@ impl Header {
         });
         let header_activate = self.clone();
         self.search_entry.connect_activate(move |entry| {
+            // The registry keeps its nonempty Text rule. Enter on an empty
+            // entry is not a search and must not be turned into one here.
+            if entry.text().is_empty() {
+                return;
+            }
             if let Some(ui) = header_activate.window_ui() {
                 ui.dispatch(
                     Caller::Ui,
@@ -1198,14 +1256,32 @@ impl Header {
                 );
             }
         });
-        self.search_entry.connect_changed(|entry| {
+        let header_typed = self.clone();
+        self.search_entry.connect_changed(move |entry| {
             crate::log!("search", "typed {:?}", entry.text());
+            let search_visible = header_typed
+                .window_ui()
+                .is_some_and(|ui| ui.search_active());
+            header_typed
+                .search_hint
+                .set_visible(!entry.text().is_empty() && !search_visible);
+            if entry.text().is_empty()
+                && header_typed.search_open.get()
+                && !header_typed.search_programmatic.get()
+                && let Some(ui) = header_typed.window_ui()
+            {
+                ui.clear_search();
+            }
         });
         let header_focus = self.clone();
         let focus = gtk::EventControllerFocus::new();
         focus.connect_leave(move |_| {
             if header_focus.search_open.get() && header_focus.search_entry.text().is_empty() {
-                header_focus.close_search();
+                if let Some(ui) = header_focus.window_ui() {
+                    ui.close_search();
+                } else {
+                    header_focus.close_search();
+                }
             }
         });
         self.search_entry.add_controller(focus);

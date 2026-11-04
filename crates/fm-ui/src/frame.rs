@@ -23,6 +23,7 @@ use crate::look::blur::Blur;
 use crate::look::motion;
 use crate::look::tokens::*;
 use crate::preview::PreviewPanel;
+use crate::search::SearchView;
 use crate::sidebar::Sidebar;
 use crate::trash::TrashBrowser;
 
@@ -219,6 +220,11 @@ impl WindowUi {
         &self.header
     }
 
+    #[cfg(test)]
+    pub(crate) fn content(&self) -> &Rc<Content> {
+        &self.content
+    }
+
     pub fn preview(&self) -> &Rc<PreviewPanel> {
         &self.preview
     }
@@ -299,11 +305,77 @@ impl WindowUi {
         self.header.open_search(query);
     }
 
+    pub fn search_active(&self) -> bool {
+        self.content.search_active()
+    }
+
+    /// Show a freshly submitted or restarted query. The header entry keeps
+    /// its focus; the results list is not selected just because it appeared.
+    pub fn begin_search(self: &Rc<Self>, view: &SearchView) {
+        self.header.open_search(Some(&view.query));
+        self.header.hide_search_hint();
+        self.content.show_search();
+        self.content.search_page().begin(view);
+    }
+
+    pub fn search_changes(&self, changes: &[fm_core::search::SearchChange]) {
+        self.content.search_page().apply_changes(changes);
+    }
+
+    pub fn search_status(&self, view: &SearchView) {
+        self.content.search_page().status(view);
+    }
+
+    pub fn search_notice(&self, message: &str) {
+        self.content.search_page().show_notice(message);
+    }
+
+    /// The session is gone (tab/folder change, close or window destruction):
+    /// close the entry and restore the ordinary content page.
+    pub fn search_revoked(self: &Rc<Self>) {
+        self.content.search_page().reset();
+        self.content.hide_search();
+        self.header.close_search();
+        self.update_content();
+        if !self.header.dialogs_open() && !self.preview.text_focused() {
+            self.content.focus_visible();
+        }
+    }
+
+    /// The entry was cleared, but stays open for another query. Only the
+    /// transient results page goes away.
+    pub fn search_cleared(self: &Rc<Self>) {
+        self.content.search_page().reset();
+        self.content.hide_search();
+        self.update_content();
+    }
+
+    pub fn close_search(self: &Rc<Self>) {
+        if let Some(process) = self.process.upgrade() {
+            process.close_search(self.id);
+        } else {
+            self.search_revoked();
+        }
+    }
+
+    pub fn clear_search(self: &Rc<Self>) {
+        if let Some(process) = self.process.upgrade() {
+            process.cancel_search(self.id);
+        } else {
+            self.search_cleared();
+        }
+    }
+
     pub fn refresh_header(self: &Rc<Self>, fade: bool) {
         self.header.rebuild(self, fade);
     }
 
     pub fn update_content(&self) {
+        if self.content.search_active() {
+            // The search page owns the visible content and the preview's exact
+            // result. The hidden folder/split keeps its own state untouched.
+            return;
+        }
         if self.content.trash_active() {
             // Do not present the hidden folder as the current view. The header
             // says Trash and the sidebar has no current-folder highlight.
@@ -363,6 +435,10 @@ impl WindowUi {
         self.editing.get() || self.header.text_focused()
     }
 
+    pub fn search_entry_focused(&self) -> bool {
+        self.header.search_entry_focused()
+    }
+
     /// A text preview owns the editing keys while its text view has focus.
     pub fn preview_text_focused(&self) -> bool {
         self.preview.text_focused()
@@ -403,6 +479,11 @@ impl WindowUi {
     /// The page lives in the central stack; opening it never creates a tab,
     /// model window or folder-history entry.
     pub fn open_trash(self: &Rc<Self>) {
+        if let Some(process) = self.process.upgrade() {
+            process.close_search(self.id);
+        } else {
+            self.search_revoked();
+        }
         let action = crate::trash::open_action(self.trash.borrow().is_some());
         match action {
             crate::trash::OpenAction::ShowExisting => {

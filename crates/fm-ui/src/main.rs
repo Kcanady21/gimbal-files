@@ -25,6 +25,7 @@ mod pdf;
 mod platform;
 mod preview;
 mod save;
+mod search;
 mod sidebar;
 mod split;
 mod thumbs;

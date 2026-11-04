@@ -22,6 +22,7 @@ use crate::fileops::dialogs;
 use crate::folder::{FolderView, StatusLine, status_text};
 use crate::look::motion;
 use crate::look::tokens::*;
+use crate::search::SearchPage;
 use crate::split::SplitView;
 
 pub struct Content {
@@ -30,6 +31,7 @@ pub struct Content {
     placeholder: gtk::Label,
     folder: Rc<FolderView>,
     split: SplitView,
+    search: Rc<SearchPage>,
     rule: gtk::Box,
     status: Rc<StatusLine>,
     progress_row: gtk::Box,
@@ -44,6 +46,7 @@ pub struct Content {
     /// Transient presentation state. This is deliberately not in the model:
     /// a session restore always comes back to an ordinary folder page.
     trash_active: Cell<bool>,
+    search_active: Cell<bool>,
     summary_gen: Rc<Cell<u64>>,
     last_failures: Rc<RefCell<Option<String>>>,
 }
@@ -119,9 +122,11 @@ impl Content {
 
         let folder = FolderView::new(process, window, status.clone(), scale, None, None);
         let split = SplitView::new(process, window, status.clone(), scale);
+        let search = SearchPage::new(process, window, scale);
         stack.add_named(&placeholder, Some("placeholder"));
         stack.add_named(folder.widget(), Some("folder"));
         stack.add_named(split.widget(), Some("split"));
+        stack.add_named(search.widget(), Some("search"));
         stack.set_visible_child_name("folder");
 
         root.append(&stack);
@@ -138,6 +143,7 @@ impl Content {
             placeholder,
             folder,
             split,
+            search,
             rule,
             status,
             progress_row,
@@ -149,6 +155,7 @@ impl Content {
             restore_anchor: Cell::new(false),
             split_shown: Cell::new(false),
             trash_active: Cell::new(false),
+            search_active: Cell::new(false),
             summary_gen: Rc::new(Cell::new(0)),
             last_failures,
         });
@@ -171,6 +178,7 @@ impl Content {
 
     pub fn show_trash(&self) {
         self.trash_active.set(true);
+        self.search_active.set(false);
         self.folder.set_status_gate(false);
         if self.split_shown.get() {
             self.split.blur();
@@ -192,6 +200,41 @@ impl Content {
         self.trash_active.get()
     }
 
+    pub fn search_page(&self) -> &Rc<SearchPage> {
+        &self.search
+    }
+
+    #[cfg(test)]
+    pub(crate) fn visible_page_for_tests(&self) -> Option<String> {
+        self.stack.visible_child_name().map(|name| name.to_string())
+    }
+
+    pub fn search_active(&self) -> bool {
+        self.search_active.get()
+    }
+
+    /// Show the transient results page over the unchanged folder/split page.
+    /// The underlying widgets stay parented, so leaving search restores their
+    /// selection, history, scroll anchor and split layout untouched.
+    pub fn show_search(&self) {
+        self.search_active.set(true);
+        self.folder.set_status_gate(false);
+        self.rule.set_visible(false);
+        self.progress_row.set_visible(false);
+        self.status.widget().set_visible(false);
+        self.stack.set_visible_child_name("search");
+    }
+
+    pub fn hide_search(&self) {
+        self.search_active.set(false);
+        if self.trash_active.get() {
+            return;
+        }
+        self.rule.set_visible(true);
+        self.status.widget().set_visible(true);
+        self.progress_row.set_visible(false);
+    }
+
     pub fn arm_anchor_restore(&self) {
         self.restore_anchor.set(true);
     }
@@ -204,10 +247,23 @@ impl Content {
         self.stack.visible_child_name().as_deref() == Some("split")
     }
 
+    /// Return keyboard focus to the visible ordinary page after a transient
+    /// page closes. Trash and search pages keep their own focus.
+    pub fn focus_visible(&self) {
+        if self.trash_active.get() || self.search_active.get() {
+            return;
+        }
+        if self.on_split_page() {
+            self.split.focus_focused();
+        } else if self.stack.visible_child_name().as_deref() == Some("folder") {
+            self.folder.grab_grid_focus();
+        }
+    }
+
     pub fn listed_names(&self) -> Vec<OsString> {
-        // The hidden folder page must never supply names while Trash is the
-        // visible page; selection.all is routed to the Trash list instead.
-        if self.trash_active.get() {
+        // The hidden folder page must never supply names while Trash or search
+        // is the visible page; file actions are refused there instead.
+        if self.trash_active.get() || self.search_active.get() {
             return Vec::new();
         }
         if self.on_split_page() {
@@ -220,7 +276,7 @@ impl Content {
     }
 
     pub fn reload(&self) {
-        if self.trash_active.get() {
+        if self.trash_active.get() || self.search_active.get() {
             return;
         }
         if self.on_split_page() {
@@ -239,6 +295,7 @@ impl Content {
     pub fn apply_scale(&self, scale: f64) {
         self.folder.apply_scale(scale);
         self.split.set_scale(scale);
+        self.search.apply_scale(scale);
         self.progress_row.set_spacing(scaled(GAP_S, scale));
         self.progress_row.set_margin_start(scaled(GAP_L, scale));
         self.progress_row.set_margin_end(scaled(GAP_L, scale));
@@ -246,6 +303,9 @@ impl Content {
 
     /// A new operation starts: hide the old row and let the counts back in.
     pub fn begin_fileop(&self) {
+        if self.search_active.get() {
+            return;
+        }
         self.summary_gen.set(self.summary_gen.get() + 1);
         self.status.end_summary();
         self.progress_row.set_visible(false);
@@ -255,7 +315,7 @@ impl Content {
     }
 
     pub fn set_progress(&self, view: Option<ProgressView>) {
-        if self.trash_active.get() {
+        if self.trash_active.get() || self.search_active.get() {
             return;
         }
         match view {
@@ -272,7 +332,7 @@ impl Content {
 
     /// Hold the status line for a few seconds, then go back to the counts.
     pub fn show_summary(&self, text: &str, failures: Option<String>) {
-        if self.trash_active.get() {
+        if self.trash_active.get() || self.search_active.get() {
             return;
         }
         self.progress_row.set_visible(false);
@@ -322,6 +382,9 @@ impl Content {
     /// Reflect the focused tab. A normal pill shows its folder grid; a split
     /// group shows one tile per tab.
     pub fn show(&self, window: &Window) {
+        if self.search_active.get() {
+            return;
+        }
         // Model events during a job or monitor refresh update the hidden pages
         // later; they never dismiss the visible Trash page. Navigation leaves
         // Trash explicitly before it asks for a destination.

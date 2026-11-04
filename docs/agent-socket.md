@@ -333,6 +333,62 @@ Gimbal confirmation dialog must be answered in the UI; socket clients cannot
 answer or impersonate it. A job is never reported complete merely because it
 was queued.
 
+## File search (view-only)
+
+`search.open` is the existing V1 command. Its optional `query` argument keeps
+the registry's nonempty `Text` rule and the existing caller validation.
+
+- `search.open` without `query` only opens or focuses that window's search
+  entry. It starts no traversal and changes no model state.
+- A nonempty `query` starts a recursive filename search in the exact focused
+  tab folder captured for that window. In a split group it is the focused
+  tile's folder only. The `run` reply means the entry was opened or the scan
+  was accepted; it does **not** mean traversal finished.
+- Results are transient view state over the workspace. `state` continues to be
+  the underlying workspace projection: it never lists search results, and
+  opening or scanning never changes the reported folder, selection, focus,
+  groups or tabs. Activating a result is an ordinary `nav.go` and is visible as
+  that navigation. A search is not a file-operation job and never appears in
+  `[[data.job]]`.
+- Matching is filename-only: case-insensitive exact name/stem, prefix and
+  substring first; for queries of at least three Unicode scalars it also accepts
+  ordered-character subsequences and bounded typo distance. Results are ranked
+  by `(class, edits, gaps, start)` then native relative path. At most 10,000 best
+  rows are retained while the scan continues; the page and the accepted `run`
+  reply do not claim a fixed latency. A full retained set is reported as partial
+  with `result limit` and retained-versus-total matches; no result list is
+  exported over the socket.
+- A second `search.open` query in the same window replaces the first. A search
+  in a ninth window can return the typed busy failure. Tab/folder changes,
+  entering Trash, root removal, query replacement and window close revoke the
+  old session; late batches are neither exported nor able to change another
+  tab or window. Removal of a completed or partial scan's root (including a
+  user-selected symlink alias) is observed by a focused root/parent monitor and
+  a bounded worker check, then revokes the page as `Search unavailable`.
+- Result activation is deferred to a bounded process-wide worker. One lookup
+  may be pending per window; a second different result reports busy, and a
+  repeated identical activation is deduplicated. Clear/Escape, replacement,
+  tab/folder/window changes and shutdown revoke it. The worker resolves the
+  exact native path; the UI revalidates the window, tab, root, query generation
+  and result before dispatching the existing `nav.go` through registry
+  validation. A vanished result explains itself without navigating, closing the
+  page or selecting another item.
+- The native bytes of an invalid-UTF-8 result never travel as a text command
+  argument. The UI dispatches the existing `nav.go` with an absolute validated
+  text path and a one-shot typed payload bound to that text and `Caller::Ui`;
+  the handler consumes the payload after registry acceptance. Wire and CLI
+  callers cannot supply or select this payload, and a mismatched target fails
+  rather than falling back to a lossy path or another item.
+- A search is ordinary UI view state, not a socket generation. Turning
+  automation Off, restarting it, or a client disconnect does not create or
+  cancel a search. The page remains for the user to close with Escape.
+- Opening, clearing or closing the entry and Escape are UI lifecycle events,
+  not commands. V1 has no socket operation to cancel, close or page search
+  results, and no search-results export. A protocol search query waits for a
+  later brief.
+- Results are read-only. Existing file commands and `preview.edit` are refused
+  with a readable explanation while the results page is shown.
+
 ## CLI
 
 ```

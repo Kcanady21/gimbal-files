@@ -87,6 +87,19 @@ pub fn install_hotkeys(app: &std::rc::Rc<WindowUi>, window: &gtk::Window) {
             {
                 return gtk::glib::Propagation::Proceed;
             }
+            // The search entry owns its editing keys and the results list owns
+            // its arrow/Home/End/Enter keys. Escape is the one cancellation
+            // control and is handled once by the window's key controller.
+            if app.search_entry_focused() && crate::search::search_entry_owns_key(key, modifiers) {
+                return gtk::glib::Propagation::Proceed;
+            }
+            if app.search_active()
+                && !app.text_entry_focused()
+                && !app.preview_text_focused()
+                && crate::search::search_results_own_key(key, modifiers)
+            {
+                return gtk::glib::Propagation::Proceed;
+            }
             app.dispatch(Caller::Hotkey, invocation.clone());
             gtk::glib::Propagation::Stop
         });

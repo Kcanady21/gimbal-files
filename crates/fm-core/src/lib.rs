@@ -14,6 +14,7 @@ pub mod fileops;
 pub mod folder_size;
 pub(crate) mod fsutil;
 pub mod preview;
+pub mod search;
 pub mod session;
 pub mod workspace;
 

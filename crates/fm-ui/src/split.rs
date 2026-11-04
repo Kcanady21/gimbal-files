@@ -946,6 +946,16 @@ impl SplitView {
         self.inner.relayout(false);
     }
 
+    /// Give the focused tile's grid the keyboard again after a transient page.
+    pub fn focus_focused(&self) {
+        let Some(id) = self.inner.focused.get() else {
+            return;
+        };
+        if let Some(view) = self.inner.view_of(id) {
+            view.grab_grid_focus();
+        }
+    }
+
     pub fn blur(&self) {
         for tile in self.inner.tiles.borrow().iter() {
             tile.gate.set(false);

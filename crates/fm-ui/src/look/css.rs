@@ -72,7 +72,7 @@ fn css_impl(
     let sect_h = (p(SECTION_H) - 2 * thin).max(1);
     let close_inner = (itc - 2 * thin).max(1);
     let search_w = (p(SEARCH_W) - 2 * gm - 2 * mid).max(1);
-    let search_entry_w = (search_w - isearch - gm).max(1);
+    let search_entry_w = (search_w - isearch - gm - p(SEARCH_HINT_W)).max(1);
     let trash_inner = (p(TRASH) - 2 * thin).max(1);
     let pitch = p(PILL_W) + p(GAP_L);
     let hover_ms = motion::ms(120);
@@ -119,6 +119,7 @@ window.gimbal-look, window.gimbal-look.background {{ background-color: {window_b
 .gl-search-field {{ min-width: {search_w}px; }}
 .gl-search-field entry {{ min-width: {search_entry_w}px; }}
 .gl-search-glyph {{ -gtk-icon-size: {inav}px; margin-right: {gm}px; color: {FG}; }}
+.gl-search-hint {{ font-size: {tsmall}px; color: alpha({FG}, 0.6); margin-left: {gs}px; }}
 .gl-path-label {{ font-size: {tc}px; }}
 .gl-path.invalid {{ border-color: @error_bg_color; }}
 .gl-pill {{ all: unset; min-height: {pill_h}px; padding: 0 {gm}px; border: {mid}px solid {OUTLINE}; border-radius: {rp}px; background-color: {pill_bg}; color: {FG}; transition: background-color {hover_ms}ms; }}
@@ -212,6 +213,21 @@ dnd .gl-drag-badge, .gl-drag-badge {{ min-width: {tsmall}px; min-height: {tsmall
 .gl-trash-empty {{ font-size: {tt}px; color: alpha({FG}, 0.75); }}
 .gl-trash-status {{ min-height: {statush}px; padding: 0 {gm}px; font-size: {tsmall}px; color: alpha({FG}, 0.75); }}
 .gl-trash-progress {{ border-top: {hair}px solid {RULE}; }}
+.gl-search-page {{ padding-top: {g2xl}px; }}
+.gl-search-title {{ font-size: {titem}px; color: alpha({FG}, 0.75); }}
+.gl-search-scope {{ font-size: {tsmall}px; color: alpha({FG}, 0.65); }}
+.gl-search-query {{ font-size: {titem}px; color: {FG}; }}
+.gl-search-notice {{ font-size: {trow}px; color: {FG}; background-color: alpha(@warning_color, 0.18); border: {thin}px solid alpha(@warning_color, 0.55); border-radius: {r}px; padding: {gs}px {gm}px; }}
+.gl-search-list {{ background-color: transparent; }}
+.gl-search-row {{ min-height: {dirrow}px; padding: {gs}px {gm}px; }}
+.gl-search-icon {{ -gtk-icon-size: {irow}px; color: {FG}; }}
+.gl-search-name {{ font-size: {titem}px; color: {FG}; }}
+.gl-search-parent {{ font-size: {tsmall}px; color: alpha({FG}, 0.65); }}
+.gl-search-meta {{ font-size: {tsmall}px; color: alpha({FG}, 0.75); }}
+.gl-search-status {{ min-height: {statush}px; font-size: {trow}px; color: alpha({FG}, 0.8); }}
+.gl-search-status.partial {{ color: @warning_color; }}
+.gl-search-status.error {{ color: @error_color; }}
+window.gimbal-look .gl-frame .gl-search-list row:selected {{ background-color: alpha(@accent_bg_color, 0.45); border-radius: {r}px; }}
 window.gimbal-look .gl-frame gridview, window.gimbal-look .gl-frame listview, window.gimbal-look .gl-frame textview, window.gimbal-look .gl-frame textview > text, window.gimbal-look .gl-frame scrolledwindow, window.gimbal-look .gl-frame viewport, window.gimbal-look .gl-frame gridview > child, window.gimbal-look windowhandle {{ background-color: transparent; }}
 window.gimbal-look .gl-frame gridview > child:selected {{ background-color: alpha(@accent_bg_color, 0.45); border-radius: {r}px; }}
 window.gimbal-look .gl-frame gridview > child:hover {{ background-color: alpha({FG}, 0.10); border-radius: {r}px; }}
