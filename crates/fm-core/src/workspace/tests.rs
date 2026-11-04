@@ -786,6 +786,121 @@ fn history_stacks_are_capped_at_one_hundred_dropping_the_oldest() {
 }
 
 #[test]
+fn recent_dirs_follow_successful_navigations_newest_first_distinct_and_capped() {
+    let mut workspace = workspace();
+    assert!(workspace.recent_dirs.is_empty());
+
+    for path in ["/tmp/a", "/tmp/b", "/tmp/c", "/tmp/d", "/tmp/e"] {
+        workspace.nav_go(folder(path), None).unwrap();
+    }
+    assert_eq!(
+        workspace.recent_dirs,
+        ["/tmp/e", "/tmp/d", "/tmp/c", "/tmp/b", "/tmp/a"]
+            .map(PathBuf::from)
+            .to_vec()
+    );
+
+    workspace.nav_go(folder("/tmp/f"), None).unwrap();
+    assert_eq!(
+        workspace.recent_dirs,
+        ["/tmp/f", "/tmp/e", "/tmp/d", "/tmp/c", "/tmp/b"]
+            .map(PathBuf::from)
+            .to_vec()
+    );
+
+    // A revisit moves the path to the front; it does not add a second entry.
+    workspace.nav_go(folder("/tmp/d"), None).unwrap();
+    assert_eq!(
+        workspace.recent_dirs,
+        ["/tmp/d", "/tmp/f", "/tmp/e", "/tmp/c", "/tmp/b"]
+            .map(PathBuf::from)
+            .to_vec()
+    );
+
+    // A relative path is never recorded, even if the model accepted it.
+    workspace.nav_go(folder("relative"), None).unwrap();
+    assert_eq!(
+        workspace.recent_dirs,
+        ["/tmp/d", "/tmp/f", "/tmp/e", "/tmp/c", "/tmp/b"]
+            .map(PathBuf::from)
+            .to_vec()
+    );
+}
+
+#[test]
+fn recent_dirs_follow_back_and_forward_but_not_focus_or_failed_navigation() {
+    let mut workspace = workspace();
+    workspace.nav_go(folder("/tmp/a"), None).unwrap();
+    workspace.nav_go(folder("/tmp/b"), None).unwrap();
+    assert_eq!(
+        workspace.recent_dirs,
+        [PathBuf::from("/tmp/b"), PathBuf::from("/tmp/a")]
+    );
+
+    workspace.nav_back().unwrap();
+    assert_eq!(
+        workspace.recent_dirs,
+        [PathBuf::from("/tmp/a"), PathBuf::from("/tmp/b")]
+    );
+    workspace.nav_forward().unwrap();
+    assert_eq!(
+        workspace.recent_dirs,
+        [PathBuf::from("/tmp/b"), PathBuf::from("/tmp/a")]
+    );
+
+    let before = workspace.recent_dirs.clone();
+    workspace.focus_window(workspace.windows[0].id).unwrap();
+    assert_eq!(workspace.recent_dirs, before);
+    assert!(workspace.nav_go(folder("/tmp/b"), None).unwrap().is_empty());
+    assert_eq!(workspace.recent_dirs, before);
+
+    let mut empty = Workspace::with_home(home());
+    assert_eq!(
+        empty.nav_go(folder("/tmp/nowhere"), None),
+        Err(WorkspaceError::NoWindow)
+    );
+    assert!(empty.recent_dirs.is_empty());
+}
+
+#[test]
+fn restore_keeps_the_stored_recent_order_and_sanitizes_the_list() {
+    let data = RestoreData {
+        focused_window: 0,
+        recent_dirs: vec![
+            folder("/tmp/b"),
+            folder("/tmp/a"),
+            folder("/tmp/b"),
+            folder("relative"),
+            folder("/tmp/c"),
+            folder("/tmp/d"),
+            folder("/tmp/e"),
+            folder("/tmp/f"),
+        ],
+        windows: vec![restore_window(
+            vec![restore_group(
+                vec![restore_tab("/tmp/a"), restore_tab("/tmp/b")],
+                [vec![0], vec![1]],
+            )],
+            vec![0],
+        )],
+    };
+
+    let (workspace, problems) = Workspace::restore(home(), data);
+    assert!(problems.is_empty(), "{problems:?}");
+    workspace.check_invariants().unwrap();
+    assert_eq!(
+        workspace.recent_dirs,
+        [
+            PathBuf::from("/tmp/b"),
+            PathBuf::from("/tmp/a"),
+            PathBuf::from("/tmp/c"),
+            PathBuf::from("/tmp/d"),
+            PathBuf::from("/tmp/e"),
+        ]
+    );
+}
+
+#[test]
 fn nav_up_stops_at_the_root() {
     let mut workspace = workspace();
     workspace.nav_go(folder("/tmp/a/b"), None).unwrap();
@@ -1163,6 +1278,7 @@ fn restore_window(groups: Vec<RestoreGroup>, pills: Vec<usize>) -> RestoreWindow
 fn restore_replaces_a_column_list_that_does_not_match_its_tabs() {
     let data = RestoreData {
         focused_window: 0,
+        recent_dirs: Vec::new(),
         windows: vec![restore_window(
             vec![restore_group(
                 vec![restore_tab("/tmp/a"), restore_tab("/tmp/b")],
@@ -1202,6 +1318,7 @@ fn restore_repairs_hand_heights_of_the_wrong_length() {
 
     let data = RestoreData {
         focused_window: 0,
+        recent_dirs: Vec::new(),
         windows: vec![restore_window(vec![group], vec![0])],
     };
 
@@ -1229,6 +1346,7 @@ fn restore_repairs_a_width_share_over_1000() {
 
     let data = RestoreData {
         focused_window: 0,
+        recent_dirs: Vec::new(),
         windows: vec![restore_window(vec![group], vec![0])],
     };
 
@@ -1263,6 +1381,7 @@ fn restore_repairs_a_focused_tab_out_of_range() {
 
     let data = RestoreData {
         focused_window: 0,
+        recent_dirs: Vec::new(),
         windows: vec![window],
     };
 
@@ -1293,6 +1412,7 @@ fn restore_trims_history_from_the_oldest_end() {
 
     let data = RestoreData {
         focused_window: 0,
+        recent_dirs: Vec::new(),
         windows: vec![restore_window(
             vec![restore_group(vec![tab], [vec![0], Vec::new()])],
             vec![0],
@@ -1331,6 +1451,7 @@ fn restore_trims_history_from_the_oldest_end() {
 fn restore_drops_an_empty_group_and_an_empty_window() {
     let data = RestoreData {
         focused_window: 1,
+        recent_dirs: Vec::new(),
         windows: vec![
             restore_window(
                 vec![

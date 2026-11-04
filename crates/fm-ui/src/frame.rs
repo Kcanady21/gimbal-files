@@ -639,8 +639,8 @@ impl WindowUi {
         self.content.cancel_drag()
     }
 
-    pub fn push_recent(&self, folder: &std::path::Path) {
-        self.sidebar.push_recent(folder);
+    pub fn set_recent(&self, recent: &[PathBuf]) {
+        self.sidebar.set_recent(recent);
     }
 
     fn scale(&self) -> f64 {

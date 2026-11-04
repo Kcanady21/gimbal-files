@@ -183,6 +183,7 @@ pub fn load(
             .and_then(Item::as_integer)
             .and_then(|value| usize::try_from(value).ok())
             .unwrap_or(0),
+        recent_dirs: read_recent_dirs(root.get("recent_dirs")),
         windows: Vec::new(),
     };
 
@@ -248,6 +249,7 @@ fn fresh_workspace(home: &Path) -> Workspace {
 fn one_window_at_home(home: &Path) -> RestoreData {
     RestoreData {
         focused_window: 0,
+        recent_dirs: Vec::new(),
         windows: vec![RestoreWindow {
             pills: vec![0],
             focused_tab: 0,
@@ -279,6 +281,14 @@ fn document_for(workspace: &Workspace) -> DocumentMut {
         .and_then(|id| workspace.windows.iter().position(|window| window.id == id))
         .unwrap_or(0);
     root.insert("focused_window", Item::Value(Value::from(focused as i64)));
+
+    if !workspace.recent_dirs.is_empty() {
+        let mut recent = Array::new();
+        for folder in &workspace.recent_dirs {
+            recent.push(path_value(folder));
+        }
+        root.insert("recent_dirs", Item::Value(Value::Array(recent)));
+    }
 
     let mut windows = ArrayOfTables::new();
     for window in &workspace.windows {
@@ -519,6 +529,12 @@ fn read_paths(item: Option<&Item>) -> Vec<PathBuf> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// The shared Recent Directories list. A missing or non-array field is empty;
+/// each malformed element is skipped without affecting the rest of the file.
+fn read_recent_dirs(item: Option<&Item>) -> Vec<PathBuf> {
+    read_paths(item)
 }
 
 fn read_heights(item: Option<&Item>) -> [Option<Vec<i32>>; 2] {
@@ -809,6 +825,11 @@ mod tests {
         assert!(problems.is_empty(), "{problems:?}");
         loaded.check_invariants().unwrap();
         assert_eq!(view(&workspace), view(&loaded));
+        assert_eq!(loaded.recent_dirs, workspace.recent_dirs);
+        assert_eq!(
+            loaded.recent_dirs,
+            vec![home.join("work").join("a"), home.join("work").join("b")]
+        );
 
         for window in &loaded.windows {
             assert!(window.selection.selected.iter().all(|selected| !selected));
@@ -837,6 +858,7 @@ mod tests {
         let (loaded, problems) = load(&path, &home, |_| true);
         assert!(problems.is_empty(), "{problems:?}");
         loaded.check_invariants().unwrap();
+        assert_eq!(loaded.recent_dirs, vec![subfolder.clone()]);
 
         let window = &loaded.windows[0];
         let tab = window.tab(window.focused_tab).unwrap();
@@ -846,6 +868,101 @@ mod tests {
         assert_eq!(tab.selection.focused, Some(name.clone()));
         assert_eq!(tab.selection.anchor, Some(name.clone()));
         assert_eq!(tab.scroll_anchor, Some(name));
+    }
+
+    #[test]
+    fn recent_dirs_are_optional_and_bad_entries_are_ignored_individually() {
+        let temp = TempDir::new("recent");
+        let home = temp.path().to_path_buf();
+        let path = temp.path().join("session.toml");
+
+        // A workspace without a history writes no field; a missing field
+        // loads as an empty list.
+        let mut workspace = Workspace::with_home(home.clone());
+        workspace.window_new(Some(home.clone())).unwrap();
+        save(&path, &workspace).unwrap();
+        assert!(!fs::read_to_string(&path).unwrap().contains("recent_dirs"));
+        let (loaded, problems) = load(&path, &home, |_| true);
+        assert!(problems.is_empty(), "{problems:?}");
+        assert!(loaded.recent_dirs.is_empty());
+
+        let first = PathBuf::from("/tmp/gimbal-p2q-recent-a");
+        let text = format!(
+            r#"version = 1
+focused_window = 0
+recent_dirs = ["/tmp/gimbal-p2q-recent-a", "relative", 7, {{ foo = 1 }}, "/tmp/gimbal-p2q-recent-a", "/tmp/gimbal-p2q-recent-b", "/tmp/gimbal-p2q-recent-c", "/tmp/gimbal-p2q-recent-d", "/tmp/gimbal-p2q-recent-e", "/tmp/gimbal-p2q-recent-f"]
+
+[[window]]
+pills = [0]
+focused_tab = 0
+
+[[window.group]]
+number = 1
+width_permille = 500
+heights = ["default", "default"]
+columns = [[0], []]
+
+[[window.group.tab]]
+folder = "{}"
+"#,
+            home.display()
+        );
+        let path = temp.write("filtered.toml", &text);
+        // The history is never probed for availability. A tab's folder is.
+        let exists = |candidate: &Path| {
+            assert_ne!(candidate, first.as_path(), "loading the history probed it");
+            true
+        };
+        let (loaded, problems) = load(&path, &home, exists);
+        assert!(problems.is_empty(), "{problems:?}");
+        loaded.check_invariants().unwrap();
+        assert_eq!(
+            loaded.recent_dirs,
+            [
+                "/tmp/gimbal-p2q-recent-a",
+                "/tmp/gimbal-p2q-recent-b",
+                "/tmp/gimbal-p2q-recent-c",
+                "/tmp/gimbal-p2q-recent-d",
+                "/tmp/gimbal-p2q-recent-e",
+            ]
+            .map(PathBuf::from)
+            .to_vec()
+        );
+    }
+
+    #[test]
+    fn a_malformed_recent_field_leaves_the_windows_restorable() {
+        let temp = TempDir::new("recent-bad");
+        let home = temp.path().to_path_buf();
+        let text = format!(
+            r#"version = 1
+focused_window = 0
+recent_dirs = "not a list"
+
+[[window]]
+pills = [0]
+focused_tab = 0
+
+[[window.group]]
+number = 1
+width_permille = 500
+heights = ["default", "default"]
+columns = [[0], []]
+
+[[window.group.tab]]
+folder = "{}"
+"#,
+            home.display()
+        );
+        let path = temp.write("malformed.toml", &text);
+
+        let (loaded, problems) = load(&path, &home, |_| true);
+        assert!(problems.is_empty(), "{problems:?}");
+        loaded.check_invariants().unwrap();
+        assert!(loaded.recent_dirs.is_empty());
+        assert_eq!(loaded.windows.len(), 1);
+        let window = &loaded.windows[0];
+        assert_eq!(window.groups[&window.pills[0]].tabs[0].folder, home);
     }
 
     #[test]

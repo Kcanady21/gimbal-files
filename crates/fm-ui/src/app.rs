@@ -342,6 +342,33 @@ impl Process {
         clipboard_reader: Rc<dyn crate::fileops::clipboard::Reader>,
         search: Rc<crate::search::SearchRuntime>,
     ) -> Rc<Self> {
+        Self::headless_parts(config_path, home, clipboard_reader, search, None)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn headless_with_session(
+        config_path: PathBuf,
+        home: PathBuf,
+        clipboard_reader: Rc<dyn crate::fileops::clipboard::Reader>,
+        session_path: PathBuf,
+    ) -> Rc<Self> {
+        Self::headless_parts(
+            config_path,
+            home,
+            clipboard_reader,
+            Rc::new(crate::search::SearchRuntime::production()),
+            Some(session_path),
+        )
+    }
+
+    #[cfg(test)]
+    fn headless_parts(
+        config_path: PathBuf,
+        home: PathBuf,
+        clipboard_reader: Rc<dyn crate::fileops::clipboard::Reader>,
+        search: Rc<crate::search::SearchRuntime>,
+        session_path: Option<PathBuf>,
+    ) -> Rc<Self> {
         let (config_file, _problems) = ConfigFile::load(&config_path);
         let process = Rc::new(Self {
             application: None,
@@ -349,7 +376,7 @@ impl Process {
             look: None,
             workspace: RefCell::new(Workspace::with_home(home)),
             windows: RefCell::new(BTreeMap::new()),
-            session_path: None,
+            session_path,
             saver: Saver::new(),
             save_source: RefCell::new(None),
             debounce: Cell::new(Debounce::new(SAVE_DELAY_MS)),
@@ -700,6 +727,11 @@ impl Process {
 
     pub fn home(&self) -> PathBuf {
         self.config.borrow().config().home.clone()
+    }
+
+    /// The shared Recent Directories list, copied out before any GTK work.
+    pub fn recent_dirs(&self) -> Vec<PathBuf> {
+        self.workspace.borrow().recent_dirs.clone()
     }
 
     pub fn scale(&self) -> f64 {
@@ -1325,6 +1357,14 @@ impl Process {
         self.focus_model_window(window);
         let result = self.workspace.borrow_mut().nav_go(path, None);
         self.finish(result);
+    }
+
+    pub fn open_recent_folder(self: &Rc<Self>, window: WindowId, path: PathBuf) {
+        if path.is_dir() {
+            self.nav_go_path(window, path);
+        } else if let Some(ui) = self.window(window) {
+            ui.show_summary(&format!("Folder unavailable: {}", path.display()), None);
+        }
     }
 
     /// The command line's file form: `nav_go(folder, select)` picks the first
@@ -1989,9 +2029,16 @@ impl Process {
         self.refresh(id, false);
     }
 
-    fn on_navigated(self: &Rc<Self>, id: WindowId, folder: &Path) {
+    fn on_navigated(self: &Rc<Self>, id: WindowId, _folder: &Path) {
+        // One navigation changes the shared history for every window. Copy it
+        // out first and only then notify the sidebars; no model borrow lives
+        // across GTK work.
+        let recent = self.recent_dirs();
+        let windows: Vec<Rc<WindowUi>> = self.windows.borrow().values().cloned().collect();
+        for ui in windows {
+            ui.set_recent(&recent);
+        }
         if let Some(ui) = self.window(id) {
-            ui.push_recent(folder);
             ui.preview().release_saved_override();
         }
         self.refresh(id, false);
@@ -5179,5 +5226,158 @@ mod tests {
         let status = crate::search::status_text(&view);
         assert!(status.contains("2 best of 21 matches"), "{status}");
         assert!(status.contains("result limit"), "{status}");
+    }
+
+    #[test]
+    fn a_recent_change_survives_quit() {
+        let scratch = search_scratch("recent-quit");
+        let executable = std::env::current_exe().expect("the test executable");
+        let output = std::process::Command::new(executable)
+            .args([
+                "--exact",
+                "app::tests::a_recent_change_survives_quit_inner",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("GIMBAL_P2Q_QUIT_ROOT", &scratch.root)
+            .output()
+            .expect("the owned quit process");
+        assert!(
+            output.status.success(),
+            "the quit save regression failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let home = scratch.root.join("home");
+        let path = scratch.root.join("state/session.toml");
+        let (loaded, problems) = session::load(&path, &home, Path::is_dir);
+        assert!(problems.is_empty(), "{problems:?}");
+        assert_eq!(loaded.recent_dirs, vec![scratch.root.join("visited")]);
+    }
+
+    #[test]
+    #[ignore = "runs in its own process so quit's global shutdown cannot affect other tests"]
+    fn a_recent_change_survives_quit_inner() {
+        let root = PathBuf::from(
+            std::env::var_os("GIMBAL_P2Q_QUIT_ROOT").expect("the parent sets the fixture root"),
+        );
+        let home = root.join("home");
+        std::fs::create_dir_all(&home).expect("fixture home");
+        let visited = root.join("visited");
+        std::fs::create_dir_all(&visited).expect("fixture folder");
+
+        let process = Process::headless_with_session(
+            root.join("config.toml"),
+            home,
+            Rc::new(NoClipboard),
+            root.join("state/session.toml"),
+        );
+        process.restore_session();
+        let window = process.workspace.borrow().windows[0].id;
+        process.nav_go_path(window, visited);
+        process.request_quit();
+    }
+
+    #[test]
+    fn navigating_in_one_window_updates_every_sidebar_recent_list() {
+        let executable = std::env::current_exe().expect("the test executable");
+        let scratch = search_scratch("recent-sidebars");
+        let output = std::process::Command::new(executable)
+            .args([
+                "--exact",
+                "app::tests::navigating_in_one_window_updates_every_sidebar_recent_list_inner",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("GIMBAL_P2Q_SIDEBAR_ROOT", &scratch.root)
+            .output()
+            .expect("the owned sidebar process");
+        assert!(
+            output.status.success(),
+            "the sidebar regression failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    #[ignore = "runs in its own process because gtk::init owns the default main context"]
+    fn navigating_in_one_window_updates_every_sidebar_recent_list_inner() {
+        let _guard = gtk_test_lock();
+        gtk::init().expect("the sidebar regression needs a GTK display");
+        adw::init().expect("libadwaita init");
+
+        let root = PathBuf::from(
+            std::env::var_os("GIMBAL_P2Q_SIDEBAR_ROOT").expect("the parent sets the fixture root"),
+        );
+        let one = root.join("one");
+        let two = root.join("two");
+        let start_a = root.join("start-a");
+        let start_b = root.join("start-b");
+        for folder in [&one, &two, &start_a, &start_b] {
+            std::fs::create_dir_all(folder).expect("fixture folder");
+        }
+        std::fs::create_dir_all(root.join("home")).expect("fixture home");
+
+        let scratch = SearchScratch { root: root.clone() };
+        let application = adw::Application::builder()
+            .application_id("org.gimbal.Files.RecentSidebarTest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        application
+            .register(None::<&gio::Cancellable>)
+            .expect("register the owned non-unique test application");
+        let runtime = Rc::new(crate::search::SearchRuntime::with_service(Arc::new(
+            crate::search::SearchService::new(),
+        )));
+        let process = gtk_search_process(&scratch, &application, runtime);
+        let a = seed_gtk_window(&process, start_a);
+        let b = seed_gtk_window(&process, start_b);
+
+        let sidebar_a = process
+            .window(a)
+            .expect("window A")
+            .sidebar_for_tests()
+            .clone();
+        let sidebar_b = process
+            .window(b)
+            .expect("window B")
+            .sidebar_for_tests()
+            .clone();
+        assert!(sidebar_a.recent_rows_for_tests().is_empty());
+        assert!(sidebar_b.recent_rows_for_tests().is_empty());
+
+        process.nav_go_path(a, one.clone());
+        process.nav_go_path(a, two.clone());
+        process.nav_go_path(a, one.clone());
+
+        let expected = vec![
+            ("one".to_string(), Some(one.display().to_string())),
+            ("two".to_string(), Some(two.display().to_string())),
+        ];
+        assert_eq!(sidebar_a.recent_rows_for_tests(), expected);
+        assert_eq!(
+            sidebar_b.recent_rows_for_tests(),
+            expected,
+            "the other window's sidebar follows the shared list"
+        );
+
+        // Rendering a remembered but currently unavailable folder probes
+        // nothing and keeps the row for a removable drive.
+        let missing = root.join("not-mounted");
+        sidebar_b.set_recent(std::slice::from_ref(&missing));
+        assert_eq!(
+            sidebar_b.recent_rows_for_tests(),
+            vec![(
+                "not-mounted".to_string(),
+                Some(missing.display().to_string())
+            )]
+        );
+        let before = process.windows_snapshot();
+        let recent = process.recent_dirs();
+        process.open_recent_folder(b, missing);
+        assert_eq!(process.windows_snapshot(), before);
+        assert_eq!(process.recent_dirs(), recent);
     }
 }

@@ -2,8 +2,7 @@
 //! The left sidebar: pinned folders with the spike's `PinnedRowLayout`, recent
 //! directories, mounted devices with drive bars, Remote and the main drive.
 //!
-//! Recent directories are kept in memory per window for now; saving them is a
-//! later session change.
+//! Recent directories are one shared session list, rendered by every window.
 
 use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
@@ -51,6 +50,7 @@ pub struct Sidebar {
 impl Sidebar {
     pub fn new(process: &Rc<Process>, window: WindowId, scale: f64) -> Rc<Self> {
         let home = process.home();
+        let recent = process.recent_dirs();
         let config = process.config.borrow();
         let sections = config.config().sections;
         drop(config);
@@ -95,6 +95,7 @@ impl Sidebar {
             &Rc::downgrade(process),
             window,
             PathBuf::from("/"),
+            Process::nav_go_path,
         );
         dnd::attach_folder_target(
             &main.root,
@@ -115,7 +116,7 @@ impl Sidebar {
             devices: RefCell::new(Vec::new()),
             device_signature: RefCell::new(Vec::new()),
             main,
-            recent: RefCell::new(Vec::new()),
+            recent: RefCell::new(recent),
             process: Rc::downgrade(process),
             window,
             home,
@@ -137,6 +138,7 @@ impl Sidebar {
         }));
 
         this.reload_from_config();
+        this.rebuild_recent();
         process.volumes().request_main_usage();
         this.refresh_from_volumes();
         this
@@ -176,12 +178,34 @@ impl Sidebar {
         }
     }
 
-    pub fn push_recent(&self, folder: &Path) {
+    /// Show the shared Recent Directories list. It is already ordered and
+    /// filtered by the workspace; rendering performs no availability probes.
+    pub fn set_recent(&self, recent: &[PathBuf]) {
         {
-            let mut recent = self.recent.borrow_mut();
-            push_recent(&mut recent, folder);
+            let mut current = self.recent.borrow_mut();
+            if current.as_slice() == recent {
+                return;
+            }
+            current.clear();
+            current.extend_from_slice(recent);
         }
         self.rebuild_recent();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn recent_rows_for_tests(&self) -> Vec<(String, Option<String>)> {
+        let mut rows = Vec::new();
+        let mut child = self.recent_content.first_child();
+        while let Some(row) = child {
+            let label = row
+                .first_child()
+                .and_then(|widget| widget.downcast::<gtk::Label>().ok())
+                .map(|label| label.text().to_string())
+                .unwrap_or_default();
+            rows.push((label, row.tooltip_text().map(|text| text.to_string())));
+            child = row.next_sibling();
+        }
+        rows
     }
 
     pub fn set_section(&self, section: Section, state: SectionState) {
@@ -208,7 +232,13 @@ impl Sidebar {
         for folder in recent {
             let row = dir_row(&recent_label(&folder, &self.home));
             row.set_tooltip_text(Some(&folder.display().to_string()));
-            attach_click(&row, &self.process, self.window, folder);
+            attach_click(
+                &row,
+                &self.process,
+                self.window,
+                folder,
+                Process::open_recent_folder,
+            );
             self.recent_content.append(&row);
         }
     }
@@ -270,7 +300,13 @@ impl Sidebar {
         row.install_cancel(Rc::downgrade(process));
         match entry.state() {
             DeviceState::Mounted { root, .. } => {
-                attach_click(&row.root, &self.process, self.window, root.clone());
+                attach_click(
+                    &row.root,
+                    &self.process,
+                    self.window,
+                    root.clone(),
+                    Process::nav_go_path,
+                );
                 let target = root.clone();
                 dnd::attach_folder_target(
                     &row.root,
@@ -478,13 +514,14 @@ fn attach_click(
     process: &Weak<Process>,
     window: WindowId,
     folder: PathBuf,
+    open: fn(&Rc<Process>, WindowId, PathBuf),
 ) {
     let click = gtk::GestureClick::new();
     click.set_button(1);
     let weak = process.clone();
     click.connect_released(move |_, _, _, _| {
         if let Some(process) = weak.upgrade() {
-            process.nav_go_path(window, folder.clone());
+            open(&process, window, folder.clone());
         }
     });
     widget.add_controller(click);
@@ -810,15 +847,6 @@ impl DriveRow {
             self.fill.add_css_class("main");
         }
     }
-}
-
-/// The folders in the Recent list: the newest first, distinct, at most five.
-pub fn push_recent(recent: &mut Vec<PathBuf>, folder: &Path) {
-    if let Some(position) = recent.iter().position(|candidate| candidate == folder) {
-        recent.remove(position);
-    }
-    recent.insert(0, folder.to_path_buf());
-    recent.truncate(5);
 }
 
 fn recent_label(path: &Path, home: &Path) -> String {
@@ -1595,17 +1623,14 @@ mod tests {
     }
 
     #[test]
-    fn recent_list_dedupes_caps_and_puts_the_newest_first() {
-        let mut recent = Vec::new();
-        for path in ["a", "b", "c", "d", "e", "f"] {
-            push_recent(&mut recent, Path::new(path));
-        }
-        let names: Vec<&str> = recent.iter().map(|path| path.to_str().unwrap()).collect();
-        assert_eq!(names, ["f", "e", "d", "c", "b"]);
-
-        push_recent(&mut recent, Path::new("d"));
-        let names: Vec<&str> = recent.iter().map(|path| path.to_str().unwrap()).collect();
-        assert_eq!(names, ["d", "f", "e", "c", "b"]);
+    fn recent_labels_use_the_folder_name_and_home_is_home() {
+        let home = Path::new("/home/kyle");
+        assert_eq!(recent_label(home, home), "Home");
+        assert_eq!(
+            recent_label(Path::new("/tmp/gimbal-p2q"), home),
+            "gimbal-p2q"
+        );
+        assert_eq!(recent_label(Path::new("/"), home), "/");
     }
 
     #[test]

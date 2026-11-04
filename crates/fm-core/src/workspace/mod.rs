@@ -31,6 +31,9 @@ use std::path::{Path, PathBuf};
 /// The most folders a tab remembers in each of its back and forward stacks.
 pub const HISTORY_LIMIT: usize = 100;
 
+/// The most folders the shared Recent Directories list remembers.
+pub const RECENT_LIMIT: usize = 5;
+
 /// The default width share: half of the width left after the gutter.
 pub const DEFAULT_WIDTH_PERMILLE: u16 = 500;
 
@@ -419,11 +422,30 @@ fn broken(message: impl Into<String>) -> InvariantError {
     }
 }
 
+/// Keep the first absolute distinct paths, in order, at most [`RECENT_LIMIT`].
+fn sanitize_recent_dirs(dirs: impl IntoIterator<Item = PathBuf>) -> Vec<PathBuf> {
+    let mut recent = Vec::new();
+    for folder in dirs {
+        if !folder.is_absolute() || recent.contains(&folder) {
+            continue;
+        }
+        recent.push(folder);
+        if recent.len() == RECENT_LIMIT {
+            break;
+        }
+    }
+    recent
+}
+
 /// The whole workspace: its windows and the most recently focused one.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Workspace {
     pub windows: Vec<Window>,
     pub focused_window: Option<WindowId>,
+    /// The shared Recent Directories list: absolute native paths, newest
+    /// first, distinct and at most [`RECENT_LIMIT`] entries. It is session
+    /// state, not a per-window list.
+    pub recent_dirs: Vec<PathBuf>,
     home: PathBuf,
     ids: IdSource,
 }
@@ -436,6 +458,9 @@ pub struct Workspace {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RestoreData {
     pub focused_window: usize,
+    /// The shared Recent Directories list. Restore filters out relative
+    /// paths and duplicates and keeps at most [`RECENT_LIMIT`] entries.
+    pub recent_dirs: Vec<PathBuf>,
     pub windows: Vec<RestoreWindow>,
 }
 
@@ -618,6 +643,7 @@ impl Workspace {
         Self {
             windows: Vec::new(),
             focused_window: None,
+            recent_dirs: Vec::new(),
             home,
             ids: IdSource::default(),
         }
@@ -831,12 +857,31 @@ impl Workspace {
         } else {
             focused_id.or_else(|| workspace.windows.first().map(|window| window.id))
         };
+        workspace.recent_dirs = sanitize_recent_dirs(data.recent_dirs);
 
         (workspace, problems)
     }
 
     pub fn home(&self) -> &Path {
         &self.home
+    }
+
+    /// Add a folder to the shared Recent Directories list. Only an absolute
+    /// native path is recorded; a path already present moves to the front.
+    /// The oldest entry is evicted at [`RECENT_LIMIT`].
+    fn record_recent(&mut self, folder: &Path) {
+        if !folder.is_absolute() {
+            return;
+        }
+        if let Some(position) = self
+            .recent_dirs
+            .iter()
+            .position(|candidate| candidate == folder)
+        {
+            self.recent_dirs.remove(position);
+        }
+        self.recent_dirs.insert(0, folder.to_path_buf());
+        self.recent_dirs.truncate(RECENT_LIMIT);
     }
 
     pub fn focused(&self) -> Option<&Window> {
@@ -1512,6 +1557,8 @@ impl Workspace {
             tab.selection.anchor = Some(name);
         }
 
+        self.record_recent(&folder);
+
         Ok(vec![Event::Navigated {
             window: window_id,
             tab: tab_id,
@@ -1542,6 +1589,8 @@ impl Workspace {
         tab.selection.clear();
         tab.scroll_anchor = None;
 
+        self.record_recent(&folder);
+
         Ok(vec![Event::Navigated {
             window: window_id,
             tab: tab_id,
@@ -1571,6 +1620,8 @@ impl Workspace {
         tab.folder = folder.clone();
         tab.selection.clear();
         tab.scroll_anchor = None;
+
+        self.record_recent(&folder);
 
         Ok(vec![Event::Navigated {
             window: window_id,
