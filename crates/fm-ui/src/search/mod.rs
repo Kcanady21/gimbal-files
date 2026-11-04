@@ -1079,6 +1079,30 @@ impl SearchRuntime {
         }
     }
 
+    /// Cancel and close every search session whose root is under one mount
+    /// root. Returns the affected windows so the caller can leave the results
+    /// page without touching a folder listing.
+    pub fn cancel_under(&self, root: &Path) -> Vec<WindowId> {
+        let windows: Vec<WindowId> = self
+            .state
+            .borrow()
+            .sessions
+            .iter()
+            .filter(|(_, session)| {
+                session.root.starts_with(root)
+                    || session
+                        .walked_root
+                        .as_ref()
+                        .is_some_and(|walked| walked.starts_with(root))
+            })
+            .map(|(window, _)| *window)
+            .collect();
+        for window in &windows {
+            self.close(*window);
+        }
+        windows
+    }
+
     /// Close every session and cancel its pending work. Called on app quit.
     pub fn shutdown(&self) {
         let windows: Vec<WindowId> = self.state.borrow().sessions.keys().copied().collect();

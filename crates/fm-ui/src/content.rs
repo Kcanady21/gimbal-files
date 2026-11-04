@@ -288,6 +288,20 @@ impl Content {
 
     /// Cancel a split tile drag: Esc, a lost grab, a right button mid-drag or
     /// the window losing focus. Returns whether a drag was active.
+    /// Release this window's folder listings, thumbnails and folder-size walks
+    /// under one mount root. Search is process-wide and released separately.
+    pub fn release_root(&self, root: &Path) -> usize {
+        let mut released = usize::from(self.folder.release_root(root));
+        if released > 0 {
+            // A terminal failure rebuilds this same folder; forget the cached
+            // display key so `show` asks the released listing for it again.
+            *self.displayed_folder.borrow_mut() = None;
+            self.displayed_tab.set(None);
+        }
+        released += self.split.release_root(root);
+        released
+    }
+
     pub fn cancel_drag(&self) -> bool {
         self.split.cancel_drag()
     }

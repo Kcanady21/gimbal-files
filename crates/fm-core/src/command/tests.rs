@@ -72,11 +72,14 @@ fn the_v1_catalogue_has_every_reviewed_command_in_order() {
         "view.toggle-sidebar",
         "view.toggle-section",
         "view.set-sort",
+        "view.clear-folder-sort",
         "agent.set-enabled",
         "pins.add",
         "pins.remove",
         "pins.move",
         "drive.mount",
+        "drive.unmount",
+        "drive.eject",
     ];
     let actual: Vec<&str> = COMMANDS.iter().map(|spec| spec.name).collect();
     assert_eq!(actual, expected);
@@ -629,6 +632,18 @@ fn the_sort_scope_defaults_to_folder() {
     )
     .expect("valid sort");
     assert_eq!(command.get("scope"), Some(&Value::Choice("global")));
+}
+
+#[test]
+fn clear_folder_sort_is_a_plain_settings_command_for_every_caller() {
+    let sort =
+        check(Caller::Ui, &["view.set-sort", "by=name", "order=ascending"]).expect("valid sort");
+    for caller in [Caller::Ui, Caller::Hotkey, Caller::Cli, Caller::Agent] {
+        let clear = check(caller, &["view.clear-folder-sort"]).expect("clear-folder-sort is valid");
+        assert_eq!(clear.effect(), Effect::Settings);
+        assert_eq!(clear.effect(), sort.effect());
+        assert!(clear.arguments().is_empty());
+    }
 }
 
 #[test]

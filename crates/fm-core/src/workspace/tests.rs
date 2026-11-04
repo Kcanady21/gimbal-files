@@ -47,6 +47,118 @@ fn split_first(workspace: &mut Workspace, n: usize) -> (GroupId, Vec<TabId>) {
 }
 
 #[test]
+fn a_vanished_mount_moves_tabs_and_split_tiles_to_its_nearest_existing_parent() {
+    let mut workspace = Workspace::with_home(home());
+    workspace
+        .window_new(Some(PathBuf::from("/run/media/kyle/USB")))
+        .unwrap();
+    workspace
+        .tab_new(Some(PathBuf::from("/tmp/elsewhere")))
+        .unwrap();
+    workspace
+        .tab_new(Some(PathBuf::from("/run/media/kyle/USB/photos")))
+        .unwrap();
+    let recent_before = workspace.recent_dirs.clone();
+    let (group, tabs) = split_first(&mut workspace, 3);
+    let layout_before = workspace.focused().unwrap().groups[&group].layout.clone();
+    let back_before = workspace.focused().unwrap().groups[&group].tabs[0]
+        .back
+        .clone();
+
+    let relocations =
+        workspace.relocate_removed_mount(Path::new("/run/media/kyle/USB"), &home(), |path| {
+            path == Path::new("/run/media/kyle") || path == Path::new("/")
+        });
+
+    assert_eq!(relocations.len(), 2);
+    assert!(relocations.iter().all(|moved| {
+        moved.to == Path::new("/run/media/kyle") && moved.from.starts_with("/run/media/kyle/USB")
+    }));
+    let window = workspace.focused().unwrap();
+    assert_eq!(window.groups[&group].layout, layout_before);
+    assert_eq!(
+        window.groups[&group]
+            .tabs
+            .iter()
+            .map(|tab| tab.id)
+            .collect::<Vec<_>>(),
+        tabs,
+        "the tab strip and split slots keep their place"
+    );
+    assert_eq!(
+        window.groups[&group].tabs[0].back, back_before,
+        "history keeps the old paths"
+    );
+    assert_eq!(workspace.recent_dirs, recent_before);
+    assert!(
+        window.groups[&group]
+            .tabs
+            .iter()
+            .find(|tab| tab.folder == Path::new("/tmp/elsewhere"))
+            .is_some()
+    );
+    workspace.check_invariants().unwrap();
+}
+
+#[test]
+fn a_vanished_mount_falls_back_to_home_and_moves_tabs_in_every_window() {
+    let mut workspace = Workspace::with_home(home());
+    workspace
+        .window_new(Some(PathBuf::from("/run/media/kyle/USB")))
+        .unwrap();
+    let first_window = workspace.focused().unwrap().id;
+    workspace
+        .window_new(Some(PathBuf::from("/run/media/kyle/USB/notes")))
+        .unwrap();
+    let second_window = workspace.focused().unwrap().id;
+    assert_ne!(first_window, second_window);
+
+    let relocations =
+        workspace.relocate_removed_mount(Path::new("/run/media/kyle/USB"), &home(), |path| {
+            path == Path::new("/home/kyle")
+        });
+
+    assert_eq!(relocations.len(), 2);
+    assert!(
+        relocations.iter().all(|moved| moved.to == home()),
+        "home is the fallback when no parent exists"
+    );
+    assert_eq!(
+        relocations
+            .iter()
+            .map(|moved| moved.window)
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([first_window, second_window])
+    );
+    for window in &workspace.windows {
+        for group in window.groups.values() {
+            for tab in &group.tabs {
+                assert_eq!(tab.folder, home());
+            }
+        }
+    }
+    assert_eq!(
+        workspace.focused().unwrap().id,
+        second_window,
+        "relocation does not change focus"
+    );
+    workspace.check_invariants().unwrap();
+}
+
+#[test]
+fn root_and_unrelated_folders_are_never_relocated() {
+    let mut workspace = workspace();
+    let before = workspace.focused().unwrap().clone();
+    let relocations =
+        workspace.relocate_removed_mount(Path::new("/run/media/kyle/USB"), &home(), |_| true);
+    assert!(relocations.is_empty());
+    assert_eq!(workspace.focused().unwrap(), &before);
+
+    let root = workspace.relocate_removed_mount(Path::new("/"), &home(), |_| true);
+    assert!(root.is_empty(), "the root filesystem is never relocated");
+}
+
+#[test]
 fn ids_are_stable_and_never_reused() {
     let mut workspace = workspace();
     let first_window = workspace.focused().unwrap().id;

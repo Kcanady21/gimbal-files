@@ -14,7 +14,9 @@ use gtk::subclass::prelude::*;
 
 use fm_core::command::{Caller, Invocation};
 use fm_core::config::{self, Section, SectionState};
-use fm_core::volumes::{DeviceEntry, DeviceState, MountStatus, VolumeId};
+use fm_core::volumes::{
+    DeviceEntry, DeviceState, DriveAction, MountStatus, RemovalStatus, VolumeId,
+};
 use fm_core::workspace::WindowId;
 
 use crate::app::Process;
@@ -259,11 +261,13 @@ impl Sidebar {
             .map(|entry| match entry.state() {
                 DeviceState::Mounted { root, .. } => {
                     format!(
-                        "{}#{}:mounted:{}:{}",
+                        "{}#{}:mounted:{}:{}:{}:{}",
                         entry.id(),
                         entry.incarnation(),
                         root.display(),
-                        entry.mount_object().unwrap_or_default()
+                        entry.mount_object().unwrap_or_default(),
+                        entry.can_unmount(),
+                        entry.can_eject()
                     )
                 }
                 DeviceState::Unmounted { .. } => {
@@ -316,6 +320,14 @@ impl Sidebar {
                     None,
                     None,
                 );
+                attach_mounted_menu(
+                    &row,
+                    Rc::downgrade(process),
+                    self.window,
+                    entry.id().clone(),
+                    entry.label().to_string(),
+                    root.clone(),
+                );
             }
             DeviceState::Unmounted { .. } => {
                 attach_unmounted_click(
@@ -345,7 +357,23 @@ impl Sidebar {
         row.set_name(entry.label());
         match entry.state() {
             DeviceState::Mounted { .. } => {
-                self.apply_usage(row, &volumes.usage_for_entry(entry));
+                if let Some(RemovalStatus::Pending(action)) = volumes.removal_status_for(entry.id())
+                {
+                    let text = if volumes.cancel_requested(entry.id()) {
+                        "Cancelling…"
+                    } else {
+                        action.pending_text()
+                    };
+                    let cancel_id =
+                        (!volumes.cancel_requested(entry.id())).then(|| entry.id().clone());
+                    let verb = match action {
+                        DriveAction::Unmount => "unmounting",
+                        DriveAction::Eject => "ejecting",
+                    };
+                    row.set_pending(text, entry.label(), cancel_id, verb);
+                } else {
+                    self.apply_usage(row, &volumes.usage_for_entry(entry));
+                }
             }
             DeviceState::Unmounted { .. } => {
                 let status = volumes.status_for(entry.id());
@@ -358,7 +386,7 @@ impl Sidebar {
                         };
                         let cancel_id =
                             (!volumes.cancel_requested(entry.id())).then(|| entry.id().clone());
-                        row.set_pending(text, entry.label(), cancel_id);
+                        row.set_pending(text, entry.label(), cancel_id, "mounting");
                     }
                     Some(status) => {
                         row.set_note(
@@ -438,6 +466,23 @@ impl Sidebar {
             self.window,
             entry.id(),
             entry.label(),
+        ))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn build_mounted_menu_for_tests(
+        &self,
+        id: &str,
+    ) -> Option<(gtk::Popover, Vec<gtk::Button>)> {
+        let process = self.process.upgrade()?;
+        let entry = process.volumes().entry(id)?;
+        let root = entry.state().root()?.to_path_buf();
+        Some(build_mounted_device_menu(
+            &self.process,
+            self.window,
+            entry.id(),
+            entry.label(),
+            &root,
         ))
     }
 
@@ -576,7 +621,7 @@ fn attach_device_menu(
         popover.set_parent(&row.root);
         popover.set_pointing_to(Some(&gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
         popover.connect_closed(|popover| popover.unparent());
-        popover.popup();
+        crate::popup::show(&popover);
     });
     row.root.add_controller(gesture);
 }
@@ -631,6 +676,177 @@ fn build_device_menu(
     menu.append(&button);
     popover.set_child(Some(&menu));
     (popover, Some(button))
+}
+
+fn attach_mounted_menu(
+    row: &Rc<DriveRow>,
+    process: Weak<Process>,
+    window: WindowId,
+    id: VolumeId,
+    name: String,
+    root: PathBuf,
+) {
+    let gesture = gtk::GestureClick::new();
+    gesture.set_button(3);
+    let weak_row = Rc::downgrade(row);
+    gesture.connect_pressed(move |_, _, x, y| {
+        let Some(row) = weak_row.upgrade() else {
+            return;
+        };
+        let (popover, _) = build_mounted_device_menu(&process, window, &id, &name, &root);
+        popover.set_parent(&row.root);
+        popover.set_pointing_to(Some(&gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+        popover.connect_closed(|popover| popover.unparent());
+        crate::popup::show(&popover);
+    });
+    row.root.add_controller(gesture);
+}
+
+/// The context menu for one mounted device. The drive's own `can_unmount` and
+/// `can_eject` answers decide; the main drive and root are never such a row.
+/// While an operation runs the menu carries Cancel instead of a second action.
+fn build_mounted_device_menu(
+    process: &Weak<Process>,
+    window: WindowId,
+    id: &VolumeId,
+    name: &str,
+    root: &Path,
+) -> (gtk::Popover, Vec<gtk::Button>) {
+    let popover = gtk::Popover::new();
+    popover.add_css_class("gl-menu");
+    let menu = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    let mut buttons = Vec::new();
+
+    let Some(process) = process.upgrade() else {
+        menu.append(&menu_note("Gimbal is closing."));
+        popover.set_child(Some(&menu));
+        return (popover, buttons);
+    };
+    let volumes = process.volumes();
+
+    if let Some(RemovalStatus::Pending(action)) = volumes.removal_status_for(id) {
+        menu.append(&menu_note(if volumes.cancel_requested(id) {
+            "Cancelling…"
+        } else {
+            action.pending_text()
+        }));
+        if !volumes.cancel_requested(id) {
+            let cancel = menu_action("Cancel", &format!("Cancel {} {name}", action.verb()));
+            let popover_for_button = popover.clone();
+            let volume_id = id.clone();
+            let weak = Rc::downgrade(&process);
+            cancel.connect_clicked(move |_| {
+                popover_for_button.popdown();
+                if let Some(process) = weak.upgrade() {
+                    process.volumes().cancel(&volume_id);
+                }
+            });
+            menu.append(&cancel);
+            buttons.push(cancel);
+        }
+        popover.set_child(Some(&menu));
+        return (popover, buttons);
+    }
+
+    // Keep the existing row actions in place ahead of the new drive actions.
+    let open = menu_action("Open", &format!("Open {name}"));
+    {
+        let popover_for_button = popover.clone();
+        let weak = Rc::downgrade(&process);
+        let folder = root.to_path_buf();
+        open.connect_clicked(move |_| {
+            popover_for_button.popdown();
+            if let Some(process) = weak.upgrade() {
+                process.dispatch_for_window(
+                    window,
+                    Caller::Ui,
+                    Invocation::new(
+                        "nav.go",
+                        vec![("path".to_string(), folder.display().to_string())],
+                    ),
+                );
+            }
+        });
+    }
+    menu.append(&open);
+    buttons.push(open);
+
+    let new_tab = menu_action("Open in new tab", &format!("Open {name} in a new tab"));
+    {
+        let popover_for_button = popover.clone();
+        let weak = Rc::downgrade(&process);
+        let folder = root.to_path_buf();
+        new_tab.connect_clicked(move |_| {
+            popover_for_button.popdown();
+            if let Some(process) = weak.upgrade() {
+                process.dispatch_for_window(
+                    window,
+                    Caller::Ui,
+                    Invocation::new(
+                        "tab.new",
+                        vec![("path".to_string(), folder.display().to_string())],
+                    ),
+                );
+            }
+        });
+    }
+    menu.append(&new_tab);
+    buttons.push(new_tab);
+
+    let Some(entry) = volumes.entry(id.as_str()) else {
+        menu.append(&menu_note("That volume is no longer present."));
+        popover.set_child(Some(&menu));
+        return (popover, buttons);
+    };
+    let mut offered = 0;
+    for action in [DriveAction::Unmount, DriveAction::Eject] {
+        let supported = match action {
+            DriveAction::Unmount => entry.can_unmount(),
+            DriveAction::Eject => entry.can_eject(),
+        };
+        if !supported {
+            continue;
+        }
+        let button = menu_action(action.verb(), &format!("{} {name}", action.verb()));
+        let popover_for_button = popover.clone();
+        let weak = Rc::downgrade(&process);
+        let volume_id = id.clone();
+        button.connect_clicked(move |_| {
+            popover_for_button.popdown();
+            if let Some(process) = weak.upgrade() {
+                process.dispatch_for_window(
+                    window,
+                    Caller::Ui,
+                    removal_invocation(action, volume_id.as_str()),
+                );
+            }
+        });
+        menu.append(&button);
+        buttons.push(button);
+        offered += 1;
+    }
+    if offered == 0 {
+        menu.append(&menu_note(
+            "This desktop does not offer to unmount or eject this drive.",
+        ));
+    }
+    popover.set_child(Some(&menu));
+    (popover, buttons)
+}
+
+fn menu_action(label: &str, accessible: &str) -> gtk::Button {
+    let button = gtk::Button::new();
+    button.add_css_class("gl-menu-item");
+    button.set_child(Some(&gtk::Label::new(Some(label))));
+    button.update_property(&[gtk::accessible::Property::Label(accessible)]);
+    button
+}
+
+fn removal_invocation(action: DriveAction, device: &str) -> Invocation {
+    Invocation::new(
+        action.command(),
+        vec![("device".to_string(), device.to_string())],
+    )
 }
 
 fn menu_note(text: &str) -> gtk::Label {
@@ -806,7 +1022,7 @@ impl DriveRow {
         *self.cancel_id.borrow_mut() = None;
     }
 
-    fn set_pending(&self, text: &str, name: &str, id: Option<VolumeId>) {
+    fn set_pending(&self, text: &str, name: &str, id: Option<VolumeId>, verb: &str) {
         self.bar.set_visible(false);
         self.status.set_visible(true);
         self.status.set_text(text);
@@ -816,7 +1032,7 @@ impl DriveRow {
         self.cancel.set_visible(self.cancel_id.borrow().is_some());
         self.cancel
             .update_property(&[gtk::accessible::Property::Label(&format!(
-                "Cancel mounting {name}"
+                "Cancel {verb} {name}"
             ))]);
     }
 
@@ -1415,7 +1631,7 @@ impl PinnedList {
             }
         });
         popover.connect_closed(|popover| popover.unparent());
-        popover.popup();
+        crate::popup::show(&popover);
     }
 
     fn dispatch(&self, invocation: Invocation) {

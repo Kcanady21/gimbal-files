@@ -23,6 +23,7 @@ mod look;
 mod open;
 mod pdf;
 mod platform;
+mod popup;
 mod preview;
 mod save;
 mod search;

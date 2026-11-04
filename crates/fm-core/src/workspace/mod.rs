@@ -352,6 +352,15 @@ pub enum Event {
     },
 }
 
+/// One tab or split tile whose folder moved because its mount disappeared.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Relocation {
+    pub window: WindowId,
+    pub tab: TabId,
+    pub from: PathBuf,
+    pub to: PathBuf,
+}
+
 /// Why an operation was refused.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WorkspaceError {
@@ -1522,6 +1531,47 @@ impl Workspace {
         Ok(events)
     }
 
+    /// Move every tab and split tile whose folder was under a disappeared
+    /// mount root to the nearest existing parent, or to home. The tab keeps
+    /// its strip position, group and tile slot; its history is untouched, so
+    /// Back to the missing folder follows the ordinary navigation-failure
+    /// path. The shared Recent Directories list is not changed.
+    pub fn relocate_removed_mount<F>(
+        &mut self,
+        root: &Path,
+        home: &Path,
+        mut is_dir: F,
+    ) -> Vec<Relocation>
+    where
+        F: FnMut(&Path) -> bool,
+    {
+        if root == Path::new("/") {
+            return Vec::new();
+        }
+        let target = nearest_existing_parent(root, home, &mut is_dir);
+        let mut relocations = Vec::new();
+        for window in &mut self.windows {
+            let window_id = window.id;
+            for group in window.groups.values_mut() {
+                for tab in &mut group.tabs {
+                    if !tab.folder.starts_with(root) {
+                        continue;
+                    }
+                    let from = std::mem::replace(&mut tab.folder, target.clone());
+                    tab.selection.clear();
+                    tab.scroll_anchor = None;
+                    relocations.push(Relocation {
+                        window: window_id,
+                        tab: tab.id,
+                        from,
+                        to: target.clone(),
+                    });
+                }
+            }
+        }
+        relocations
+    }
+
     /// Go to a folder, optionally selecting one name in it. The caller decides
     /// whether a path is a file and passes its parent folder plus the name.
     pub fn nav_go(
@@ -2386,4 +2436,25 @@ fn push_history(stack: &mut Vec<PathBuf>, folder: PathBuf) {
         stack.remove(0);
     }
     stack.push(folder);
+}
+
+/// The nearest existing ancestor of a vanished mount root. Home is the
+/// fallback when no ancestor exists; `/` is the last resort when even home is
+/// gone.
+fn nearest_existing_parent<F>(root: &Path, home: &Path, is_dir: &mut F) -> PathBuf
+where
+    F: FnMut(&Path) -> bool,
+{
+    let mut candidate = root.parent();
+    while let Some(parent) = candidate {
+        if is_dir(parent) {
+            return parent.to_path_buf();
+        }
+        candidate = parent.parent();
+    }
+    if is_dir(home) {
+        home.to_path_buf()
+    } else {
+        PathBuf::from("/")
+    }
 }

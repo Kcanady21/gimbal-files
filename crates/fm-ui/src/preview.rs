@@ -742,6 +742,8 @@ pub struct PreviewPanel {
     /// load/render sets it before replacing the pending job, so the worker can
     /// skip the expensive part or the stale send as soon as it checks.
     image_cancel: RefCell<Option<Arc<AtomicBool>>>,
+    /// The path whose load is in flight, for the unmount release step.
+    loading_path: RefCell<Option<PathBuf>>,
     /// The honest longest-edge cap for the current document. PDF rasterization
     /// is bounded by a conservative square, so its display cap is lower than
     /// the image cap until the actual page geometry is known.
@@ -979,6 +981,7 @@ impl PreviewPanel {
             source_size: Cell::new(None),
             render_generation: Cell::new(0),
             image_cancel: RefCell::new(None),
+            loading_path: RefCell::new(None),
             render_edge_cap: Cell::new(preview::MAX_RENDER_EDGE),
             render_timer: MonitorTimer::new(),
             last_render_viewport: Cell::new((0, 0)),
@@ -1009,6 +1012,47 @@ impl PreviewPanel {
 
     pub fn activity(&self) -> Option<fm_core::preview::EditorActivity> {
         self.session.borrow().activity()
+    }
+
+    /// The filename of a dirty editor whose file is under one mount root.
+    pub fn dirty_file_name_under(&self, root: &Path) -> Option<String> {
+        let session = self.session.borrow();
+        if !session.is_dirty() {
+            return None;
+        }
+        let document = session.current_document()?;
+        document.path.starts_with(root).then(|| {
+            document
+                .path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| document.path.display().to_string())
+        })
+    }
+
+    /// Cancel preview image/PDF work and external monitors for a document
+    /// under one mount root. The visible buffer is left alone; the unmount
+    /// path has already refused a dirty editor.
+    pub fn release_root(&self, root: &Path) -> bool {
+        let current = self
+            .session
+            .borrow()
+            .current_document()
+            .map(|document| document.path.clone());
+        let loading = self.loading_path.borrow().clone();
+        let under_root = |path: &PathBuf| path.starts_with(root);
+        if !current.as_ref().is_some_and(under_root) && !loading.as_ref().is_some_and(under_root) {
+            return false;
+        }
+        if let Some(cancel) = self.image_cancel.borrow_mut().take() {
+            cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.loading_path.borrow_mut().take();
+        self.cancel_pdf_render();
+        self.render_timer.cancel();
+        self.monitor_timer.cancel();
+        self.clear_monitors();
+        true
     }
 
     pub fn allow_close(&self) {
@@ -1318,6 +1362,7 @@ impl PreviewPanel {
         self.stack.set_visible_child_name("message");
         self.update_title();
         self.update_actions();
+        *self.loading_path.borrow_mut() = Some(ticket.path.clone());
         self.submit_image(ImageJob::Load {
             generation: ticket.generation,
             path: ticket.path.clone(),
@@ -1491,6 +1536,7 @@ impl PreviewPanel {
             crate::log!("preview", "load result was stale");
             return;
         }
+        *self.loading_path.borrow_mut() = None;
         self.fallback.borrow_mut().take();
         self.source_size.set(None);
         self.render_edge_cap.set(preview::MAX_RENDER_EDGE);

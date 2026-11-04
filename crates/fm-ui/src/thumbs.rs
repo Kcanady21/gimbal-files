@@ -305,8 +305,9 @@ pub(crate) struct Thumbnailer {
     tx: Sender<ThumbEvent>,
     next_token: u64,
     /// Tokens that were handed to the worker pool and have not produced a
-    /// non-stale event yet. Only these count as pending work.
-    live: RefCell<HashMap<u64, Arc<AtomicBool>>>,
+    /// non-stale event yet. Only these count as pending work. Each carries its
+    /// source path so one unmount can release exactly that mount's work.
+    live: RefCell<HashMap<u64, (PathBuf, Arc<AtomicBool>)>>,
     /// Bounded demand that met a full worker queue. Retried when a poll sees
     /// capacity; an unbind/cancel removes the exact token.
     deferred: RefCell<VecDeque<ThumbJob>>,
@@ -338,6 +339,7 @@ impl Thumbnailer {
         let token = self.next_token;
         let cancel = Arc::new(AtomicBool::new(false));
         let live_cancel = cancel.clone();
+        let live_path = source.clone();
         let job = ThumbJob {
             token,
             key,
@@ -352,7 +354,9 @@ impl Thumbnailer {
             Ok(()) => {
                 #[cfg(test)]
                 QUEUED.fetch_add(1, Ordering::SeqCst);
-                self.live.borrow_mut().insert(token, live_cancel);
+                self.live
+                    .borrow_mut()
+                    .insert(token, (live_path, live_cancel));
                 Ok((token, Scheduled::Queued))
             }
             Err(TrySendError::Full(job)) => {
@@ -370,7 +374,7 @@ impl Thumbnailer {
     }
 
     pub(crate) fn cancel(&self, token: u64) {
-        if let Some(cancel) = self.live.borrow_mut().remove(&token) {
+        if let Some((_, cancel)) = self.live.borrow_mut().remove(&token) {
             cancel.store(true, Ordering::Relaxed);
             return;
         }
@@ -384,6 +388,36 @@ impl Thumbnailer {
         {
             job.cancel.store(true, Ordering::Relaxed);
         }
+    }
+
+    /// Cancel queued and live thumbnail work for files below one mount root.
+    /// The visible cache is left alone; the cells are rebuilt after the mount
+    /// event or failure.
+    pub(crate) fn release_root(&self, root: &Path) -> usize {
+        let mut released = 0;
+        {
+            let mut live = self.live.borrow_mut();
+            live.retain(|_, (path, cancel)| {
+                if path.starts_with(root) {
+                    cancel.store(true, Ordering::Relaxed);
+                    released += 1;
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+        let mut deferred = self.deferred.borrow_mut();
+        let before = deferred.len();
+        deferred.retain(|job| {
+            if job.source.starts_with(root) {
+                job.cancel.store(true, Ordering::Relaxed);
+                false
+            } else {
+                true
+            }
+        });
+        released + before - deferred.len()
     }
 
     pub(crate) fn try_next(&self) -> Option<ThumbEvent> {
@@ -407,11 +441,12 @@ impl Thumbnailer {
             };
             let cancel = job.cancel.clone();
             let token = job.token;
+            let path = job.source.clone();
             match pool().try_send(job) {
                 Ok(()) => {
                     #[cfg(test)]
                     QUEUED.fetch_add(1, Ordering::SeqCst);
-                    self.live.borrow_mut().insert(token, cancel);
+                    self.live.borrow_mut().insert(token, (path, cancel));
                     progressed = true;
                 }
                 Err(TrySendError::Full(job)) => {
@@ -452,7 +487,7 @@ impl Drop for Thumbnailer {
     fn drop(&mut self) {
         // Closing/replacing the view must cancel queued work too, not only the
         // token map: workers still hold these Arc flags in their channel jobs.
-        for (_, cancel) in self.live.borrow_mut().drain() {
+        for (_, (_, cancel)) in self.live.borrow_mut().drain() {
             cancel.store(true, Ordering::Relaxed);
         }
         for job in self.deferred.borrow_mut().drain(..) {

@@ -28,6 +28,12 @@ pub struct RawMount {
     /// The native unix-device identifier, when the mount has one.
     pub native: Option<String>,
     pub uuid: Option<String>,
+    /// The backend mount object's own answer. This is the only unmount rule;
+    /// no path list decides for a system mount.
+    pub can_unmount: bool,
+    /// The backend mount object's own answer. Ejecting powers the drive down
+    /// where the service supports it.
+    pub can_eject: bool,
 }
 
 /// One volume as the backend currently sees it.
@@ -84,6 +90,9 @@ pub enum DeviceState {
         /// the same volume is remounted at the same root, so usage and row
         /// state cannot cross a mount replacement.
         mount_object: u64,
+        /// The live mount's own capability answers.
+        can_unmount: bool,
+        can_eject: bool,
     },
     Unmounted {
         mountable: bool,
@@ -110,6 +119,26 @@ impl DeviceState {
             DeviceState::Mounted { mount_object, .. } => Some(*mount_object),
             DeviceState::Unmounted { .. } => None,
         }
+    }
+
+    pub fn can_unmount(&self) -> bool {
+        matches!(
+            self,
+            DeviceState::Mounted {
+                can_unmount: true,
+                ..
+            }
+        )
+    }
+
+    pub fn can_eject(&self) -> bool {
+        matches!(
+            self,
+            DeviceState::Mounted {
+                can_eject: true,
+                ..
+            }
+        )
     }
 
     pub fn mountable(&self) -> bool {
@@ -179,6 +208,14 @@ impl DeviceEntry {
         self.state.mount_object()
     }
 
+    pub fn can_unmount(&self) -> bool {
+        self.state.can_unmount()
+    }
+
+    pub fn can_eject(&self) -> bool {
+        self.state.can_eject()
+    }
+
     /// The backend object serial. It is not a mount specification on its own;
     /// [`Inventory::mount_target`] binds it to the entry's id and incarnation.
     pub fn object(&self) -> u64 {
@@ -228,6 +265,112 @@ impl MountTarget {
     }
 }
 
+/// The two reviewed ways to take a mounted device away.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum DriveAction {
+    Unmount,
+    Eject,
+}
+
+impl DriveAction {
+    pub fn verb(self) -> &'static str {
+        match self {
+            DriveAction::Unmount => "Unmount",
+            DriveAction::Eject => "Eject",
+        }
+    }
+
+    pub fn command(self) -> &'static str {
+        match self {
+            DriveAction::Unmount => "drive.unmount",
+            DriveAction::Eject => "drive.eject",
+        }
+    }
+
+    pub fn pending_text(self) -> &'static str {
+        match self {
+            DriveAction::Unmount => "Unmounting…",
+            DriveAction::Eject => "Ejecting…",
+        }
+    }
+}
+
+impl fmt::Display for DriveAction {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            DriveAction::Unmount => "unmount",
+            DriveAction::Eject => "eject",
+        })
+    }
+}
+
+/// A live mounted device candidate. It is produced only by
+/// [`Inventory::removal_target`] for the exact live mount incarnation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RemovalTarget {
+    id: VolumeId,
+    incarnation: u64,
+    mount_object: u64,
+    root: PathBuf,
+    label: String,
+    action: DriveAction,
+}
+
+impl RemovalTarget {
+    pub fn id(&self) -> &VolumeId {
+        &self.id
+    }
+
+    pub fn incarnation(&self) -> u64 {
+        self.incarnation
+    }
+
+    pub fn mount_object(&self) -> u64 {
+        self.mount_object
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    pub fn label(&self) -> &str {
+        &self.label
+    }
+
+    pub fn action(&self) -> DriveAction {
+        self.action
+    }
+}
+
+/// Why a mounted device cannot start an unmount or eject. These are refusals
+/// before any backend call.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RemovalRefusal {
+    UnknownId,
+    NotMounted,
+    Pending,
+    NotSupported(DriveAction),
+}
+
+impl fmt::Display for RemovalRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RemovalRefusal::UnknownId => {
+                f.write_str("that volume is no longer present; refresh the Device list")
+            }
+            RemovalRefusal::NotMounted => f.write_str("that volume is not mounted"),
+            RemovalRefusal::Pending => {
+                f.write_str("an operation is already running for that volume")
+            }
+            RemovalRefusal::NotSupported(action) => write!(
+                f,
+                "the volume service does not offer to {} that volume",
+                action
+            ),
+        }
+    }
+}
+
 /// Why a device id cannot start a mount. These are refusals before any backend
 /// call.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -255,6 +398,10 @@ pub enum MountFailureKind {
     Denied,
     DeviceGone,
     BackendUnavailable,
+    Busy,
+    /// The backend already showed its own dialog; a second status message
+    /// would duplicate it.
+    Handled,
     Failed,
 }
 
@@ -265,6 +412,8 @@ impl MountFailureKind {
             MountFailureKind::Denied => "Permission denied",
             MountFailureKind::DeviceGone => "Device removed",
             MountFailureKind::BackendUnavailable => "Volume service unavailable",
+            MountFailureKind::Busy => "Drive busy",
+            MountFailureKind::Handled => "",
             MountFailureKind::Failed => "Mount failed",
         }
     }
@@ -331,6 +480,99 @@ impl MountStatus {
     pub fn detail(&self) -> Option<&str> {
         match self {
             MountStatus::Failed { detail, .. } => Some(detail),
+            _ => None,
+        }
+    }
+}
+
+/// A short unmount/eject result. The detail stays separate, as with mounts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RemovalFailureKind {
+    Cancelled,
+    Denied,
+    DeviceGone,
+    BackendUnavailable,
+    Busy,
+    Handled,
+    Failed,
+}
+
+impl RemovalFailureKind {
+    pub fn short(self, action: DriveAction) -> &'static str {
+        match self {
+            RemovalFailureKind::Cancelled => match action {
+                DriveAction::Unmount => "Unmount cancelled",
+                DriveAction::Eject => "Eject cancelled",
+            },
+            RemovalFailureKind::Denied => "Permission denied",
+            RemovalFailureKind::DeviceGone => "Device removed",
+            RemovalFailureKind::BackendUnavailable => "Volume service unavailable",
+            RemovalFailureKind::Busy => "Drive busy",
+            RemovalFailureKind::Handled => "",
+            RemovalFailureKind::Failed => match action {
+                DriveAction::Unmount => "Unmount failed",
+                DriveAction::Eject => "Eject failed",
+            },
+        }
+    }
+}
+
+/// The shared state of one unmount/eject attempt.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RemovalStatus {
+    Pending(DriveAction),
+    Unmounted,
+    Ejected,
+    Failed {
+        action: DriveAction,
+        kind: RemovalFailureKind,
+        detail: String,
+    },
+}
+
+impl RemovalStatus {
+    pub fn pending(action: DriveAction) -> Self {
+        RemovalStatus::Pending(action)
+    }
+
+    pub fn failed(
+        action: DriveAction,
+        kind: RemovalFailureKind,
+        detail: impl Into<String>,
+    ) -> Self {
+        RemovalStatus::Failed {
+            action,
+            kind,
+            detail: detail.into(),
+        }
+    }
+
+    pub fn is_pending(&self) -> bool {
+        matches!(self, RemovalStatus::Pending(_))
+    }
+
+    pub fn is_terminal(&self) -> bool {
+        !self.is_pending()
+    }
+
+    pub fn action(&self) -> Option<DriveAction> {
+        match self {
+            RemovalStatus::Pending(action) => Some(*action),
+            RemovalStatus::Failed { action, .. } => Some(*action),
+            RemovalStatus::Unmounted | RemovalStatus::Ejected => None,
+        }
+    }
+
+    pub fn kind(&self) -> Option<RemovalFailureKind> {
+        match self {
+            RemovalStatus::Failed { kind, .. } => Some(*kind),
+            _ => None,
+        }
+    }
+
+    pub fn detail(&self) -> Option<&str> {
+        match self {
+            RemovalStatus::Failed { detail, .. } => Some(detail),
             _ => None,
         }
     }
@@ -422,6 +664,49 @@ impl Inventory {
         }
     }
 
+    /// The only path from a command's text to an unmount or eject. Unknown ids,
+    /// unmounted entries, an operation already running for this id, and a
+    /// mount whose own `can_unmount`/`can_eject` answer is false all fail here,
+    /// before the backend is called. The main drive and `/` are never device
+    /// rows, so they cannot produce a target either.
+    pub fn removal_target(
+        &self,
+        device: &str,
+        action: DriveAction,
+        pending: bool,
+    ) -> Result<RemovalTarget, RemovalRefusal> {
+        let entry = self
+            .entry_for_device(device)
+            .ok_or(RemovalRefusal::UnknownId)?;
+        if pending {
+            return Err(RemovalRefusal::Pending);
+        }
+        let DeviceState::Mounted {
+            root,
+            mount_object,
+            can_unmount,
+            can_eject,
+        } = &entry.state
+        else {
+            return Err(RemovalRefusal::NotMounted);
+        };
+        let supported = match action {
+            DriveAction::Unmount => *can_unmount,
+            DriveAction::Eject => *can_eject,
+        };
+        if !supported {
+            return Err(RemovalRefusal::NotSupported(action));
+        }
+        Ok(RemovalTarget {
+            id: entry.id.clone(),
+            incarnation: entry.incarnation,
+            mount_object: *mount_object,
+            root: root.clone(),
+            label: entry.label.clone(),
+            action,
+        })
+    }
+
     /// Whether this exact entry incarnation is mounted now, where, and by
     /// which live mount object. A late callback uses this instead of trusting
     /// its own success.
@@ -429,7 +714,9 @@ impl Inventory {
         self.entry(id)
             .filter(|entry| entry.incarnation == incarnation)
             .and_then(|entry| match &entry.state {
-                DeviceState::Mounted { root, mount_object } => Some((root.clone(), *mount_object)),
+                DeviceState::Mounted {
+                    root, mount_object, ..
+                } => Some((root.clone(), *mount_object)),
                 DeviceState::Unmounted { .. } => None,
             })
     }
@@ -555,6 +842,8 @@ fn candidates(snapshot: &RawSnapshot) -> Vec<Candidate> {
                 state: DeviceState::Mounted {
                     root: mount.root.clone(),
                     mount_object: mount.object,
+                    can_unmount: mount.can_unmount,
+                    can_eject: mount.can_eject,
                 },
             });
             continue;
@@ -610,6 +899,8 @@ fn candidates(snapshot: &RawSnapshot) -> Vec<Candidate> {
             state: DeviceState::Mounted {
                 root: mount.root.clone(),
                 mount_object: mount.object,
+                can_unmount: mount.can_unmount,
+                can_eject: mount.can_eject,
             },
         });
     }
@@ -648,6 +939,8 @@ mod tests {
             label: label.to_string(),
             native: None,
             uuid: None,
+            can_unmount: true,
+            can_eject: true,
         }
     }
 
@@ -676,6 +969,8 @@ mod tests {
             label: "Camera".to_string(),
             native: Some("/dev/sdb1".to_string()),
             uuid: Some("uuid-2".to_string()),
+            can_unmount: true,
+            can_eject: true,
         });
         let snapshot = snapshot(
             vec![volume(1, Some("/dev/sda2"), "USB"), mounted],
@@ -858,6 +1153,8 @@ mod tests {
             label: "USB".to_string(),
             native: Some("/dev/sdb1".to_string()),
             uuid: Some("uuid-1".to_string()),
+            can_unmount: true,
+            can_eject: true,
         };
         let mut mounted = volume(1, Some("/dev/sdb1"), "USB");
         mounted.mount = Some(mount);
@@ -887,6 +1184,8 @@ mod tests {
             label: "USB".to_string(),
             native: Some("/dev/sdb1".to_string()),
             uuid: Some("uuid-1".to_string()),
+            can_unmount: true,
+            can_eject: true,
         });
         let mut inventory = Inventory::new();
         inventory.reconcile(&snapshot(vec![first], vec![]));
@@ -906,6 +1205,8 @@ mod tests {
             label: "USB".to_string(),
             native: Some("/dev/sdb1".to_string()),
             uuid: Some("uuid-1".to_string()),
+            can_unmount: true,
+            can_eject: true,
         });
         let report = inventory.reconcile(&snapshot(vec![second], vec![]));
         assert!(report.changed, "a new mount object changes the row state");
@@ -929,6 +1230,8 @@ mod tests {
             label: "Root".to_string(),
             native: Some("/dev/nvme0n1p2".to_string()),
             uuid: Some("uuid-root".to_string()),
+            can_unmount: false,
+            can_eject: false,
         });
         let mut inventory = Inventory::new();
         inventory.reconcile(&snapshot(vec![root_volume.clone()], vec![]));
@@ -957,5 +1260,136 @@ mod tests {
         inventory.reconcile(&snapshot);
         assert_eq!(inventory.entries()[0].label(), "abc");
         assert_eq!(inventory.entries()[0].native(), Some("/dev/disk/by-id/abc"));
+    }
+
+    #[test]
+    fn removal_targets_obey_the_mount_capabilities_and_pending_state() {
+        let mut removable = volume(1, Some("/dev/sdb1"), "USB");
+        removable.mount = Some(RawMount {
+            object: 20,
+            root: PathBuf::from("/run/media/kyle/USB"),
+            label: "USB".to_string(),
+            native: Some("/dev/sdb1".to_string()),
+            uuid: Some("uuid-1".to_string()),
+            can_unmount: true,
+            can_eject: false,
+        });
+        let unmounted = volume(2, Some("/dev/sdc1"), "Waiting");
+        let mut inventory = Inventory::new();
+        inventory.reconcile(&snapshot(vec![removable, unmounted], vec![]));
+        let usb = inventory
+            .entries()
+            .iter()
+            .find(|entry| entry.label() == "USB")
+            .unwrap();
+
+        let target = inventory
+            .removal_target(usb.id().as_str(), DriveAction::Unmount, false)
+            .expect("the mount can be unmounted");
+        assert_eq!(target.mount_object(), 20);
+        assert_eq!(target.root(), Path::new("/run/media/kyle/USB"));
+        assert_eq!(
+            inventory.removal_target(usb.id().as_str(), DriveAction::Eject, false),
+            Err(RemovalRefusal::NotSupported(DriveAction::Eject)),
+            "eject follows the mount's own answer, not a path list"
+        );
+        assert_eq!(
+            inventory.removal_target(usb.id().as_str(), DriveAction::Unmount, true),
+            Err(RemovalRefusal::Pending)
+        );
+        assert_eq!(
+            inventory.removal_target(
+                inventory.entries()[1].id().as_str(),
+                DriveAction::Unmount,
+                false
+            ),
+            Err(RemovalRefusal::NotMounted)
+        );
+        assert_eq!(
+            inventory.removal_target("volume-99999", DriveAction::Unmount, false),
+            Err(RemovalRefusal::UnknownId)
+        );
+    }
+
+    #[test]
+    fn root_and_system_mounts_never_become_removal_targets() {
+        let mut root_volume = volume(1, Some("/dev/nvme0n1p2"), "Root");
+        root_volume.mount = Some(RawMount {
+            object: 90,
+            root: PathBuf::from("/"),
+            label: "Root".to_string(),
+            native: Some("/dev/nvme0n1p2".to_string()),
+            uuid: Some("uuid-root".to_string()),
+            can_unmount: false,
+            can_eject: false,
+        });
+        let mut inventory = Inventory::new();
+        inventory.reconcile(&snapshot(vec![root_volume], vec![]));
+        assert!(inventory.entries().is_empty());
+        assert_eq!(
+            inventory.removal_target("volume-1", DriveAction::Unmount, false),
+            Err(RemovalRefusal::UnknownId)
+        );
+
+        // A navigation-only system mount is a visible row only when it has a
+        // live mount; its capability answers still decide.
+        let system_mount = RawMount {
+            object: 40,
+            root: PathBuf::from("/home"),
+            label: "Home".to_string(),
+            native: None,
+            uuid: None,
+            can_unmount: false,
+            can_eject: false,
+        };
+        inventory.reconcile(&snapshot(vec![], vec![system_mount]));
+        let home = inventory.entries()[0].clone();
+        assert_eq!(
+            inventory.removal_target(home.id().as_str(), DriveAction::Unmount, false),
+            Err(RemovalRefusal::NotSupported(DriveAction::Unmount))
+        );
+        assert_eq!(
+            inventory.removal_target(home.id().as_str(), DriveAction::Eject, false),
+            Err(RemovalRefusal::NotSupported(DriveAction::Eject))
+        );
+    }
+
+    #[test]
+    fn same_root_replacement_gets_a_new_removal_mount_object() {
+        let mut first = volume(1, Some("/dev/sdb1"), "USB");
+        first.mount = Some(RawMount {
+            object: 20,
+            root: PathBuf::from("/run/media/kyle/USB"),
+            label: "USB".to_string(),
+            native: Some("/dev/sdb1".to_string()),
+            uuid: Some("uuid-1".to_string()),
+            can_unmount: true,
+            can_eject: true,
+        });
+        let mut inventory = Inventory::new();
+        inventory.reconcile(&snapshot(vec![first], vec![]));
+        let id = inventory.entries()[0].id().clone();
+        let old = inventory
+            .removal_target(id.as_str(), DriveAction::Unmount, false)
+            .unwrap();
+        assert_eq!(old.mount_object(), 20);
+
+        let mut second = volume(1, Some("/dev/sdb1"), "USB");
+        second.mount = Some(RawMount {
+            object: 21,
+            root: PathBuf::from("/run/media/kyle/USB"),
+            label: "USB".to_string(),
+            native: Some("/dev/sdb1".to_string()),
+            uuid: Some("uuid-1".to_string()),
+            can_unmount: true,
+            can_eject: true,
+        });
+        inventory.reconcile(&snapshot(vec![second], vec![]));
+        let new = inventory
+            .removal_target(id.as_str(), DriveAction::Eject, false)
+            .unwrap();
+        assert_eq!(new.mount_object(), 21);
+        assert_ne!(old.mount_object(), new.mount_object());
+        assert_eq!(old.id(), new.id(), "the volume object kept its opaque id");
     }
 }

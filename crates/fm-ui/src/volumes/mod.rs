@@ -22,8 +22,9 @@ use gtk::glib;
 use gtk::prelude::*;
 
 use fm_core::volumes::{
-    DeviceEntry, Inventory, MountFailureKind, MountRefusal, MountStatus, MountTarget, RawSnapshot,
-    ReconcileReport, VolumeId,
+    DeviceEntry, DriveAction, Inventory, MountFailureKind, MountRefusal, MountStatus, MountTarget,
+    RawSnapshot, ReconcileReport, RemovalFailureKind, RemovalRefusal, RemovalStatus, RemovalTarget,
+    VolumeId,
 };
 use fm_core::workspace::WindowId;
 
@@ -45,6 +46,19 @@ const MOUNT_RECONCILE_DELAY: Duration = Duration::from_millis(100);
 pub type MountDone = Box<dyn FnOnce(Result<(), glib::Error>)>;
 pub type UsageDone = Box<dyn FnOnce(Result<(u64, u64), glib::Error>)>;
 
+/// A UI-owned preflight that runs synchronously before the backend sees an
+/// unmount or eject. It may refuse with the exact user-facing message, or
+/// release Gimbal's own handles under the root and return `Ok`.
+pub trait DriveGate {
+    fn before_removal(
+        &self,
+        window: WindowId,
+        root: &Path,
+        label: &str,
+        action: DriveAction,
+    ) -> Result<(), String>;
+}
+
 /// The injectable backend. Production uses [`GioBackend`]; tests replace it
 /// with an in-memory volume/mount/usage source and never touch a real device.
 pub trait Backend {
@@ -55,6 +69,24 @@ pub trait Backend {
     fn mount(
         &self,
         target: &MountTarget,
+        parent: Option<&gtk::Window>,
+        cancellable: &gio::Cancellable,
+        done: MountDone,
+    ) -> Result<Option<gio::MountOperation>, glib::Error>;
+    /// Start an unmount with `Mount::unmount_with_operation`. The operation is
+    /// returned so the controller can drop it with the request.
+    fn unmount(
+        &self,
+        target: &RemovalTarget,
+        parent: Option<&gtk::Window>,
+        cancellable: &gio::Cancellable,
+        done: MountDone,
+    ) -> Result<Option<gio::MountOperation>, glib::Error>;
+    /// Start an eject with `Mount::eject_with_operation`. The backend unmounts
+    /// every mount on the drive and powers it down where it can.
+    fn eject(
+        &self,
+        target: &RemovalTarget,
         parent: Option<&gtk::Window>,
         cancellable: &gio::Cancellable,
         done: MountDone,
@@ -92,6 +124,32 @@ impl Backend for HeadlessBackend {
         ))
     }
 
+    fn unmount(
+        &self,
+        _target: &RemovalTarget,
+        _parent: Option<&gtk::Window>,
+        _cancellable: &gio::Cancellable,
+        _done: MountDone,
+    ) -> Result<Option<gio::MountOperation>, glib::Error> {
+        Err(glib::Error::new(
+            gio::IOErrorEnum::NotSupported,
+            "no volume backend is available",
+        ))
+    }
+
+    fn eject(
+        &self,
+        _target: &RemovalTarget,
+        _parent: Option<&gtk::Window>,
+        _cancellable: &gio::Cancellable,
+        _done: MountDone,
+    ) -> Result<Option<gio::MountOperation>, glib::Error> {
+        Err(glib::Error::new(
+            gio::IOErrorEnum::NotSupported,
+            "no volume backend is available",
+        ))
+    }
+
     fn usage(&self, _root: &Path, _cancellable: &gio::Cancellable, done: UsageDone) {
         done(Err(glib::Error::new(
             gio::IOErrorEnum::NotSupported,
@@ -112,6 +170,18 @@ pub enum MountBegin {
     AlreadyPending,
     AlreadyMounted,
     Busy,
+}
+
+/// The accepted result of an unmount/eject dispatch. `Pending` is not a
+/// completed removal.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RemovalBegin {
+    Pending,
+    AlreadyPending,
+    Busy,
+    /// The UI gate refused before any backend call. The string is the exact
+    /// user-facing message.
+    Refused(String),
 }
 
 /// The state of an asynchronous usage query.
@@ -236,7 +306,43 @@ impl MountRequest {
     }
 }
 
+/// One accepted unmount/eject attempt. It mirrors the mount attempt rules:
+/// a process-monotonic token, visible ownership separate from backend slot
+/// accounting, and a stale callback that can retire only its own call.
+struct RemovalRequest {
+    token: u64,
+    id: VolumeId,
+    incarnation: u64,
+    mount_object: u64,
+    root: PathBuf,
+    label: String,
+    action: DriveAction,
+    window: WindowId,
+    cancellable: gio::Cancellable,
+    operation: RefCell<Option<gio::MountOperation>>,
+    visible: Cell<bool>,
+    cancel_requested: Cell<bool>,
+    callback_ok: Cell<bool>,
+    attempts: Cell<u32>,
+    retry_scheduled: Cell<bool>,
+    slot_released: Cell<bool>,
+}
+
+/// One terminal removal result, delivered to the process after every internal
+/// borrow is released. It carries the initiating window for the eject summary
+/// and the root for relocation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RemovalNotice {
+    pub window: WindowId,
+    pub id: VolumeId,
+    pub label: String,
+    pub root: PathBuf,
+    pub action: DriveAction,
+    pub status: RemovalStatus,
+}
+
 type Listener = Rc<dyn Fn() -> bool>;
+type RemovalListener = Rc<dyn Fn(&RemovalNotice) -> bool>;
 
 /// The one process-wide volume service.
 pub struct Volumes {
@@ -248,12 +354,17 @@ pub struct Volumes {
     /// callback arrives.
     requests: RefCell<HashMap<VolumeId, Rc<MountRequest>>>,
     statuses: RefCell<HashMap<VolumeId, MountStatus>>,
-    /// Backend mount calls that have not yet reported their callback. This is
-    /// the actual four-request cap, separate from visible pending rows.
+    removals: RefCell<HashMap<VolumeId, Rc<RemovalRequest>>>,
+    removal_statuses: RefCell<HashMap<VolumeId, RemovalStatus>>,
+    /// Backend drive calls (mount, unmount or eject) that have not yet
+    /// reported their callback. This is the actual four-request cap, separate
+    /// from visible pending rows.
     outstanding_mounts: Cell<usize>,
     next_attempt: Cell<u64>,
     usage: RefCell<UsageState>,
     listeners: RefCell<Vec<Listener>>,
+    removal_listeners: RefCell<Vec<RemovalListener>>,
+    removal_gate: RefCell<Option<Rc<dyn DriveGate>>>,
     note: RefCell<String>,
     monitor: RefCell<Option<gio::VolumeMonitor>>,
     refresh_source: RefCell<Option<glib::SourceId>>,
@@ -269,10 +380,14 @@ impl Volumes {
             main_label: RefCell::new("Main Drive".to_string()),
             requests: RefCell::new(HashMap::new()),
             statuses: RefCell::new(HashMap::new()),
+            removals: RefCell::new(HashMap::new()),
+            removal_statuses: RefCell::new(HashMap::new()),
             outstanding_mounts: Cell::new(0),
             next_attempt: Cell::new(0),
             usage: RefCell::new(UsageState::default()),
             listeners: RefCell::new(Vec::new()),
+            removal_listeners: RefCell::new(Vec::new()),
+            removal_gate: RefCell::new(None),
             note: RefCell::new(note),
             monitor: RefCell::new(None),
             refresh_source: RefCell::new(None),
@@ -313,6 +428,21 @@ impl Volumes {
         self.inventory.borrow().mount_target(device)
     }
 
+    /// Resolve a mounted row's opaque id to the exact live mount. A pending
+    /// mount or removal for the same id is refused as `Pending`.
+    pub fn removal_target(
+        &self,
+        device: &str,
+        action: DriveAction,
+    ) -> Result<RemovalTarget, RemovalRefusal> {
+        let busy = self
+            .inventory
+            .borrow()
+            .entry_for_device(device)
+            .is_some_and(|entry| self.is_pending(entry.id()));
+        self.inventory.borrow().removal_target(device, action, busy)
+    }
+
     pub fn status_for(&self, id: &VolumeId) -> Option<MountStatus> {
         if self.requests.borrow().contains_key(id) {
             return Some(MountStatus::pending());
@@ -320,8 +450,16 @@ impl Volumes {
         self.statuses.borrow().get(id).cloned()
     }
 
+    /// The shared pending/terminal state of an unmount or eject.
+    pub fn removal_status_for(&self, id: &VolumeId) -> Option<RemovalStatus> {
+        if let Some(request) = self.removals.borrow().get(id) {
+            return Some(RemovalStatus::pending(request.action));
+        }
+        self.removal_statuses.borrow().get(id).cloned()
+    }
+
     pub fn is_pending(&self, id: &VolumeId) -> bool {
-        self.requests.borrow().contains_key(id)
+        self.requests.borrow().contains_key(id) || self.removals.borrow().contains_key(id)
     }
 
     pub fn cancel_requested(&self, id: &VolumeId) -> bool {
@@ -329,6 +467,23 @@ impl Volumes {
             .borrow()
             .get(id)
             .is_some_and(|request| request.cancel_requested.get())
+            || self
+                .removals
+                .borrow()
+                .get(id)
+                .is_some_and(|request| request.cancel_requested.get())
+    }
+
+    /// Install the synchronous UI preflight/release step. One process owns one
+    /// gate; replacing it is only for tests.
+    pub fn set_gate(&self, gate: Rc<dyn DriveGate>) {
+        *self.removal_gate.borrow_mut() = Some(gate);
+    }
+
+    /// Receive terminal unmount/eject results after all internal borrows have
+    /// been released. The listener returns false to be dropped.
+    pub fn listen_removal(&self, listener: Rc<dyn Fn(&RemovalNotice) -> bool>) {
+        self.removal_listeners.borrow_mut().push(listener);
     }
 
     #[cfg(test)]
@@ -454,6 +609,7 @@ impl Volumes {
     fn after_inventory(self: &Rc<Self>, report: &ReconcileReport) {
         self.prune_statuses();
         self.reconcile_mount_requests();
+        self.reconcile_removals();
         self.reconcile_usage(report.changed);
         self.notify();
     }
@@ -469,6 +625,20 @@ impl Volumes {
                 status.is_mounted()
             } else {
                 !status.is_mounted()
+            }
+        });
+
+        let mut removal_statuses = self.removal_statuses.borrow_mut();
+        removal_statuses.retain(|id, status| {
+            let Some(entry) = entries.iter().find(|entry| entry.id() == id) else {
+                // A successful eject removes the volume row entirely; a
+                // failure for a removed id has already been reported.
+                return false;
+            };
+            match status {
+                RemovalStatus::Pending(_) => true,
+                RemovalStatus::Failed { .. } => entry.state().is_mounted(),
+                RemovalStatus::Unmounted | RemovalStatus::Ejected => false,
             }
         });
     }
@@ -545,6 +715,92 @@ impl Volumes {
         MountBegin::Pending
     }
 
+    /// Start an explicit unmount or eject. Duplicate/cap checks and the UI gate
+    /// run before any backend call; the gate releases Gimbal's own handles.
+    pub fn remove(
+        self: &Rc<Self>,
+        window: WindowId,
+        target: RemovalTarget,
+        parent: Option<&gtk::Window>,
+    ) -> RemovalBegin {
+        if self.removals.borrow().contains_key(target.id())
+            || self.requests.borrow().contains_key(target.id())
+        {
+            return RemovalBegin::AlreadyPending;
+        }
+        if self.outstanding_mounts.get() >= MAX_ACTIVE_MOUNTS {
+            return RemovalBegin::Busy;
+        }
+
+        let gate = self.removal_gate.borrow().clone();
+        if let Some(gate) = gate
+            && let Err(message) =
+                gate.before_removal(window, target.root(), target.label(), target.action())
+        {
+            return RemovalBegin::Refused(message);
+        }
+
+        self.next_attempt.set(self.next_attempt.get() + 1);
+        let token = self.next_attempt.get();
+        let request = Rc::new(RemovalRequest {
+            token,
+            id: target.id().clone(),
+            incarnation: target.incarnation(),
+            mount_object: target.mount_object(),
+            root: target.root().to_path_buf(),
+            label: target.label().to_string(),
+            action: target.action(),
+            window,
+            cancellable: gio::Cancellable::new(),
+            operation: RefCell::new(None),
+            visible: Cell::new(true),
+            cancel_requested: Cell::new(false),
+            callback_ok: Cell::new(false),
+            attempts: Cell::new(0),
+            retry_scheduled: Cell::new(false),
+            slot_released: Cell::new(false),
+        });
+        self.removals
+            .borrow_mut()
+            .insert(target.id().clone(), request.clone());
+        self.removal_statuses
+            .borrow_mut()
+            .insert(target.id().clone(), RemovalStatus::pending(target.action()));
+        self.outstanding_mounts
+            .set(self.outstanding_mounts.get() + 1);
+        log!(
+            "volumes",
+            "{} '{}' at {} for window {window} as attempt {token}",
+            target.action(),
+            target.label(),
+            target.root().display()
+        );
+        self.notify();
+
+        let weak = Rc::downgrade(self);
+        let callback_request = request.clone();
+        let cancellable = request.cancellable.clone();
+        let done: MountDone = Box::new(move |result| {
+            if let Some(volumes) = weak.upgrade() {
+                volumes.finish_removal(&callback_request, result);
+            }
+        });
+
+        let result = match target.action() {
+            DriveAction::Unmount => self.backend.unmount(&target, parent, &cancellable, done),
+            DriveAction::Eject => self.backend.eject(&target, parent, &cancellable, done),
+        };
+        match result {
+            Ok(operation) => {
+                if request.visible.get() && self.is_current_removal(&request) {
+                    *request.operation.borrow_mut() = operation;
+                }
+            }
+            Err(error) => self.finish_removal(&request, Err(error)),
+        }
+        RemovalBegin::Pending
+    }
+
     fn is_current_attempt(&self, request: &MountRequest) -> bool {
         self.requests
             .borrow()
@@ -552,7 +808,21 @@ impl Volumes {
             .is_some_and(|current| current.token == request.token)
     }
 
+    fn is_current_removal(&self, request: &RemovalRequest) -> bool {
+        self.removals
+            .borrow()
+            .get(&request.id)
+            .is_some_and(|current| current.token == request.token)
+    }
+
     fn release_mount_slot(&self, request: &MountRequest) {
+        if !request.slot_released.replace(true) {
+            self.outstanding_mounts
+                .set(self.outstanding_mounts.get().saturating_sub(1));
+        }
+    }
+
+    fn release_removal_slot(&self, request: &RemovalRequest) {
         if !request.slot_released.replace(true) {
             self.outstanding_mounts
                 .set(self.outstanding_mounts.get().saturating_sub(1));
@@ -601,6 +871,165 @@ impl Volumes {
             }
         }
         self.after_inventory(&report);
+    }
+
+    fn finish_removal(
+        self: &Rc<Self>,
+        request: &Rc<RemovalRequest>,
+        result: Result<(), glib::Error>,
+    ) {
+        let current = request.visible.get() && self.is_current_removal(request);
+        self.release_removal_slot(request);
+        if !current {
+            return;
+        }
+
+        let report = self.refresh_inventory();
+        let still_there = self
+            .inventory
+            .borrow()
+            .entry(&request.id)
+            .filter(|entry| entry.incarnation() == request.incarnation)
+            .and_then(|entry| entry.mount_object())
+            == Some(request.mount_object);
+        if !still_there {
+            self.complete_removal(request, removal_success(request.action));
+            self.after_inventory(&report);
+            return;
+        }
+
+        match result {
+            // Success is not trusted until the live inventory stops reporting
+            // this exact mount object. The monitor or a short poll resolves it.
+            Ok(()) => request.callback_ok.set(true),
+            Err(error) => {
+                let status = classify_removal_error(&error, request.action);
+                self.complete_removal(request, status);
+            }
+        }
+        self.after_inventory(&report);
+    }
+
+    fn reconcile_removals(self: &Rc<Self>) {
+        let requests: Vec<Rc<RemovalRequest>> = self.removals.borrow().values().cloned().collect();
+        for request in requests {
+            if !request.visible.get() || !self.is_current_removal(&request) {
+                continue;
+            }
+            let still_there = self
+                .inventory
+                .borrow()
+                .entry(&request.id)
+                .filter(|entry| entry.incarnation() == request.incarnation)
+                .and_then(|entry| entry.mount_object())
+                == Some(request.mount_object);
+            if !still_there {
+                self.complete_removal(&request, removal_success(request.action));
+                continue;
+            }
+
+            if request.callback_ok.get() && !request.retry_scheduled.get() {
+                request.retry_scheduled.set(true);
+                let attempts = request.attempts.get() + 1;
+                request.attempts.set(attempts);
+                if attempts > MOUNT_RECONCILE_ATTEMPTS {
+                    self.complete_removal(
+                        &request,
+                        RemovalStatus::failed(
+                            request.action,
+                            RemovalFailureKind::Failed,
+                            "the desktop reported success but the drive is still mounted",
+                        ),
+                    );
+                } else {
+                    self.schedule_removal_retry(request.id.clone(), request.token);
+                }
+            }
+        }
+    }
+
+    fn schedule_removal_retry(self: &Rc<Self>, id: VolumeId, token: u64) {
+        let weak = Rc::downgrade(self);
+        glib::timeout_add_local_once(MOUNT_RECONCILE_DELAY, move || {
+            if let Some(volumes) = weak.upgrade() {
+                volumes.deliver_removal_retry(&id, token);
+            }
+        });
+    }
+
+    fn deliver_removal_retry(self: &Rc<Self>, id: &VolumeId, token: u64) {
+        let still_pending = {
+            let removals = self.removals.borrow();
+            match removals.get(id) {
+                Some(request) if request.visible.get() && request.token == token => {
+                    request.retry_scheduled.set(false);
+                    true
+                }
+                _ => false,
+            }
+        };
+        if still_pending {
+            self.refresh();
+        }
+    }
+
+    fn retire_removal(&self, request: &RemovalRequest, status: RemovalStatus) -> bool {
+        if !request.visible.replace(false) {
+            return false;
+        }
+        let was_current = {
+            let mut removals = self.removals.borrow_mut();
+            if removals
+                .get(&request.id)
+                .is_some_and(|current| current.token == request.token)
+            {
+                removals.remove(&request.id);
+                true
+            } else {
+                false
+            }
+        };
+        if !was_current {
+            return false;
+        }
+        request.operation.borrow_mut().take();
+        log!(
+            "volumes",
+            "{} of {} (attempt {}) ended: {:?}",
+            request.action,
+            request.id,
+            request.token,
+            status
+        );
+        self.removal_statuses
+            .borrow_mut()
+            .insert(request.id.clone(), status.clone());
+        let notice = RemovalNotice {
+            window: request.window,
+            id: request.id.clone(),
+            label: request.label.clone(),
+            root: request.root.clone(),
+            action: request.action,
+            status,
+        };
+        self.notify_removal(&notice);
+        self.notify();
+        true
+    }
+
+    fn complete_removal(self: &Rc<Self>, request: &Rc<RemovalRequest>, status: RemovalStatus) {
+        self.retire_removal(request, status);
+    }
+
+    fn notify_removal(&self, notice: &RemovalNotice) {
+        let listeners = self.removal_listeners.borrow().clone();
+        let mut live = Vec::with_capacity(listeners.len());
+        for listener in listeners {
+            if listener(notice) {
+                live.push(listener);
+            }
+        }
+        *self.removal_listeners.borrow_mut() = live;
     }
 
     fn reconcile_mount_requests(self: &Rc<Self>) {
@@ -725,6 +1154,21 @@ impl Volumes {
     /// This is request lifecycle, not a registry command, and never unmounts a
     /// completed mount.
     pub fn cancel(&self, id: &VolumeId) {
+        if let Some(request) = self.removals.borrow().get(id).cloned() {
+            if !request.visible.get() || request.cancel_requested.replace(true) {
+                return;
+            }
+            log!(
+                "volumes",
+                "cancelling the {} of {}",
+                request.action,
+                request.id
+            );
+            request.cancellable.cancel();
+            request.operation.borrow_mut().take();
+            self.notify();
+            return;
+        }
         let Some(request) = self.requests.borrow().get(id).cloned() else {
             return;
         };
@@ -760,6 +1204,27 @@ impl Volumes {
                 )),
             );
         }
+
+        let removals: Vec<Rc<RemovalRequest>> = self
+            .removals
+            .borrow()
+            .values()
+            .filter(|request| request.window == window)
+            .cloned()
+            .collect();
+        for request in removals {
+            request.cancel_requested.set(true);
+            request.cancellable.cancel();
+            request.operation.borrow_mut().take();
+            self.retire_removal(
+                &request,
+                RemovalStatus::failed(
+                    request.action,
+                    RemovalFailureKind::Cancelled,
+                    "the window requesting the operation was closed",
+                ),
+            );
+        }
     }
 
     /// The app is leaving. Cancel every request and usage query; never join a
@@ -776,6 +1241,15 @@ impl Volumes {
             request.slot_released.set(true);
         }
         self.requests.borrow_mut().clear();
+        let removals: Vec<Rc<RemovalRequest>> = self.removals.borrow().values().cloned().collect();
+        for request in removals {
+            request.cancellable.cancel();
+            request.operation.borrow_mut().take();
+            request.visible.set(false);
+            request.slot_released.set(true);
+        }
+        self.removals.borrow_mut().clear();
+        self.removal_statuses.borrow_mut().clear();
         self.outstanding_mounts.set(0);
 
         let mut usage = self.usage.borrow_mut();
@@ -1056,18 +1530,67 @@ fn first_nonempty(values: &[&String]) -> Option<String> {
 /// Map a GIO error to a truthful row state. Cancellation, permission denial,
 /// removal and a missing backend stay distinct.
 pub fn classify_mount_error(error: &glib::Error) -> MountStatus {
+    let kind = match error_kind(error) {
+        ErrorKind::Cancelled => MountFailureKind::Cancelled,
+        ErrorKind::Denied => MountFailureKind::Denied,
+        ErrorKind::DeviceGone => MountFailureKind::DeviceGone,
+        ErrorKind::BackendUnavailable => MountFailureKind::BackendUnavailable,
+        ErrorKind::Busy => MountFailureKind::Busy,
+        ErrorKind::Handled => MountFailureKind::Handled,
+        ErrorKind::Failed => MountFailureKind::Failed,
+    };
+    MountStatus::failed(kind, error.message())
+}
+
+/// The same honest mapping for an unmount or eject. An authentication prompt
+/// the user cancelled is `Cancelled`, not a failure.
+pub fn classify_removal_error(error: &glib::Error, action: DriveAction) -> RemovalStatus {
+    let kind = match error_kind(error) {
+        ErrorKind::Cancelled => RemovalFailureKind::Cancelled,
+        ErrorKind::Denied => RemovalFailureKind::Denied,
+        ErrorKind::DeviceGone => RemovalFailureKind::DeviceGone,
+        ErrorKind::BackendUnavailable => RemovalFailureKind::BackendUnavailable,
+        ErrorKind::Busy => RemovalFailureKind::Busy,
+        ErrorKind::Handled => RemovalFailureKind::Handled,
+        ErrorKind::Failed => RemovalFailureKind::Failed,
+    };
+    RemovalStatus::failed(action, kind, error.message())
+}
+
+enum ErrorKind {
+    Cancelled,
+    Denied,
+    DeviceGone,
+    BackendUnavailable,
+    Busy,
+    Handled,
+    Failed,
+}
+
+fn error_kind(error: &glib::Error) -> ErrorKind {
     if error.matches(gio::IOErrorEnum::Cancelled) {
-        MountStatus::failed(MountFailureKind::Cancelled, error.message())
+        ErrorKind::Cancelled
     } else if error.matches(gio::IOErrorEnum::PermissionDenied) {
-        MountStatus::failed(MountFailureKind::Denied, error.message())
+        ErrorKind::Denied
     } else if error.matches(gio::IOErrorEnum::NotFound)
         || error.matches(gio::IOErrorEnum::NotMounted)
     {
-        MountStatus::failed(MountFailureKind::DeviceGone, error.message())
+        ErrorKind::DeviceGone
     } else if error.matches(gio::IOErrorEnum::NotSupported) {
-        MountStatus::failed(MountFailureKind::BackendUnavailable, error.message())
+        ErrorKind::BackendUnavailable
+    } else if error.matches(gio::IOErrorEnum::Busy) || error.matches(gio::IOErrorEnum::WouldBlock) {
+        ErrorKind::Busy
+    } else if error.matches(gio::IOErrorEnum::FailedHandled) {
+        ErrorKind::Handled
     } else {
-        MountStatus::failed(MountFailureKind::Failed, error.message())
+        ErrorKind::Failed
+    }
+}
+
+fn removal_success(action: DriveAction) -> RemovalStatus {
+    match action {
+        DriveAction::Unmount => RemovalStatus::Unmounted,
+        DriveAction::Eject => RemovalStatus::Ejected,
     }
 }
 
@@ -1118,6 +1641,10 @@ impl Volumes {
 
     pub(crate) fn pending_requests_for_tests(&self) -> usize {
         self.requests.borrow().len()
+    }
+
+    pub(crate) fn pending_removals_for_tests(&self) -> usize {
+        self.removals.borrow().len()
     }
 
     pub(crate) fn attempt_token_for_tests(&self, id: &VolumeId) -> Option<u64> {

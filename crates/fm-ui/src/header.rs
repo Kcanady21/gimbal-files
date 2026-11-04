@@ -14,6 +14,7 @@ use std::time::Duration;
 
 use adw::prelude::*;
 use fm_core::command::{Caller, Invocation};
+use fm_core::config::{Config, SortBy, SortOrder, SortRule};
 use fm_core::workspace::{Group, Window, WindowId};
 use gtk::{gdk, glib, pango};
 
@@ -182,6 +183,9 @@ pub struct Header {
     /// The open Settings switch and status label, so every window shows the
     /// shared listener state. The flag guards programmatic switch updates.
     agent_widgets: RefCell<Option<AgentWidgets>>,
+    /// The open Settings menu's Sort rows. The header owns them while the menu
+    /// is open; the rows' click handlers hold only weak references.
+    sort_rows: RefCell<Option<Rc<SortRows>>>,
     ui: RefCell<Weak<WindowUi>>,
 }
 
@@ -307,6 +311,7 @@ impl Header {
             animate_group: Cell::new(None),
             dialogs: Cell::new(0),
             agent_widgets: RefCell::new(None),
+            sort_rows: RefCell::new(None),
             ui: RefCell::new(Weak::new()),
         });
         let weak = Rc::downgrade(&header);
@@ -341,6 +346,16 @@ impl Header {
             switch.set_active(status.state == crate::agent::AgentState::On);
             guard.set(false);
             label.set_text(&agent_status_text(status));
+        }
+    }
+
+    /// Sync the open Settings menu's Sort rows with the config, after any sort
+    /// change: a menu click, a hotkey or another window.
+    pub fn refresh_sort_menu(&self) {
+        let rows = self.sort_rows.borrow().clone();
+        let ui = self.ui.borrow().upgrade();
+        if let (Some(rows), Some(ui)) = (rows, ui) {
+            rows.refresh(&ui);
         }
     }
 
@@ -784,7 +799,7 @@ impl Header {
         let weak = popover.downgrade();
         motion.connect_enter(move |_, _, _| {
             if let Some(popover) = weak.upgrade() {
-                popover.popup();
+                crate::popup::show(&popover);
             }
         });
         pill.add_controller(motion);
@@ -793,7 +808,7 @@ impl Header {
         let weak = popover.downgrade();
         click.connect_released(move |_, _, _, _| {
             if let Some(popover) = weak.upgrade() {
-                popover.popup();
+                crate::popup::show(&popover);
             }
         });
         pill.add_controller(click);
@@ -931,7 +946,7 @@ impl Header {
 
         popover.set_child(Some(&menu));
         close_on_closed(&popover);
-        popover.popup();
+        crate::popup::show(&popover);
     }
 
     fn open_add_group_menu(
@@ -971,7 +986,7 @@ impl Header {
         }
         popover.set_child(Some(&menu));
         close_on_closed(&popover);
-        popover.popup();
+        crate::popup::show(&popover);
     }
 
     fn open_rename_popover(
@@ -1018,7 +1033,7 @@ impl Header {
                 popover.unparent();
             }
         });
-        popover.popup();
+        crate::popup::show(&popover);
         entry.grab_focus();
         entry.select_region(0, -1);
         let weak_entry = entry.downgrade();
@@ -1363,7 +1378,11 @@ fn open_main_menu(ui: &Rc<WindowUi>, anchor: &gtk::Button) {
     let ui_settings = ui.clone();
     let settings_anchor = anchor.clone();
     menu_item(&popover, &menu, "Settings", true, move || {
-        open_settings_menu(&ui_settings, &settings_anchor);
+        // Open the submenu after this click and the closing main menu are
+        // done, never from inside the popover being torn down (see popup.rs).
+        let ui = ui_settings.clone();
+        let anchor = settings_anchor.clone();
+        gtk::glib::idle_add_local_once(move || open_settings_menu(&ui, &anchor));
     });
     let ui_quit = ui.clone();
     menu_item(&popover, &menu, "Quit", true, move || {
@@ -1371,7 +1390,7 @@ fn open_main_menu(ui: &Rc<WindowUi>, anchor: &gtk::Button) {
     });
     popover.set_child(Some(&menu));
     close_on_closed(&popover);
-    popover.popup();
+    crate::popup::show(&popover);
 }
 
 /// The Settings submenu. The switch is the only path to `agent.set-enabled`
@@ -1388,6 +1407,81 @@ fn open_settings_menu(ui: &Rc<WindowUi>, anchor: &gtk::Button) {
         .build();
     heading.add_css_class("gl-menu-item");
     menu.append(&heading);
+
+    let sort_heading = gtk::Label::builder()
+        .label("Sort")
+        .halign(gtk::Align::Start)
+        .build();
+    sort_heading.add_css_class("gl-menu-item");
+    menu.append(&sort_heading);
+
+    let keys: Vec<(SortBy, SortRow)> = [SortBy::Name, SortBy::Modified, SortBy::Size, SortBy::Type]
+        .into_iter()
+        .map(|by| (by, sort_row(&menu)))
+        .collect();
+    let orders: Vec<(SortOrder, SortRow)> = [SortOrder::Ascending, SortOrder::Descending]
+        .into_iter()
+        .map(|order| (order, sort_row(&menu)))
+        .collect();
+    let folder = sort_row(&menu);
+    let sort_rows = Rc::new(SortRows {
+        keys,
+        orders,
+        folder,
+    });
+    sort_rows.refresh(ui);
+    *ui.header().sort_rows.borrow_mut() = Some(sort_rows.clone());
+    {
+        let header = Rc::downgrade(ui.header());
+        let rows = Rc::downgrade(&sort_rows);
+        popover.connect_closed(move |_| {
+            let (Some(header), Some(rows)) = (header.upgrade(), rows.upgrade()) else {
+                return;
+            };
+            let mut slot = header.sort_rows.borrow_mut();
+            if slot.as_ref().is_some_and(|open| Rc::ptr_eq(open, &rows)) {
+                *slot = None;
+            }
+        });
+    }
+
+    for (by, row) in &sort_rows.keys {
+        let ui_key = ui.clone();
+        let rows = Rc::downgrade(&sort_rows);
+        let by = *by;
+        row.button.connect_clicked(move |_| {
+            let state = sort_state_now(&ui_key);
+            ui_key.dispatch(Caller::Ui, sort_key_action(&state, by).invocation());
+            if let Some(rows) = rows.upgrade() {
+                rows.refresh(&ui_key);
+            }
+        });
+    }
+    for (order, row) in &sort_rows.orders {
+        let ui_order = ui.clone();
+        let rows = Rc::downgrade(&sort_rows);
+        let order = *order;
+        row.button.connect_clicked(move |_| {
+            let state = sort_state_now(&ui_order);
+            ui_order.dispatch(Caller::Ui, sort_order_action(&state, order).invocation());
+            if let Some(rows) = rows.upgrade() {
+                rows.refresh(&ui_order);
+            }
+        });
+    }
+    {
+        let ui_folder = ui.clone();
+        let rows = Rc::downgrade(&sort_rows);
+        sort_rows.folder.button.connect_clicked(move |_| {
+            let state = sort_state_now(&ui_folder);
+            if let Some(action) = sort_folder_toggle_action(&state) {
+                ui_folder.dispatch(Caller::Ui, action.invocation());
+            }
+            if let Some(rows) = rows.upgrade() {
+                rows.refresh(&ui_folder);
+            }
+        });
+    }
 
     let row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
     row.add_css_class("gl-menu-item");
@@ -1471,7 +1565,7 @@ fn open_settings_menu(ui: &Rc<WindowUi>, anchor: &gtk::Button) {
 
     popover.set_child(Some(&menu));
     close_on_closed(&popover);
-    popover.popup();
+    crate::popup::show(&popover);
 }
 
 fn agent_status_text(status: &crate::agent::AgentStatus) -> String {
@@ -1488,6 +1582,220 @@ fn agent_status_text(status: &crate::agent::AgentStatus) -> String {
         text.push_str(detail);
     }
     text
+}
+
+/// Which sort the Settings rows are showing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SortScope {
+    Global,
+    Folder,
+}
+
+impl SortScope {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Global => "global",
+            Self::Folder => "folder",
+        }
+    }
+}
+
+/// A click in the Sort section, before it becomes a command invocation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SortMenuAction {
+    SetSort {
+        by: SortBy,
+        order: SortOrder,
+        scope: SortScope,
+    },
+    ClearFolderSort,
+}
+
+impl SortMenuAction {
+    pub fn invocation(&self) -> Invocation {
+        match self {
+            Self::SetSort { by, order, scope } => Invocation::new(
+                "view.set-sort",
+                vec![
+                    ("by".to_string(), by.as_str().to_string()),
+                    ("order".to_string(), order.as_str().to_string()),
+                    ("scope".to_string(), scope.as_str().to_string()),
+                ],
+            ),
+            Self::ClearFolderSort => Invocation::new("view.clear-folder-sort", Vec::new()),
+        }
+    }
+}
+
+/// The rule and scope the Sort rows display. It always comes from the loaded
+/// config, never from widget state.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SortMenuState {
+    pub rule: SortRule,
+    pub scope: SortScope,
+    pub folder_available: bool,
+    pub folder_label: String,
+}
+
+pub fn sort_menu_state(config: &Config, folder: Option<&Path>) -> SortMenuState {
+    let Some(folder) = folder else {
+        return SortMenuState {
+            rule: config.sort.global(),
+            scope: SortScope::Global,
+            folder_available: false,
+            folder_label: "Only this folder".to_string(),
+        };
+    };
+
+    SortMenuState {
+        rule: config.sort_for(folder),
+        scope: if config.has_folder_sort(folder) {
+            SortScope::Folder
+        } else {
+            SortScope::Global
+        },
+        folder_available: true,
+        folder_label: sort_folder_label(folder),
+    }
+}
+
+fn sort_folder_label(folder: &Path) -> String {
+    match folder.file_name() {
+        Some(name) if !name.is_empty() => format!("Only for {}", name.to_string_lossy()),
+        _ => "Only this folder".to_string(),
+    }
+}
+
+pub fn sort_key_label(by: SortBy) -> &'static str {
+    match by {
+        SortBy::Name => "Name",
+        SortBy::Modified => "Date modified",
+        SortBy::Size => "Size",
+        SortBy::Type => "Type",
+    }
+}
+
+pub fn sort_order_label(by: SortBy, order: SortOrder) -> &'static str {
+    match (by, order) {
+        (SortBy::Name | SortBy::Type, SortOrder::Ascending) => "A → Z",
+        (SortBy::Name | SortBy::Type, SortOrder::Descending) => "Z → A",
+        (SortBy::Modified, SortOrder::Ascending) => "Oldest first",
+        (SortBy::Modified, SortOrder::Descending) => "Newest first",
+        (SortBy::Size, SortOrder::Ascending) => "Smallest first",
+        (SortBy::Size, SortOrder::Descending) => "Largest first",
+    }
+}
+
+/// Choosing a key keeps the order currently shown and writes to the checked
+/// scope.
+pub fn sort_key_action(state: &SortMenuState, by: SortBy) -> SortMenuAction {
+    SortMenuAction::SetSort {
+        by,
+        order: state.rule.order,
+        scope: state.scope,
+    }
+}
+
+/// Choosing an order keeps the key currently shown and writes to the checked
+/// scope.
+pub fn sort_order_action(state: &SortMenuState, order: SortOrder) -> SortMenuAction {
+    SortMenuAction::SetSort {
+        by: state.rule.by,
+        order,
+        scope: state.scope,
+    }
+}
+
+/// The "Only this folder" check. Checking creates an override with the rule
+/// currently shown; unchecking removes it. A view without a folder cannot.
+pub fn sort_folder_toggle_action(state: &SortMenuState) -> Option<SortMenuAction> {
+    if !state.folder_available {
+        return None;
+    }
+    Some(match state.scope {
+        SortScope::Folder => SortMenuAction::ClearFolderSort,
+        SortScope::Global => SortMenuAction::SetSort {
+            by: state.rule.by,
+            order: state.rule.order,
+            scope: SortScope::Folder,
+        },
+    })
+}
+
+fn sort_row_text(checked: bool, text: &str) -> String {
+    if checked {
+        format!("✓ {text}")
+    } else {
+        format!("   {text}")
+    }
+}
+
+struct SortRow {
+    button: gtk::Button,
+    label: gtk::Label,
+}
+
+struct SortRows {
+    keys: Vec<(SortBy, SortRow)>,
+    orders: Vec<(SortOrder, SortRow)>,
+    folder: SortRow,
+}
+
+impl SortRows {
+    fn refresh(&self, ui: &Rc<WindowUi>) {
+        let state = sort_state_now(ui);
+        for (by, row) in &self.keys {
+            row.label
+                .set_text(&sort_row_text(state.rule.by == *by, sort_key_label(*by)));
+        }
+        for (order, row) in &self.orders {
+            row.label.set_text(&sort_row_text(
+                state.rule.order == *order,
+                sort_order_label(state.rule.by, *order),
+            ));
+        }
+        self.folder.label.set_text(&sort_row_text(
+            state.scope == SortScope::Folder,
+            &state.folder_label,
+        ));
+        self.folder.button.set_sensitive(state.folder_available);
+        self.folder
+            .button
+            .set_tooltip_text(if state.folder_available {
+                None
+            } else {
+                Some("This view has no folder, so sort settings apply to every folder.")
+            });
+    }
+}
+
+fn sort_state_now(ui: &Rc<WindowUi>) -> SortMenuState {
+    let folder = focused_sort_folder(ui);
+    let Some(process) = ui.process_upgrade() else {
+        return sort_menu_state(&Config::default(), None);
+    };
+    let config = process.config.borrow();
+    sort_menu_state(config.config(), folder.as_deref())
+}
+
+fn focused_sort_folder(ui: &Rc<WindowUi>) -> Option<PathBuf> {
+    if ui.trash_active() || ui.search_active() {
+        return None;
+    }
+    ui.workspace_window()
+        .and_then(|window| window.tab(window.focused_tab).map(|tab| tab.folder.clone()))
+}
+
+fn sort_row(menu: &gtk::Box) -> SortRow {
+    let button = gtk::Button::new();
+    button.add_css_class("gl-menu-item");
+    let label = gtk::Label::builder()
+        .halign(gtk::Align::Start)
+        .hexpand(true)
+        .build();
+    button.set_child(Some(&label));
+    menu.append(&button);
+    SortRow { button, label }
 }
 
 fn menu_item(
@@ -1649,5 +1957,142 @@ mod tests {
         assert!(!view.can_up);
         assert!(!view.can_back);
         assert!(!view.can_forward);
+    }
+
+    fn downloads_example() -> (Config, SortMenuState) {
+        let home = Path::new("/home/kyle");
+        let mut config = Config::with_defaults(home, &Default::default());
+        config.sort.by = SortBy::Name;
+        config.sort.order = SortOrder::Ascending;
+        config.sort.folders.push(fm_core::config::FolderSort {
+            folder: home.join("Downloads"),
+            by: SortBy::Modified,
+            order: SortOrder::Descending,
+        });
+        let state = sort_menu_state(&config, Some(&home.join("Downloads")));
+        (config, state)
+    }
+
+    #[test]
+    fn the_downloads_example_shows_its_folder_rule_and_writes_to_it() {
+        let (_config, state) = downloads_example();
+        assert_eq!(
+            state.rule,
+            SortRule {
+                by: SortBy::Modified,
+                order: SortOrder::Descending,
+                folders_first: true,
+            }
+        );
+        assert_eq!(state.scope, SortScope::Folder);
+        assert_eq!(state.folder_label, "Only for Downloads");
+        assert_eq!(
+            sort_order_label(SortBy::Modified, SortOrder::Descending),
+            "Newest first"
+        );
+
+        assert_eq!(
+            sort_key_action(&state, SortBy::Size).invocation(),
+            Invocation::new(
+                "view.set-sort",
+                vec![
+                    ("by".to_string(), "size".to_string()),
+                    ("order".to_string(), "descending".to_string()),
+                    ("scope".to_string(), "folder".to_string()),
+                ],
+            )
+        );
+        assert_eq!(
+            sort_order_action(&state, SortOrder::Ascending).invocation(),
+            Invocation::new(
+                "view.set-sort",
+                vec![
+                    ("by".to_string(), "modified".to_string()),
+                    ("order".to_string(), "ascending".to_string()),
+                    ("scope".to_string(), "folder".to_string()),
+                ],
+            )
+        );
+        assert_eq!(
+            sort_folder_toggle_action(&state)
+                .expect("a folder can be unchecked")
+                .invocation(),
+            Invocation::new("view.clear-folder-sort", Vec::new())
+        );
+    }
+
+    #[test]
+    fn another_folder_shows_the_global_rule_and_checking_creates_an_override() {
+        let (config, _) = downloads_example();
+        let state = sort_menu_state(&config, Some(Path::new("/home/kyle/Documents")));
+        assert_eq!(
+            state.rule,
+            SortRule {
+                by: SortBy::Name,
+                order: SortOrder::Ascending,
+                folders_first: true,
+            }
+        );
+        assert_eq!(state.scope, SortScope::Global);
+        assert_eq!(state.folder_label, "Only for Documents");
+        assert_eq!(
+            sort_folder_toggle_action(&state).unwrap(),
+            SortMenuAction::SetSort {
+                by: SortBy::Name,
+                order: SortOrder::Ascending,
+                scope: SortScope::Folder,
+            }
+        );
+        assert_eq!(
+            sort_key_action(&state, SortBy::Type).invocation(),
+            Invocation::new(
+                "view.set-sort",
+                vec![
+                    ("by".to_string(), "type".to_string()),
+                    ("order".to_string(), "ascending".to_string()),
+                    ("scope".to_string(), "global".to_string()),
+                ],
+            )
+        );
+    }
+
+    #[test]
+    fn a_view_without_a_folder_shows_the_global_rule_and_cannot_check_the_row() {
+        let (config, _) = downloads_example();
+        let state = sort_menu_state(&config, None);
+        assert_eq!(state.rule, config.sort.global());
+        assert_eq!(state.scope, SortScope::Global);
+        assert!(!state.folder_available);
+        assert_eq!(state.folder_label, "Only this folder");
+        assert_eq!(sort_folder_toggle_action(&state), None);
+        assert_eq!(
+            sort_key_action(&state, SortBy::Modified).invocation(),
+            Invocation::new(
+                "view.set-sort",
+                vec![
+                    ("by".to_string(), "modified".to_string()),
+                    ("order".to_string(), "ascending".to_string()),
+                    ("scope".to_string(), "global".to_string()),
+                ],
+            )
+        );
+    }
+
+    #[test]
+    fn check_marks_and_order_words_follow_the_rule() {
+        assert_eq!(sort_row_text(true, "Name"), "✓ Name");
+        assert_eq!(sort_row_text(false, "Name"), "   Name");
+        assert_eq!(
+            sort_order_label(SortBy::Name, SortOrder::Ascending),
+            "A → Z"
+        );
+        assert_eq!(
+            sort_order_label(SortBy::Size, SortOrder::Descending),
+            "Largest first"
+        );
+        assert_eq!(
+            sort_order_label(SortBy::Modified, SortOrder::Ascending),
+            "Oldest first"
+        );
     }
 }

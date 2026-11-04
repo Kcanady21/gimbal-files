@@ -18,6 +18,7 @@ mod worker;
 
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
+use std::path::Path;
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -693,6 +694,24 @@ impl FileOps {
         }
     }
 
+    /// Whether a running or queued operation has a source or destination under
+    /// one mount root. It is a refusal before the volume service is asked to
+    /// unmount; Gimbal never cancels the user's operation silently.
+    pub fn touches_root(&self, root: &Path) -> bool {
+        let current = self
+            .current
+            .borrow()
+            .as_ref()
+            .is_some_and(|current| request_touches_root(&current.request, root));
+        if current {
+            return true;
+        }
+        self.queue
+            .borrow()
+            .iter()
+            .any(|job| request_touches_root(&job.request, root))
+    }
+
     pub fn waiting(&self) -> usize {
         self.queue.borrow().len()
     }
@@ -719,6 +738,25 @@ impl FileOps {
 
     pub fn baobab_available(&self) -> bool {
         self.baobab.get()
+    }
+}
+
+fn request_touches_root(request: &Request, root: &Path) -> bool {
+    match request {
+        Request::Trash { paths } => paths.iter().any(|path| path.starts_with(root)),
+        Request::Copy { paths, to } | Request::Move { paths, to } => {
+            paths.iter().any(|path| path.starts_with(root)) || to.starts_with(root)
+        }
+        Request::Rename { path, .. } => path.starts_with(root),
+        Request::NewFolder { in_folder, .. } => in_folder.starts_with(root),
+        Request::Restore { items } | Request::DeleteSelected { items } => items
+            .iter()
+            .filter_map(|item| item.original())
+            .any(|path| path.starts_with(root)),
+        Request::EmptyTrash => false,
+        // An undo may move any path from the last operation; refuse
+        // conservatively while it is running.
+        Request::Undo => true,
     }
 }
 

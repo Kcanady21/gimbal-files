@@ -74,7 +74,7 @@ pub fn show_menu(
 
     popover.set_child(Some(&menu));
     close_on_closed(&popover);
-    popover.popup();
+    crate::popup::show(&popover);
 }
 
 fn run_action(ui: &Rc<WindowUi>, anchor: &gtk::Widget, item: &MenuItem) {
@@ -153,7 +153,7 @@ pub fn open_rename(ui: &Rc<WindowUi>, anchor: &gtk::Widget, path: &Path) {
             popover.unparent();
         }
     });
-    popover.popup();
+    crate::popup::show(&popover);
     entry.grab_focus();
     let selection = stem.chars().count() as i32;
     entry.select_region(0, selection);
@@ -226,7 +226,7 @@ pub fn open_new_folder(ui: &Rc<WindowUi>, anchor: &gtk::Widget, folder: &Path) {
             popover.unparent();
         }
     });
-    popover.popup();
+    crate::popup::show(&popover);
     entry.grab_focus();
 }
 

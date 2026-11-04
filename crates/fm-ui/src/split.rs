@@ -790,6 +790,8 @@ struct Slot {
 /// One drawn tile or pill: its tab, its Fixed position and its size.
 type VisualState = (TabId, (f64, f64), (i32, i32));
 
+type DisplayedFolder = Rc<RefCell<Option<PathBuf>>>;
+
 struct Tile {
     id: TabId,
     outer: gtk::Box,
@@ -960,6 +962,26 @@ impl SplitView {
         for tile in self.inner.tiles.borrow().iter() {
             tile.gate.set(false);
         }
+    }
+
+    /// Drop folder monitors, thumbnail demand and folder-size walks in every
+    /// tile showing a folder under one mount root.
+    pub fn release_root(&self, root: &Path) -> usize {
+        let tiles: Vec<(Rc<FolderView>, DisplayedFolder)> = self
+            .inner
+            .tiles
+            .borrow()
+            .iter()
+            .map(|tile| (tile.view.clone(), tile.displayed_folder.clone()))
+            .collect();
+        let mut released = 0;
+        for (view, displayed) in tiles {
+            if view.release_root(root) {
+                *displayed.borrow_mut() = None;
+                released += 1;
+            }
+        }
+        released
     }
 
     pub fn reload_focused(&self) {
@@ -2090,7 +2112,7 @@ impl Inner {
                 popover.unparent();
             }
         });
-        popover.popup();
+        crate::popup::show(&popover);
     }
 }
 

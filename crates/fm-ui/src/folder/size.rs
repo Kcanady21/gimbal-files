@@ -8,7 +8,7 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::ffi::OsString;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
@@ -323,7 +323,9 @@ struct Job {
 
 struct QueueState {
     pending: VecDeque<Job>,
-    active: HashMap<u64, Arc<AtomicBool>>,
+    /// Active scans keep their root as well as their flag so one unmount can
+    /// release exactly the handles under that mount.
+    active: HashMap<u64, (PathBuf, Arc<AtomicBool>)>,
     stopped: bool,
 }
 
@@ -462,6 +464,44 @@ impl Service {
         self.inner.cache.lock().unwrap().invalidate_all();
     }
 
+    /// Cancel queued and running folder-size walks below one mount root and
+    /// forget their cached totals. Runs on the GTK thread and never waits for a
+    /// worker: an already running native scan sees its flag at the next check.
+    pub fn release_root(&self, root: &Path) -> usize {
+        self.inner.cache_epoch.fetch_add(1, Ordering::SeqCst);
+        let mut released = 0;
+        {
+            let mut queue = self.inner.queue.lock().unwrap();
+            for (path, cancel) in queue.active.values() {
+                if path.starts_with(root) {
+                    cancel.store(true, Ordering::SeqCst);
+                    released += 1;
+                }
+            }
+            let before = queue.pending.len();
+            queue.pending.retain(|job| {
+                if job.request.path.starts_with(root) {
+                    job.cancel.store(true, Ordering::SeqCst);
+                    false
+                } else {
+                    true
+                }
+            });
+            released += before - queue.pending.len();
+        }
+        // The cache has no root-range removal; dropping it is conservative and
+        // cheap for a one-off unmount.
+        self.inner.cache.lock().unwrap().invalidate_all();
+        if released > 0 {
+            crate::log!(
+                "folder-size",
+                "released {released} scan(s) under {}",
+                root.display()
+            );
+        }
+        released
+    }
+
     /// Cancel queued and running work and wait for both workers to return.
     /// A worker blocked inside a local filesystem call can delay this join;
     /// the UI never waits for it during normal browsing.
@@ -472,7 +512,7 @@ impl Service {
         {
             let mut queue = self.inner.queue.lock().unwrap();
             queue.stopped = true;
-            for cancel in queue.active.values() {
+            for (_, cancel) in queue.active.values() {
                 cancel.store(true, Ordering::SeqCst);
             }
             for job in queue.pending.drain(..) {
@@ -508,7 +548,9 @@ fn worker_loop(inner: Arc<Inner>) {
                     return;
                 }
                 if let Some(job) = queue.pending.pop_front() {
-                    queue.active.insert(job.token, job.cancel.clone());
+                    queue
+                        .active
+                        .insert(job.token, (job.request.path.clone(), job.cancel.clone()));
                     break job;
                 }
                 queue = inner.ready.wait(queue).unwrap();
@@ -596,6 +638,16 @@ pub fn invalidate_all() {
             service.invalidate_all();
         }
     });
+}
+
+/// Cancel every folder-size walk under one mount root, without waiting.
+pub fn release_root(root: &Path) -> usize {
+    SERVICE.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .map(|service| service.release_root(root))
+            .unwrap_or(0)
+    })
 }
 
 pub fn shutdown() {

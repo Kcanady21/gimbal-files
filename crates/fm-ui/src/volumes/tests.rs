@@ -11,12 +11,15 @@ use gtk::glib;
 use gtk::prelude::*;
 
 use fm_core::volumes::{
-    MountFailureKind, MountRefusal, MountStatus, MountTarget, RawMount, RawSnapshot, RawVolume,
-    VolumeId,
+    DriveAction, MountFailureKind, MountRefusal, MountStatus, MountTarget, RawMount, RawSnapshot,
+    RawVolume, RemovalFailureKind, RemovalRefusal, RemovalStatus, RemovalTarget, VolumeId,
 };
 use fm_core::workspace::WindowId;
 
-use super::{Backend, MountBegin, MountDone, UsageDone, UsageValue, Volumes};
+use super::{
+    Backend, DriveGate, MountBegin, MountDone, RemovalBegin, RemovalNotice, UsageDone, UsageValue,
+    Volumes,
+};
 
 #[derive(Default)]
 struct FakeInner {
@@ -26,6 +29,9 @@ struct FakeInner {
     mount_calls: Vec<MountTarget>,
     pending_mounts: Vec<(VolumeId, gio::Cancellable, MountDone)>,
     fail_next_mount: Option<(gio::IOErrorEnum, String)>,
+    removal_calls: Vec<RemovalTarget>,
+    pending_removals: Vec<(VolumeId, gio::Cancellable, MountDone)>,
+    order: Rc<RefCell<Vec<String>>>,
     snapshot_calls: u64,
     usage_calls: Vec<PathBuf>,
     pending_usage: Vec<(PathBuf, gio::Cancellable, UsageDone)>,
@@ -88,6 +94,8 @@ impl FakeBackend {
             label: label.to_string(),
             native: None,
             uuid: None,
+            can_unmount: true,
+            can_eject: true,
         });
         object
     }
@@ -101,6 +109,50 @@ impl FakeBackend {
 
     pub(crate) fn fail_next_mount(&self, kind: gio::IOErrorEnum, message: &str) {
         self.inner.borrow_mut().fail_next_mount = Some((kind, message.to_string()));
+    }
+
+    pub(crate) fn set_capabilities(&self, object: u64, unmount: bool, eject: bool) {
+        let mut inner = self.inner.borrow_mut();
+        if let Some(volume) = inner
+            .volumes
+            .iter_mut()
+            .find(|volume| volume.object == object)
+            && let Some(mount) = volume.mount.as_mut()
+        {
+            mount.can_unmount = unmount;
+            mount.can_eject = eject;
+        }
+    }
+
+    pub(crate) fn order(&self) -> Rc<RefCell<Vec<String>>> {
+        self.inner.borrow().order.clone()
+    }
+
+    pub(crate) fn removal_calls(&self) -> Vec<RemovalTarget> {
+        self.inner.borrow().removal_calls.clone()
+    }
+
+    pub(crate) fn complete_removal(&self, id: &VolumeId, result: Result<(), glib::Error>) {
+        let pending = {
+            let mut inner = self.inner.borrow_mut();
+            inner
+                .pending_removals
+                .iter()
+                .position(|(candidate, _, _)| candidate == id)
+                .map(|index| inner.pending_removals.remove(index))
+        };
+        if let Some((_, _, done)) = pending {
+            done(result);
+        }
+    }
+
+    pub(crate) fn removal_cancellable(&self, id: &VolumeId) -> Option<gio::Cancellable> {
+        self.inner
+            .borrow()
+            .pending_removals
+            .iter()
+            .find(|(candidate, _, _)| candidate == id)
+            .map(|(_, cancellable, _)| cancellable.clone())
     }
 
     pub(crate) fn snapshot_calls(&self) -> u64 {
@@ -122,10 +174,12 @@ impl FakeBackend {
             label: volume.label.clone(),
             native: volume.native.clone(),
             uuid: volume.uuid.clone(),
+            can_unmount: true,
+            can_eject: true,
         });
     }
 
-    fn set_unmounted(&self, object: u64) {
+    pub(crate) fn set_unmounted(&self, object: u64) {
         if let Some(volume) = self
             .inner
             .borrow_mut()
@@ -186,6 +240,22 @@ impl FakeBackend {
             .iter()
             .find(|(candidate, _, _)| candidate == id)
             .map(|(_, cancellable, _)| cancellable.clone())
+    }
+
+    fn start_removal(
+        &self,
+        target: &RemovalTarget,
+        kind: &str,
+        cancellable: &gio::Cancellable,
+        done: MountDone,
+    ) -> Result<Option<gio::MountOperation>, glib::Error> {
+        let mut inner = self.inner.borrow_mut();
+        inner.removal_calls.push(target.clone());
+        inner.order.borrow_mut().push(format!("backend:{kind}"));
+        inner
+            .pending_removals
+            .push((target.id().clone(), cancellable.clone(), done));
+        Ok(None)
     }
 
     fn complete_usage(&self, root: &Path, result: Result<(u64, u64), glib::Error>) {
@@ -260,6 +330,26 @@ impl Backend for FakeBackend {
             .pending_mounts
             .push((target.id().clone(), cancellable.clone(), done));
         Ok(None)
+    }
+
+    fn unmount(
+        &self,
+        target: &RemovalTarget,
+        _parent: Option<&gtk::Window>,
+        cancellable: &gio::Cancellable,
+        done: MountDone,
+    ) -> Result<Option<gio::MountOperation>, glib::Error> {
+        self.start_removal(target, "unmount", cancellable, done)
+    }
+
+    fn eject(
+        &self,
+        target: &RemovalTarget,
+        _parent: Option<&gtk::Window>,
+        cancellable: &gio::Cancellable,
+        done: MountDone,
+    ) -> Result<Option<gio::MountOperation>, glib::Error> {
+        self.start_removal(target, "eject", cancellable, done)
     }
 
     fn usage(&self, root: &Path, cancellable: &gio::Cancellable, done: UsageDone) {
@@ -1253,6 +1343,348 @@ fn shutdown_cancels_requests_and_usage_without_waiting() {
 }
 
 // -------------------------------------------------------------------------
+// Unmount and eject
+// -------------------------------------------------------------------------
+
+fn mounted_entry(volumes: &Rc<Volumes>, native: &str) -> fm_core::volumes::DeviceEntry {
+    entry_by_native(volumes, native)
+}
+
+fn notice_log(volumes: &Rc<Volumes>) -> Rc<RefCell<Vec<RemovalNotice>>> {
+    let notices = Rc::new(RefCell::new(Vec::new()));
+    let captured = notices.clone();
+    volumes.listen_removal(Rc::new(move |notice| {
+        captured.borrow_mut().push(notice.clone());
+        true
+    }));
+    notices
+}
+
+#[test]
+fn unmount_success_returns_the_row_to_unmounted_and_drops_its_bar() {
+    let backend = Rc::new(FakeBackend::default());
+    let object = backend.add_volume("/dev/sdb1", "USB");
+    backend.set_mounted(object, "/run/media/kyle/USB");
+    let volumes = Volumes::new(backend.clone());
+    volumes.refresh_for_tests();
+    let notices = notice_log(&volumes);
+    let entry = mounted_entry(&volumes, "/dev/sdb1");
+
+    let target = volumes
+        .removal_target(entry.id().as_str(), DriveAction::Unmount)
+        .expect("a mounted row with can_unmount");
+    assert_eq!(
+        volumes.remove(window(1), target, None),
+        RemovalBegin::Pending
+    );
+    assert_eq!(
+        volumes.removal_status_for(entry.id()),
+        Some(RemovalStatus::pending(DriveAction::Unmount))
+    );
+    assert_eq!(volumes.pending_removals_for_tests(), 1);
+    assert_eq!(backend.removal_calls().len(), 1);
+    assert_eq!(backend.removal_calls()[0].action(), DriveAction::Unmount);
+
+    backend.set_unmounted(object);
+    backend.complete_removal(entry.id(), Ok(()));
+    volumes.refresh_for_tests();
+
+    let after = mounted_entry(&volumes, "/dev/sdb1");
+    assert!(!after.state().is_mounted());
+    assert_eq!(volumes.usage_for_entry(&after), UsageValue::Unknown);
+    assert_eq!(volumes.pending_removals_for_tests(), 0);
+    assert!(matches!(
+        notices.borrow().last().map(|notice| &notice.status),
+        Some(RemovalStatus::Unmounted)
+    ));
+}
+
+#[test]
+fn eject_success_removes_the_volume_row_and_reports_it_safely_removable() {
+    let backend = Rc::new(FakeBackend::default());
+    let object = backend.add_volume("/dev/sdb1", "USB");
+    backend.set_mounted(object, "/run/media/kyle/USB");
+    let volumes = Volumes::new(backend.clone());
+    volumes.refresh_for_tests();
+    let notices = notice_log(&volumes);
+    let entry = mounted_entry(&volumes, "/dev/sdb1");
+
+    let target = volumes
+        .removal_target(entry.id().as_str(), DriveAction::Eject)
+        .expect("eject follows can_eject");
+    assert_eq!(
+        volumes.remove(window(7), target, None),
+        RemovalBegin::Pending
+    );
+    assert_eq!(backend.removal_calls()[0].action(), DriveAction::Eject);
+
+    backend.remove_volume(object);
+    backend.complete_removal(entry.id(), Ok(()));
+    volumes.refresh_for_tests();
+
+    assert!(volumes.entry(entry.id().as_str()).is_none());
+    assert_eq!(volumes.pending_removals_for_tests(), 0);
+    let notices = notices.borrow();
+    let notice = notices.last().expect("one terminal notice");
+    assert_eq!(notice.status, RemovalStatus::Ejected);
+    assert_eq!(notice.window, window(7));
+    assert_eq!(notice.label, "USB");
+}
+
+#[test]
+fn capabilities_and_pending_state_refuse_before_the_backend() {
+    let backend = Rc::new(FakeBackend::default());
+    let object = backend.add_volume("/dev/sdb1", "USB");
+    backend.set_mounted(object, "/run/media/kyle/USB");
+    let volumes = Volumes::new(backend.clone());
+    volumes.refresh_for_tests();
+    let entry = mounted_entry(&volumes, "/dev/sdb1");
+
+    backend.set_capabilities(object, false, true);
+    volumes.refresh_for_tests();
+    assert_eq!(
+        volumes.removal_target(entry.id().as_str(), DriveAction::Unmount),
+        Err(RemovalRefusal::NotSupported(DriveAction::Unmount))
+    );
+    let target = volumes
+        .removal_target(entry.id().as_str(), DriveAction::Eject)
+        .unwrap();
+    assert_eq!(
+        volumes.remove(window(1), target.clone(), None),
+        RemovalBegin::Pending
+    );
+    assert_eq!(
+        volumes.removal_target(entry.id().as_str(), DriveAction::Eject),
+        Err(RemovalRefusal::Pending)
+    );
+    assert_eq!(
+        volumes.remove(window(2), target, None),
+        RemovalBegin::AlreadyPending
+    );
+    assert_eq!(backend.removal_calls().len(), 1);
+}
+
+#[test]
+fn busy_and_auth_cancelled_are_distinct_and_leave_the_drive_mounted() {
+    let backend = Rc::new(FakeBackend::default());
+    let object = backend.add_volume("/dev/sdb1", "USB");
+    backend.set_mounted(object, "/run/media/kyle/USB");
+    let volumes = Volumes::new(backend.clone());
+    volumes.refresh_for_tests();
+    let notices = notice_log(&volumes);
+    let entry = mounted_entry(&volumes, "/dev/sdb1");
+
+    let target = volumes
+        .removal_target(entry.id().as_str(), DriveAction::Unmount)
+        .unwrap();
+    volumes.remove(window(1), target, None);
+    backend.complete_removal(
+        entry.id(),
+        Err(error(gio::IOErrorEnum::Busy, "another app holds files")),
+    );
+    assert_eq!(
+        volumes.removal_status_for(entry.id()),
+        Some(RemovalStatus::failed(
+            DriveAction::Unmount,
+            RemovalFailureKind::Busy,
+            "another app holds files"
+        ))
+    );
+    assert!(mounted_entry(&volumes, "/dev/sdb1").state().is_mounted());
+
+    let target = volumes
+        .removal_target(entry.id().as_str(), DriveAction::Eject)
+        .unwrap();
+    volumes.remove(window(1), target, None);
+    backend.complete_removal(
+        entry.id(),
+        Err(error(
+            gio::IOErrorEnum::Cancelled,
+            "authentication cancelled",
+        )),
+    );
+    assert_eq!(
+        volumes.removal_status_for(entry.id()),
+        Some(RemovalStatus::failed(
+            DriveAction::Eject,
+            RemovalFailureKind::Cancelled,
+            "authentication cancelled"
+        ))
+    );
+    assert!(mounted_entry(&volumes, "/dev/sdb1").state().is_mounted());
+    let kinds: Vec<_> = notices
+        .borrow()
+        .iter()
+        .filter_map(|notice| notice.status.kind())
+        .collect();
+    assert_eq!(
+        kinds,
+        vec![RemovalFailureKind::Busy, RemovalFailureKind::Cancelled]
+    );
+}
+
+#[test]
+fn cancel_cancels_only_that_requests_own_operation() {
+    let backend = Rc::new(FakeBackend::default());
+    let object = backend.add_volume("/dev/sdb1", "USB");
+    backend.set_mounted(object, "/run/media/kyle/USB");
+    let volumes = Volumes::new(backend.clone());
+    volumes.refresh_for_tests();
+    let entry = mounted_entry(&volumes, "/dev/sdb1");
+    let target = volumes
+        .removal_target(entry.id().as_str(), DriveAction::Unmount)
+        .unwrap();
+    volumes.remove(window(1), target, None);
+    let cancellable = backend.removal_cancellable(entry.id()).unwrap();
+    assert!(!cancellable.is_cancelled());
+
+    volumes.cancel(entry.id());
+    assert!(cancellable.is_cancelled());
+    assert!(volumes.cancel_requested(entry.id()));
+    assert_eq!(volumes.pending_removals_for_tests(), 1);
+
+    backend.complete_removal(
+        entry.id(),
+        Err(error(gio::IOErrorEnum::Cancelled, "cancelled by user")),
+    );
+    assert_eq!(
+        volumes.removal_status_for(entry.id()),
+        Some(RemovalStatus::failed(
+            DriveAction::Unmount,
+            RemovalFailureKind::Cancelled,
+            "cancelled by user"
+        ))
+    );
+    assert!(mounted_entry(&volumes, "/dev/sdb1").state().is_mounted());
+}
+
+#[test]
+fn a_stale_removal_callback_cannot_finish_a_replacement_attempt() {
+    let backend = Rc::new(FakeBackend::default());
+    let object = backend.add_volume("/dev/sdb1", "USB");
+    backend.set_mounted(object, "/run/media/kyle/USB");
+    let volumes = Volumes::new(backend.clone());
+    volumes.refresh_for_tests();
+    let old = mounted_entry(&volumes, "/dev/sdb1");
+    let old_id = old.id().clone();
+    let first = volumes
+        .removal_target(old_id.as_str(), DriveAction::Unmount)
+        .unwrap();
+    volumes.remove(window(1), first, None);
+
+    // The stick disappears before its callback. Inventory is the truth.
+    backend.remove_volume(object);
+    volumes.refresh_for_tests();
+    assert_eq!(volumes.pending_removals_for_tests(), 0);
+    assert_eq!(
+        volumes.active_mounts(),
+        1,
+        "the vanished attempt still owns its backend slot"
+    );
+
+    // Reinsertion makes a new id; a new unmount starts on it.
+    let replacement_object = backend.add_volume("/dev/sdb1", "USB");
+    backend.set_mounted(replacement_object, "/run/media/kyle/USB");
+    volumes.refresh_for_tests();
+    let replacement = mounted_entry(&volumes, "/dev/sdb1");
+    assert_ne!(replacement.id(), &old_id);
+    let second = volumes
+        .removal_target(replacement.id().as_str(), DriveAction::Unmount)
+        .unwrap();
+    volumes.remove(window(1), second, None);
+    assert_eq!(volumes.active_mounts(), 2);
+
+    // The old callback arrives late. It releases only its own slot.
+    backend.complete_removal(
+        &old_id,
+        Err(error(gio::IOErrorEnum::PermissionDenied, "old attempt")),
+    );
+    assert_eq!(
+        volumes.removal_status_for(replacement.id()),
+        Some(RemovalStatus::pending(DriveAction::Unmount)),
+        "the old callback cannot finish the replacement"
+    );
+    assert_eq!(volumes.pending_removals_for_tests(), 1);
+    assert_eq!(volumes.active_mounts(), 1);
+    backend.complete_removal(
+        replacement.id(),
+        Err(error(gio::IOErrorEnum::Busy, "new attempt busy")),
+    );
+}
+
+#[test]
+fn release_runs_before_the_backend_call() {
+    struct RecordingGate {
+        order: Rc<RefCell<Vec<String>>>,
+    }
+    impl DriveGate for RecordingGate {
+        fn before_removal(
+            &self,
+            _window: WindowId,
+            _root: &Path,
+            _label: &str,
+            _action: DriveAction,
+        ) -> Result<(), String> {
+            self.order.borrow_mut().push("release".to_string());
+            Ok(())
+        }
+    }
+
+    let backend = Rc::new(FakeBackend::default());
+    let object = backend.add_volume("/dev/sdb1", "USB");
+    backend.set_mounted(object, "/run/media/kyle/USB");
+    let volumes = Volumes::new(backend.clone());
+    volumes.refresh_for_tests();
+    let order = backend.order();
+    volumes.set_gate(Rc::new(RecordingGate {
+        order: order.clone(),
+    }));
+    let entry = mounted_entry(&volumes, "/dev/sdb1");
+    let target = volumes
+        .removal_target(entry.id().as_str(), DriveAction::Unmount)
+        .unwrap();
+    volumes.remove(window(1), target, None);
+    assert_eq!(
+        order.borrow().as_slice(),
+        ["release", "backend:unmount"],
+        "all Gimbal handles are released before the backend starts"
+    );
+}
+
+#[test]
+fn a_refused_gate_never_reaches_the_backend() {
+    struct RefusingGate;
+    impl DriveGate for RefusingGate {
+        fn before_removal(
+            &self,
+            _window: WindowId,
+            _root: &Path,
+            label: &str,
+            _action: DriveAction,
+        ) -> Result<(), String> {
+            Err(format!("{label} is in use by a file operation."))
+        }
+    }
+
+    let backend = Rc::new(FakeBackend::default());
+    let object = backend.add_volume("/dev/sdb1", "USB");
+    backend.set_mounted(object, "/run/media/kyle/USB");
+    let volumes = Volumes::new(backend.clone());
+    volumes.refresh_for_tests();
+    volumes.set_gate(Rc::new(RefusingGate));
+    let entry = mounted_entry(&volumes, "/dev/sdb1");
+    let target = volumes
+        .removal_target(entry.id().as_str(), DriveAction::Unmount)
+        .unwrap();
+    assert_eq!(
+        volumes.remove(window(1), target, None),
+        RemovalBegin::Refused("USB is in use by a file operation.".to_string())
+    );
+    assert!(backend.removal_calls().is_empty());
+    assert_eq!(volumes.pending_removals_for_tests(), 0);
+}
+
+// -------------------------------------------------------------------------
 // Registry -> the real UiHandler -> Process -> controller -> injected backend
 // -------------------------------------------------------------------------
 
@@ -1307,6 +1739,113 @@ fn dispatch_mount(
         ),
         &mut handler,
     )
+}
+
+fn dispatch_removal(
+    process: &Rc<crate::app::Process>,
+    window: WindowId,
+    command: &str,
+    device: &str,
+) -> fm_core::command::Outcome {
+    use fm_core::command::{Caller, Invocation, Registry};
+
+    let mut handler = crate::commands::UiHandler {
+        caller: Caller::Ui,
+        window,
+        process: Rc::downgrade(process),
+    };
+    Registry::new().dispatch(
+        Caller::Ui,
+        &Invocation::new(command, vec![("device".to_string(), device.to_string())]),
+        &mut handler,
+    )
+}
+
+#[test]
+fn registry_unmount_and_eject_route_through_the_shared_controller() {
+    let backend = Rc::new(FakeBackend::default());
+    let object = backend.add_volume("/dev/sdb1", "USB");
+    backend.set_mounted(object, "/run/media/kyle/USB");
+    let volumes = Volumes::new(backend.clone());
+    volumes.refresh_for_tests();
+    let entry = mounted_entry(&volumes, "/dev/sdb1");
+    let (process, root) = scratch_process("handler-unmount", volumes);
+    let window = process.seed_window(root.join("home"));
+
+    let outcome = dispatch_removal(&process, window, "drive.unmount", entry.id().as_str());
+    assert_eq!(outcome, fm_core::command::Outcome::Done);
+    assert_eq!(
+        process.volumes().removal_status_for(entry.id()),
+        Some(RemovalStatus::pending(DriveAction::Unmount))
+    );
+    assert_eq!(backend.removal_calls()[0].action(), DriveAction::Unmount);
+
+    let duplicate = dispatch_removal(&process, window, "drive.eject", entry.id().as_str());
+    assert!(matches!(duplicate, fm_core::command::Outcome::Failed(_)));
+    assert_eq!(backend.removal_calls().len(), 1);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn a_running_file_operation_refuses_unmount_before_the_backend() {
+    let backend = Rc::new(FakeBackend::default());
+    let object = backend.add_volume("/dev/sdb1", "USB");
+    backend.set_mounted(object, "/run/media/kyle/USB");
+    let volumes = Volumes::new(backend.clone());
+    volumes.refresh_for_tests();
+    let entry = mounted_entry(&volumes, "/dev/sdb1");
+    let (process, root) = scratch_process("handler-fileop", volumes);
+    let window = process.seed_window(root.join("home"));
+    process
+        .fileops()
+        .expect("the headless process has a file-op worker")
+        .submit(
+            window,
+            fm_core::fileops::Request::Copy {
+                paths: vec![PathBuf::from("/run/media/kyle/USB/file.txt")],
+                to: PathBuf::from("/run/media/kyle/USB/destination"),
+            },
+            false,
+            None,
+        );
+
+    let outcome = dispatch_removal(&process, window, "drive.unmount", entry.id().as_str());
+    match outcome {
+        fm_core::command::Outcome::Failed(message) => assert_eq!(
+            message,
+            "USB is in use by a file operation. Wait for it to finish or cancel it."
+        ),
+        other => panic!("expected a file-operation refusal, got {other:?}"),
+    }
+    assert!(backend.removal_calls().is_empty());
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn a_dirty_editor_refuses_unmount_before_the_backend() {
+    let backend = Rc::new(FakeBackend::default());
+    let object = backend.add_volume("/dev/sdb1", "USB");
+    backend.set_mounted(object, "/run/media/kyle/USB");
+    let volumes = Volumes::new(backend.clone());
+    volumes.refresh_for_tests();
+    let entry = mounted_entry(&volumes, "/dev/sdb1");
+    let (process, root) = scratch_process("handler-dirty", volumes);
+    let window = process.seed_window(root.join("home"));
+    process.set_dirty_preview_for_tests(
+        window,
+        PathBuf::from("/run/media/kyle/USB/notes.txt"),
+        "notes.txt",
+    );
+
+    let outcome = dispatch_removal(&process, window, "drive.unmount", entry.id().as_str());
+    match outcome {
+        fm_core::command::Outcome::Failed(message) => {
+            assert_eq!(message, "Save or discard the changes to “notes.txt” first")
+        }
+        other => panic!("expected a dirty-editor refusal, got {other:?}"),
+    }
+    assert!(backend.removal_calls().is_empty());
+    let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]

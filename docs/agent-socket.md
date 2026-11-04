@@ -65,16 +65,17 @@ Unavailable through the socket (refused by the registry before any handler):
 
 - `preview.edit`, `preview.discard`, `preview.save`, `preview.save-as`
 - `trash.empty`, `trash.delete-permanently`
+- `drive.mount`, `drive.unmount`, `drive.eject`
 - `agent.set-enabled`
 - unknown commands, unknown/duplicate arguments, context-filled `Files` paths
   that an agent did not supply, and every malformed invocation
 
 There is no generic eval, shell execution or raw config write. Clipboard,
 `Launch` and `System` operations keep their existing policy; `System` is listed
-as not available and refused before dispatch. `drive.mount` is one of those
-operations: its Devices-sidebar Mount action is UI-only, and no socket
-state/query/navigation/startup path can mount a volume. P2p did not add a
-socket command, protocol, or remote mount support.
+as not available and refused before dispatch. `drive.mount`, `drive.unmount` and
+`drive.eject` are those operations: their Devices-sidebar actions are UI-only,
+and no socket state/query/navigation/startup path can mount, unmount or eject a
+volume. P2s did not add a socket command, protocol, or remote drive support.
 
 Remote file operations must use explicit absolute paths. A relative path is
 rejected, never resolved against Gimbal's working directory. A `dry-run=true`
@@ -239,7 +240,7 @@ Documented codes: `malformed`, `unsupported-version`, `unknown-operation`,
 ```toml
 [data]
 offset = 0
-total = 53
+total = 54
 next = 5
 
 [[data.command]]
@@ -255,6 +256,9 @@ kind = "paths"
 presence = "from selection"
 required = true
 ```
+
+`view.clear-folder-sort` is the newest registry entry. It takes no
+arguments, affects the focused tab's folder and is available to every caller.
 
 `state` data:
 

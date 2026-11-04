@@ -518,6 +518,15 @@ pub const COMMANDS: &[CommandSpec] = &[
             },
         ],
     },
+    // Kyle approved removing a folder's sort exception on Nov 4. It acts on
+    // the focused tab's folder and falls back to the global sort.
+    CommandSpec {
+        name: "view.clear-folder-sort",
+        summary: "Clear this folder's sort rule and use the global one.",
+        effect: Effect::Settings,
+        undo: false,
+        arguments: &[],
+    },
     // Kyle approved one Settings key for local automation on Nov 3. It is a
     // UI-only switch: the registry refuses Agent, Cli and Hotkey before any
     // handler or config write. The switch itself is the only caller.
@@ -566,4 +575,57 @@ pub const COMMANDS: &[CommandSpec] = &[
             default: None,
         }],
     },
+    // Kyle approved both on Nov 4. They take the same opaque device id as
+    // drive.mount and stay UI-only through the command's System effect.
+    CommandSpec {
+        name: "drive.unmount",
+        summary: "Unmount a mounted drive.",
+        effect: Effect::System,
+        undo: false,
+        arguments: &[ArgSpec {
+            name: "device",
+            kind: ArgKind::Text,
+            presence: Presence::Required,
+            default: None,
+        }],
+    },
+    CommandSpec {
+        name: "drive.eject",
+        summary: "Eject a mounted drive.",
+        effect: Effect::System,
+        undo: false,
+        arguments: &[ArgSpec {
+            name: "device",
+            kind: ArgKind::Text,
+            presence: Presence::Required,
+            default: None,
+        }],
+    },
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn drive_command(name: &str) -> &'static CommandSpec {
+        COMMANDS
+            .iter()
+            .find(|spec| spec.name == name)
+            .expect("the reviewed drive command")
+    }
+
+    #[test]
+    fn unmount_and_eject_are_system_commands_with_the_opaque_device_argument() {
+        for name in ["drive.unmount", "drive.eject"] {
+            let spec = drive_command(name);
+            assert_eq!(spec.effect, Effect::System);
+            assert!(!spec.undo, "{name} has no undo");
+            assert_eq!(spec.arguments.len(), 1);
+            let argument = &spec.arguments[0];
+            assert_eq!(argument.name, "device");
+            assert!(matches!(argument.kind, ArgKind::Text));
+            assert!(matches!(argument.presence, Presence::Required));
+            assert!(!spec.summary.is_empty());
+        }
+    }
+}

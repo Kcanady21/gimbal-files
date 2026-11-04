@@ -1094,7 +1094,7 @@ impl TrashBrowser {
                 popover.unparent();
             }
         });
-        popover.popup();
+        crate::popup::show(&popover);
     }
 
     fn selected_positions(&self) -> Vec<u32> {

@@ -13,6 +13,7 @@ use fm_core::config::{self, Change, ConfigFile};
 use fm_core::fileops::{Decisions, Plan, Report, Request, TrashIdentity, TrashUri};
 use fm_core::preview::Selection;
 use fm_core::session::{self, SessionProblem};
+use fm_core::volumes::{DriveAction, RemovalFailureKind, RemovalStatus};
 use fm_core::workspace::{Event, Heights, TabId, WindowId, Workspace};
 use gtk::gio;
 use gtk::glib;
@@ -91,6 +92,9 @@ pub struct Process {
     /// The process-wide GIO volume inventory, mount requests and usage
     /// queries. Every window reads this one service.
     volumes: RefCell<Rc<crate::volumes::Volumes>>,
+    /// Mount roots the volume listener saw on its previous notification. A
+    /// root that vanishes relocates every tab and tile under it.
+    known_mount_roots: RefCell<HashSet<PathBuf>>,
     /// Headless bridge tests skip GTK window construction and session saves.
     headless: bool,
     /// Test seam for the Trash page's contextual refusal. Production always
@@ -101,6 +105,10 @@ pub struct Process {
     /// evidence after registry validation.
     #[cfg(test)]
     native_nav_evidence_uses: Cell<usize>,
+    /// Test seam for a dirty preview in a headless process, where no GTK
+    /// PreviewPanel exists. Production reads the real panels only.
+    #[cfg(test)]
+    dirty_preview_overrides: RefCell<Vec<(WindowId, PathBuf, String)>>,
 }
 
 /// Trusted out-of-band navigation evidence. `expected` and `caller` are set for
@@ -122,6 +130,27 @@ impl PendingNav {
                     && matches!(command.get("path"), Some(Value::Path(path)) if path.to_str() == Some(expected.as_str()))
             }
             _ => true,
+        }
+    }
+}
+
+/// The production preflight: refuse when Gimbal itself would keep the drive
+/// busy, otherwise release every handle it holds under that mount root.
+struct ProcessDriveGate {
+    process: std::rc::Weak<Process>,
+}
+
+impl crate::volumes::DriveGate for ProcessDriveGate {
+    fn before_removal(
+        &self,
+        window: WindowId,
+        root: &Path,
+        label: &str,
+        action: DriveAction,
+    ) -> Result<(), String> {
+        match self.process.upgrade() {
+            Some(process) => process.before_drive_removal(window, root, label, action),
+            None => Ok(()),
         }
     }
 }
@@ -255,6 +284,7 @@ impl Process {
         let look = Look::new(scale, opacity, font);
         let workspace = Workspace::with_home(config.home.clone());
         let volumes = crate::volumes::Volumes::production();
+        let known_mount_roots = mounted_roots(&volumes);
         let process_tag = format!(
             "{}-{}",
             std::process::id(),
@@ -293,14 +323,18 @@ impl Process {
             search_in_poll: Cell::new(false),
             clipboard_reader: Rc::new(crate::fileops::clipboard::SystemReader),
             volumes: RefCell::new(volumes),
+            known_mount_roots: RefCell::new(known_mount_roots),
             headless: false,
             #[cfg(test)]
             trash_pages: RefCell::new(BTreeSet::new()),
             #[cfg(test)]
             native_nav_evidence_uses: Cell::new(0),
+            #[cfg(test)]
+            dirty_preview_overrides: RefCell::new(Vec::new()),
         });
         let fileops = FileOps::new(&process);
         *process.fileops.borrow_mut() = Some(fileops);
+        process.install_volume_wiring();
         let weak = Rc::downgrade(&process);
         process.search.set_wake(move || {
             if let Some(process) = weak.upgrade() {
@@ -370,6 +404,7 @@ impl Process {
         session_path: Option<PathBuf>,
     ) -> Rc<Self> {
         let (config_file, _problems) = ConfigFile::load(&config_path);
+        let known_mount_roots = HashSet::new();
         let process = Rc::new(Self {
             application: None,
             config: Rc::new(RefCell::new(config_file)),
@@ -402,12 +437,16 @@ impl Process {
             volumes: RefCell::new(crate::volumes::Volumes::new(Rc::new(
                 crate::volumes::HeadlessBackend,
             ))),
+            known_mount_roots: RefCell::new(known_mount_roots),
             headless: true,
             trash_pages: RefCell::new(BTreeSet::new()),
             native_nav_evidence_uses: Cell::new(0),
+            #[cfg(test)]
+            dirty_preview_overrides: RefCell::new(Vec::new()),
         });
         let fileops = FileOps::new_manual(&process);
         *process.fileops.borrow_mut() = Some(fileops);
+        process.install_volume_wiring();
         let weak = Rc::downgrade(&process);
         process.search.set_wake(move || {
             if let Some(process) = weak.upgrade() {
@@ -596,6 +635,13 @@ impl Process {
         self.native_nav_evidence_uses.get()
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_dirty_preview_for_tests(&self, window: WindowId, path: PathBuf, name: &str) {
+        self.dirty_preview_overrides
+            .borrow_mut()
+            .push((window, path, name.to_string()));
+    }
+
     pub(crate) fn clipboard_reader(&self) -> Rc<dyn crate::fileops::clipboard::Reader> {
         self.clipboard_reader.clone()
     }
@@ -605,8 +651,13 @@ impl Process {
     }
 
     #[cfg(test)]
-    pub(crate) fn install_volumes_for_tests(&self, volumes: Rc<crate::volumes::Volumes>) {
-        *self.volumes.borrow_mut() = volumes;
+    pub(crate) fn install_volumes_for_tests(self: &Rc<Self>, volumes: Rc<crate::volumes::Volumes>) {
+        {
+            let mut slot = self.volumes.borrow_mut();
+            *slot = volumes.clone();
+        }
+        *self.known_mount_roots.borrow_mut() = mounted_roots(&volumes);
+        self.install_volume_wiring();
     }
 
     /// Every model window, cloned for a read-only agent projection.
@@ -2070,6 +2121,263 @@ impl Process {
         }
     }
 
+    /// Connect the one volume service to this process: the synchronous
+    /// preflight/release gate, mount-root relocation on every inventory change,
+    /// and terminal unmount/eject summaries.
+    fn install_volume_wiring(self: &Rc<Self>) {
+        let volumes = self.volumes();
+        volumes.set_gate(Rc::new(ProcessDriveGate {
+            process: Rc::downgrade(self),
+        }));
+
+        let weak = Rc::downgrade(self);
+        volumes.listen(Rc::new(move || {
+            if let Some(process) = weak.upgrade() {
+                process.volume_inventory_changed();
+                true
+            } else {
+                false
+            }
+        }));
+
+        let weak = Rc::downgrade(self);
+        volumes.listen_removal(Rc::new(move |notice| {
+            if let Some(process) = weak.upgrade() {
+                process.removal_notice(notice);
+                true
+            } else {
+                false
+            }
+        }));
+    }
+
+    fn volume_inventory_changed(self: &Rc<Self>) {
+        let current = mounted_roots(&self.volumes());
+        let removed: Vec<PathBuf> = {
+            let known = self.known_mount_roots.borrow();
+            known.difference(&current).cloned().collect()
+        };
+        *self.known_mount_roots.borrow_mut() = current;
+        for root in removed {
+            let home = self.home();
+            let (relocations, windows) = {
+                let mut workspace = self.workspace.borrow_mut();
+                let relocations =
+                    workspace.relocate_removed_mount(&root, &home, |path| path.is_dir());
+                let windows: BTreeSet<WindowId> =
+                    relocations.iter().map(|moved| moved.window).collect();
+                (relocations, windows)
+            };
+            for moved in &relocations {
+                crate::log!(
+                    "volumes",
+                    "relocated tab {} of window {} from {} to {} after {} disappeared",
+                    moved.tab,
+                    moved.window,
+                    moved.from.display(),
+                    moved.to.display(),
+                    root.display()
+                );
+            }
+            if !relocations.is_empty() {
+                self.schedule_save();
+            }
+            for window in windows {
+                self.refresh(window, false);
+            }
+        }
+    }
+
+    fn before_drive_removal(
+        self: &Rc<Self>,
+        window: WindowId,
+        root: &Path,
+        label: &str,
+        action: DriveAction,
+    ) -> Result<(), String> {
+        if self
+            .fileops()
+            .is_some_and(|fileops| fileops.touches_root(root))
+        {
+            let message = format!(
+                "{label} is in use by a file operation. Wait for it to finish or cancel it."
+            );
+            crate::log!(
+                "volumes",
+                "refused to {} {} for window {window}: {message}",
+                action,
+                label
+            );
+            return Err(message);
+        }
+
+        let windows: Vec<(WindowId, Rc<WindowUi>)> = self
+            .windows
+            .borrow()
+            .iter()
+            .map(|(id, ui)| (*id, ui.clone()))
+            .collect();
+        for (_, ui) in &windows {
+            if let Some(name) = ui.preview().dirty_file_name_under(root) {
+                let message = format!("Save or discard the changes to “{name}” first");
+                crate::log!(
+                    "volumes",
+                    "refused to {} {} for window {window}: {message}",
+                    action,
+                    label
+                );
+                return Err(message);
+            }
+        }
+        #[cfg(test)]
+        if let Some((_, _, name)) = self
+            .dirty_preview_overrides
+            .borrow()
+            .iter()
+            .find(|(_, path, _)| path.starts_with(root))
+        {
+            let message = format!("Save or discard the changes to “{name}” first");
+            crate::log!(
+                "volumes",
+                "refused to {} {} for window {window}: {message}",
+                action,
+                label
+            );
+            return Err(message);
+        }
+
+        // Gimbal must not be its own blocker. Release every handle it holds
+        // under this mount before the backend is asked to unmount it.
+        crate::folder::size::release_root(root);
+        crate::log!(
+            "volumes",
+            "released folder-size walks under {}",
+            root.display()
+        );
+
+        let closed = self.search.cancel_under(root);
+        for search_window in &closed {
+            if let Some(ui) = self.window(*search_window) {
+                ui.search_revoked();
+            }
+        }
+        crate::log!(
+            "volumes",
+            "released {} search session(s) under {}",
+            closed.len(),
+            root.display()
+        );
+
+        let mut released_views = 0;
+        for (_, ui) in &windows {
+            released_views += ui.release_root(root);
+        }
+        crate::log!(
+            "volumes",
+            "released {} folder view(s), thumbnail queue(s) and preview load(s) under {}",
+            released_views,
+            root.display()
+        );
+        Ok(())
+    }
+
+    fn removal_notice(self: &Rc<Self>, notice: &crate::volumes::RemovalNotice) {
+        match &notice.status {
+            RemovalStatus::Ejected => {
+                if let Some(ui) = self.window(notice.window) {
+                    ui.show_summary(&format!("{} can be removed safely", notice.label), None);
+                }
+            }
+            RemovalStatus::Failed {
+                action,
+                kind,
+                detail,
+            } => {
+                // A terminal failure means the drive stays mounted. Rebuild
+                // any listing the release step dropped so the row and tabs are
+                // usable again.
+                self.refresh_all_windows();
+                if *kind == RemovalFailureKind::Handled {
+                    return;
+                }
+                if *kind == RemovalFailureKind::Cancelled {
+                    crate::log!(
+                        "volumes",
+                        "{} of {} was cancelled: {detail}",
+                        action,
+                        notice.label
+                    );
+                }
+                let text = if *kind == RemovalFailureKind::Busy {
+                    format!("{} is busy: another app is using files on it", notice.label)
+                } else {
+                    kind.short(*action).to_string()
+                };
+                if !text.is_empty()
+                    && let Some(ui) = self.window(notice.window)
+                {
+                    ui.show_summary(&text, None);
+                }
+            }
+            RemovalStatus::Pending(_) | RemovalStatus::Unmounted => {}
+        }
+    }
+
+    fn refresh_all_windows(self: &Rc<Self>) {
+        let windows: Vec<WindowId> = self.windows.borrow().keys().copied().collect();
+        for window in windows {
+            self.refresh(window, false);
+        }
+    }
+
+    fn remove_device(
+        self: &Rc<Self>,
+        window: WindowId,
+        command: &CheckedCommand,
+        action: DriveAction,
+    ) -> Outcome {
+        let Some(device) = argument_text(command, "device") else {
+            return Outcome::Failed(format!("{} needs a volume id", action.command()));
+        };
+        let volumes = self.volumes();
+        let target = match volumes.removal_target(&device, action) {
+            Ok(target) => target,
+            Err(refusal) => {
+                let message = format!("cannot {}: {refusal}", action);
+                if let Some(ui) = self.window(window) {
+                    ui.show_summary(&message, None);
+                }
+                return Outcome::Failed(message);
+            }
+        };
+        let parent: Option<gtk::Window> = self
+            .window(window)
+            .map(|ui| ui.window().clone().upcast::<gtk::Window>());
+        match volumes.remove(window, target, parent.as_ref()) {
+            crate::volumes::RemovalBegin::Pending => Outcome::Done,
+            crate::volumes::RemovalBegin::AlreadyPending => {
+                let message = format!("{} is already running", action.pending_text());
+                if let Some(ui) = self.window(window) {
+                    ui.show_summary(&message, None);
+                }
+                Outcome::Failed(message)
+            }
+            crate::volumes::RemovalBegin::Busy => {
+                let message = "Gimbal is already handling four drive operations".to_string();
+                if let Some(ui) = self.window(window) {
+                    ui.show_summary(&message, None);
+                }
+                Outcome::Failed(message)
+            }
+            crate::volumes::RemovalBegin::Refused(message) => {
+                if let Some(ui) = self.window(window) {
+                    ui.show_summary(&message, None);
+                }
+                Outcome::Failed(message)
+            }
+        }
+    }
+
     fn mount_device(self: &Rc<Self>, window: WindowId, command: &CheckedCommand) -> Outcome {
         let Some(device) = argument_text(command, "device") else {
             return Outcome::Failed("drive.mount needs a volume id".to_string());
@@ -2178,10 +2486,39 @@ impl Process {
                 }
                 crate::log!("pins", "the sidebars follow the config");
             }
-            Change::SetSort { folder, .. } => {
+            Change::SetSort { folder, by, order } => {
+                match folder {
+                    Some(folder) => crate::log!(
+                        "sort",
+                        "scope folder folder {} rule {} {}",
+                        folder.display(),
+                        by.as_str(),
+                        order.as_str()
+                    ),
+                    None => crate::log!(
+                        "sort",
+                        "scope global folder all rule {} {}",
+                        by.as_str(),
+                        order.as_str()
+                    ),
+                }
                 let windows: Vec<Rc<WindowUi>> = self.windows.borrow().values().cloned().collect();
                 for ui in windows {
                     ui.sort_changed(folder.as_deref());
+                }
+            }
+            Change::ClearFolderSort { folder } => {
+                let global = self.config.borrow().config().sort.global();
+                crate::log!(
+                    "sort",
+                    "scope folder folder {} rule global {} {}",
+                    folder.display(),
+                    global.by.as_str(),
+                    global.order.as_str()
+                );
+                let windows: Vec<Rc<WindowUi>> = self.windows.borrow().values().cloned().collect();
+                for ui in windows {
+                    ui.sort_changed(Some(folder));
                 }
             }
             other => crate::log!("command", "change applied: {other:?}"),
@@ -2302,6 +2639,8 @@ impl Process {
                 };
             }
             "drive.mount" => return self.mount_device(window, command),
+            "drive.unmount" => return self.remove_device(window, command, DriveAction::Unmount),
+            "drive.eject" => return self.remove_device(window, command, DriveAction::Eject),
             _ => {}
         }
 
@@ -3244,6 +3583,15 @@ fn argument_paths(command: &CheckedCommand, name: &str) -> Option<Vec<PathBuf>> 
     }
 }
 
+fn mounted_roots(volumes: &crate::volumes::Volumes) -> HashSet<PathBuf> {
+    volumes
+        .entries()
+        .iter()
+        .filter_map(|entry| entry.state().root().map(Path::to_path_buf))
+        .filter(|root| root != Path::new("/"))
+        .collect()
+}
+
 fn argument_text(command: &CheckedCommand, name: &str) -> Option<String> {
     match command.get(name) {
         Some(Value::Text(text)) => Some(text.clone()),
@@ -3748,11 +4096,15 @@ mod tests {
             volumes: RefCell::new(crate::volumes::Volumes::new(Rc::new(
                 crate::volumes::HeadlessBackend,
             ))),
+            known_mount_roots: RefCell::new(HashSet::new()),
             headless: false,
             trash_pages: RefCell::new(BTreeSet::new()),
             native_nav_evidence_uses: Cell::new(0),
+            #[cfg(test)]
+            dirty_preview_overrides: RefCell::new(Vec::new()),
         });
         *process.fileops.borrow_mut() = Some(FileOps::new_manual(&process));
+        process.install_volume_wiring();
         let weak = Rc::downgrade(&process);
         process.search.set_wake(move || {
             if let Some(process) = weak.upgrade() {
@@ -5056,6 +5408,60 @@ mod tests {
             "the mounted row shows its real usage bar: {camera_snapshot:?}"
         );
 
+        // A mounted row's real context menu offers the reviewed actions. The
+        // pending row swaps them for Cancel, and success returns it to the
+        // unmounted state with no bar.
+        let menu_labels = |buttons: &[gtk::Button]| -> Vec<String> {
+            buttons
+                .iter()
+                .filter_map(|button| {
+                    button
+                        .child()
+                        .and_then(|child| child.downcast::<gtk::Label>().ok())
+                        .map(|label| label.text().to_string())
+                })
+                .collect()
+        };
+        let (_menu, buttons) = sidebar
+            .build_mounted_menu_for_tests(camera.id().as_str())
+            .expect("the mounted Camera row has a menu");
+        assert!(menu_labels(&buttons).contains(&"Unmount".to_string()));
+        assert!(menu_labels(&buttons).contains(&"Eject".to_string()));
+        let unmount = buttons
+            .iter()
+            .find(|button| {
+                button
+                    .child()
+                    .and_then(|child| child.downcast::<gtk::Label>().ok())
+                    .is_some_and(|label| label.text() == "Unmount")
+            })
+            .expect("Unmount follows can_unmount");
+        unmount.emit_clicked();
+        let pending_unmount = sidebar
+            .device_snapshot_for_tests(camera.id().as_str())
+            .expect("Camera widget row");
+        assert_eq!(pending_unmount.1, "Unmounting…");
+        assert!(!pending_unmount.2);
+        assert!(pending_unmount.3, "the pending row offers Cancel");
+        let (_menu, pending_buttons) = sidebar
+            .build_mounted_menu_for_tests(camera.id().as_str())
+            .expect("the pending mounted row has a menu");
+        assert!(
+            menu_labels(&pending_buttons)
+                .iter()
+                .any(|label| label == "Cancel"),
+            "the pending menu offers Cancel instead of Unmount/Eject"
+        );
+
+        backend.set_unmounted(camera_object);
+        backend.complete_removal(camera.id(), Ok(()));
+        volumes.refresh_for_tests();
+        let unmounted = sidebar
+            .device_snapshot_for_tests(camera.id().as_str())
+            .expect("Camera widget row");
+        assert_eq!(unmounted.1, "Not mounted");
+        assert!(!unmounted.2, "success removes the usage bar");
+
         // The real context-menu button carries the opaque volume id into the
         // one registry command. No second runner is involved.
         let (_popover, mount) = sidebar
@@ -5379,5 +5785,322 @@ mod tests {
         process.open_recent_folder(b, missing);
         assert_eq!(process.windows_snapshot(), before);
         assert_eq!(process.recent_dirs(), recent);
+    }
+    fn write_sized(path: &Path, size: usize) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("fixture parent");
+        }
+        std::fs::write(path, vec![b'x'; size]).expect("fixture");
+    }
+
+    fn added_tab(events: &[Event]) -> TabId {
+        events
+            .iter()
+            .find_map(|event| match event {
+                Event::TabAdded { tab, .. } => Some(*tab),
+                _ => None,
+            })
+            .expect("the tab that was just added")
+    }
+
+    fn wait_for_names(
+        process: &Rc<Process>,
+        ui: &Rc<WindowUi>,
+        context: &glib::MainContext,
+        window: WindowId,
+        tab: TabId,
+        expected: &[&str],
+    ) {
+        process.focus_tab(window, tab);
+        let expected: Vec<OsString> = expected.iter().map(OsString::from).collect();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut last = Vec::new();
+        while std::time::Instant::now() < deadline {
+            context.iteration(false);
+            last = ui.content().listed_names();
+            if last == expected {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        panic!("tile {tab:?} never showed {expected:?}; it showed {last:?}");
+    }
+
+    /// P2r item 3 in its own process: the real Settings command re-sorts both
+    /// tiles on the focused folder, leaves another folder alone, and a global
+    /// change touches every tile but keeps the folder override.
+    #[test]
+    fn real_split_view_keeps_per_folder_sort_through_dispatch() {
+        let executable = std::env::current_exe().expect("the test executable");
+        let output = std::process::Command::new(executable)
+            .args([
+                "--exact",
+                "app::tests::real_split_view_keeps_per_folder_sort_through_dispatch_inner",
+                "--ignored",
+                "--nocapture",
+            ])
+            .output()
+            .expect("the owned sort widget process");
+        assert!(
+            output.status.success(),
+            "the split sort regression failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    #[ignore = "runs in its own process through the subprocess widget regression"]
+    fn real_split_view_keeps_per_folder_sort_through_dispatch_inner() {
+        let _guard = gtk_test_lock();
+        gtk::init().expect("the sort regression needs a GTK display");
+        adw::init().expect("libadwaita init");
+
+        let context = glib::MainContext::default();
+        let scratch = search_scratch("gtk-sort-split");
+        let downloads = scratch.root.join("downloads");
+        let documents = scratch.root.join("documents");
+        for (name, size) in [("a.txt", 10), ("b.txt", 30), ("c.txt", 20)] {
+            write_sized(&downloads.join(name), size);
+            write_sized(&documents.join(name), size);
+        }
+        let config_text = format!(
+            r#"[sort]
+by = "size"
+order = "descending"
+folders-first = true
+
+[[sort.folder]]
+path = "{}"
+by = "name"
+order = "descending"
+"#,
+            downloads.display()
+        );
+        std::fs::write(scratch.root.join("config.toml"), config_text).expect("sort config");
+
+        let application = adw::Application::builder()
+            .application_id("org.gimbal.Files.SortSplitTest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        application
+            .register(None::<&gio::Cancellable>)
+            .expect("register the owned non-unique test application");
+        let runtime = Rc::new(crate::search::SearchRuntime::with_service(Arc::new(
+            crate::search::SearchService::new(),
+        )));
+        let process = gtk_search_process(&scratch, &application, runtime);
+        let window = seed_gtk_window(&process, downloads.clone());
+        let ui = process.window(window).expect("real window");
+        let first = process.window_snapshot(window).expect("window").focused_tab;
+
+        let events = {
+            let mut workspace = process.workspace.borrow_mut();
+            workspace
+                .tab_new(Some(downloads.clone()))
+                .expect("second Downloads tab")
+        };
+        let second = added_tab(&events);
+        process.apply_events(&events);
+        let events = {
+            let mut workspace = process.workspace.borrow_mut();
+            workspace
+                .tab_new(Some(documents.clone()))
+                .expect("Documents tab")
+        };
+        let third = added_tab(&events);
+        process.apply_events(&events);
+        let events = {
+            let mut workspace = process.workspace.borrow_mut();
+            let mut events = workspace.pill_ctrl_click(0).expect("select first");
+            events.extend(workspace.pill_ctrl_click(1).expect("select second"));
+            events.extend(workspace.pill_ctrl_click(2).expect("select third"));
+            events.extend(workspace.group_split().expect("split all three tabs"));
+            events
+        };
+        process.apply_events(&events);
+        assert!(
+            process
+                .window_snapshot(window)
+                .expect("window")
+                .groups
+                .values()
+                .any(fm_core::workspace::Group::is_split)
+        );
+
+        wait_for_names(
+            &process,
+            &ui,
+            &context,
+            window,
+            first,
+            &["c.txt", "b.txt", "a.txt"],
+        );
+        wait_for_names(
+            &process,
+            &ui,
+            &context,
+            window,
+            second,
+            &["c.txt", "b.txt", "a.txt"],
+        );
+        wait_for_names(
+            &process,
+            &ui,
+            &context,
+            window,
+            third,
+            &["b.txt", "c.txt", "a.txt"],
+        );
+
+        process.focus_tab(window, first);
+        process.dispatch_for_window(
+            window,
+            Caller::Ui,
+            Invocation::new(
+                "view.set-sort",
+                vec![
+                    ("by".to_string(), "name".to_string()),
+                    ("order".to_string(), "ascending".to_string()),
+                    ("scope".to_string(), "folder".to_string()),
+                ],
+            ),
+        );
+        let config = process.config.borrow().config().clone();
+        assert_eq!(
+            config.sort_for(&downloads),
+            fm_core::config::SortRule {
+                by: fm_core::config::SortBy::Name,
+                order: fm_core::config::SortOrder::Ascending,
+                folders_first: true,
+            }
+        );
+        wait_for_names(
+            &process,
+            &ui,
+            &context,
+            window,
+            first,
+            &["a.txt", "b.txt", "c.txt"],
+        );
+        wait_for_names(
+            &process,
+            &ui,
+            &context,
+            window,
+            second,
+            &["a.txt", "b.txt", "c.txt"],
+        );
+        wait_for_names(
+            &process,
+            &ui,
+            &context,
+            window,
+            third,
+            &["b.txt", "c.txt", "a.txt"],
+        );
+
+        process.focus_tab(window, first);
+        process.dispatch_for_window(
+            window,
+            Caller::Ui,
+            Invocation::new(
+                "view.set-sort",
+                vec![
+                    ("by".to_string(), "size".to_string()),
+                    ("order".to_string(), "ascending".to_string()),
+                    ("scope".to_string(), "global".to_string()),
+                ],
+            ),
+        );
+        let config = process.config.borrow().config().clone();
+        assert_eq!(
+            config.sort_for(&downloads),
+            fm_core::config::SortRule {
+                by: fm_core::config::SortBy::Name,
+                order: fm_core::config::SortOrder::Ascending,
+                folders_first: true,
+            },
+            "a global change keeps the Downloads override"
+        );
+        assert_eq!(
+            (
+                config.sort_for(&documents).by,
+                config.sort_for(&documents).order
+            ),
+            (
+                fm_core::config::SortBy::Size,
+                fm_core::config::SortOrder::Ascending
+            ),
+            "Documents has no override and follows the global change"
+        );
+        wait_for_names(
+            &process,
+            &ui,
+            &context,
+            window,
+            first,
+            &["a.txt", "b.txt", "c.txt"],
+        );
+        wait_for_names(
+            &process,
+            &ui,
+            &context,
+            window,
+            second,
+            &["a.txt", "b.txt", "c.txt"],
+        );
+        wait_for_names(
+            &process,
+            &ui,
+            &context,
+            window,
+            third,
+            &["a.txt", "c.txt", "b.txt"],
+        );
+
+        // Clearing the focused folder's override re-sorts both of its tiles
+        // back to the global rule, leaving the other folder alone.
+        process.focus_tab(window, first);
+        process.dispatch_for_window(
+            window,
+            Caller::Ui,
+            Invocation::new("view.clear-folder-sort", Vec::new()),
+        );
+        let config = process.config.borrow().config().clone();
+        assert!(!config.has_folder_sort(&downloads));
+        assert_eq!(config.sort_for(&downloads), config.sort.global());
+        assert_eq!(
+            (config.sort.global().by, config.sort.global().order),
+            (
+                fm_core::config::SortBy::Size,
+                fm_core::config::SortOrder::Ascending
+            ),
+            "clearing the folder rule must not change the global rule"
+        );
+        wait_for_names(
+            &process,
+            &ui,
+            &context,
+            window,
+            first,
+            &["a.txt", "c.txt", "b.txt"],
+        );
+        wait_for_names(
+            &process,
+            &ui,
+            &context,
+            window,
+            second,
+            &["a.txt", "c.txt", "b.txt"],
+        );
+        wait_for_names(
+            &process,
+            &ui,
+            &context,
+            window,
+            third,
+            &["a.txt", "c.txt", "b.txt"],
+        );
     }
 }

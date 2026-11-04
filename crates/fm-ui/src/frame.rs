@@ -4,7 +4,7 @@
 //! process and sends commands back through it.
 
 use std::cell::{Cell, RefCell};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::{Rc, Weak};
 
 use adw::prelude::*;
@@ -370,6 +370,21 @@ impl WindowUi {
         self.header.rebuild(self, fade);
     }
 
+    /// Release every Gimbal handle under one mount root before the volume
+    /// service is asked to unmount it. Returns the number of folder views
+    /// whose listing was dropped.
+    pub fn release_root(&self, root: &Path) -> usize {
+        let released = self.content.release_root(root);
+        if self.preview.release_root(root) {
+            crate::log!(
+                "volumes",
+                "released preview loads and monitors under {}",
+                root.display()
+            );
+        }
+        released
+    }
+
     pub fn update_content(&self) {
         if self.content.search_active() {
             // The search page owns the visible content and the preview's exact
@@ -633,6 +648,7 @@ impl WindowUi {
 
     pub fn sort_changed(&self, folder: Option<&std::path::Path>) {
         self.content.refresh_sort(folder);
+        self.header.refresh_sort_menu();
     }
 
     pub fn cancel_split_drag(&self) -> bool {

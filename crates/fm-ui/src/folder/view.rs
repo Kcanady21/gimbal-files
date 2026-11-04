@@ -619,6 +619,38 @@ impl FolderView {
         self.dir_list.set_file(Some(&gio::File::for_path(&folder)));
     }
 
+    /// Drop this view's folder monitor, thumbnail demand and folder-size walk
+    /// when its folder is under a mount that is about to be unmounted. The
+    /// relocation or a terminal-failure refresh gives it a new folder.
+    pub fn release_root(&self, root: &Path) -> bool {
+        let Some(current) = self.current.borrow().clone() else {
+            self.cancel_size_all();
+            self.cancel_all_thumbnails();
+            self.thumbnails.borrow().release_root(root);
+            return false;
+        };
+        if !current.starts_with(root) {
+            return false;
+        }
+        self.cancel_size_all();
+        self.cancel_all_thumbnails();
+        self.thumbnails.borrow().release_root(root);
+        self.dir_list.set_file(None::<&gio::File>);
+        *self.current.borrow_mut() = None;
+        self.loaded.set(false);
+        *self.cell_bindings.borrow_mut() = HashMap::new();
+        *self.cell_positions.borrow_mut() = Vec::new();
+        self.wanted.borrow_mut().clear();
+        self.counts.set((0, 0));
+        crate::log!(
+            "folder",
+            "released listing and handles under {} for {}",
+            root.display(),
+            current.display()
+        );
+        true
+    }
+
     /// Re-read the current folder, keeping the selection and the top item.
     pub fn reload(&self) {
         let Some(folder) = self.current.borrow().clone() else {

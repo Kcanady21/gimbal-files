@@ -15,7 +15,7 @@ use gtk::gio;
 use gtk::glib;
 use gtk::prelude::*;
 
-use fm_core::volumes::{MountTarget, RawMount, RawSnapshot, RawVolume};
+use fm_core::volumes::{MountTarget, RawMount, RawSnapshot, RawVolume, RemovalTarget};
 
 use super::{Backend, MountDone, UsageDone};
 
@@ -82,6 +82,23 @@ impl GioBackend {
         })
     }
 
+    fn existing_mount_serial(&self, mount: &gio::Mount) -> Option<u64> {
+        let key = mount.as_ptr() as usize;
+        let serials = self.mount_serials.borrow();
+        serials.get(&key).and_then(|(weak, serial)| {
+            weak.upgrade()
+                .is_some_and(|live| live == *mount)
+                .then_some(*serial)
+        })
+    }
+
+    fn find_mount(&self, serial: u64) -> Option<gio::Mount> {
+        self.monitor
+            .mounts()
+            .into_iter()
+            .find(|mount| self.existing_mount_serial(mount) == Some(serial))
+    }
+
     fn raw_mount(&self, mount: &gio::Mount, volume: Option<&gio::Volume>) -> RawMount {
         let root = mount
             .root()
@@ -105,6 +122,8 @@ impl GioBackend {
                     .and_then(|volume| volume.uuid())
                     .map(|value| value.to_string())
             }),
+            can_unmount: mount.can_unmount(),
+            can_eject: mount.can_eject(),
         }
     }
 }
@@ -180,6 +199,78 @@ impl Backend for GioBackend {
         let keep = operation.clone();
         volume.mount(
             gio::MountMountFlags::NONE,
+            Some(&operation),
+            Some(cancellable),
+            move |result| {
+                drop(keep);
+                done(result);
+            },
+        );
+        Ok(Some(operation.upcast()))
+    }
+
+    fn unmount(
+        &self,
+        target: &RemovalTarget,
+        parent: Option<&gtk::Window>,
+        cancellable: &gio::Cancellable,
+        done: MountDone,
+    ) -> Result<Option<gio::MountOperation>, glib::Error> {
+        let mount = self.find_mount(target.mount_object()).ok_or_else(|| {
+            glib::Error::new(gio::IOErrorEnum::NotFound, "the mount is no longer present")
+        })?;
+        if !mount.can_unmount() {
+            return Err(glib::Error::new(
+                gio::IOErrorEnum::NotSupported,
+                "the volume service does not offer to unmount this mount",
+            ));
+        }
+        let Some(parent) = parent else {
+            return Err(glib::Error::new(
+                gio::IOErrorEnum::Failed,
+                "the window needed for authentication is gone",
+            ));
+        };
+        let operation = gtk::MountOperation::new(Some(parent));
+        let keep = operation.clone();
+        mount.unmount_with_operation(
+            gio::MountUnmountFlags::NONE,
+            Some(&operation),
+            Some(cancellable),
+            move |result| {
+                drop(keep);
+                done(result);
+            },
+        );
+        Ok(Some(operation.upcast()))
+    }
+
+    fn eject(
+        &self,
+        target: &RemovalTarget,
+        parent: Option<&gtk::Window>,
+        cancellable: &gio::Cancellable,
+        done: MountDone,
+    ) -> Result<Option<gio::MountOperation>, glib::Error> {
+        let mount = self.find_mount(target.mount_object()).ok_or_else(|| {
+            glib::Error::new(gio::IOErrorEnum::NotFound, "the mount is no longer present")
+        })?;
+        if !mount.can_eject() {
+            return Err(glib::Error::new(
+                gio::IOErrorEnum::NotSupported,
+                "the volume service does not offer to eject this mount",
+            ));
+        }
+        let Some(parent) = parent else {
+            return Err(glib::Error::new(
+                gio::IOErrorEnum::Failed,
+                "the window needed for authentication is gone",
+            ));
+        };
+        let operation = gtk::MountOperation::new(Some(parent));
+        let keep = operation.clone();
+        mount.eject_with_operation(
+            gio::MountUnmountFlags::NONE,
             Some(&operation),
             Some(cancellable),
             move |result| {

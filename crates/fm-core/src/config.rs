@@ -531,6 +531,17 @@ impl Config {
             self.sort.global()
         }
     }
+
+    /// Whether this folder has an exception of its own. The last matching
+    /// entry is the effective one, exactly as `sort_for` chooses it.
+    pub fn has_folder_sort(&self, folder: &Path) -> bool {
+        let target = normalize_path(&expand_home(folder, &self.home));
+        self.sort
+            .folders
+            .iter()
+            .rev()
+            .any(|rule| normalize_path(&expand_home(&rule.folder, &self.home)) == target)
+    }
 }
 
 /// The default hotkeys from the brief. Commands that need typed input get no
@@ -599,6 +610,10 @@ pub enum Change {
         folder: Option<PathBuf>,
         by: SortBy,
         order: SortOrder,
+    },
+    /// Remove one folder's sort exception so it falls back to the global rule.
+    ClearFolderSort {
+        folder: PathBuf,
     },
     SetAgentEnabled(bool),
 }
@@ -826,6 +841,18 @@ impl ConfigFile {
     /// Update the in-memory config and the parsed document, then save. A file
     /// that did not parse is never written.
     pub fn apply(&mut self, change: Change) -> Result<(), ApplyError> {
+        // Clearing a folder that has no exception is a true no-op: no in-memory
+        // change, no document edit and no write.
+        if let Change::ClearFolderSort { folder } = &change {
+            let target = normalize_path(&expand_home(folder, &self.config.home));
+            let exists = self.config.sort.folders.iter().any(|rule| {
+                normalize_path(&expand_home(&rule.folder, &self.config.home)) == target
+            });
+            if !exists {
+                return Ok(());
+            }
+        }
+
         apply_to_config(&mut self.config, &change);
 
         let Self {
@@ -953,6 +980,9 @@ pub fn change_for(
                 _ => None,
             }
         }
+        "view.clear-folder-sort" => Some(Change::ClearFolderSort {
+            folder: current_folder.to_path_buf(),
+        }),
         "pins.add" => command
             .get("path")
             .and_then(path_argument)
@@ -1836,6 +1866,14 @@ fn apply_to_config(config: &mut Config, change: &Change) {
                 }
             }
         }
+        Change::ClearFolderSort { folder } => {
+            let target = normalize_path(&expand_home(folder, &config.home));
+            if let Some(index) = config.sort.folders.iter().rposition(|rule| {
+                normalize_path(&expand_home(&rule.folder, &config.home)) == target
+            }) {
+                config.sort.folders.remove(index);
+            }
+        }
         Change::SetAgentEnabled(enabled) => config.agent.enabled = *enabled,
     }
 }
@@ -1969,6 +2007,53 @@ fn apply_to_document(document: &mut DocumentMut, change: &Change, config: &Confi
                         set_inline_value(table, "order", Value::from(order.as_str()));
                     } else {
                         array.push(Value::InlineTable(folder_sort_inline(&name, *by, *order)));
+                    }
+                }
+                _ => {}
+            }
+        }
+        Change::ClearFolderSort { folder } => {
+            let target = normalize_path(&expand_home(folder, &config.home));
+            let sort = ensure_table(document, "sort");
+            let Some(item) = sort.get_mut("folder") else {
+                return;
+            };
+            match item {
+                Item::ArrayOfTables(tables) => {
+                    let index = (0..tables.len()).rev().find(|index| {
+                        tables
+                            .get(*index)
+                            .and_then(|table| table.get("path"))
+                            .and_then(Item::as_value)
+                            .and_then(toml_edit::Value::as_str)
+                            .map(|text| {
+                                normalize_path(&expand_home(Path::new(text), &config.home))
+                                    == target
+                            })
+                            .unwrap_or(false)
+                    });
+                    if let Some(index) = index {
+                        tables.remove(index);
+                    }
+                }
+                Item::Value(value) => {
+                    let Some(array) = value.as_array_mut() else {
+                        return;
+                    };
+                    let index = (0..array.len()).rev().find(|index| {
+                        array
+                            .get(*index)
+                            .and_then(toml_edit::Value::as_inline_table)
+                            .and_then(|table| table.get("path"))
+                            .and_then(toml_edit::Value::as_str)
+                            .map(|text| {
+                                normalize_path(&expand_home(Path::new(text), &config.home))
+                                    == target
+                            })
+                            .unwrap_or(false)
+                    });
+                    if let Some(index) = index {
+                        array.remove(index);
                     }
                 }
                 _ => {}
@@ -2844,6 +2929,147 @@ folders-first = true
         );
     }
 
+    #[test]
+    fn clearing_a_folder_rule_matches_both_path_forms_and_falls_back_to_global() {
+        let temp = TempDir::new("sort-clear-paths");
+        let home = temp.path();
+        let path = temp.write(
+            "config.toml",
+            r#"[sort]
+by = "size"
+order = "descending"
+
+[[sort.folder]]
+path = "~/Downloads"
+by = "modified"
+order = "descending"
+"#,
+        );
+        let (mut file, problems) = ConfigFile::load_with(&path, home, &SpecialFolders::default());
+        assert!(problems.is_empty(), "{problems:?}");
+        let downloads = home.join("Downloads");
+        assert_eq!(
+            file.config().sort_for(&downloads),
+            SortRule {
+                by: SortBy::Modified,
+                order: SortOrder::Descending,
+                folders_first: true,
+            }
+        );
+
+        // The file wrote `~/Downloads`; clear it from the absolute path.
+        file.apply(Change::ClearFolderSort {
+            folder: downloads.clone(),
+        })
+        .expect("clears");
+        assert_eq!(
+            file.config().sort_for(&downloads),
+            file.config().sort.global()
+        );
+        assert!(file.config().sort.folders.is_empty());
+        assert!(
+            !fs::read_to_string(&path)
+                .expect("read")
+                .contains("[[sort.folder]]")
+        );
+
+        // The other way round: write the absolute path, clear through `~`.
+        file.apply(Change::SetSort {
+            folder: Some(downloads.clone()),
+            by: SortBy::Modified,
+            order: SortOrder::Descending,
+        })
+        .expect("writes");
+        let saved = fs::read_to_string(&path).expect("read");
+        assert!(saved.contains(&format!("path = \"{}\"", downloads.display())));
+        file.apply(Change::ClearFolderSort {
+            folder: PathBuf::from("~/Downloads"),
+        })
+        .expect("clears through home");
+        assert_eq!(
+            file.config().sort_for(&downloads),
+            file.config().sort.global()
+        );
+        assert!(file.config().sort.folders.is_empty());
+    }
+
+    #[test]
+    fn clearing_a_missing_folder_rule_writes_nothing() {
+        let temp = TempDir::new("sort-clear-missing");
+        let home = temp.path();
+        let path = temp.write(
+            "config.toml",
+            "# untouched\n[sort]\nby = \"name\"\norder = \"ascending\"\n",
+        );
+        let before = fs::read_to_string(&path).expect("read");
+        let (mut file, problems) = ConfigFile::load_with(&path, home, &SpecialFolders::default());
+        assert!(problems.is_empty(), "{problems:?}");
+
+        file.apply(Change::ClearFolderSort {
+            folder: home.join("Downloads"),
+        })
+        .expect("a no-op is not an error");
+
+        assert_eq!(fs::read_to_string(&path).expect("read"), before);
+        assert!(file.config().sort.folders.is_empty());
+    }
+
+    #[test]
+    fn clearing_one_folder_rule_keeps_the_rest_of_the_file_byte_for_byte() {
+        let temp = TempDir::new("sort-clear-bytes");
+        let home = temp.path();
+        let text = r#"# keep this comment
+[look]
+scale = 0.90     # keep
+
+[sort]
+by = "name"       # global
+order = "ascending"
+folders-first = true
+
+[[sort.folder]]
+path = "~/Downloads"
+by = "modified"
+order = "descending"
+
+[[sort.folder]]
+path = "/tmp/gimbal-other"   # keep this rule
+by = "size"
+order = "ascending"
+"#;
+        let path = temp.write("config.toml", text);
+        let (mut file, problems) = ConfigFile::load_with(&path, home, &SpecialFolders::default());
+        assert!(problems.is_empty(), "{problems:?}");
+
+        file.apply(Change::ClearFolderSort {
+            folder: home.join("Downloads"),
+        })
+        .expect("clears");
+
+        let expected = r#"# keep this comment
+[look]
+scale = 0.90     # keep
+
+[sort]
+by = "name"       # global
+order = "ascending"
+folders-first = true
+
+[[sort.folder]]
+path = "/tmp/gimbal-other"   # keep this rule
+by = "size"
+order = "ascending"
+"#;
+        assert_eq!(fs::read_to_string(&path).expect("read"), expected);
+        let (reloaded, problems) = ConfigFile::load_with(&path, home, &SpecialFolders::default());
+        assert!(problems.is_empty(), "{problems:?}");
+        assert_eq!(reloaded.config().sort.folders.len(), 1);
+        assert_eq!(
+            reloaded.config().sort_for(&home.join("Downloads")),
+            reloaded.config().sort.global()
+        );
+    }
+
     // ---------------------------------------------------------------------
     // Commands
     // ---------------------------------------------------------------------
@@ -2869,6 +3095,7 @@ folders-first = true
                 "view.set-sort",
                 &["view.set-sort", "by=name", "order=ascending"],
             ),
+            ("view.clear-folder-sort", &["view.clear-folder-sort"]),
             ("pins.add", &["pins.add", "path=/tmp"]),
             ("pins.remove", &["pins.remove", "path=/tmp"]),
             ("pins.move", &["pins.move", "from=0", "to=1"]),
