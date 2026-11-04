@@ -30,6 +30,7 @@ mod sidebar;
 mod split;
 mod thumbs;
 mod trash;
+mod volumes;
 
 use std::cell::RefCell;
 use std::path::PathBuf;

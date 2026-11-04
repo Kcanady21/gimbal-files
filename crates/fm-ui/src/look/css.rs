@@ -162,6 +162,10 @@ window.gimbal-look, window.gimbal-look.background {{ background-color: {window_b
 {bars}
 .gl-drive-label {{ font-size: {ttiny}px; }}
 .gl-drive-cap {{ font-size: {ttiny}px; margin-left: {gs}px; }}
+.gl-drive-status {{ font-size: {ttiny}px; color: alpha({FG}, 0.75); }}
+.gl-drive-cancel {{ all: unset; min-height: {gxl}px; padding: 0 {gm}px; margin-left: {gs}px; border: {thin}px solid {OUTLINE}; border-radius: {rp}px; color: {FG}; font-size: {tsmall}px; }}
+.gl-drive-cancel:hover {{ background-color: {HOVER}; }}
+.gl-drive-cancel:focus-visible {{ box-shadow: 0 0 0 {thin}px {FOCUS_RING}; }}
 .gl-main-label {{ font-size: {tsmall}px; }}
 .gl-grid {{ border-spacing: {gxl}px; margin: {g2xl}px {gmar}px 0 {gmar}px; background-color: transparent; }}
 .gl-grid.tile {{ margin: {gm}px; }}
@@ -197,6 +201,7 @@ dnd .gl-drag-badge, .gl-drag-badge {{ min-width: {tsmall}px; min-height: {tsmall
 .gl-menu-item:hover {{ background-color: {HOVER}; }}
 .gl-menu-item:disabled {{ color: alpha({FG}, 0.45); }}
 .gl-menu-item:focus-visible {{ box-shadow: 0 0 0 {thin}px {FOCUS_RING}; }}
+.gl-menu-note {{ padding: {gs}px {gm}px; color: alpha({FG}, 0.75); font-size: {tsmall}px; }}
 .gl-trash-view {{ padding: {gm}px; color: {FG}; }}
 .gl-trash-actions {{ min-height: {ch}px; margin-bottom: {gm}px; }}
 .gl-trash-title {{ font-size: {tt}px; color: {FG}; }}

@@ -71,7 +71,10 @@ Unavailable through the socket (refused by the registry before any handler):
 
 There is no generic eval, shell execution or raw config write. Clipboard,
 `Launch` and `System` operations keep their existing policy; `System` is listed
-as not available and refused before dispatch.
+as not available and refused before dispatch. `drive.mount` is one of those
+operations: its Devices-sidebar Mount action is UI-only, and no socket
+state/query/navigation/startup path can mount a volume. P2p did not add a
+socket command, protocol, or remote mount support.
 
 Remote file operations must use explicit absolute paths. A relative path is
 rejected, never resolved against Gimbal's working directory. A `dry-run=true`

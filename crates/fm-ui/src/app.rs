@@ -88,6 +88,9 @@ pub struct Process {
     /// The injectable clipboard reader. Production uses the GTK clipboard;
     /// tests can pause or fail a read without touching Kyle's clipboard.
     clipboard_reader: Rc<dyn crate::fileops::clipboard::Reader>,
+    /// The process-wide GIO volume inventory, mount requests and usage
+    /// queries. Every window reads this one service.
+    volumes: RefCell<Rc<crate::volumes::Volumes>>,
     /// Headless bridge tests skip GTK window construction and session saves.
     headless: bool,
     /// Test seam for the Trash page's contextual refusal. Production always
@@ -251,6 +254,7 @@ impl Process {
 
         let look = Look::new(scale, opacity, font);
         let workspace = Workspace::with_home(config.home.clone());
+        let volumes = crate::volumes::Volumes::production();
         let process_tag = format!(
             "{}-{}",
             std::process::id(),
@@ -288,6 +292,7 @@ impl Process {
             search_poll: RefCell::new(None),
             search_in_poll: Cell::new(false),
             clipboard_reader: Rc::new(crate::fileops::clipboard::SystemReader),
+            volumes: RefCell::new(volumes),
             headless: false,
             #[cfg(test)]
             trash_pages: RefCell::new(BTreeSet::new()),
@@ -367,6 +372,9 @@ impl Process {
             search_poll: RefCell::new(None),
             search_in_poll: Cell::new(false),
             clipboard_reader,
+            volumes: RefCell::new(crate::volumes::Volumes::new(Rc::new(
+                crate::volumes::HeadlessBackend,
+            ))),
             headless: true,
             trash_pages: RefCell::new(BTreeSet::new()),
             native_nav_evidence_uses: Cell::new(0),
@@ -565,6 +573,15 @@ impl Process {
         self.clipboard_reader.clone()
     }
 
+    pub(crate) fn volumes(&self) -> Rc<crate::volumes::Volumes> {
+        self.volumes.borrow().clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_volumes_for_tests(&self, volumes: Rc<crate::volumes::Volumes>) {
+        *self.volumes.borrow_mut() = volumes;
+    }
+
     /// Every model window, cloned for a read-only agent projection.
     pub fn windows_snapshot(&self) -> Vec<fm_core::workspace::Window> {
         self.workspace.borrow().windows.clone()
@@ -712,6 +729,7 @@ impl Process {
     }
 
     pub fn forget_window(&self, id: WindowId) {
+        self.volumes().cancel_window(id);
         self.search.close(id);
         self.windows.borrow_mut().remove(&id);
     }
@@ -733,6 +751,9 @@ impl Process {
     }
 
     fn destroy_window(&self, id: WindowId) {
+        // A pending mount belongs to the window that started it. Cancel
+        // through its own cancellable before the parent window is destroyed.
+        self.volumes().cancel_window(id);
         self.search.close(id);
         self.stop_search_poll_if_idle();
         if let Some(ui) = self.windows.borrow_mut().remove(&id) {
@@ -1751,6 +1772,7 @@ impl Process {
         // Revoke monitors, pending activations and root checks before the app
         // leaves. A blocked native lookup is never joined.
         self.search.shutdown();
+        self.volumes().shutdown();
         // Owned Poppler children must be killed/reaped while their workers
         // still exist; setting a flag after `application.quit` is too late.
         crate::folder::size::shutdown();
@@ -2001,6 +2023,33 @@ impl Process {
         }
     }
 
+    fn mount_device(self: &Rc<Self>, window: WindowId, command: &CheckedCommand) -> Outcome {
+        let Some(device) = argument_text(command, "device") else {
+            return Outcome::Failed("drive.mount needs a volume id".to_string());
+        };
+        let volumes = self.volumes();
+        // The id is resolved only through the shared inventory. An unknown or
+        // stale id, a mounted volume, or a volume without a native unix device
+        // fails here, before the backend sees anything.
+        let target = match volumes.mount_target(&device) {
+            Ok(target) => target,
+            Err(refusal) => return Outcome::Failed(format!("cannot mount: {refusal}")),
+        };
+        let parent: Option<gtk::Window> = self
+            .window(window)
+            .map(|ui| ui.window().clone().upcast::<gtk::Window>());
+        match volumes.mount(window, target, parent.as_ref()) {
+            crate::volumes::MountBegin::Pending => Outcome::Done,
+            crate::volumes::MountBegin::AlreadyMounted => Outcome::Done,
+            crate::volumes::MountBegin::AlreadyPending => {
+                Outcome::Failed("that volume is already being mounted".to_string())
+            }
+            crate::volumes::MountBegin::Busy => {
+                Outcome::Failed("Gimbal is already mounting four volumes".to_string())
+            }
+        }
+    }
+
     fn settings_change(self: &Rc<Self>, window: WindowId, command: &CheckedCommand) -> Outcome {
         // The one Settings key with a runtime side effect. The registry has
         // already refused every caller but Ui before this handler is reached.
@@ -2205,6 +2254,7 @@ impl Process {
                     Err(error) => Outcome::Failed(error),
                 };
             }
+            "drive.mount" => return self.mount_device(window, command),
             _ => {}
         }
 
@@ -3648,6 +3698,9 @@ mod tests {
             search_poll: RefCell::new(None),
             search_in_poll: Cell::new(false),
             clipboard_reader: Rc::new(NoClipboard),
+            volumes: RefCell::new(crate::volumes::Volumes::new(Rc::new(
+                crate::volumes::HeadlessBackend,
+            ))),
             headless: false,
             trash_pages: RefCell::new(BTreeSet::new()),
             native_nav_evidence_uses: Cell::new(0),
@@ -4843,6 +4896,217 @@ mod tests {
         assert_eq!(page.row_paths_for_tests()[1], second.path);
         assert!(page.selection_for_tests().selected_item().is_some());
         assert_eq!(page.row_score_for_tests(1), Some(second.score));
+    }
+
+    #[test]
+    fn real_sidebar_mount_menu_pending_cancel_and_live_refresh() {
+        let executable = std::env::current_exe().expect("the test executable");
+        let output = std::process::Command::new(executable)
+            .args([
+                "--exact",
+                "app::tests::real_sidebar_mount_menu_pending_cancel_and_live_refresh_inner",
+                "--ignored",
+                "--nocapture",
+            ])
+            .output()
+            .expect("the owned sidebar widget regression process");
+        assert!(
+            output.status.success(),
+            "the real sidebar widget regression failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    #[ignore = "runs in its own process through the subprocess widget regression"]
+    fn real_sidebar_mount_menu_pending_cancel_and_live_refresh_inner() {
+        let _guard = gtk_test_lock();
+        gtk::init().expect("the sidebar regression needs a GTK display");
+        adw::init().expect("libadwaita init");
+
+        let context = glib::MainContext::default();
+        let scratch = search_scratch("gtk-mount");
+
+        let application = adw::Application::builder()
+            .application_id("org.gimbal.Files.MountWidgetTest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        application
+            .register(None::<&gio::Cancellable>)
+            .expect("register the owned non-unique test application");
+        let runtime = Rc::new(crate::search::SearchRuntime::with_service(Arc::new(
+            crate::search::SearchService::new(),
+        )));
+        let process = gtk_search_process(&scratch, &application, runtime);
+
+        // Injected inventory: one unmounted local volume, one already mounted
+        // camera and the main root. No GIO backend is constructed.
+        let backend = Rc::new(crate::volumes::tests::FakeBackend::default());
+        let usb_object = backend.add_volume("/dev/sdb1", "USB");
+        let camera_object = backend.add_volume("/dev/sdc1", "Camera");
+        let second_object = backend.add_volume("/dev/sdd1", "Second");
+        backend.add_unmountable_volume(None, "Locked");
+        backend.set_mounted(camera_object, "/media/camera");
+        backend.add_plain_mount("/", "Root");
+        let volumes = crate::volumes::Volumes::new(backend.clone());
+        volumes.refresh_for_tests();
+        process.install_volumes_for_tests(volumes.clone());
+
+        let window = seed_gtk_window(&process, scratch.root.join("home"));
+        let ui = process.window(window).expect("real window");
+        ui.window().present();
+        let sidebar = ui.sidebar_for_tests();
+
+        let usb = volumes
+            .entries()
+            .into_iter()
+            .find(|entry| entry.label() == "USB")
+            .expect("USB row");
+        let camera = volumes
+            .entries()
+            .into_iter()
+            .find(|entry| entry.label() == "Camera")
+            .expect("Camera row");
+        let locked = volumes
+            .entries()
+            .into_iter()
+            .find(|entry| entry.label() == "Locked")
+            .expect("Locked row");
+        let second = volumes
+            .entries()
+            .into_iter()
+            .find(|entry| entry.label() == "Second")
+            .expect("Second row");
+        assert_eq!(sidebar.device_ids_for_tests().len(), 4);
+
+        let locked_snapshot = sidebar
+            .device_snapshot_for_tests(locked.id().as_str())
+            .expect("Locked widget row");
+        assert_eq!(locked_snapshot.1, "Not mounted");
+        assert!(!locked_snapshot.2);
+        let (_popover, locked_mount) = sidebar
+            .build_mount_menu_for_tests(locked.id().as_str())
+            .expect("menu for the ineligible row");
+        assert!(
+            locked_mount.is_none(),
+            "an ineligible volume offers no Mount item"
+        );
+
+        let snapshot = sidebar
+            .device_snapshot_for_tests(usb.id().as_str())
+            .expect("USB widget row");
+        assert_eq!(snapshot.0, "USB");
+        assert_eq!(snapshot.1, "Not mounted");
+        assert!(!snapshot.2, "an unmounted row has no fake drive bar");
+        assert!(!snapshot.3, "no Cancel before a request exists");
+
+        let camera_snapshot = sidebar
+            .device_snapshot_for_tests(camera.id().as_str())
+            .expect("Camera widget row");
+        assert!(
+            camera_snapshot.2,
+            "the mounted row shows its real usage bar: {camera_snapshot:?}"
+        );
+
+        // The real context-menu button carries the opaque volume id into the
+        // one registry command. No second runner is involved.
+        let (_popover, mount) = sidebar
+            .build_mount_menu_for_tests(usb.id().as_str())
+            .expect("menu for the USB row");
+        let mount = mount.expect("an eligible volume offers Mount");
+        mount.emit_clicked();
+        assert_eq!(backend.mount_calls(), 1);
+        let pending = sidebar
+            .device_snapshot_for_tests(usb.id().as_str())
+            .expect("USB widget row");
+        assert_eq!(pending.1, "Mounting…");
+        assert!(!pending.2);
+        assert!(pending.3, "the pending row has an accessible Cancel");
+
+        // Every window's menu now refuses a duplicate for this volume.
+        let (_popover, duplicate) = sidebar
+            .build_mount_menu_for_tests(usb.id().as_str())
+            .expect("menu for the pending row");
+        assert!(duplicate.is_none(), "no second Mount action while pending");
+
+        let cancel = sidebar
+            .cancel_button_for_tests(usb.id().as_str())
+            .expect("pending Cancel");
+        assert!(cancel.get_visible());
+        cancel.emit_clicked();
+        let cancellable = backend
+            .mount_cancellable(usb.id())
+            .expect("the request's own cancellable");
+        assert!(cancellable.is_cancelled());
+        let cancelling = sidebar
+            .device_snapshot_for_tests(usb.id().as_str())
+            .expect("USB widget row");
+        assert_eq!(cancelling.1, "Cancelling…");
+
+        // Monitor arrival wins; the late callback is idempotent and the row
+        // becomes a navigable mounted row with a real usage bar.
+        backend.set_mounted(usb_object, "/media/usb");
+        volumes.refresh_for_tests();
+        let mounted = sidebar
+            .device_snapshot_for_tests(usb.id().as_str())
+            .expect("USB widget row");
+        assert!(mounted.2, "the mounted row gained its usage bar");
+        assert!(!mounted.3, "the pending Cancel control is gone");
+
+        let main = sidebar.main_snapshot_for_tests();
+        assert_eq!(main.0, "Root");
+        assert!(main.2, "the main row uses the async usage path");
+
+        // A late callback after monitor reconciliation cannot change state.
+        backend.complete_mount(usb.id(), Ok(()));
+        assert!(
+            volumes
+                .status_for(usb.id())
+                .is_some_and(|status| status.is_mounted())
+        );
+
+        // A callback-before-monitor request stays visibly pending, then the
+        // live inventory refresh turns this real row into a usage bar.
+        let (_popover, second_mount) = sidebar
+            .build_mount_menu_for_tests(second.id().as_str())
+            .expect("menu for the Second row");
+        second_mount.expect("Second is eligible").emit_clicked();
+        backend.complete_mount(second.id(), Ok(()));
+        let still_pending = sidebar
+            .device_snapshot_for_tests(second.id().as_str())
+            .expect("Second widget row");
+        assert_eq!(
+            still_pending.1, "Mounting…",
+            "a callback without a live root is not mounted"
+        );
+        backend.set_mounted(second_object, "/media/second");
+        volumes.refresh_for_tests();
+        let second_mounted = sidebar
+            .device_snapshot_for_tests(second.id().as_str())
+            .expect("Second widget row");
+        assert!(second_mounted.2, "monitor reconciliation completed the row");
+
+        // Block every injected usage completion and flood monitor refreshes.
+        // The query caps hold, the widget tree stays usable and unknown usage
+        // remains honest rather than drawing a zero-full bar.
+        backend.block_usage(true);
+        for index in 0..8 {
+            let object = backend.add_volume(&format!("/dev/sd{index}c1"), "Extra");
+            backend.set_mounted(object, &format!("/media/extra-{index}"));
+        }
+        for _ in 0..20 {
+            volumes.refresh_for_tests();
+        }
+        let (active, pending) = volumes.usage_counts();
+        assert_eq!(active, 4, "the four-slot usage cap holds under a flood");
+        assert!(pending <= 32, "the pending queue is bounded: {pending}");
+        context.iteration(false);
+        assert_eq!(ui.window().title().as_deref(), Some("Gimbal Files"));
+        assert!(
+            sidebar.device_ids_for_tests().len() >= 10,
+            "the live sidebar still follows the enlarged inventory"
+        );
     }
 
     #[test]

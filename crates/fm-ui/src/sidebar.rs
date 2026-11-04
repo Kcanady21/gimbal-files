@@ -10,12 +10,12 @@ use std::path::{Path, PathBuf};
 use std::rc::{Rc, Weak};
 
 use adw::prelude::*;
-use gtk::gio;
 use gtk::glib;
 use gtk::subclass::prelude::*;
 
 use fm_core::command::{Caller, Invocation};
 use fm_core::config::{self, Section, SectionState};
+use fm_core::volumes::{DeviceEntry, DeviceState, MountStatus, VolumeId};
 use fm_core::workspace::WindowId;
 
 use crate::app::Process;
@@ -23,6 +23,7 @@ use crate::dnd;
 use crate::look::css::bar_class;
 use crate::look::motion;
 use crate::look::tokens::*;
+use crate::volumes::UsageValue;
 
 const BAR_FILL_CLASSES: [&str; 11] = [
     "bar-lv0", "bar-lv1", "bar-lv2", "bar-lv3", "bar-lv4", "bar-lv5", "bar-lv6", "bar-lv7",
@@ -36,10 +37,10 @@ pub struct Sidebar {
     recent_content: gtk::Box,
     devices_content: gtk::Box,
     revealers: RefCell<Vec<(Section, gtk::Revealer)>>,
-    devices: RefCell<Vec<Rc<DriveRow>>>,
+    devices: RefCell<Vec<(VolumeId, Rc<DriveRow>)>>,
+    device_signature: RefCell<Vec<String>>,
     main: Rc<DriveRow>,
     recent: RefCell<Vec<PathBuf>>,
-    monitor: gio::VolumeMonitor,
     process: Weak<Process>,
     window: WindowId,
     home: PathBuf,
@@ -89,6 +90,12 @@ impl Sidebar {
         root.append(&scroll);
         root.append(&rule());
         let main = DriveRow::new("Main Drive", true, scale);
+        attach_click(
+            &main.root,
+            &Rc::downgrade(process),
+            window,
+            PathBuf::from("/"),
+        );
         dnd::attach_folder_target(
             &main.root,
             Rc::downgrade(process),
@@ -106,9 +113,9 @@ impl Sidebar {
             devices_content,
             revealers: RefCell::new(revealers),
             devices: RefCell::new(Vec::new()),
+            device_signature: RefCell::new(Vec::new()),
             main,
             recent: RefCell::new(Vec::new()),
-            monitor: gio::VolumeMonitor::get(),
             process: Rc::downgrade(process),
             window,
             home,
@@ -116,31 +123,22 @@ impl Sidebar {
             current: RefCell::new(None),
         });
 
+        // Every sidebar follows the one process-shared inventory. The weak
+        // upgrade returns false once this window is gone, so the volume service
+        // never keeps a closed window alive.
         let weak = Rc::downgrade(&this);
-        this.monitor.connect_mount_added(move |_, _| {
+        process.volumes().listen(Rc::new(move || {
             if let Some(sidebar) = weak.upgrade() {
-                sidebar.refresh_devices();
-                sidebar.refresh_main();
+                sidebar.refresh_from_volumes();
+                true
+            } else {
+                false
             }
-        });
-        let weak = Rc::downgrade(&this);
-        this.monitor.connect_mount_removed(move |_, _| {
-            if let Some(sidebar) = weak.upgrade() {
-                sidebar.refresh_devices();
-                sidebar.refresh_main();
-            }
-        });
-        let weak = Rc::downgrade(&this);
-        this.monitor.connect_mount_changed(move |_, _| {
-            if let Some(sidebar) = weak.upgrade() {
-                sidebar.refresh_devices();
-                sidebar.refresh_main();
-            }
-        });
+        }));
 
         this.reload_from_config();
-        this.refresh_devices();
-        this.refresh_main();
+        process.volumes().request_main_usage();
+        this.refresh_from_volumes();
         this
     }
 
@@ -199,7 +197,7 @@ impl Sidebar {
         self.scale.set(scale);
         self.pinned.set_scale(scale);
         self.main.set_scale(scale);
-        for row in self.devices.borrow().iter() {
+        for (_, row) in self.devices.borrow().iter() {
             row.set_scale(scale);
         }
     }
@@ -215,48 +213,205 @@ impl Sidebar {
         }
     }
 
-    fn refresh_devices(&self) {
-        clear_children(&self.devices_content);
-        let scale = self.scale.get();
-        let mut rows = Vec::new();
-        for mount in self.monitor.mounts() {
-            let Some(root) = mount.root().path() else {
-                continue;
-            };
-            if root == Path::new("/") {
-                continue;
+    fn refresh_from_volumes(&self) {
+        self.refresh_main();
+        self.sync_devices();
+    }
+
+    fn sync_devices(&self) {
+        let Some(process) = self.process.upgrade() else {
+            return;
+        };
+        let volumes = process.volumes();
+        let entries = volumes.entries();
+        let signature: Vec<String> = entries
+            .iter()
+            .map(|entry| match entry.state() {
+                DeviceState::Mounted { root, .. } => {
+                    format!(
+                        "{}#{}:mounted:{}:{}",
+                        entry.id(),
+                        entry.incarnation(),
+                        root.display(),
+                        entry.mount_object().unwrap_or_default()
+                    )
+                }
+                DeviceState::Unmounted { .. } => {
+                    format!("{}#{}:unmounted", entry.id(), entry.incarnation())
+                }
+            })
+            .collect();
+
+        if signature != *self.device_signature.borrow() {
+            clear_children(&self.devices_content);
+            let mut rows = Vec::with_capacity(entries.len());
+            for entry in &entries {
+                let row = self.build_device_row(&process, entry);
+                self.devices_content.append(&row.root);
+                rows.push((entry.id().clone(), row));
             }
-            let name = mount.name().to_string();
-            let name = if name.is_empty() {
-                path_label(&root)
-            } else {
-                name
-            };
-            let row = DriveRow::new(&name, false, scale);
-            if let Some((total, free)) = filesystem(&root) {
-                row.set_values(total, free);
-            }
-            attach_click(&row.root, &self.process, self.window, root.clone());
-            dnd::attach_folder_target(
-                &row.root,
-                self.process.clone(),
-                self.window,
-                Rc::new(move || Some(root.clone())),
-                None,
-                None,
-            );
-            self.devices_content.append(&row.root);
-            rows.push(row);
+            *self.devices.borrow_mut() = rows;
+            *self.device_signature.borrow_mut() = signature;
         }
-        *self.devices.borrow_mut() = rows;
+
+        // Usage and mount status change without changing the row identity.
+        // Update text and bars in place, so focus and an open context menu
+        // survive an unrelated capacity result.
+        let rows = self.devices.borrow().clone();
+        for (id, row) in rows {
+            if let Some(entry) = entries.iter().find(|entry| entry.id() == &id) {
+                self.apply_device_row(&volumes, entry, &row);
+            }
+        }
+    }
+
+    fn build_device_row(&self, process: &Rc<Process>, entry: &DeviceEntry) -> Rc<DriveRow> {
+        let row = DriveRow::new(entry.label(), false, self.scale.get());
+        row.install_cancel(Rc::downgrade(process));
+        match entry.state() {
+            DeviceState::Mounted { root, .. } => {
+                attach_click(&row.root, &self.process, self.window, root.clone());
+                let target = root.clone();
+                dnd::attach_folder_target(
+                    &row.root,
+                    self.process.clone(),
+                    self.window,
+                    Rc::new(move || Some(target.clone())),
+                    None,
+                    None,
+                );
+            }
+            DeviceState::Unmounted { .. } => {
+                attach_unmounted_click(
+                    &row,
+                    Rc::downgrade(process),
+                    self.window,
+                    entry.id().clone(),
+                );
+                attach_device_menu(
+                    &row,
+                    Rc::downgrade(process),
+                    self.window,
+                    entry.id().clone(),
+                    entry.label().to_string(),
+                );
+            }
+        }
+        row
+    }
+
+    fn apply_device_row(
+        &self,
+        volumes: &crate::volumes::Volumes,
+        entry: &DeviceEntry,
+        row: &Rc<DriveRow>,
+    ) {
+        row.set_name(entry.label());
+        match entry.state() {
+            DeviceState::Mounted { .. } => {
+                self.apply_usage(row, &volumes.usage_for_entry(entry));
+            }
+            DeviceState::Unmounted { .. } => {
+                let status = volumes.status_for(entry.id());
+                match status {
+                    Some(MountStatus::Pending) => {
+                        let text = if volumes.cancel_requested(entry.id()) {
+                            "Cancelling…"
+                        } else {
+                            "Mounting…"
+                        };
+                        let cancel_id =
+                            (!volumes.cancel_requested(entry.id())).then(|| entry.id().clone());
+                        row.set_pending(text, entry.label(), cancel_id);
+                    }
+                    Some(status) => {
+                        row.set_note(
+                            &format!("Not mounted · {}", status.short()),
+                            status.detail(),
+                        );
+                    }
+                    None => {
+                        row.set_note("Not mounted", entry.state().explanation());
+                    }
+                }
+            }
+        }
+    }
+
+    fn apply_usage(&self, row: &Rc<DriveRow>, usage: &UsageValue) {
+        if let Some((total, free)) = usage.ready() {
+            row.set_values(total, free);
+        } else {
+            row.set_note(usage.short(), usage.detail());
+        }
     }
 
     fn refresh_main(&self) {
-        let name = root_mount_name(&self.monitor);
-        self.main.set_name(&name);
-        if let Some((total, free)) = filesystem(Path::new("/")) {
-            self.main.set_values(total, free);
-        }
+        let Some(process) = self.process.upgrade() else {
+            return;
+        };
+        let volumes = process.volumes();
+        self.main.set_name(&volumes.main_label());
+        self.apply_usage(&self.main, &volumes.main_usage());
+    }
+
+    #[cfg(test)]
+    pub(crate) fn device_ids_for_tests(&self) -> Vec<String> {
+        self.devices
+            .borrow()
+            .iter()
+            .map(|(id, _)| id.as_str().to_string())
+            .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn device_snapshot_for_tests(
+        &self,
+        id: &str,
+    ) -> Option<(String, String, bool, bool)> {
+        let devices = self.devices.borrow();
+        let (_, row) = devices
+            .iter()
+            .find(|(candidate, _)| candidate.as_str() == id)?;
+        Some((
+            row.name.text().to_string(),
+            row.status.text().to_string(),
+            row.bar.get_visible(),
+            row.cancel.get_visible(),
+        ))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn main_snapshot_for_tests(&self) -> (String, String, bool) {
+        (
+            self.main.name.text().to_string(),
+            self.main.status.text().to_string(),
+            self.main.bar.get_visible(),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn build_mount_menu_for_tests(
+        &self,
+        id: &str,
+    ) -> Option<(gtk::Popover, Option<gtk::Button>)> {
+        let process = self.process.upgrade()?;
+        let entry = process.volumes().entry(id)?;
+        Some(build_device_menu(
+            &self.process,
+            self.window,
+            entry.id(),
+            entry.label(),
+        ))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cancel_button_for_tests(&self, id: &str) -> Option<gtk::Button> {
+        let devices = self.devices.borrow();
+        let (_, row) = devices
+            .iter()
+            .find(|(candidate, _)| candidate.as_str() == id)?;
+        Some(row.cancel.clone())
     }
 }
 
@@ -335,6 +490,128 @@ fn attach_click(
     widget.add_controller(click);
 }
 
+/// An unmounted row never navigates or accepts a drop. A primary click only
+/// explains the right-click action (or why this volume cannot be mounted).
+fn attach_unmounted_click(
+    row: &Rc<DriveRow>,
+    process: Weak<Process>,
+    window: WindowId,
+    id: VolumeId,
+) {
+    let click = gtk::GestureClick::new();
+    click.set_button(1);
+    let weak_row = Rc::downgrade(row);
+    click.connect_released(move |_, presses, _, _| {
+        let (Some(row), Some(process)) = (weak_row.upgrade(), process.upgrade()) else {
+            return;
+        };
+        let volumes = process.volumes();
+        if volumes.is_pending(&id) {
+            return;
+        }
+        match volumes.mount_target(id.as_str()) {
+            Ok(_) if presses == 2 => {
+                process.dispatch_for_window(window, Caller::Ui, mount_invocation(id.as_str()));
+            }
+            Ok(_) if presses == 1 => row.set_note("Double-click or right-click to mount", None),
+            Err(reason) => row.set_note("Not mounted", Some(&reason.to_string())),
+            _ => {}
+        }
+    });
+    row.root.add_controller(click);
+}
+
+fn attach_device_menu(
+    row: &Rc<DriveRow>,
+    process: Weak<Process>,
+    window: WindowId,
+    id: VolumeId,
+    name: String,
+) {
+    let gesture = gtk::GestureClick::new();
+    gesture.set_button(3);
+    let weak_row = Rc::downgrade(row);
+    gesture.connect_pressed(move |_, _, x, y| {
+        let Some(row) = weak_row.upgrade() else {
+            return;
+        };
+        let (popover, _) = build_device_menu(&process, window, &id, &name);
+        popover.set_parent(&row.root);
+        popover.set_pointing_to(Some(&gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+        popover.connect_closed(|popover| popover.unparent());
+        popover.popup();
+    });
+    row.root.add_controller(gesture);
+}
+
+/// The context menu for one unmounted device. Mount is present only when the
+/// shared inventory says this exact id is eligible and no request is pending.
+/// The button carries that id into the one registry command.
+fn build_device_menu(
+    process: &Weak<Process>,
+    window: WindowId,
+    id: &VolumeId,
+    name: &str,
+) -> (gtk::Popover, Option<gtk::Button>) {
+    let popover = gtk::Popover::new();
+    popover.add_css_class("gl-menu");
+    let menu = gtk::Box::new(gtk::Orientation::Vertical, 0);
+
+    let Some(process) = process.upgrade() else {
+        menu.append(&menu_note("Gimbal is closing."));
+        popover.set_child(Some(&menu));
+        return (popover, None);
+    };
+    let volumes = process.volumes();
+    if volumes.is_pending(id) {
+        menu.append(&menu_note("Mounting…"));
+        popover.set_child(Some(&menu));
+        return (popover, None);
+    }
+    if volumes.mount_target(id.as_str()).is_err() {
+        let explanation = volumes
+            .entry(id.as_str())
+            .and_then(|entry| entry.state().explanation().map(str::to_string))
+            .unwrap_or_else(|| "This volume cannot be mounted.".to_string());
+        menu.append(&menu_note(&explanation));
+        popover.set_child(Some(&menu));
+        return (popover, None);
+    }
+
+    let button = gtk::Button::new();
+    button.add_css_class("gl-menu-item");
+    button.set_child(Some(&gtk::Label::new(Some("Mount"))));
+    button.update_property(&[gtk::accessible::Property::Label(&format!("Mount {name}"))]);
+    let popover_for_button = popover.clone();
+    let weak = Rc::downgrade(&process);
+    let id = id.clone();
+    button.connect_clicked(move |_| {
+        popover_for_button.popdown();
+        if let Some(process) = weak.upgrade() {
+            process.dispatch_for_window(window, Caller::Ui, mount_invocation(id.as_str()));
+        }
+    });
+    menu.append(&button);
+    popover.set_child(Some(&menu));
+    (popover, Some(button))
+}
+
+fn menu_note(text: &str) -> gtk::Label {
+    let label = gtk::Label::new(Some(text));
+    label.add_css_class("gl-menu-note");
+    label.set_xalign(0.0);
+    label.set_wrap(true);
+    label.set_max_width_chars(42);
+    label
+}
+
+fn mount_invocation(device: &str) -> Invocation {
+    Invocation::new(
+        "drive.mount",
+        vec![("device".to_string(), device.to_string())],
+    )
+}
+
 fn clear_children(widget: &gtk::Box) {
     while let Some(child) = widget.first_child() {
         child.unparent();
@@ -353,9 +630,14 @@ pub fn drive_fullness(total: u64, free: u64) -> f64 {
 struct DriveRow {
     root: gtk::Box,
     name: gtk::Label,
+    bar: gtk::Box,
     fill: gtk::Box,
     percent: gtk::Label,
     capacity: gtk::Label,
+    status: gtk::Label,
+    cancel: gtk::Button,
+    cancel_id: RefCell<Option<VolumeId>>,
+    cancel_process: RefCell<Option<Weak<Process>>>,
     total: Cell<u64>,
     free: Cell<u64>,
     scale: Cell<f64>,
@@ -396,32 +678,71 @@ impl DriveRow {
         name.set_xalign(0.5);
         name.set_ellipsize(gtk::pango::EllipsizeMode::End);
         root.append(&name);
-        let row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-        row.set_halign(gtk::Align::Center);
-        row.append(&overlay);
+
+        let bar = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        bar.set_halign(gtk::Align::Center);
+        bar.append(&overlay);
         let capacity = gtk::Label::new(None);
         capacity.add_css_class("gl-drive-cap");
         capacity.set_ellipsize(gtk::pango::EllipsizeMode::End);
         if main {
             capacity.add_css_class("gl-main-label");
         }
-        row.append(&capacity);
-        root.append(&row);
+        bar.append(&capacity);
+        root.append(&bar);
+
+        let status_line = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        status_line.set_halign(gtk::Align::Center);
+        let status = gtk::Label::new(Some("Not mounted"));
+        status.add_css_class("gl-drive-status");
+        status.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        status_line.append(&status);
+        let cancel = gtk::Button::with_label("Cancel");
+        cancel.add_css_class("gl-drive-cancel");
+        cancel.set_visible(false);
+        status_line.append(&cancel);
+        root.append(&status_line);
 
         let this = Rc::new(Self {
             root,
             name,
+            bar,
             fill,
             percent,
             capacity,
+            status,
+            cancel,
+            cancel_id: RefCell::new(None),
+            cancel_process: RefCell::new(None),
             total: Cell::new(0),
             free: Cell::new(0),
             scale: Cell::new(scale),
             bar_width: if main { MAIN_BAR_W } else { BAR_W },
             main,
         });
-        this.set_values(0, 0);
+        this.bar.set_visible(false);
         this
+    }
+
+    fn install_cancel(self: &Rc<Self>, process: Weak<Process>) {
+        *self.cancel_process.borrow_mut() = Some(process);
+        let weak = Rc::downgrade(self);
+        self.cancel.connect_clicked(move |_| {
+            let Some(row) = weak.upgrade() else {
+                return;
+            };
+            let Some(id) = row.cancel_id.borrow().clone() else {
+                return;
+            };
+            let Some(process) = row.cancel_process.borrow().as_ref().and_then(Weak::upgrade) else {
+                return;
+            };
+            process.volumes().cancel(&id);
+            // Keep the row pending until the operation's own callback says
+            // what actually happened; this only records the request.
+            row.status.set_text("Cancelling…");
+            row.cancel.set_visible(false);
+        });
     }
 
     fn set_name(&self, name: &str) {
@@ -432,7 +753,34 @@ impl DriveRow {
         self.total.set(total);
         self.free.set(free);
         self.capacity.set_text(&glib::format_size(total));
+        self.bar.set_visible(true);
+        self.status.set_visible(false);
+        self.cancel.set_visible(false);
+        *self.cancel_id.borrow_mut() = None;
         self.paint();
+    }
+
+    fn set_note(&self, text: &str, detail: Option<&str>) {
+        self.bar.set_visible(false);
+        self.status.set_visible(true);
+        self.status.set_text(text);
+        self.status.set_tooltip_text(detail);
+        self.cancel.set_visible(false);
+        *self.cancel_id.borrow_mut() = None;
+    }
+
+    fn set_pending(&self, text: &str, name: &str, id: Option<VolumeId>) {
+        self.bar.set_visible(false);
+        self.status.set_visible(true);
+        self.status.set_text(text);
+        self.status
+            .set_tooltip_text(Some("Waiting for the desktop volume service"));
+        *self.cancel_id.borrow_mut() = id;
+        self.cancel.set_visible(self.cancel_id.borrow().is_some());
+        self.cancel
+            .update_property(&[gtk::accessible::Property::Label(&format!(
+                "Cancel mounting {name}"
+            ))]);
     }
 
     fn set_scale(&self, scale: f64) {
@@ -462,30 +810,6 @@ impl DriveRow {
             self.fill.add_css_class("main");
         }
     }
-}
-
-fn filesystem(path: &Path) -> Option<(u64, u64)> {
-    let file = gio::File::for_path(path);
-    let info = file
-        .query_filesystem_info(
-            "filesystem::size,filesystem::free",
-            None::<&gio::Cancellable>,
-        )
-        .ok()?;
-    Some((
-        info.attribute_uint64("filesystem::size"),
-        info.attribute_uint64("filesystem::free"),
-    ))
-}
-
-fn root_mount_name(monitor: &gio::VolumeMonitor) -> String {
-    monitor
-        .mounts()
-        .into_iter()
-        .find(|mount| mount.root().path().as_deref() == Some(Path::new("/")))
-        .map(|mount| mount.name().to_string())
-        .filter(|name| !name.is_empty())
-        .unwrap_or_else(|| "Main Drive".to_string())
 }
 
 /// The folders in the Recent list: the newest first, distinct, at most five.

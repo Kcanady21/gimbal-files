@@ -622,6 +622,11 @@ impl WindowUi {
         self.sidebar.reload_from_config();
     }
 
+    #[cfg(test)]
+    pub(crate) fn sidebar_for_tests(&self) -> &Rc<Sidebar> {
+        &self.sidebar
+    }
+
     pub fn set_section(&self, section: Section, state: SectionState) {
         self.sidebar.set_section(section, state);
     }
