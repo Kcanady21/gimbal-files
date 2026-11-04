@@ -1938,14 +1938,18 @@ pub fn thumbnail_candidates_unchecked(info: &gio::FileInfo) -> Vec<ThumbnailSour
         {
             continue;
         }
-        let Some(path) = info
-            .attribute_string(attribute)
-            .map(|value| PathBuf::from(value.as_str()))
-            .or_else(|| {
-                info.attribute_byte_string(attribute)
-                    .map(|value| PathBuf::from(OsString::from_vec(value.as_bytes().to_vec())))
-            })
-        else {
+        // GIO stores thumbnail paths as byte strings; asking for the other
+        // type logs a GLib-GIO-CRITICAL, so read only the stored type.
+        let path = match info.attribute_type(attribute) {
+            gio::FileAttributeType::ByteString => info
+                .attribute_byte_string(attribute)
+                .map(|value| PathBuf::from(OsString::from_vec(value.as_bytes().to_vec()))),
+            gio::FileAttributeType::String => info
+                .attribute_string(attribute)
+                .map(|value| PathBuf::from(value.as_str())),
+            _ => None,
+        };
+        let Some(path) = path else {
             continue;
         };
         if candidates.iter().any(|candidate| candidate.path == path) {
