@@ -39,6 +39,13 @@ const REQUIRED_PATH: ArgSpec = ArgSpec {
     default: None,
 };
 
+const REQUIRED_PATHS: ArgSpec = ArgSpec {
+    name: "paths",
+    kind: ArgKind::Paths,
+    presence: Presence::Required,
+    default: None,
+};
+
 const REQUIRED_NAME: ArgSpec = ArgSpec {
     name: "name",
     kind: ArgKind::Text,
@@ -162,6 +169,13 @@ pub const COMMANDS: &[CommandSpec] = &[
         effect: Effect::View,
         undo: false,
         arguments: &[],
+    },
+    CommandSpec {
+        name: "group.open",
+        summary: "Open folders as one tiled group.",
+        effect: Effect::View,
+        undo: false,
+        arguments: &[REQUIRED_PATHS],
     },
     CommandSpec {
         name: "group.split",

@@ -240,7 +240,7 @@ Documented codes: `malformed`, `unsupported-version`, `unknown-operation`,
 ```toml
 [data]
 offset = 0
-total = 54
+total = 57
 next = 5
 
 [[data.command]]
@@ -257,8 +257,10 @@ presence = "from selection"
 required = true
 ```
 
-`view.clear-folder-sort` is the newest registry entry. It takes no
-arguments, affects the focused tab's folder and is available to every caller.
+`group.open` is the newest registry entry. It takes repeated
+`paths=<absolute folder>` arguments and opens them as one split group after the
+focused pill; it is available to every caller, like `group.split`. A path that
+is not an existing folder refuses the whole command.
 
 `state` data:
 

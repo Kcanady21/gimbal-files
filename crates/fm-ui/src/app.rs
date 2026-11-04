@@ -1481,6 +1481,41 @@ impl Process {
         }
     }
 
+    /// `group.open` validates every folder before the pure model operation,
+    /// so a missing path leaves the workspace untouched. The one `group:` log
+    /// line reports the count and the new pill, or why it was refused.
+    fn group_open_command(self: &Rc<Self>, paths: Vec<PathBuf>) -> Outcome {
+        if let Some(missing) = paths.iter().find(|path| !path.is_dir()) {
+            crate::log!(
+                "group",
+                "refused {} folders: {} is not an existing folder",
+                paths.len(),
+                missing.display()
+            );
+            return Outcome::Failed(format!("{} is not an existing folder", missing.display()));
+        }
+
+        let count = paths.len();
+        let result = self.workspace.borrow_mut().group_open(paths);
+        match &result {
+            Ok(events) => {
+                let pill = events.iter().find_map(|event| match event {
+                    Event::TabAdded { index, .. } => Some(*index),
+                    _ => None,
+                });
+                match pill {
+                    Some(pill) => crate::log!(
+                        "group",
+                        "opened {count} folders as one group at pill {pill}"
+                    ),
+                    None => crate::log!("group", "opened {count} folders as one group"),
+                }
+            }
+            Err(error) => crate::log!("group", "refused {count} folders: {error}"),
+        }
+        self.finish(result)
+    }
+
     pub fn selected_paths(&self, window: WindowId) -> Vec<PathBuf> {
         let Some(window) = self.window_snapshot(window) else {
             return Vec::new();
@@ -2652,6 +2687,11 @@ impl Process {
             && let Some(outcome) = self.run_file_command(window, caller, command)
         {
             return outcome;
+        }
+
+        if command.name() == "group.open" {
+            let paths = argument_paths(command, "paths").unwrap_or_default();
+            return self.group_open_command(paths);
         }
 
         if command.name() == "file.open" {
@@ -4046,6 +4086,46 @@ mod tests {
                 crate::search::SearchService::new(),
             ))),
         )
+    }
+
+    #[test]
+    fn group_open_refuses_a_missing_folder_without_opening_anything() {
+        let scratch = search_scratch("group-open");
+        let process = headless_search_process(&scratch);
+        let events = process
+            .workspace
+            .borrow_mut()
+            .window_new(Some(scratch.root.join("home")))
+            .expect("a scratch window");
+        let window = events
+            .iter()
+            .find_map(|event| match event {
+                Event::WindowOpened(id) => Some(*id),
+                _ => None,
+            })
+            .expect("window id");
+        let before = process.workspace.borrow().clone();
+        let missing = scratch.root.join("missing");
+
+        let outcome = process.dispatch_with_outcome(
+            window,
+            Caller::Ui,
+            &Invocation::new(
+                "group.open",
+                vec![
+                    (
+                        "paths".to_string(),
+                        scratch.root.join("home").display().to_string(),
+                    ),
+                    ("paths".to_string(), missing.display().to_string()),
+                ],
+            ),
+        );
+        assert!(
+            matches!(outcome, Outcome::Failed(ref message) if message.contains("missing")),
+            "{outcome:?}"
+        );
+        assert_eq!(*process.workspace.borrow(), before);
     }
 
     /// A real GTK widget process for the entry-to-visible-results regression.

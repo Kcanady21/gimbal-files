@@ -71,6 +71,14 @@ pub fn item_menu(items: &[ItemInfo]) -> Vec<MenuItem> {
         MenuAction::Command(path_args(&paths)),
     )];
 
+    if items.len() >= 2 && items.iter().all(|item| item.is_dir) {
+        menu.push(item(
+            "Open in New Group",
+            "group.open",
+            MenuAction::Command(path_args(&paths)),
+        ));
+    }
+
     if single_folder == Some(true) {
         let folder = items[0].path.to_string_lossy().into_owned();
         menu.push(item(
@@ -271,6 +279,36 @@ mod tests {
             new_tab.action,
             MenuAction::Command(vec![("path".to_string(), "/tmp/docs".to_string())])
         );
+    }
+
+    #[test]
+    fn several_folders_get_open_in_new_group_after_open_in_view_order() {
+        let menu = item_menu(&[folder("a"), folder("b"), folder("c")]);
+        assert_eq!(labels(&menu)[..2], ["Open", "Open in New Group"]);
+        let entry = menu
+            .iter()
+            .find(|item| item.command == "group.open")
+            .unwrap();
+        assert_eq!(
+            entry.action,
+            MenuAction::Command(vec![
+                ("paths".to_string(), "/tmp/a".to_string()),
+                ("paths".to_string(), "/tmp/b".to_string()),
+                ("paths".to_string(), "/tmp/c".to_string()),
+            ])
+        );
+    }
+
+    #[test]
+    fn a_file_in_the_selection_has_no_open_in_new_group() {
+        let menu = item_menu(&[folder("docs"), file("a.txt"), folder("more")]);
+        assert!(!labels(&menu).contains(&"Open in New Group"));
+    }
+
+    #[test]
+    fn one_folder_alone_has_no_open_in_new_group() {
+        let menu = item_menu(&[folder("docs")]);
+        assert!(!labels(&menu).contains(&"Open in New Group"));
     }
 
     #[test]

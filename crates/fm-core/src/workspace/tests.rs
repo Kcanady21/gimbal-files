@@ -369,6 +369,185 @@ fn group_split_inserts_at_the_first_selected_pill() {
 }
 
 #[test]
+fn group_open_inserts_after_the_focused_pill_and_focuses_the_first_folder() {
+    let mut workspace = workspace();
+    workspace.tab_new(Some(folder("/tmp/second"))).unwrap();
+    workspace.pill_click(0).unwrap();
+    let window_id = workspace.windows[0].id;
+
+    let events = workspace
+        .group_open(vec![folder("/tmp/one"), folder("/tmp/two")])
+        .unwrap();
+    assert!(matches!(events[0], Event::TabAdded { window, index: 1, .. } if window == window_id));
+    assert!(
+        events.iter().any(
+            |event| matches!(event, Event::GroupFormed { window, .. } if *window == window_id)
+        )
+    );
+    assert!(
+        events.iter().any(
+            |event| matches!(event, Event::FocusChanged { window, .. } if *window == window_id)
+        )
+    );
+
+    let window = workspace.focused().unwrap();
+    assert_eq!(window.pills.len(), 3);
+    assert_eq!(window.selection.selected, vec![false, false, false]);
+    let group = &window.groups[&window.pills[1]];
+    assert_eq!(group.tabs.len(), 2);
+    let one = group
+        .tabs
+        .iter()
+        .find(|tab| tab.folder == folder("/tmp/one"))
+        .unwrap()
+        .id;
+    let two = group
+        .tabs
+        .iter()
+        .find(|tab| tab.folder == folder("/tmp/two"))
+        .unwrap()
+        .id;
+    assert_eq!(group.layout.columns, initial_columns(&[one, two]));
+    assert_eq!(window.focused_tab, one);
+    assert_eq!(window.focused_tab_ref().unwrap().folder, folder("/tmp/one"));
+    workspace.check_invariants().unwrap();
+}
+
+#[test]
+fn group_open_with_four_folders_builds_the_split_layout() {
+    let mut workspace = workspace();
+    let paths = ["/tmp/a", "/tmp/b", "/tmp/c", "/tmp/d"].map(folder);
+    let events = workspace.group_open(paths.to_vec()).unwrap();
+    assert!(matches!(events[0], Event::TabAdded { index: 1, .. }));
+
+    let window = workspace.focused().unwrap();
+    assert_eq!(window.pills.len(), 2);
+    let group = &window.groups[&window.pills[1]];
+    assert_eq!(group.tabs.len(), 4);
+    let input_ids: Vec<TabId> = paths
+        .iter()
+        .map(|path| {
+            group
+                .tabs
+                .iter()
+                .find(|tab| &tab.folder == path)
+                .unwrap()
+                .id
+        })
+        .collect();
+    assert_eq!(group.layout.columns, initial_columns(&input_ids));
+    assert_eq!(column_counts(&group.layout.columns), (2, 2));
+    assert_eq!(window.focused_tab, input_ids[0]);
+    assert_eq!(window.focused_tab_ref().unwrap().folder, paths[0]);
+    workspace.check_invariants().unwrap();
+}
+
+#[test]
+fn group_open_collapses_exact_duplicates_keeping_the_first() {
+    let mut workspace = workspace();
+    let (a, b, c) = (folder("/tmp/a"), folder("/tmp/b"), folder("/tmp/c"));
+    let events = workspace
+        .group_open(vec![a.clone(), b.clone(), a.clone(), c.clone()])
+        .unwrap();
+    assert!(matches!(events[0], Event::TabAdded { index: 1, .. }));
+
+    let window = workspace.focused().unwrap();
+    let group = &window.groups[&window.pills[1]];
+    assert_eq!(group.tabs.len(), 3);
+    let input_ids: Vec<TabId> = [a, b, c]
+        .iter()
+        .map(|path| {
+            group
+                .tabs
+                .iter()
+                .find(|tab| &tab.folder == path)
+                .unwrap()
+                .id
+        })
+        .collect();
+    assert_eq!(group.layout.columns, initial_columns(&input_ids));
+    assert_eq!(window.focused_tab, input_ids[0]);
+}
+
+#[test]
+fn group_open_refuses_fewer_than_two_folders_and_changes_nothing() {
+    let mut workspace = workspace();
+    let before = workspace.clone();
+    assert_eq!(
+        workspace.group_open(vec![folder("/tmp/one")]).unwrap_err(),
+        WorkspaceError::NotEnoughTabs { selected: 1 }
+    );
+    assert_eq!(workspace, before);
+    assert_eq!(
+        workspace.group_open(Vec::new()).unwrap_err(),
+        WorkspaceError::NotEnoughTabs { selected: 0 }
+    );
+    assert_eq!(
+        workspace
+            .group_open(vec![folder("/tmp/a"), folder("/tmp/a")])
+            .unwrap_err(),
+        WorkspaceError::NotEnoughTabs { selected: 1 }
+    );
+    assert_eq!(workspace, before);
+}
+
+#[test]
+fn group_open_with_no_window_opens_one_holding_the_group() {
+    let mut workspace = Workspace::with_home(home());
+    let paths = ["/tmp/a", "/tmp/b", "/tmp/c"].map(folder);
+    let events = workspace.group_open(paths.to_vec()).unwrap();
+    assert!(matches!(events[0], Event::WindowOpened(_)));
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, Event::GroupFormed { .. }))
+    );
+
+    let window = workspace.focused().unwrap();
+    assert_eq!(workspace.windows.len(), 1);
+    assert_eq!(window.pills.len(), 1);
+    assert_eq!(window.selection.selected, vec![false]);
+    let group = &window.groups[&window.pills[0]];
+    assert_eq!(group.tabs.len(), 3);
+    assert_eq!(group.number, 1);
+    assert!(group.is_split());
+    let input_ids: Vec<TabId> = paths
+        .iter()
+        .map(|path| {
+            group
+                .tabs
+                .iter()
+                .find(|tab| &tab.folder == path)
+                .unwrap()
+                .id
+        })
+        .collect();
+    assert_eq!(group.layout.columns, initial_columns(&input_ids));
+    assert_eq!(window.focused_tab, input_ids[0]);
+    workspace.check_invariants().unwrap();
+}
+
+#[test]
+fn group_open_clears_an_existing_pill_selection() {
+    let mut workspace = workspace();
+    workspace.tab_new(Some(folder("/tmp/a"))).unwrap();
+    workspace.pill_ctrl_click(1).unwrap();
+    workspace.pill_ctrl_click(0).unwrap();
+
+    let events = workspace
+        .group_open(vec![folder("/tmp/one"), folder("/tmp/two")])
+        .unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, Event::SelectionChanged { .. }))
+    );
+    let window = workspace.focused().unwrap();
+    assert_eq!(window.selection.selected, vec![false, false, false]);
+    assert_eq!(window.selection.anchor, 1);
+}
+
+#[test]
 fn tab_new_opens_after_a_group_pill_and_not_inside_it() {
     let mut workspace = workspace();
     let (group_id, tabs) = split_first(&mut workspace, 2);
@@ -392,13 +571,47 @@ fn tab_new_opens_after_a_group_pill_and_not_inside_it() {
 }
 
 #[test]
-fn closing_the_last_pill_closes_the_window() {
+fn closing_the_last_pill_opens_home_and_keeps_the_window() {
     let mut workspace = workspace();
+    let window_id = workspace.windows[0].id;
+    let old_tab = workspace.windows[0].focused_tab;
     let events = workspace.tab_close().unwrap();
-    assert!(matches!(events[0], Event::TabClosed { .. }));
-    assert!(matches!(events[1], Event::WindowClosed(_)));
-    assert_eq!(events[2], Event::LastWindowClosed);
-    assert!(workspace.windows.is_empty());
+    assert!(matches!(events[0], Event::TabClosed { tab, .. } if tab == old_tab));
+    assert!(matches!(events[1], Event::TabAdded { window, index: 0, .. } if window == window_id));
+    assert!(matches!(events[2], Event::FocusChanged { window, .. } if window == window_id));
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, Event::WindowClosed(_) | Event::LastWindowClosed))
+    );
+
+    let window = &workspace.windows[0];
+    assert_eq!(workspace.windows.len(), 1);
+    assert_eq!(window.pills.len(), 1);
+    assert_eq!(window.selection.selected, vec![false]);
+    let tab = window.focused_tab_ref().unwrap();
+    assert_ne!(tab.id, old_tab);
+    assert_eq!(tab.folder, workspace.home().to_path_buf());
+}
+
+#[test]
+fn closing_every_selected_pill_opens_home() {
+    let mut workspace = workspace();
+    workspace.tab_new(Some(folder("/tmp/second"))).unwrap();
+    workspace.pill_shift_click(0).unwrap();
+    let events = workspace.tab_close_selected().unwrap();
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, Event::WindowClosed(_) | Event::LastWindowClosed))
+    );
+    let window = &workspace.windows[0];
+    assert_eq!(window.pills.len(), 1);
+    assert_eq!(window.selection.selected, vec![false]);
+    assert_eq!(
+        window.focused_tab_ref().unwrap().folder,
+        workspace.home().to_path_buf()
+    );
 }
 
 #[test]

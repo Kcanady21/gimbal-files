@@ -1029,7 +1029,7 @@ impl Workspace {
     }
 
     /// Close the focused tab. A tab that is the last one in its pill closes
-    /// the pill, and a window with no pills closes.
+    /// the pill, and a window left with no pills gets a fresh tab at home.
     pub fn tab_close(&mut self) -> Result<Vec<Event>, WorkspaceError> {
         let window_index = self.focused_index_or_error()?;
         let (group_id, pill, tab_id, count) = {
@@ -1261,6 +1261,103 @@ impl Workspace {
             window: new_window_id,
             tab: tab_id,
         });
+        Ok(events)
+    }
+
+    /// Open `paths` as one new split group after the focused pill. Exact
+    /// duplicates collapse to their first occurrence; fewer than two folders
+    /// is refused. This is pure: it never touches the filesystem, so the
+    /// caller decides whether every path is an existing folder.
+    pub fn group_open(&mut self, paths: Vec<PathBuf>) -> Result<Vec<Event>, WorkspaceError> {
+        let mut folders: Vec<PathBuf> = Vec::with_capacity(paths.len());
+        for path in paths {
+            if !folders.iter().any(|folder| folder == &path) {
+                folders.push(path);
+            }
+        }
+        if folders.len() < 2 {
+            return Err(WorkspaceError::NotEnoughTabs {
+                selected: folders.len(),
+            });
+        }
+
+        let mut tabs = Vec::with_capacity(folders.len());
+        for folder in folders {
+            let tab_id = self.ids.tab();
+            tabs.push(Tab::new(tab_id, folder));
+        }
+        let ids: Vec<TabId> = tabs.iter().map(|tab| tab.id).collect();
+        let first_tab = ids[0];
+        let columns = initial_columns(&ids);
+
+        let Some(window_index) = self.focused_index() else {
+            let window_id = self.ids.window();
+            let group_id = self.ids.group();
+            let group = Group::new(group_id, 1, tabs, columns);
+            self.windows
+                .push(Window::new(window_id, group_id, group, first_tab));
+            self.focused_window = Some(window_id);
+            return Ok(vec![
+                Event::WindowOpened(window_id),
+                Event::TabAdded {
+                    window: window_id,
+                    group: group_id,
+                    tab: first_tab,
+                    index: 0,
+                },
+                Event::GroupFormed {
+                    window: window_id,
+                    group: group_id,
+                },
+                Event::FocusChanged {
+                    window: window_id,
+                    tab: first_tab,
+                },
+            ]);
+        };
+
+        let (window_id, position) = {
+            let window = &self.windows[window_index];
+            (
+                window.id,
+                window
+                    .focused_pill_index()
+                    .ok_or(WorkspaceError::NoFocusedTab)?
+                    + 1,
+            )
+        };
+        let group_id = self.ids.group();
+        let number = next_group_number(&self.windows[window_index]);
+        let group = Group::new(group_id, number, tabs, columns);
+
+        let window = &mut self.windows[window_index];
+        window.groups.insert(group_id, group);
+        window.pills.insert(position, group_id);
+        window.selection.selected.insert(position, false);
+        let had_selection = window.selection.selected.iter().any(|selected| *selected);
+        window.selection.selected.fill(false);
+        window.selection.anchor = position;
+        window.focused_tab = first_tab;
+
+        let mut events = vec![
+            Event::TabAdded {
+                window: window_id,
+                group: group_id,
+                tab: first_tab,
+                index: position,
+            },
+            Event::GroupFormed {
+                window: window_id,
+                group: group_id,
+            },
+            Event::FocusChanged {
+                window: window_id,
+                tab: first_tab,
+            },
+        ];
+        if had_selection {
+            events.push(Event::SelectionChanged { window: window_id });
+        }
         Ok(events)
     }
 
@@ -2311,20 +2408,30 @@ impl Workspace {
         }
 
         if self.windows[window_index].pills.is_empty() {
-            self.windows.remove(window_index);
-            events.push(Event::WindowClosed(window_id));
-            if self.windows.is_empty() {
-                self.focused_window = None;
-                events.push(Event::LastWindowClosed);
-            } else {
-                let next = window_index.min(self.windows.len() - 1);
-                let window = &self.windows[next];
-                self.focused_window = Some(window.id);
-                events.push(Event::WindowFocused(window.id));
-                events.push(Event::FocusChanged {
-                    window: window.id,
-                    tab: window.focused_tab,
-                });
+            // Closing tabs never closes the window: the last one gives way to
+            // a fresh tab at home, and only the window's ✕ closes it.
+            let tab_id = self.ids.tab();
+            let group_id = self.ids.group();
+            let tab = Tab::new(tab_id, self.home.clone());
+            let group = Group::new(group_id, 1, vec![tab], initial_columns(&[tab_id]));
+            let window = &mut self.windows[window_index];
+            window.groups.insert(group_id, group);
+            window.pills.push(group_id);
+            window.selection.selected.push(false);
+            window.selection.anchor = 0;
+            window.focused_tab = tab_id;
+            events.push(Event::TabAdded {
+                window: window_id,
+                group: group_id,
+                tab: tab_id,
+                index: 0,
+            });
+            events.push(Event::FocusChanged {
+                window: window_id,
+                tab: tab_id,
+            });
+            if had_selection {
+                events.push(Event::SelectionChanged { window: window_id });
             }
         } else {
             let window = &mut self.windows[window_index];

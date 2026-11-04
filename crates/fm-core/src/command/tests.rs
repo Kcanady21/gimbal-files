@@ -34,6 +34,7 @@ fn the_v1_catalogue_has_every_reviewed_command_in_order() {
         "tab.focus",
         "tab.move",
         "tab.open-in-new-window",
+        "group.open",
         "group.split",
         "group.close",
         "group.rename",
@@ -591,6 +592,36 @@ fn bool_accepts_true_and_false_only() {
 fn a_files_command_defaults_dry_run_to_false() {
     let command = check(Caller::Ui, &["file.trash", "paths=/tmp/x"]).expect("valid");
     assert_eq!(command.get("dry-run"), Some(&Value::Bool(false)));
+}
+
+#[test]
+fn group_open_takes_required_repeated_paths_for_every_caller() {
+    let spec = COMMANDS
+        .iter()
+        .find(|spec| spec.name == "group.open")
+        .expect("the reviewed group.open command");
+    assert_eq!(spec.effect, Effect::View);
+    assert!(!spec.undo);
+    assert_eq!(spec.arguments.len(), 1);
+    assert_eq!(spec.arguments[0].name, "paths");
+    assert!(matches!(spec.arguments[0].kind, ArgKind::Paths));
+    assert!(matches!(spec.arguments[0].presence, Presence::Required));
+
+    for caller in [Caller::Ui, Caller::Hotkey, Caller::Cli, Caller::Agent] {
+        let command = check(caller, &["group.open", "paths=/tmp/a", "paths=/tmp/b"])
+            .expect("every caller may name explicit folders");
+        assert_eq!(
+            command.get("paths"),
+            Some(&Value::Paths(vec![
+                PathBuf::from("/tmp/a"),
+                PathBuf::from("/tmp/b")
+            ]))
+        );
+        assert!(
+            check(caller, &["group.open"]).is_err(),
+            "{caller} must supply the paths"
+        );
+    }
 }
 
 #[test]

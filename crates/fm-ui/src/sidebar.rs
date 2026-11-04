@@ -5,6 +5,7 @@
 //! Recent directories are one shared session list, rendered by every window.
 
 use std::cell::{Cell, RefCell};
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::rc::{Rc, Weak};
 
@@ -32,9 +33,108 @@ const BAR_FILL_CLASSES: [&str; 11] = [
 ];
 const BAR_LABEL_CLASSES: [&str; 3] = ["bar-label-lo", "bar-label-hi", "bar-label-err"];
 
+/// Which sidebar list owns the one selection. Selecting in Pinned clears
+/// Recent's selection, and the reverse.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SidebarList {
+    Pinned,
+    Recent,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SidebarClick {
+    Plain,
+    Toggle,
+    Range,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SidebarMenu {
+    Group,
+    Single,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct SidebarSelection {
+    list: Option<SidebarList>,
+    selected: BTreeSet<usize>,
+    anchor: usize,
+}
+
+/// The sidebar's selection rules, pure: a plain click clears the selection and
+/// moves the anchor; Ctrl toggles one row and also moves the anchor; Shift
+/// selects the range from the anchor. A click in the other list starts a fresh
+/// selection there.
+fn sidebar_selection_after(
+    list: SidebarList,
+    state: &SidebarSelection,
+    slot: usize,
+    len: usize,
+    click: SidebarClick,
+) -> SidebarSelection {
+    if slot >= len {
+        return state.clone();
+    }
+    let mut next = if state.list == Some(list) {
+        state.clone()
+    } else {
+        SidebarSelection {
+            list: Some(list),
+            selected: BTreeSet::new(),
+            anchor: slot,
+        }
+    };
+    match click {
+        SidebarClick::Plain => {
+            next.selected.clear();
+            next.anchor = slot;
+        }
+        SidebarClick::Toggle => {
+            if !next.selected.remove(&slot) {
+                next.selected.insert(slot);
+            }
+            next.anchor = slot;
+        }
+        SidebarClick::Range => {
+            let (from, to) = (next.anchor.min(slot), next.anchor.max(slot));
+            next.selected.clear();
+            next.selected.extend(from..=to);
+        }
+    }
+    next
+}
+
+/// Which menu a right-click shows. A click inside a selection of two or more
+/// keeps it and offers the group action; anything else makes that row the only
+/// selection and offers its single-row menu.
+fn sidebar_right_click(
+    list: SidebarList,
+    state: &SidebarSelection,
+    slot: usize,
+    len: usize,
+) -> (SidebarSelection, SidebarMenu) {
+    if slot >= len {
+        return (state.clone(), SidebarMenu::Single);
+    }
+    let inside =
+        state.list == Some(list) && state.selected.len() >= 2 && state.selected.contains(&slot);
+    if inside {
+        return (state.clone(), SidebarMenu::Group);
+    }
+    (
+        SidebarSelection {
+            list: Some(list),
+            selected: BTreeSet::from([slot]),
+            anchor: slot,
+        },
+        SidebarMenu::Single,
+    )
+}
+
 pub struct Sidebar {
     root: gtk::Box,
     pinned: Rc<PinnedList>,
+    selection: Rc<RefCell<SidebarSelection>>,
     recent_content: gtk::Box,
     devices_content: gtk::Box,
     revealers: RefCell<Vec<(Section, gtk::Revealer)>>,
@@ -57,7 +157,8 @@ impl Sidebar {
         let sections = config.config().sections;
         drop(config);
 
-        let pinned = PinnedList::new(process, window, home.clone());
+        let selection = Rc::new(RefCell::new(SidebarSelection::default()));
+        let pinned = PinnedList::new(process, window, home.clone(), selection.clone());
         let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
         root.set_vexpand(true);
 
@@ -112,6 +213,7 @@ impl Sidebar {
         let this = Rc::new(Self {
             root,
             pinned,
+            selection,
             recent_content,
             devices_content,
             revealers: RefCell::new(revealers),
@@ -125,6 +227,45 @@ impl Sidebar {
             scale: Cell::new(scale),
             current: RefCell::new(None),
         });
+
+        this.recent_content.set_focusable(true);
+        let weak = Rc::downgrade(&this);
+        let recent_click = gtk::GestureClick::new();
+        recent_click.set_button(1);
+        recent_click.connect_released(move |gesture, _, _, y| {
+            if let Some(sidebar) = weak.upgrade() {
+                sidebar.recent_clicked(gesture.current_event_state(), y);
+            }
+        });
+        this.recent_content.add_controller(recent_click);
+
+        let weak = Rc::downgrade(&this);
+        let recent_right = gtk::GestureClick::new();
+        recent_right.set_button(3);
+        recent_right.connect_pressed(move |_, _, x, y| {
+            if let Some(sidebar) = weak.upgrade() {
+                sidebar.recent_context_menu(x, y);
+            }
+        });
+        this.recent_content.add_controller(recent_right);
+
+        let weak = Rc::downgrade(&this);
+        let key = gtk::EventControllerKey::new();
+        key.connect_key_pressed(move |_, key, _, _| {
+            // Escape is the sidebar's only when it clears a selection; the
+            // window's own Escape (search, pill selection, split drag) runs
+            // otherwise.
+            let cleared = key == gtk::gdk::Key::Escape
+                && weak
+                    .upgrade()
+                    .is_some_and(|sidebar| sidebar.clear_selection());
+            if cleared {
+                glib::Propagation::Stop
+            } else {
+                glib::Propagation::Proceed
+            }
+        });
+        this.root.add_controller(key);
 
         // Every sidebar follows the one process-shared inventory. The weak
         // upgrade returns false once this window is gone, so the volume service
@@ -161,6 +302,7 @@ impl Sidebar {
             (config.pins.clone(), config.sections)
         };
         self.pinned.rebuild(&pins);
+        self.paint_recent_selection();
         for (section, revealer) in self.revealers.borrow().iter() {
             revealer.set_reveal_child(sections.get(*section) == SectionState::Expanded);
         }
@@ -229,20 +371,181 @@ impl Sidebar {
     }
 
     fn rebuild_recent(&self) {
+        *self.selection.borrow_mut() = SidebarSelection::default();
         clear_children(&self.recent_content);
         let recent = self.recent.borrow().clone();
         for folder in recent {
             let row = dir_row(&recent_label(&folder, &self.home));
             row.set_tooltip_text(Some(&folder.display().to_string()));
-            attach_click(
-                &row,
-                &self.process,
-                self.window,
-                folder,
-                Process::open_recent_folder,
-            );
             self.recent_content.append(&row);
         }
+        self.paint_selection();
+    }
+
+    /// Clear the selection; `true` when there was one to clear.
+    fn clear_selection(&self) -> bool {
+        let had = !self.selection.borrow().selected.is_empty();
+        *self.selection.borrow_mut() = SidebarSelection::default();
+        self.paint_selection();
+        had
+    }
+
+    fn paint_selection(&self) {
+        self.pinned.paint_selection();
+        self.paint_recent_selection();
+    }
+
+    fn paint_recent_selection(&self) {
+        let selection = self.selection.borrow();
+        let active = selection.list == Some(SidebarList::Recent) && !selection.selected.is_empty();
+        let mut child = self.recent_content.first_child();
+        let mut index = 0;
+        while let Some(row) = child {
+            row.remove_css_class("sel");
+            if active && selection.selected.contains(&index) {
+                row.add_css_class("sel");
+            }
+            index += 1;
+            child = row.next_sibling();
+        }
+    }
+
+    fn recent_slot(&self, y: f64) -> Option<usize> {
+        let mut child = self.recent_content.first_child();
+        let mut index = 0;
+        while let Some(row) = child {
+            if let Some(bounds) = row.compute_bounds(&self.recent_content) {
+                let top = f64::from(bounds.y());
+                let bottom = top + f64::from(bounds.height());
+                if y >= top && y < bottom {
+                    return Some(index);
+                }
+            }
+            index += 1;
+            child = row.next_sibling();
+        }
+        None
+    }
+
+    fn recent_clicked(&self, state: gtk::gdk::ModifierType, y: f64) {
+        let Some(slot) = self.recent_slot(y) else {
+            return;
+        };
+        let click = if state.contains(gtk::gdk::ModifierType::CONTROL_MASK) {
+            SidebarClick::Toggle
+        } else if state.contains(gtk::gdk::ModifierType::SHIFT_MASK) {
+            SidebarClick::Range
+        } else {
+            SidebarClick::Plain
+        };
+        let next = {
+            let current = self.selection.borrow();
+            sidebar_selection_after(
+                SidebarList::Recent,
+                &current,
+                slot,
+                self.recent.borrow().len(),
+                click,
+            )
+        };
+        *self.selection.borrow_mut() = next;
+        self.paint_selection();
+        if click != SidebarClick::Plain {
+            // Only a selecting click takes focus, so Escape can clear it; a
+            // plain click navigates and leaves the grid's keyboard focus alone.
+            self.recent_content.grab_focus();
+            return;
+        }
+        let path = self.recent.borrow().get(slot).cloned();
+        if let (Some(process), Some(path)) = (self.process.upgrade(), path) {
+            process.open_recent_folder(self.window, path);
+        }
+    }
+
+    fn recent_context_menu(&self, x: f64, y: f64) {
+        let Some(slot) = self.recent_slot(y) else {
+            return;
+        };
+        let (next, menu) = {
+            let current = self.selection.borrow();
+            sidebar_right_click(
+                SidebarList::Recent,
+                &current,
+                slot,
+                self.recent.borrow().len(),
+            )
+        };
+        *self.selection.borrow_mut() = next;
+        self.paint_selection();
+
+        let popover = gtk::Popover::new();
+        popover.add_css_class("gl-menu");
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        match menu {
+            SidebarMenu::Group => {
+                let paths: Vec<PathBuf> = {
+                    let selection = self.selection.borrow();
+                    let recent = self.recent.borrow();
+                    selection
+                        .selected
+                        .iter()
+                        .filter_map(|index| recent.get(*index).cloned())
+                        .collect()
+                };
+                let button = menu_action(
+                    "Open in New Group",
+                    "Open the selected recent folders in a new group",
+                );
+                let popover_for_button = popover.clone();
+                let process = self.process.clone();
+                let window = self.window;
+                button.connect_clicked(move |_| {
+                    popover_for_button.popdown();
+                    let Some(arguments) = group_arguments(&paths) else {
+                        return;
+                    };
+                    if let Some(process) = process.upgrade() {
+                        process.dispatch_for_window(
+                            window,
+                            Caller::Ui,
+                            Invocation::new("group.open", arguments),
+                        );
+                    }
+                });
+                content.append(&button);
+            }
+            SidebarMenu::Single => {
+                let Some(path) = self.recent.borrow().get(slot).cloned() else {
+                    return;
+                };
+                let button = menu_action(
+                    "Open in New Tab",
+                    &format!("Open {} in a new tab", path.display()),
+                );
+                let popover_for_button = popover.clone();
+                let process = self.process.clone();
+                let window = self.window;
+                button.connect_clicked(move |_| {
+                    popover_for_button.popdown();
+                    let Some(arguments) = single_path_argument(&path) else {
+                        return;
+                    };
+                    if let Some(process) = process.upgrade() {
+                        process.dispatch_for_window(
+                            window,
+                            Caller::Ui,
+                            Invocation::new("tab.new", arguments),
+                        );
+                    }
+                });
+                content.append(&button);
+            }
+        }
+        popover.set_child(Some(&content));
+        popover.set_parent(&self.recent_content);
+        popover.set_pointing_to(Some(&gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+        popover.connect_closed(|popover| popover.unparent());
+        crate::popup::show(&popover);
     }
 
     fn refresh_from_volumes(&self) {
@@ -842,6 +1145,34 @@ fn menu_action(label: &str, accessible: &str) -> gtk::Button {
     button
 }
 
+fn group_arguments(paths: &[PathBuf]) -> Option<Vec<(String, String)>> {
+    let mut arguments = Vec::with_capacity(paths.len());
+    for path in paths {
+        let Some(text) = path.to_str() else {
+            crate::log!(
+                "sidebar",
+                "cannot open a non-UTF-8 path in a group: {}",
+                path.display()
+            );
+            return None;
+        };
+        arguments.push(("paths".to_string(), text.to_string()));
+    }
+    Some(arguments)
+}
+
+fn single_path_argument(path: &Path) -> Option<Vec<(String, String)>> {
+    let Some(text) = path.to_str() else {
+        crate::log!(
+            "sidebar",
+            "cannot open a non-UTF-8 path: {}",
+            path.display()
+        );
+        return None;
+    };
+    Some(vec![("path".to_string(), text.to_string())])
+}
+
 fn removal_invocation(action: DriveAction, device: &str) -> Invocation {
     Invocation::new(
         action.command(),
@@ -1361,6 +1692,7 @@ struct PinnedList {
     widgets: RefCell<Vec<gtk::Box>>,
     gens: RefCell<Vec<Rc<Cell<u64>>>>,
     selected: Cell<Option<usize>>,
+    selection: Rc<RefCell<SidebarSelection>>,
     scale: Cell<f64>,
     drag: RefCell<Option<PinDrag>>,
     animations: RefCell<Vec<adw::Animation>>,
@@ -1372,12 +1704,18 @@ struct PinnedList {
 }
 
 impl PinnedList {
-    fn new(process: &Rc<Process>, window: WindowId, home: PathBuf) -> Rc<Self> {
+    fn new(
+        process: &Rc<Process>,
+        window: WindowId,
+        home: PathBuf,
+        selection: Rc<RefCell<SidebarSelection>>,
+    ) -> Rc<Self> {
         let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
         root.add_css_class("gl-pinned");
         let rows = PinnedRows::new();
         rows.set_hexpand(true);
         rows.set_valign(gtk::Align::Start);
+        rows.set_focusable(true);
         root.append(&rows);
         // The empty part of the pinned list is a drop target of its own; the
         // rows above it have their own targets.
@@ -1392,6 +1730,7 @@ impl PinnedList {
             widgets: RefCell::new(Vec::new()),
             gens: RefCell::new(Vec::new()),
             selected: Cell::new(None),
+            selection,
             scale: Cell::new(1.0),
             drag: RefCell::new(None),
             animations: RefCell::new(Vec::new()),
@@ -1404,9 +1743,9 @@ impl PinnedList {
 
         let weak = Rc::downgrade(&this);
         let drag = gtk::GestureDrag::new();
-        drag.connect_drag_begin(move |_, x, y| {
+        drag.connect_drag_begin(move |gesture, x, y| {
             if let Some(this) = weak.upgrade() {
-                this.begin_drag(x, y);
+                this.begin_drag(x, y, gesture.current_event_state());
             }
         });
         let weak = Rc::downgrade(&this);
@@ -1432,9 +1771,9 @@ impl PinnedList {
         let weak = Rc::downgrade(&this);
         let click = this.click.clone();
         click.set_button(1);
-        click.connect_released(move |_, n_press, _, y| {
+        click.connect_released(move |gesture, n_press, _, y| {
             if let Some(this) = weak.upgrade() {
-                this.clicked(n_press, y);
+                this.clicked(n_press, y, gesture.current_event_state());
             }
         });
         this.rows.add_controller(click);
@@ -1444,7 +1783,7 @@ impl PinnedList {
         right.set_button(3);
         right.connect_pressed(move |_, _, x, y| {
             if let Some(this) = weak.upgrade() {
-                this.show_unpin(x, y);
+                this.show_context_menu(x, y);
             }
         });
         this.rows.add_controller(right);
@@ -1465,6 +1804,7 @@ impl PinnedList {
     }
 
     fn rebuild(&self, paths: &[PathBuf]) {
+        *self.selection.borrow_mut() = SidebarSelection::default();
         self.animations.borrow_mut().clear();
         *self.drag.borrow_mut() = None;
         self.rows.clear_rows();
@@ -1510,6 +1850,7 @@ impl PinnedList {
         {
             self.selected.set(None);
         }
+        self.paint_selection();
     }
 
     fn set_scale(&self, scale: f64) {
@@ -1538,21 +1879,52 @@ impl PinnedList {
     fn select(&self, slot: Option<usize>) {
         let slot = slot.filter(|index| *index < self.names_len());
         self.selected.set(slot);
+        self.paint_selection();
+    }
+
+    fn paint_selection(&self) {
+        let selection = self.selection.borrow();
+        let active = selection.list == Some(SidebarList::Pinned) && !selection.selected.is_empty();
         for (index, row) in self.widgets.borrow().iter().enumerate() {
             row.remove_css_class("sel");
-            if slot == Some(index) {
+            let marked = if active {
+                selection.selected.contains(&index)
+            } else {
+                self.selected.get() == Some(index)
+            };
+            if marked {
                 row.add_css_class("sel");
             }
         }
     }
 
-    fn clicked(&self, n_press: i32, y: f64) {
+    fn clicked(&self, n_press: i32, y: f64, state: gtk::gdk::ModifierType) {
         let n = self.names_len();
         let row_h = self.row_h();
         if n == 0 || y < 0.0 {
             return;
         }
         let slot = pin_slot(y, row_h, n);
+        let ctrl = state.contains(gtk::gdk::ModifierType::CONTROL_MASK);
+        let shift = state.contains(gtk::gdk::ModifierType::SHIFT_MASK);
+        if ctrl || shift {
+            let click = if ctrl {
+                SidebarClick::Toggle
+            } else {
+                SidebarClick::Range
+            };
+            let next = {
+                let current = self.selection.borrow();
+                sidebar_selection_after(SidebarList::Pinned, &current, slot, n, click)
+            };
+            *self.selection.borrow_mut() = next;
+            self.paint_selection();
+            // As in Recent: only a selecting click takes keyboard focus.
+            self.rows.grab_focus();
+            return;
+        }
+
+        *self.selection.borrow_mut() = SidebarSelection::default();
         match pin_release(n, row_h, slot, y, n_press, false) {
             PinRelease::Open { slot } => self.open_once(slot),
             PinRelease::Select { slot } => self.select(Some(slot)),
@@ -1593,43 +1965,107 @@ impl PinnedList {
         }
     }
 
-    fn show_unpin(&self, x: f64, y: f64) {
+    fn show_context_menu(&self, x: f64, y: f64) {
         let n = self.names_len();
         let row_h = self.row_h();
         if n == 0 || y < 0.0 || row_h <= 0 {
             return;
         }
         let slot = pin_slot(y, row_h, n);
-        let Some(path) = self.names.borrow().get(slot).cloned() else {
-            return;
+        let (next, menu) = {
+            let current = self.selection.borrow();
+            sidebar_right_click(SidebarList::Pinned, &current, slot, n)
         };
+        *self.selection.borrow_mut() = next;
+        self.paint_selection();
+
         let popover = gtk::Popover::new();
         popover.add_css_class("gl-menu");
-        let menu = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        let button = gtk::Button::new();
-        button.add_css_class("gl-menu-item");
-        button.set_child(Some(&gtk::Label::new(Some("Unpin"))));
-        menu.append(&button);
-        popover.set_child(Some(&menu));
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        match menu {
+            SidebarMenu::Group => {
+                let paths: Vec<PathBuf> = {
+                    let selection = self.selection.borrow();
+                    let names = self.names.borrow();
+                    selection
+                        .selected
+                        .iter()
+                        .filter_map(|index| names.get(*index))
+                        .map(|path| config::expand_home(path, &self.home))
+                        .collect()
+                };
+                let button =
+                    menu_action("Open in New Group", "Open the selected pins in a new group");
+                let popover_for_button = popover.clone();
+                let process = self.process.clone();
+                let window = self.window;
+                button.connect_clicked(move |_| {
+                    popover_for_button.popdown();
+                    let Some(arguments) = group_arguments(&paths) else {
+                        return;
+                    };
+                    if let Some(process) = process.upgrade() {
+                        process.dispatch_for_window(
+                            window,
+                            Caller::Ui,
+                            Invocation::new("group.open", arguments),
+                        );
+                    }
+                });
+                content.append(&button);
+            }
+            SidebarMenu::Single => {
+                let Some(path) = self.names.borrow().get(slot).cloned() else {
+                    return;
+                };
+                let unpin = menu_action("Unpin", &format!("Unpin {}", path.display()));
+                let popover_for_unpin = popover.clone();
+                let process = self.process.clone();
+                let window = self.window;
+                let unpin_path = path.clone();
+                unpin.connect_clicked(move |_| {
+                    popover_for_unpin.popdown();
+                    let Some(path) = unpin_path.to_str().map(str::to_string) else {
+                        crate::log!("pins", "cannot unpin a non-UTF-8 path");
+                        return;
+                    };
+                    if let Some(process) = process.upgrade() {
+                        process.dispatch_for_window(
+                            window,
+                            Caller::Ui,
+                            Invocation::new("pins.remove", vec![("path".to_string(), path)]),
+                        );
+                    }
+                });
+                content.append(&unpin);
+
+                let expanded = config::expand_home(&path, &self.home);
+                let new_tab = menu_action(
+                    "Open in New Tab",
+                    &format!("Open {} in a new tab", expanded.display()),
+                );
+                let popover_for_tab = popover.clone();
+                let process = self.process.clone();
+                let window = self.window;
+                new_tab.connect_clicked(move |_| {
+                    popover_for_tab.popdown();
+                    let Some(arguments) = single_path_argument(&expanded) else {
+                        return;
+                    };
+                    if let Some(process) = process.upgrade() {
+                        process.dispatch_for_window(
+                            window,
+                            Caller::Ui,
+                            Invocation::new("tab.new", arguments),
+                        );
+                    }
+                });
+                content.append(&new_tab);
+            }
+        }
+        popover.set_child(Some(&content));
         popover.set_parent(&self.rows);
         popover.set_pointing_to(Some(&gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
-        let process = self.process.clone();
-        let window = self.window;
-        let popover_for_button = popover.clone();
-        button.connect_clicked(move |_| {
-            popover_for_button.popdown();
-            let Some(path) = path.to_str().map(str::to_string) else {
-                crate::log!("pins", "cannot unpin a non-UTF-8 path");
-                return;
-            };
-            if let Some(process) = process.upgrade() {
-                process.dispatch_for_window(
-                    window,
-                    Caller::Ui,
-                    Invocation::new("pins.remove", vec![("path".to_string(), path)]),
-                );
-            }
-        });
         popover.connect_closed(|popover| popover.unparent());
         crate::popup::show(&popover);
     }
@@ -1640,7 +2076,13 @@ impl PinnedList {
         }
     }
 
-    fn begin_drag(&self, x: f64, y: f64) {
+    fn begin_drag(&self, x: f64, y: f64, state: gtk::gdk::ModifierType) {
+        if state
+            .intersects(gtk::gdk::ModifierType::CONTROL_MASK | gtk::gdk::ModifierType::SHIFT_MASK)
+        {
+            *self.drag.borrow_mut() = None;
+            return;
+        }
         let n = self.names_len();
         let row_h = self.row_h();
         if n == 0 || row_h <= 0 || y < 0.0 {
@@ -1807,14 +2249,12 @@ impl PinnedList {
         let mut sibling: Option<gtk::Widget> = None;
         for (index, row) in widgets.iter().enumerate() {
             row.insert_after(&self.rows, sibling.as_ref());
-            row.remove_css_class("sel");
-            if self.selected.get() == Some(index) {
-                row.add_css_class("sel");
-            }
             self.bump_gen(index);
             self.slide_y(index, row, index as i32 * row_h);
             sibling = Some(row.clone().upcast());
         }
+        drop(widgets);
+        self.paint_selection();
         self.rows
             .set_size_request(-1, self.names_len() as i32 * row_h);
     }
@@ -1917,5 +2357,130 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn a_plain_sidebar_click_clears_and_moves_the_anchor() {
+        let mut state = SidebarSelection {
+            list: Some(SidebarList::Pinned),
+            selected: BTreeSet::from([0, 2, 3]),
+            anchor: 0,
+        };
+        state = sidebar_selection_after(SidebarList::Pinned, &state, 1, 5, SidebarClick::Plain);
+        assert!(state.selected.is_empty());
+        assert_eq!(state.anchor, 1);
+        assert_eq!(state.list, Some(SidebarList::Pinned));
+    }
+
+    #[test]
+    fn ctrl_click_toggles_and_moves_the_anchor_without_navigating() {
+        let mut state = SidebarSelection {
+            list: Some(SidebarList::Recent),
+            ..SidebarSelection::default()
+        };
+        state = sidebar_selection_after(SidebarList::Recent, &state, 2, 5, SidebarClick::Toggle);
+        assert_eq!(state.selected, BTreeSet::from([2]));
+        assert_eq!(state.anchor, 2);
+
+        state = sidebar_selection_after(SidebarList::Recent, &state, 4, 5, SidebarClick::Toggle);
+        assert_eq!(state.selected, BTreeSet::from([2, 4]));
+        assert_eq!(state.anchor, 4);
+
+        state = sidebar_selection_after(SidebarList::Recent, &state, 2, 5, SidebarClick::Toggle);
+        assert_eq!(state.selected, BTreeSet::from([4]));
+        assert_eq!(state.anchor, 2);
+    }
+
+    #[test]
+    fn shift_click_selects_the_range_from_the_last_clicked_row() {
+        let mut state = SidebarSelection {
+            list: Some(SidebarList::Pinned),
+            ..SidebarSelection::default()
+        };
+        state = sidebar_selection_after(SidebarList::Pinned, &state, 3, 6, SidebarClick::Plain);
+        state = sidebar_selection_after(SidebarList::Pinned, &state, 1, 6, SidebarClick::Range);
+        assert_eq!(state.selected, BTreeSet::from([1, 2, 3]));
+        assert_eq!(state.anchor, 3);
+
+        state = sidebar_selection_after(SidebarList::Pinned, &state, 5, 6, SidebarClick::Range);
+        assert_eq!(state.selected, BTreeSet::from([3, 4, 5]));
+        assert_eq!(state.anchor, 3);
+    }
+
+    #[test]
+    fn selecting_in_the_other_list_starts_a_fresh_selection() {
+        let pinned = SidebarSelection {
+            list: Some(SidebarList::Pinned),
+            selected: BTreeSet::from([0, 1]),
+            anchor: 1,
+        };
+        let recent =
+            sidebar_selection_after(SidebarList::Recent, &pinned, 3, 5, SidebarClick::Toggle);
+        assert_eq!(recent.list, Some(SidebarList::Recent));
+        assert_eq!(recent.selected, BTreeSet::from([3]));
+        assert_eq!(recent.anchor, 3);
+
+        let back = sidebar_selection_after(SidebarList::Pinned, &recent, 2, 5, SidebarClick::Plain);
+        assert_eq!(back.list, Some(SidebarList::Pinned));
+        assert!(back.selected.is_empty());
+        assert_eq!(back.anchor, 2);
+    }
+
+    #[test]
+    fn a_click_past_the_end_changes_nothing() {
+        let state = SidebarSelection {
+            list: Some(SidebarList::Pinned),
+            selected: BTreeSet::from([1]),
+            anchor: 1,
+        };
+        assert_eq!(
+            sidebar_selection_after(SidebarList::Pinned, &state, 9, 3, SidebarClick::Plain,),
+            state
+        );
+        assert_eq!(
+            sidebar_right_click(SidebarList::Pinned, &state, 9, 3),
+            (state.clone(), SidebarMenu::Single)
+        );
+    }
+
+    #[test]
+    fn right_click_inside_a_multi_selection_keeps_the_group_menu() {
+        let state = SidebarSelection {
+            list: Some(SidebarList::Pinned),
+            selected: BTreeSet::from([1, 3, 4]),
+            anchor: 3,
+        };
+        assert_eq!(
+            sidebar_right_click(SidebarList::Pinned, &state, 3, 6),
+            (state.clone(), SidebarMenu::Group)
+        );
+    }
+
+    #[test]
+    fn right_click_outside_or_with_one_selected_shows_the_single_menu() {
+        let multi = SidebarSelection {
+            list: Some(SidebarList::Pinned),
+            selected: BTreeSet::from([1, 3]),
+            anchor: 3,
+        };
+        let (outside, menu) = sidebar_right_click(SidebarList::Pinned, &multi, 5, 6);
+        assert_eq!(menu, SidebarMenu::Single);
+        assert_eq!(outside.selected, BTreeSet::from([5]));
+        assert_eq!(outside.anchor, 5);
+
+        let single = SidebarSelection {
+            list: Some(SidebarList::Recent),
+            selected: BTreeSet::from([2]),
+            anchor: 2,
+        };
+        let (again, menu) = sidebar_right_click(SidebarList::Recent, &single, 2, 6);
+        assert_eq!(menu, SidebarMenu::Single);
+        assert_eq!(again.selected, BTreeSet::from([2]));
+
+        let empty = SidebarSelection::default();
+        let (clicked, menu) = sidebar_right_click(SidebarList::Recent, &empty, 4, 6);
+        assert_eq!(menu, SidebarMenu::Single);
+        assert_eq!(clicked.list, Some(SidebarList::Recent));
+        assert_eq!(clicked.selected, BTreeSet::from([4]));
     }
 }

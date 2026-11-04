@@ -153,6 +153,7 @@ window.gimbal-look, window.gimbal-look.background {{ background-color: {window_b
 .gl-pin-empty {{ min-height: {pinrow}px; }}
 .gl-dir-row {{ min-height: {dirrow}px; }}
 .gl-dir-row label {{ font-size: {titem}px; }}
+.gl-dir-row.sel {{ background-color: {pin_sel}; }}
 .gl-drive-name {{ font-size: {titem}px; }}
 .gl-drive-block {{ margin-bottom: {gs}px; }}
 .gl-drive-track {{ min-width: {barw}px; min-height: {barh}px; background-color: {track}; }}
@@ -458,6 +459,7 @@ mod tests {
         assert!(plain.contains(".gl-pinned { color: @sidebar_fg_color"));
         assert!(!plain.contains(".gl-pinned { background-color"));
         assert!(plain.contains(".gl-pinned-row.sel { background-color:"));
+        assert!(plain.contains(".gl-dir-row.sel { background-color:"));
         assert!(plain.contains(".gl-section { margin-top: 6px; }"));
         assert!(plain.contains(".gl-section-content { margin: 8px 0 10px 0; }"));
         assert!(plain.contains(".gl-section:last-child .gl-section-content { margin-bottom: 0; }"));
