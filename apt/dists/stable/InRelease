@@ -1,0 +1,21 @@
+-----BEGIN PGP SIGNED MESSAGE-----
+Hash: SHA256
+
+Origin: Gimbal Files
+Label: Gimbal Files
+Suite: stable
+Codename: stable
+Architectures: amd64
+Components: main
+Description: Gimbal Files apt repository
+Date: Thu, 05 Nov 2026 15:52:27 +0000
+SHA256:
+ 77d6a17250c9d3301d6e0b9a3b1bb03ebbd88f5cd02d530ad6561032a74264ca 1019 main/binary-amd64/Packages
+ f686b187b8344e90d4448637357530747ac9cdce0e1b0b45e3aae837d0d19afd 622 main/binary-amd64/Packages.gz
+-----BEGIN PGP SIGNATURE-----
+
+iHUEARYIAB0WIQSzkWuZ7NhHza0ZNwuazpkux0QEbQUCauympAAKCRCazpkux0QE
+bX6fAQDdWtbBWKiQRqV8sYisku1EDeiG/qw2JKNi3oudFoy8ZwD/TB1xXkIZhv1a
+4vWQR02URN0cDWzCti7Zd6BZ7ZuxQQM=
+=DpbX
+-----END PGP SIGNATURE-----

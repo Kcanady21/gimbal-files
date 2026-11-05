@@ -1,0 +1,20 @@
+Package: gimbal-files
+Version: 0.1.0
+Architecture: amd64
+Maintainer: Kyle Canady <wayofthewayald1@gmail.com>
+Installed-Size: 7621
+Depends: libadwaita-1-0 (>= 1.5~beta), libc6 (>= 2.39), libcairo2 (>= 1.2.4), libgcc-s1 (>= 4.2), libgdk-pixbuf-2.0-0 (>= 2.31.1), libglib2.0-0t64 (>= 2.62.0), libgraphene-1.0-0 (>= 1.5.4), libgtk-4-1 (>= 4.21.5), libpango-1.0-0 (>= 1.14.0), libwayland-client0 (>= 1.11.0)
+Recommends: baobab
+Filename: pool/main/g/gimbal-files/gimbal-files_0.1.0_amd64.deb
+Size: 2476298
+MD5sum: bc4d66a781620bdf169358b501c17075
+SHA1: 3c26ce93dd4c8f8fa59c9d9ebc6e3bcd3e26aa89
+SHA256: 81f179f90628d8b716d4194c134479ef5ed1afd67419a12356a5d1caa896ce9a
+Section: utils
+Priority: optional
+Homepage: https://github.com/Kcanady21/gimbal-files
+Description: file manager for Wayland with tabs and a split view
+ Gimbal Files is a GTK 4 and libadwaita file manager for Wayland. It has
+ tabs and a split view, a keyboard-driven command registry, file operations
+ with undo, previews, drag and drop, and drive mounting.
+
