@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
+<!-- PLACEHOLDER app icon. Kyle will replace this with the real Gimbal Files icon.
+     Geometry follows crates/fm-ui/icons/gimbal-folder-symbolic.svg, but the
+     colours here are fixed because this file is loaded from the hicolor icon
+     theme, outside Gimbal's CSS palette. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <rect x="4" y="4" width="120" height="120" rx="26" fill="#1c71d8"/>
+  <path d="M 20 39 H 49 C 51 39 52 40 53 41 L 57 47 H 108 C 112 47 116 50 116 55 V 62 H 20 Z"
+        fill="#99c1f1"/>
+  <path d="M 20 55 H 116 C 119 55 121 57 121 60 L 116 96 C 115.6 99 113 101 110 101 H 18
+           C 15 101 12.4 99 12 96 L 7 60 C 6.7 57 8.5 55 12 55 Z"
+        fill="#ffffff"/>
+  <path d="M 110 55 H 116 C 119 55 121 57 121 60 L 116 96 C 115.6 99 113 101 110 101 H 105
+           C 108 101 110.6 99 111 96 L 116 60 C 116.3 57 113.5 55 110 55 Z"
+        fill="#c0d5f0"/>
+</svg>

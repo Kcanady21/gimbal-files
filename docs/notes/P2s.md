@@ -275,7 +275,7 @@ pointer and AT-SPI. Each run was ≤9 s; Kyle's instance was closed.
    running when Unmount was pressed. Unmount succeeded right after it. The log shows walks, searches
    and the folder view released first. A folder big enough to still be counting needs a hand test.
 5. Kyle (above): Eject removes the row.
-6. Not run (needs the stick pulled by hand).
+6. Not run by Claude (needs the stick pulled by hand). Kyle, Nov 5: **pass**.
 7. **Pass.** WD-Blue-SSD and Nvme-Storage-1: Open, Open in new tab, Unmount, and no Eject. Right-click
    on Main Drive opens no menu. `/` has no row. Nothing was clicked on these drives.
 

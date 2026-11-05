@@ -1,0 +1,144 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Manual test for scripts/install.sh. It needs a release build, so
+# scripts/check.sh does not run it. Nothing outside a /tmp scratch folder is
+# touched.
+set -euo pipefail
+
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+repo_root="$(cd -- "$script_dir/.." && pwd -P)"
+
+for binary in gimbal-files gimbal-files-cli; do
+    if [[ ! -x "$repo_root/target/release/$binary" ]]; then
+        echo "test-install.sh: target/release/$binary is missing; run 'cargo build --workspace --release' first" >&2
+        exit 1
+    fi
+done
+
+scratch="$(mktemp -d /tmp/gimbal-p2u-test.XXXXXX)"
+cleanup() {
+    rm -rf -- "$scratch"
+}
+trap cleanup EXIT
+
+home="$scratch/home"
+# Spaces, & and parentheses: the launcher's Exec line must still work.
+prefix="$scratch/pre fix & (x)"
+mkdir -p \
+    "$home/.config/gimbal-files" \
+    "$home/.local/state/gimbal-files" \
+    "$prefix/bin" \
+    "$prefix/share/applications" \
+    "$prefix/share/icons/hicolor/scalable/apps" \
+    "$prefix/share/gimbal-files"
+
+printf 'keep\n' >"$home/.config/gimbal-files/config.toml"
+printf 'keep\n' >"$home/.local/state/gimbal-files/session.toml"
+printf 'keep\n' >"$prefix/bin/keep-me"
+printf 'keep\n' >"$prefix/share/applications/keep-me.desktop"
+printf 'keep\n' >"$prefix/share/icons/hicolor/scalable/apps/keep-me.svg"
+printf 'keep\n' >"$prefix/share/gimbal-files/keep-me"
+
+fail() {
+    echo "test-install.sh: FAIL: $*" >&2
+    exit 1
+}
+
+check_mode() {
+    local path="$1"
+    local expected="$2"
+    [[ -f "$path" ]] || fail "missing $path"
+    local actual
+    actual="$(stat -c '%a' "$path")"
+    [[ "$actual" == "$expected" ]] || fail "$path has mode $actual, expected $expected"
+}
+
+run_install() {
+    HOME="$home" XDG_DATA_HOME="$scratch/ignored-data" \
+        "$repo_root/scripts/install.sh" --prefix "$prefix"
+}
+
+run_install
+
+version="$(sed -n '/^\[workspace\.package\]/,/^\[/s/^version[[:space:]]*=[[:space:]]*"\(.*\)"[[:space:]]*$/\1/p' "$repo_root/Cargo.toml" | head -n 1)"
+[[ -n "$version" ]] || fail "could not read the workspace version"
+
+check_mode "$prefix/bin/gimbal-files" 755
+check_mode "$prefix/bin/gimbal-files-cli" 755
+check_mode "$prefix/share/applications/io.github.kcanady21.GimbalFiles.desktop" 644
+check_mode "$prefix/share/icons/hicolor/scalable/apps/io.github.kcanady21.GimbalFiles.svg" 644
+check_mode "$prefix/share/gimbal-files/install.toml" 644
+
+cmp -s "$repo_root/target/release/gimbal-files" "$prefix/bin/gimbal-files" \
+    || fail "installed gimbal-files differs from target/release"
+cmp -s "$repo_root/target/release/gimbal-files-cli" "$prefix/bin/gimbal-files-cli" \
+    || fail "installed gimbal-files-cli differs from target/release"
+
+grep -qx "bin_dir = \"$prefix/bin\"" "$prefix/share/gimbal-files/install.toml" \
+    || fail "marker bin_dir is wrong"
+grep -qx "prefix = \"$prefix\"" "$prefix/share/gimbal-files/install.toml" \
+    || fail "marker prefix is wrong"
+grep -qx "version = \"$version\"" "$prefix/share/gimbal-files/install.toml" \
+    || fail "marker version is wrong"
+grep -qx "data_dir = \"$prefix/share\"" "$prefix/share/gimbal-files/install.toml" \
+    || fail "marker data_dir is wrong"
+grep -qxF "Exec=\"$prefix/bin/gimbal-files\" %U" \
+    "$prefix/share/applications/io.github.kcanady21.GimbalFiles.desktop" \
+    || fail "the desktop entry does not run the installed binary by absolute path"
+if command -v desktop-file-validate >/dev/null 2>&1; then
+    desktop-file-validate "$prefix/share/applications/io.github.kcanady21.GimbalFiles.desktop" \
+        || fail "the installed desktop entry does not validate"
+fi
+
+[[ -z "$(find "$prefix" \( -name '.*.tmp.*' -o -name '.*.src.*' \) -print -quit)" ]] \
+    || fail "a temporary install file was left behind"
+
+# Reinstall over a damaged copy: the copy-then-mv path must replace it and
+# restore the mode.
+printf 'stale\n' >"$prefix/bin/gimbal-files"
+chmod 0644 "$prefix/bin/gimbal-files"
+run_install
+check_mode "$prefix/bin/gimbal-files" 755
+cmp -s "$repo_root/target/release/gimbal-files" "$prefix/bin/gimbal-files" \
+    || fail "reinstall did not replace gimbal-files"
+
+[[ -z "$(find "$prefix" \( -name '.*.tmp.*' -o -name '.*.src.*' \) -print -quit)" ]] \
+    || fail "a temporary install file was left behind after reinstall"
+
+HOME="$home" XDG_DATA_HOME="$scratch/ignored-data" \
+    "$repo_root/scripts/install.sh" --prefix "$prefix" --uninstall
+
+for gone in \
+    "$prefix/bin/gimbal-files" \
+    "$prefix/bin/gimbal-files-cli" \
+    "$prefix/share/applications/io.github.kcanady21.GimbalFiles.desktop" \
+    "$prefix/share/icons/hicolor/scalable/apps/io.github.kcanady21.GimbalFiles.svg" \
+    "$prefix/share/gimbal-files/install.toml"; do
+    [[ ! -e "$gone" ]] || fail "uninstall left $gone"
+done
+
+for kept in \
+    "$prefix/bin/keep-me" \
+    "$prefix/share/applications/keep-me.desktop" \
+    "$prefix/share/icons/hicolor/scalable/apps/keep-me.svg" \
+    "$prefix/share/gimbal-files/keep-me" \
+    "$home/.config/gimbal-files/config.toml" \
+    "$home/.local/state/gimbal-files/session.toml"; do
+    [[ -f "$kept" ]] || fail "uninstall removed $kept"
+done
+
+# --data-dir keeps the data where an earlier install put it (an updater passes
+# the marker's data_dir back), separate from the prefix.
+data="$scratch/custom data"
+HOME="$home" "$repo_root/scripts/install.sh" --prefix "$prefix" --data-dir "$data"
+grep -qx "data_dir = \"$data\"" "$data/gimbal-files/install.toml" \
+    || fail "--data-dir marker data_dir is wrong"
+[[ -f "$data/applications/io.github.kcanady21.GimbalFiles.desktop" ]] \
+    || fail "--data-dir did not place the desktop entry"
+[[ ! -e "$prefix/share/gimbal-files/install.toml" ]] \
+    || fail "--data-dir also wrote a marker under the prefix"
+HOME="$home" "$repo_root/scripts/install.sh" --prefix "$prefix" --data-dir "$data" --uninstall
+[[ ! -e "$data/gimbal-files/install.toml" && ! -e "$prefix/bin/gimbal-files" ]] \
+    || fail "--data-dir uninstall left files"
+
+echo "PASS: install, reinstall and uninstall in $scratch"

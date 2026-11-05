@@ -1,0 +1,15 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Gimbal Files
+GenericName=File Manager
+Comment=Browse and manage files
+Exec=gimbal-files %U
+Icon=io.github.kcanady21.GimbalFiles
+Terminal=false
+Categories=System;FileTools;FileManager;
+MimeType=inode/directory;
+Keywords=files;folders;manager;browse;
+StartupNotify=true
+StartupWMClass=io.github.kcanady21.GimbalFiles

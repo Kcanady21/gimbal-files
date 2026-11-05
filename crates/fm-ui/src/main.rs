@@ -61,6 +61,10 @@ fn main() -> gtk::glib::ExitCode {
 /// The first activation (or open) builds the process and restores the session.
 /// `true` means this call created it.
 fn ensure_process(application: &adw::Application) -> (Rc<Process>, bool) {
+    // GTK has initialized by the time activate/open runs. The installed
+    // hicolor icon has the same name as the app id, which is also the Wayland
+    // app id and the desktop entry's StartupWMClass.
+    gtk::Window::set_default_icon_name(fm_core::APP_ID);
     PROCESS.with(|slot| {
         let existing = slot.borrow().clone();
         if let Some(process) = existing {
