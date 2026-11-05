@@ -8,7 +8,7 @@ script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 
 usage() {
     cat <<'EOF'
-Usage: install.sh [--prefix DIR] [--data-dir DIR] [--uninstall]
+Usage: install.sh [--prefix DIR] [--data-dir DIR] [--no-prompt] [--uninstall]
 
 Install Gimbal Files under ~/.local (or DIR), or remove the files this script
 installed. Run it from a checkout after `cargo build --release`, or from an
@@ -17,6 +17,8 @@ unpacked release tarball.
   --prefix DIR   install under DIR instead of ~/.local
   --data-dir DIR put the desktop entry, icon and marker under DIR instead of
                  the default (DIR/share with --prefix, else XDG_DATA_HOME)
+  --no-prompt    never ask anything (for updaters and scripts); a missing
+                 optional tool is only reported
   --uninstall    remove exactly the installed files
   -h, --help     show this help
 EOF
@@ -31,6 +33,7 @@ prefix=""
 prefix_given=false
 data_dir_arg=""
 uninstall=false
+no_prompt=false
 while (( $# > 0 )); do
     case "$1" in
         --prefix)
@@ -57,6 +60,10 @@ while (( $# > 0 )); do
         --data-dir=*)
             data_dir_arg="${1#*=}"
             [[ -n "$data_dir_arg" ]] || error "--data-dir needs a directory"
+            shift
+            ;;
+        --no-prompt)
+            no_prompt=true
             shift
             ;;
         --uninstall)
@@ -255,3 +262,51 @@ case ":${PATH:-}:" in
 esac
 
 echo "Installed Gimbal Files $version to $prefix"
+
+# Disk Usage in the folder menu opens Baobab, which is a system package, so
+# Gimbal can't ship it. Offer the distro's package manager, which asks for a
+# password; Gimbal's own install never does. Without a person at the keyboard
+# (--no-prompt, or no terminal), only say how. GIMBAL_INSTALL_PRETEND_MISSING
+# lets scripts/test-install.sh exercise this path on a machine that has it.
+baobab_install_command() {
+    if command -v apt-get >/dev/null 2>&1; then
+        echo "sudo apt install baobab"
+    elif command -v dnf >/dev/null 2>&1; then
+        echo "sudo dnf install baobab"
+    elif command -v pacman >/dev/null 2>&1; then
+        echo "sudo pacman -S --needed baobab"
+    elif command -v zypper >/dev/null 2>&1; then
+        echo "sudo zypper install baobab"
+    fi
+}
+
+baobab_missing=false
+if [[ "${GIMBAL_INSTALL_PRETEND_MISSING:-}" == "baobab" ]] || ! command -v baobab >/dev/null 2>&1; then
+    baobab_missing=true
+fi
+if $baobab_missing; then
+    baobab_command="$(baobab_install_command)"
+    echo "Disk Usage in Gimbal's folder menu needs Baobab (GNOME Disk Usage Analyzer), which is not installed."
+    if [[ -z "$baobab_command" ]]; then
+        echo "Install the 'baobab' package with your distribution's package manager to enable it."
+    elif $no_prompt || [[ ! -t 0 || ! -t 1 ]] || ! command -v sudo >/dev/null 2>&1; then
+        echo "To enable it, run: $baobab_command"
+    else
+        printf 'Install it now with "%s"? This asks for your password. [y/N] ' "$baobab_command"
+        read -r answer || answer=""
+        case "$answer" in
+            y|Y)
+                # The command is one of the fixed strings above.
+                read -r -a baobab_argv <<<"$baobab_command"
+                if "${baobab_argv[@]}"; then
+                    echo "Baobab installed. Restart Gimbal Files if it is running to enable Disk Usage."
+                else
+                    echo "warning: installing Baobab failed; Gimbal Files is installed without Disk Usage" >&2
+                fi
+                ;;
+            *)
+                echo "Skipped. To enable Disk Usage later, run: $baobab_command"
+                ;;
+        esac
+    fi
+fi

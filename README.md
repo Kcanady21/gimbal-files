@@ -14,6 +14,12 @@ and a deliberately quiet, transparent look.
 
 Ubuntu 26.04 ships this stack. Older distributions may not.
 
+Optional: **Baobab** (GNOME Disk Usage Analyzer) for **Disk Usage** in the
+folder menu. The row is greyed out without it. When it is missing,
+`install.sh` offers to install it with your distribution's package manager
+(that step asks for your password; Gimbal's own install never does).
+`--no-prompt` skips the question and only prints the command.
+
 ## Install from a release
 
 Releases are signed prebuilt tarballs for x86_64 Linux. Download one, check

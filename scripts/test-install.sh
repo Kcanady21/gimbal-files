@@ -55,7 +55,7 @@ check_mode() {
 
 run_install() {
     HOME="$home" XDG_DATA_HOME="$scratch/ignored-data" \
-        "$repo_root/scripts/install.sh" --prefix "$prefix"
+        "$repo_root/scripts/install.sh" --prefix "$prefix" --no-prompt
 }
 
 run_install
@@ -126,6 +126,28 @@ for kept in \
     "$home/.local/state/gimbal-files/session.toml"; do
     [[ -f "$kept" ]] || fail "uninstall removed $kept"
 done
+
+# A missing Baobab is reported with the install command and never runs sudo
+# when nobody can answer: neither with --no-prompt nor without a terminal. A
+# fake sudo records any call.
+fakebin="$scratch/fakebin"
+mkdir -p "$fakebin"
+printf '#!/bin/sh\ntouch "%s/sudo-called"\nexit 1\n' "$scratch" >"$fakebin/sudo"
+chmod 0755 "$fakebin/sudo"
+for flags in "--no-prompt" ""; do
+    # shellcheck disable=SC2086 # flags is empty or one word on purpose
+    out="$(PATH="$fakebin:$PATH" HOME="$home" GIMBAL_INSTALL_PRETEND_MISSING=baobab \
+        "$repo_root/scripts/install.sh" --prefix "$prefix" $flags </dev/null 2>&1)"
+    grep -q "needs Baobab" <<<"$out" || fail "missing Baobab was not reported (${flags:-no tty})"
+    grep -q "baobab" <<<"$(grep -E 'run: |package' <<<"$out")" \
+        || fail "no install hint for Baobab (${flags:-no tty})"
+    [[ ! -e "$scratch/sudo-called" ]] || fail "sudo ran without a person to answer (${flags:-no tty})"
+done
+out="$(HOME="$home" "$repo_root/scripts/install.sh" --prefix "$prefix" --no-prompt 2>&1)"
+if command -v baobab >/dev/null 2>&1; then
+    ! grep -q "needs Baobab" <<<"$out" || fail "Baobab is installed but was reported missing"
+fi
+HOME="$home" "$repo_root/scripts/install.sh" --prefix "$prefix" --uninstall >/dev/null
 
 # --data-dir keeps the data where an earlier install put it (an updater passes
 # the marker's data_dir back), separate from the prefix.

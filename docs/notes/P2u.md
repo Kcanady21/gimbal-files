@@ -323,3 +323,26 @@ Not run yet:
 
 - the real `~/.local` install and the launcher in Noctalia (waiting on Kyle's go);
 - real signing (minisign isn't installed, and there's no key yet).
+
+## Baobab check (Claude, Nov 5, 2026, Kyle's call)
+
+Kyle asked for the installer to check for Baobab and install it when missing. He chose to have it
+ask first.
+
+- After installing, `install.sh` looks for `baobab` on PATH. If it's missing, the script says so.
+- When someone is at a terminal and `--no-prompt` isn't given, it asks `Install it now with "<cmd>"?
+  This asks for your password. [y/N]`. On yes it runs one fixed command:
+  `sudo apt install baobab`, `sudo dnf install baobab`, `sudo pacman -S --needed baobab` or
+  `sudo zypper install baobab`, whichever manager is present.
+- On no, with no terminal, with `--no-prompt`, or without sudo, it only prints the command. With no
+  known package manager, it names the package.
+- A failed package install only warns. Gimbal stays installed. Gimbal's own install still never
+  asks for a password.
+- `GIMBAL_INSTALL_PRETEND_MISSING=baobab` forces the missing path, so the test can run on a machine
+  that has Baobab.
+- `test-install.sh` runs that path with `--no-prompt` and with stdin from `/dev/null`. A fake `sudo`
+  first on PATH must never be called. It also checks that an installed Baobab isn't reported
+  missing. Passes. [observed]
+- The y/N prompt itself needs a person at a terminal: Kyle sees it only on a machine without
+  Baobab. [inferred]
+- P2v must pass `--no-prompt` to `install.sh`. Its brief now says so.
