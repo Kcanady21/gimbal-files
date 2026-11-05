@@ -7,6 +7,9 @@
 //! focuses its model window, and every header click or hotkey in a window
 //! focuses that window before dispatching.
 
+#[path = "update.rs"]
+pub mod update;
+
 use adw::prelude::*;
 use fm_core::command::{Caller, CheckedCommand, Effect, Invocation, Outcome, Registry, Value};
 use fm_core::config::{self, Change, ConfigFile};
@@ -62,6 +65,9 @@ pub struct Process {
     /// switch is the only path that changes it; agents cannot.
     pub(crate) agent: RefCell<crate::agent::AgentRuntime>,
     agent_poll: RefCell<Option<glib::SourceId>>,
+    /// The notice-only daily update check: its loaded state, install kind,
+    /// last result and the one background check in flight.
+    update: RefCell<Option<update::UpdateRuntime>>,
     /// The file-job id the handler just queued, read by the socket bridge.
     command_job: Cell<Option<u64>>,
     /// A bridge job token reserved before an asynchronous handler (clipboard
@@ -311,6 +317,7 @@ impl Process {
             quit: RefCell::new(QuitCoordinator::default()),
             agent: RefCell::new(crate::agent::AgentRuntime::new(process_tag)),
             agent_poll: RefCell::new(None),
+            update: RefCell::new(None),
             command_job: Cell::new(None),
             reserved_job: RefCell::new(None),
             pending_authorization: RefCell::new(None),
@@ -343,6 +350,7 @@ impl Process {
         });
         process.restore_session();
         crate::agent::start_if_enabled(&process);
+        update::start(&process);
         let weak = Rc::downgrade(&process);
         let poll = glib::timeout_add_local(crate::agent::POLL, move || match weak.upgrade() {
             Some(process) => crate::agent::poll(&process),
@@ -423,6 +431,7 @@ impl Process {
             quit: RefCell::new(QuitCoordinator::default()),
             agent: RefCell::new(crate::agent::AgentRuntime::new("test".to_string())),
             agent_poll: RefCell::new(None),
+            update: RefCell::new(Some(update::UpdateRuntime::idle())),
             command_job: Cell::new(None),
             reserved_job: RefCell::new(None),
             pending_authorization: RefCell::new(None),
@@ -2676,6 +2685,12 @@ impl Process {
             "drive.mount" => return self.mount_device(window, command),
             "drive.unmount" => return self.remove_device(window, command, DriveAction::Unmount),
             "drive.eject" => return self.remove_device(window, command, DriveAction::Eject),
+            "updates.set-enabled" | "updates.check" => {
+                if caller != Caller::Ui {
+                    return Outcome::Failed(fm_core::update::text::UI_ONLY.to_string());
+                }
+                return update::command(self, window, command);
+            }
             _ => {}
         }
 
@@ -4162,6 +4177,7 @@ mod tests {
             quit: RefCell::new(QuitCoordinator::default()),
             agent: RefCell::new(crate::agent::AgentRuntime::new("gtk-test".to_string())),
             agent_poll: RefCell::new(None),
+            update: RefCell::new(Some(update::UpdateRuntime::idle())),
             command_job: Cell::new(None),
             reserved_job: RefCell::new(None),
             pending_authorization: RefCell::new(None),

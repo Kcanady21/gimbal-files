@@ -67,6 +67,7 @@ Unavailable through the socket (refused by the registry before any handler):
 - `trash.empty`, `trash.delete-permanently`
 - `drive.mount`, `drive.unmount`, `drive.eject`
 - `agent.set-enabled`
+- `updates.set-enabled`, `updates.check`
 - unknown commands, unknown/duplicate arguments, context-filled `Files` paths
   that an agent did not supply, and every malformed invocation
 
@@ -76,6 +77,9 @@ as not available and refused before dispatch. `drive.mount`, `drive.unmount` and
 `drive.eject` are those operations: their Devices-sidebar actions are UI-only,
 and no socket state/query/navigation/startup path can mount, unmount or eject a
 volume. P2s did not add a socket command, protocol, or remote drive support.
+`updates.set-enabled` and `updates.check` are also Settings-only `System`
+commands; the socket lists them as unavailable and refuses them before
+dispatch, so a local script can neither change nor trigger the update check.
 
 Remote file operations must use explicit absolute paths. A relative path is
 rejected, never resolved against Gimbal's working directory. A `dry-run=true`

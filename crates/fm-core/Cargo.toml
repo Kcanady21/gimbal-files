@@ -12,6 +12,8 @@ repository.workspace = true
 gio.workspace = true
 glib.workspace = true
 toml_edit.workspace = true
+ureq.workspace = true
+minisign-verify.workspace = true
 
 [lints]
 workspace = true

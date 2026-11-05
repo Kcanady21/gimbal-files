@@ -146,6 +146,14 @@ struct DragState {
 
 type AgentWidgets = (gtk::Switch, gtk::Label, Rc<Cell<bool>>);
 
+struct UpdateWidgets {
+    switch: gtk::Switch,
+    status: gtk::Label,
+    check: gtk::Button,
+    releases: gtk::Button,
+    syncing: Rc<Cell<bool>>,
+}
+
 pub struct Header {
     window_id: WindowId,
     handle: gtk::WindowHandle,
@@ -183,6 +191,8 @@ pub struct Header {
     /// The open Settings switch and status label, so every window shows the
     /// shared listener state. The flag guards programmatic switch updates.
     agent_widgets: RefCell<Option<AgentWidgets>>,
+    /// The open Settings menu's Updates switch, status and buttons.
+    update_widgets: RefCell<Option<UpdateWidgets>>,
     /// The open Settings menu's Sort rows. The header owns them while the menu
     /// is open; the rows' click handlers hold only weak references.
     sort_rows: RefCell<Option<Rc<SortRows>>>,
@@ -311,6 +321,7 @@ impl Header {
             animate_group: Cell::new(None),
             dialogs: Cell::new(0),
             agent_widgets: RefCell::new(None),
+            update_widgets: RefCell::new(None),
             sort_rows: RefCell::new(None),
             ui: RefCell::new(Weak::new()),
         });
@@ -347,6 +358,30 @@ impl Header {
             guard.set(false);
             label.set_text(&agent_status_text(status));
         }
+    }
+
+    /// Sync the open Settings menu's Updates rows with the process state.
+    pub fn refresh_update_status(&self, status: &crate::app::update::UpdateStatus) {
+        let widgets = self.update_widgets.borrow().as_ref().map(|widgets| {
+            (
+                widgets.switch.clone(),
+                widgets.status.clone(),
+                widgets.check.clone(),
+                widgets.releases.clone(),
+                widgets.syncing.clone(),
+            )
+        });
+        let Some((switch, label, check, releases, syncing)) = widgets else {
+            return;
+        };
+        syncing.set(true);
+        switch.set_active(status.check_enabled);
+        syncing.set(false);
+        let development = status.kind == fm_core::update::InstallKind::Development;
+        switch.set_sensitive(!development);
+        check.set_sensitive(!development && status.check_enabled && !status.checking);
+        releases.set_visible(status.releases_visible());
+        label.set_text(&status.status_text());
     }
 
     /// Sync the open Settings menu's Sort rows with the config, after any sort
@@ -1561,6 +1596,114 @@ fn open_settings_menu(ui: &Rc<WindowUi>, anchor: &gtk::Button) {
                 switch_syncing.set(false);
             }
         }
+    });
+
+    let update_status = ui
+        .process_upgrade()
+        .map(|process| crate::app::update::status(&process))
+        .unwrap_or(crate::app::update::UpdateStatus {
+            kind: fm_core::update::InstallKind::Development,
+            check_enabled: true,
+            checking: false,
+            result: None,
+        });
+
+    let updates_heading = gtk::Label::builder()
+        .label(fm_core::update::text::UPDATES)
+        .halign(gtk::Align::Start)
+        .build();
+    updates_heading.add_css_class("gl-menu-item");
+    menu.append(&updates_heading);
+
+    let version_label = gtk::Label::builder()
+        .label(fm_core::update::text::version_label())
+        .halign(gtk::Align::Start)
+        .build();
+    version_label.add_css_class("gl-menu-item");
+    menu.append(&version_label);
+
+    let update_row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+    update_row.add_css_class("gl-menu-item");
+    let update_label = gtk::Label::builder()
+        .label(fm_core::update::text::CHECK_FOR_UPDATES)
+        .halign(gtk::Align::Start)
+        .hexpand(true)
+        .build();
+    let update_switch = gtk::Switch::new();
+    update_switch.update_property(&[gtk::accessible::Property::Label(
+        fm_core::update::text::CHECK_FOR_UPDATES,
+    )]);
+    update_row.append(&update_label);
+    update_row.append(&update_switch);
+    menu.append(&update_row);
+
+    let update_syncing = Rc::new(Cell::new(false));
+    let check_now = gtk::Button::with_label(fm_core::update::text::CHECK_NOW);
+    check_now.add_css_class("gl-menu-item");
+    menu.append(&check_now);
+    let releases = gtk::Button::with_label(fm_core::update::text::OPEN_RELEASES);
+    releases.add_css_class("gl-menu-item");
+    releases.set_visible(false);
+    menu.append(&releases);
+
+    let update_status_label = gtk::Label::builder()
+        .label(update_status.status_text())
+        .wrap(true)
+        .xalign(0.0)
+        .halign(gtk::Align::Start)
+        .build();
+    update_status_label.add_css_class("dim-label");
+    menu.append(&update_status_label);
+
+    *ui.header().update_widgets.borrow_mut() = Some(UpdateWidgets {
+        switch: update_switch.clone(),
+        status: update_status_label,
+        check: check_now.clone(),
+        releases: releases.clone(),
+        syncing: update_syncing.clone(),
+    });
+    ui.header().refresh_update_status(&update_status);
+
+    let ui_update_switch = ui.clone();
+    let switch_widget = update_switch.clone();
+    let switch_syncing = update_syncing.clone();
+    update_switch.connect_active_notify(move |_| {
+        if switch_syncing.get() {
+            return;
+        }
+        let requested = switch_widget.is_active();
+        ui_update_switch.dispatch(
+            Caller::Ui,
+            crate::app::update::set_enabled_invocation(requested),
+        );
+        if let Some(process) = ui_update_switch.process_upgrade() {
+            let status = crate::app::update::status(&process);
+            ui_update_switch.header().refresh_update_status(&status);
+            if status.check_enabled != requested {
+                switch_syncing.set(true);
+                switch_widget.set_active(status.check_enabled);
+                switch_syncing.set(false);
+            }
+        }
+    });
+
+    let ui_check = ui.clone();
+    check_now.connect_clicked(move |_| {
+        ui_check.dispatch(Caller::Ui, crate::app::update::check_now_invocation());
+    });
+
+    let ui_releases = ui.clone();
+    releases.connect_clicked(move |_| {
+        let launcher = gtk::UriLauncher::new(fm_core::update::RELEASES_PAGE);
+        launcher.launch(
+            Some(ui_releases.window()),
+            None::<&gtk::gio::Cancellable>,
+            |result| {
+                if let Err(error) = result {
+                    crate::log!("update", "could not open the releases page: {error}");
+                }
+            },
+        );
     });
 
     popover.set_child(Some(&menu));

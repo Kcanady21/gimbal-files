@@ -556,6 +556,28 @@ pub const COMMANDS: &[CommandSpec] = &[
             default: None,
         }],
     },
+    // P2v: notice-only update controls. Both are System commands, so the
+    // agent socket refuses them before a handler, like drive.unmount. The
+    // Settings switch and Check now button are their only callers.
+    CommandSpec {
+        name: "updates.set-enabled",
+        summary: "Check GitHub once a day for a newer release.",
+        effect: Effect::System,
+        undo: false,
+        arguments: &[ArgSpec {
+            name: "enabled",
+            kind: ArgKind::Bool,
+            presence: Presence::Required,
+            default: None,
+        }],
+    },
+    CommandSpec {
+        name: "updates.check",
+        summary: "Check for a newer release now.",
+        effect: Effect::System,
+        undo: false,
+        arguments: &[],
+    },
     CommandSpec {
         name: "pins.add",
         summary: "Pin a folder.",
@@ -641,5 +663,21 @@ mod tests {
             assert!(matches!(argument.presence, Presence::Required));
             assert!(!spec.summary.is_empty());
         }
+    }
+
+    #[test]
+    fn update_commands_are_system_commands_with_the_reviewed_arguments() {
+        let set = drive_command("updates.set-enabled");
+        assert_eq!(set.effect, Effect::System);
+        assert!(!set.undo);
+        assert_eq!(set.arguments.len(), 1);
+        assert_eq!(set.arguments[0].name, "enabled");
+        assert!(matches!(set.arguments[0].kind, ArgKind::Bool));
+        assert!(matches!(set.arguments[0].presence, Presence::Required));
+
+        let check = drive_command("updates.check");
+        assert_eq!(check.effect, Effect::System);
+        assert!(!check.undo);
+        assert!(check.arguments.is_empty());
     }
 }

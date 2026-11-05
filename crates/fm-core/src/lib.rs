@@ -16,6 +16,7 @@ pub(crate) mod fsutil;
 pub mod preview;
 pub mod search;
 pub mod session;
+pub mod update;
 pub mod volumes;
 pub mod workspace;
 

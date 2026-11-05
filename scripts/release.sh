@@ -236,6 +236,12 @@ update_apt_repo() {
 step "scripts/check.sh" "$repo_root/scripts/check.sh"
 step "cargo build --workspace --release" cargo build --workspace --release
 
+# The .deb's copyright credits every crate in Cargo.lock. Refuse a stale list.
+echo "==> checking the crate list in packaging/debian/copyright"
+cargo metadata --format-version 1 --offline --locked \
+    | python3 -I "$script_dir/copyright-crates.py" \
+    || error "packaging/debian/copyright does not match Cargo.lock; regenerate it with: cargo metadata --format-version 1 --offline | python3 -I scripts/copyright-crates.py --write"
+
 echo "==> staging $stage_name"
 rm -rf -- "$stage"
 rm -f -- "$tarball" "$tarball.minisig" "$latest" "$latest.minisig" "$deb"

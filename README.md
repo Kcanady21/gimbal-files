@@ -195,6 +195,9 @@ touches your configuration or session.
 - Session (windows, tabs and split layout):
   `$XDG_STATE_HOME/gimbal-files/session.toml`, or
   `~/.local/state/gimbal-files/session.toml`.
+- Update check (last check time and the last version announced):
+  `$XDG_STATE_HOME/gimbal-files/update.toml`, or
+  `~/.local/state/gimbal-files/update.toml`.
 - Install marker (tarball and source installs):
   `$XDG_DATA_HOME/gimbal-files/install.toml`, or
   `~/.local/share/gimbal-files/install.toml`; under `--prefix DIR` it is
@@ -204,11 +207,15 @@ The apt package does not write an install marker.
 
 ## Updates
 
-Gimbal Files checks GitHub once a day and tells you when a newer version is
-out. The update itself is apt's job for the package (or the tarball's job for
-other distributions); Gimbal does not install anything itself. A development
-build run from `target/` never checks for updates. This notice-only check is
-not part of the 0.1.0 build yet.
+Gimbal Files checks GitHub once a day for a newer release. It only tells you;
+it never downloads or installs anything. The apt package updates with
+`sudo apt upgrade` (or `gimbal` on GimbalOS), and tarball users download the new
+tarball. Turn the daily check off in Settings with **Check for updates**.
+
+Only a release notice signed with Gimbal's minisign key is believed, so a
+spoofed or replayed notice cannot make Gimbal report a false update. A
+development build run from `target/` never checks for updates; Settings says
+so.
 
 ## Contributing
 

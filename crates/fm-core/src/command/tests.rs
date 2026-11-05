@@ -75,6 +75,8 @@ fn the_v1_catalogue_has_every_reviewed_command_in_order() {
         "view.set-sort",
         "view.clear-folder-sort",
         "agent.set-enabled",
+        "updates.set-enabled",
+        "updates.check",
         "pins.add",
         "pins.remove",
         "pins.move",
@@ -249,6 +251,49 @@ fn the_automation_switch_is_ui_only_and_the_denied_handler_is_never_reached() {
     assert_eq!(handler.seen.len(), 1);
     assert!(check(Caller::Ui, &["agent.set-enabled"]).is_err());
     assert!(check(Caller::Ui, &["agent.set-enabled", "enabled=maybe"]).is_err());
+}
+
+#[test]
+fn update_commands_are_system_commands_and_the_ui_reaches_their_handler() {
+    let set = Registry::new()
+        .command("updates.set-enabled")
+        .expect("the approved switch exists");
+    assert_eq!(set.effect, Effect::System);
+    assert!(!set.undo);
+    let argument = set.argument("enabled").expect("a required bool");
+    assert_eq!(argument.kind, ArgKind::Bool);
+    assert_eq!(argument.presence, Presence::Required);
+
+    let check_spec = Registry::new()
+        .command("updates.check")
+        .expect("the approved check exists");
+    assert_eq!(check_spec.effect, Effect::System);
+    assert!(!check_spec.undo);
+    assert!(check_spec.arguments().is_empty());
+
+    // The registry accepts the Settings UI. The local socket refuses every
+    // System effect before dispatch, which is what keeps these UI-only.
+    assert!(caller_allowed(
+        "updates.set-enabled",
+        Effect::System,
+        Caller::Ui
+    ));
+    assert!(caller_allowed("updates.check", Effect::System, Caller::Ui));
+
+    for tokens in [
+        vec!["updates.set-enabled", "enabled=true"],
+        vec!["updates.set-enabled", "enabled=false"],
+        vec!["updates.check"],
+    ] {
+        let mut handler = Recorder::new(Outcome::Done);
+        let outcome =
+            Registry::new().dispatch(Caller::Ui, &parse_invocation(&tokens), &mut handler);
+        assert_eq!(outcome, Outcome::Done, "{tokens:?}");
+        assert_eq!(handler.seen.len(), 1, "{tokens:?}");
+    }
+
+    assert!(check(Caller::Ui, &["updates.set-enabled"]).is_err());
+    assert!(check(Caller::Ui, &["updates.set-enabled", "enabled=maybe"]).is_err());
 }
 
 #[test]

@@ -45,7 +45,7 @@ pub const MIN_LEFT_WIDTH: u32 = 300;
 pub const MIN_RIGHT_WIDTH: u32 = 360;
 
 const KNOWN_TOP_LEVEL: &[&str] = &[
-    "look", "sidebars", "sections", "pins", "sort", "hotkeys", "agent",
+    "look", "sidebars", "sections", "pins", "sort", "hotkeys", "agent", "updates",
 ];
 
 /// The config path as a pure function of `XDG_CONFIG_HOME` and the home
@@ -475,6 +475,8 @@ pub struct Config {
     /// The local automation socket. Off unless the user's own Settings switch
     /// saved `true`; a missing or bad value is always Off.
     pub agent: Agent,
+    /// The notice-only update check. On unless the user turned it off.
+    pub updates: Updates,
     /// Runtime context: home for `~` expansion. Not written to the file.
     pub home: PathBuf,
 }
@@ -484,6 +486,19 @@ pub struct Config {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Agent {
     pub enabled: bool,
+}
+
+/// The daily update check. It defaults On for old and missing configs and is
+/// changed only by the Settings switch (`updates.set-enabled`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Updates {
+    pub check: bool,
+}
+
+impl Default for Updates {
+    fn default() -> Self {
+        Self { check: true }
+    }
 }
 
 impl Default for Config {
@@ -505,6 +520,7 @@ impl Config {
             sort: Sort::default(),
             hotkeys: default_hotkeys(),
             agent: Agent::default(),
+            updates: Updates::default(),
             home,
         }
     }
@@ -616,6 +632,8 @@ pub enum Change {
         folder: PathBuf,
     },
     SetAgentEnabled(bool),
+    /// Turn the daily signed-notice check on or off.
+    SetUpdatesEnabled(bool),
 }
 
 /// What went wrong while loading the config.
@@ -1000,6 +1018,10 @@ pub fn change_for(
             Some(CommandValue::Bool(enabled)) => Some(Change::SetAgentEnabled(*enabled)),
             _ => None,
         },
+        "updates.set-enabled" => match command.get("enabled") {
+            Some(CommandValue::Bool(enabled)) => Some(Change::SetUpdatesEnabled(*enabled)),
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -1105,6 +1127,7 @@ impl Loader<'_> {
         self.read_sort(root, config);
         self.read_hotkeys(root, config);
         self.read_agent(root, config);
+        self.read_updates(root, config);
     }
 
     fn unknown_entry(&mut self, table: &dyn TableLike, prefix: &str, key: &str, item: &Item) {
@@ -1494,6 +1517,44 @@ impl Loader<'_> {
         config.agent.enabled = valid && enabled;
     }
 
+    /// `[updates] check = true|false`. The default is On. As with `[agent]`,
+    /// the whole section must be valid before its bool applies: a wrong shape,
+    /// unknown key or wrong type leaves the default On.
+    fn read_updates(&mut self, root: &Table, config: &mut Config) {
+        let Some(item) = root.get("updates") else {
+            return;
+        };
+        let Some(table) = table_like(item) else {
+            self.wrong_type("updates", item, "a table");
+            config.updates.check = Updates::default().check;
+            return;
+        };
+
+        let mut valid = true;
+        for (key, value) in table.iter() {
+            if key != "check" {
+                self.unknown_entry(table, "updates", key, value);
+                valid = false;
+            }
+        }
+
+        let check = match table.get("check") {
+            Some(item) => match self.read_bool(item, "updates.check") {
+                Some(value) => value,
+                None => {
+                    valid = false;
+                    true
+                }
+            },
+            None => true,
+        };
+        config.updates.check = if valid {
+            check
+        } else {
+            Updates::default().check
+        };
+    }
+
     fn read_inline_hotkey(&mut self, inline: &InlineTable, key: &str) -> Option<Hotkey> {
         let Some(command_value) = inline.get("command") else {
             self.report(
@@ -1875,6 +1936,7 @@ fn apply_to_config(config: &mut Config, change: &Change) {
             }
         }
         Change::SetAgentEnabled(enabled) => config.agent.enabled = *enabled,
+        Change::SetUpdatesEnabled(enabled) => config.updates.check = *enabled,
     }
 }
 
@@ -2061,6 +2123,9 @@ fn apply_to_document(document: &mut DocumentMut, change: &Change, config: &Confi
         }
         Change::SetAgentEnabled(enabled) => {
             set_root_value(document, "agent", "enabled", Value::from(*enabled));
+        }
+        Change::SetUpdatesEnabled(enabled) => {
+            set_root_value(document, "updates", "check", Value::from(*enabled));
         }
     }
 }
@@ -3421,6 +3486,112 @@ answer = 42
         assert_eq!(
             change_for(&disabled, &config, home),
             Some(Change::SetAgentEnabled(false))
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // P2v: the notice-only update check
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn update_checks_default_on_and_read_false() {
+        let temp = TempDir::new("updates-default");
+        let home = temp.path();
+        let path = temp.write("config.toml", "[look]\nscale = 1.0\n");
+        let (file, problems) = ConfigFile::load_with(&path, home, &SpecialFolders::default());
+        assert!(problems.is_empty(), "{problems:?}");
+        assert!(file.config().updates.check);
+
+        let missing = temp.path().join("absent.toml");
+        let (file, problems) = ConfigFile::load_with(&missing, home, &SpecialFolders::default());
+        assert!(problems.is_empty());
+        assert!(file.config().updates.check);
+
+        let off = temp.write("off.toml", "[updates]\ncheck = false\n");
+        let (file, problems) = ConfigFile::load_with(&off, home, &SpecialFolders::default());
+        assert!(problems.is_empty(), "{problems:?}");
+        assert!(!file.config().updates.check);
+
+        let on = temp.write("on.toml", "[updates]\ncheck = true\n");
+        let (file, problems) = ConfigFile::load_with(&on, home, &SpecialFolders::default());
+        assert!(problems.is_empty());
+        assert!(file.config().updates.check);
+    }
+
+    #[test]
+    fn an_invalid_updates_section_leaves_the_default_on_in_every_key_order() {
+        let temp = TempDir::new("updates-invalid");
+        let home = temp.path();
+        let cases = [
+            ("unknown-first", "[updates]\nextra = 1\ncheck = false\n"),
+            ("unknown-last", "[updates]\ncheck = false\nextra = 1\n"),
+            ("wrong-shape", "updates = false\n"),
+            ("array-shape", "updates = [false]\n"),
+            ("wrong-type", "[updates]\ncheck = \"no\"\n"),
+            (
+                "nested",
+                "[updates]\ncheck = false\nnested = { value = 1 }\n",
+            ),
+        ];
+        for (name, text) in cases {
+            let path = temp.write(&format!("{name}.toml"), text);
+            let (file, problems) = ConfigFile::load_with(&path, home, &SpecialFolders::default());
+            assert!(
+                file.config().updates.check,
+                "{name} changed the default despite a problem: {problems:?}"
+            );
+            assert!(!problems.is_empty(), "{name} was not diagnosed");
+        }
+
+        let parse = temp.write("parse.toml", "[updates\ncheck = false\n");
+        let (file, problems) = ConfigFile::load_with(&parse, home, &SpecialFolders::default());
+        assert!(file.config().updates.check);
+        assert_eq!(problems[0].kind, ConfigProblemKind::Parse);
+    }
+
+    #[test]
+    fn updates_save_one_key_and_preserve_comments_and_other_settings() {
+        let temp = TempDir::new("updates-save");
+        let home = temp.path();
+        let path = temp.write(
+            "config.toml",
+            "# keep this comment\n[look]\nscale = 0.9\n\n[agent]\nenabled = true\n",
+        );
+        let (mut file, problems) = ConfigFile::load_with(&path, home, &SpecialFolders::default());
+        assert!(problems.is_empty(), "{problems:?}");
+        file.apply(Change::SetUpdatesEnabled(false)).expect("saves");
+
+        let text = fs::read_to_string(&path).expect("read");
+        assert!(text.contains("# keep this comment"), "{text}");
+        assert!(text.contains("scale = 0.9"), "{text}");
+        assert!(text.contains("[agent]\nenabled = true"), "{text}");
+        assert!(text.contains("[updates]"), "{text}");
+        assert!(text.contains("check = false"), "{text}");
+
+        let (file, problems) = ConfigFile::load_with(&path, home, &SpecialFolders::default());
+        assert!(problems.is_empty());
+        assert!(!file.config().updates.check);
+    }
+
+    #[test]
+    fn updates_change_comes_from_the_typed_bool_argument() {
+        let home = Path::new("/tmp/home");
+        let config = default_config(home);
+        let disabled = check(
+            "updates.set-enabled",
+            &["updates.set-enabled", "enabled=false"],
+        );
+        assert_eq!(
+            change_for(&disabled, &config, home),
+            Some(Change::SetUpdatesEnabled(false))
+        );
+        let enabled = check(
+            "updates.set-enabled",
+            &["updates.set-enabled", "enabled=true"],
+        );
+        assert_eq!(
+            change_for(&enabled, &config, home),
+            Some(Change::SetUpdatesEnabled(true))
         );
     }
 }

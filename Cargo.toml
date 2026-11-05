@@ -21,6 +21,11 @@ wayland-protocols = { version = "=0.32.13", features = ["client", "staging"] }
 glib = "=0.22.10"
 gio = "=0.22.10"
 toml_edit = "=0.25.17"
+# P2v: the notice-only update check. ureq uses rustls and the OS certificate
+# verifier (platform-verifier) rather than a bundled root list;
+# minisign-verify checks the signed release notice.
+ureq = { version = "=3.5.1", default-features = false, features = ["rustls-no-provider", "_ring", "platform-verifier"] }
+minisign-verify = "=0.3.0"
 fm-core = { path = "crates/fm-core" }
 fm-ui = { path = "crates/fm-ui" }
 fm-agent = { path = "crates/fm-agent" }

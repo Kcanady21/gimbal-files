@@ -28,6 +28,17 @@ allow = [
     # libloading (through wayland-sys, for GDK's Wayland backend): the ISC
     # license is a permissive MIT-style license, compatible with GPLv3.
     "ISC",
+    # subtle (through rustls): BSD-3-Clause is a permissive, OSI-approved
+    # license with only attribution and no-copyleft terms. The FSF lists the
+    # closely related 3-clause BSD terms as GPL-compatible; its warranty and
+    # endorsement clauses impose no restriction on the combined work.
+    "BSD-3-Clause",
+    # webpki-root-certs (a data crate in rustls-platform-verifier's tree):
+    # CDLA-Permissive-2.0 allows use, modification and sharing, puts no
+    # condition on results, and asks only that the agreement accompany shared
+    # copies of the Data. That attribution-style condition is permissive and
+    # adds no restriction to a GPL-3.0-or-later work, so the licenses combine.
+    "CDLA-Permissive-2.0",
 ]
 confidence-threshold = 0.8
 
