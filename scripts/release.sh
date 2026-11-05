@@ -148,6 +148,8 @@ write_pages_site() {
     local pages="$1"
     mkdir -p "$pages/apt"
     : >"$pages/.nojekyll"
+    # The one-line setup the README offers: curl -fsSL …/apt/setup.sh | bash
+    install -m 0644 "$repo_root/packaging/apt-setup.sh" "$pages/apt/setup.sh"
     cat >"$pages/index.html" <<'EOF'
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 <!doctype html>

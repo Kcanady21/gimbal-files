@@ -10,7 +10,19 @@ and a deliberately quiet, transparent look.
 This is the main install for Debian-family systems on x86_64 (amd64). Updates
 then come through apt.
 
-### One-time setup
+### One command
+
+Paste this into a terminal and type your password when `sudo` asks:
+
+```sh
+curl -fsSL https://kcanady21.github.io/gimbal-files/apt/setup.sh | bash
+```
+
+It adds the signed repository and installs `gimbal-files`, doing exactly the
+manual steps below. To read the script before running it, open
+<https://kcanady21.github.io/gimbal-files/apt/setup.sh>.
+
+### Or set it up by hand
 
 1. Download the archive keyring:
 
@@ -67,6 +79,12 @@ To stop updates as well, remove the two setup files:
 sudo rm /etc/apt/sources.list.d/gimbal-files.sources \
   /etc/apt/keyrings/gimbal-files.gpg
 sudo apt update
+```
+
+Or do both in one command:
+
+```sh
+curl -fsSL https://kcanady21.github.io/gimbal-files/apt/setup.sh | bash -s -- --uninstall
 ```
 
 Your configuration and session are left alone.
