@@ -2,7 +2,7 @@
 //! Injected volume backends and production-path tests. No real device is
 //! opened, mounted, unmounted or ejected.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
@@ -31,6 +31,7 @@ struct FakeInner {
     fail_next_mount: Option<(gio::IOErrorEnum, String)>,
     removal_calls: Vec<RemovalTarget>,
     pending_removals: Vec<(VolumeId, gio::Cancellable, MountDone)>,
+    removal_operations: Vec<(VolumeId, gio::MountOperation)>,
     order: Rc<RefCell<Vec<String>>>,
     snapshot_calls: u64,
     usage_calls: Vec<PathBuf>,
@@ -255,7 +256,23 @@ impl FakeBackend {
         inner
             .pending_removals
             .push((target.id().clone(), cancellable.clone(), done));
-        Ok(None)
+        // A real operation, as the GIO backend hands back, so tests can see
+        // what the controller does with it.
+        let operation = gio::MountOperation::new();
+        inner
+            .removal_operations
+            .push((target.id().clone(), operation.clone()));
+        Ok(Some(operation))
+    }
+
+    pub(crate) fn removal_operation(&self, id: &VolumeId) -> Option<gio::MountOperation> {
+        self.inner
+            .borrow()
+            .removal_operations
+            .iter()
+            .rev()
+            .find(|(candidate, _)| candidate == id)
+            .map(|(_, operation)| operation.clone())
     }
 
     fn complete_usage(&self, root: &Path, result: Result<(u64, u64), glib::Error>) {
@@ -1556,6 +1573,35 @@ fn cancel_cancels_only_that_requests_own_operation() {
         ))
     );
     assert!(mounted_entry(&volumes, "/dev/sdb1").state().is_mounted());
+}
+
+#[test]
+fn cancel_aborts_the_operation_so_gtk_closes_its_busy_dialog() {
+    let backend = Rc::new(FakeBackend::default());
+    let object = backend.add_volume("/dev/sdb1", "USB");
+    backend.set_mounted(object, "/run/media/kyle/USB");
+    let volumes = Volumes::new(backend.clone());
+    volumes.refresh_for_tests();
+    let entry = mounted_entry(&volumes, "/dev/sdb1");
+    let target = volumes
+        .removal_target(entry.id().as_str(), DriveAction::Unmount)
+        .unwrap();
+    volumes.remove(window(1), target, None);
+    let operation = backend.removal_operation(entry.id()).unwrap();
+    let aborted = Rc::new(Cell::new(0));
+    operation.connect_aborted({
+        let aborted = aborted.clone();
+        move |_| aborted.set(aborted.get() + 1)
+    });
+
+    volumes.cancel(entry.id());
+    assert_eq!(aborted.get(), 1, "cancel aborts the operation");
+
+    backend.complete_removal(
+        entry.id(),
+        Err(error(gio::IOErrorEnum::Cancelled, "cancelled by user")),
+    );
+    assert_eq!(aborted.get(), 1, "the late callback aborts nothing twice");
 }
 
 #[test]

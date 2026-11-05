@@ -300,6 +300,17 @@ struct MountRequest {
     slot_released: Cell<bool>,
 }
 
+/// Drop a request's operation and tell it the request is over. GTK closes a
+/// dialog the operation still shows (the "volume is busy" process list) only
+/// on `aborted`; cancelling the GIO call alone leaves it open. With no dialog
+/// showing, `aborted` does nothing.
+fn dismiss_operation(slot: &RefCell<Option<gio::MountOperation>>) {
+    let operation = slot.borrow_mut().take();
+    if let Some(operation) = operation {
+        operation.emit_by_name::<()>("aborted", &[]);
+    }
+}
+
 impl MountRequest {
     fn id(&self) -> &VolumeId {
         &self.id
@@ -992,7 +1003,7 @@ impl Volumes {
         if !was_current {
             return false;
         }
-        request.operation.borrow_mut().take();
+        dismiss_operation(&request.operation);
         log!(
             "volumes",
             "{} of {} (attempt {}) ended: {:?}",
@@ -1129,7 +1140,7 @@ impl Volumes {
         if !was_current {
             return false;
         }
-        request.operation.borrow_mut().take();
+        dismiss_operation(&request.operation);
         if let Some(status) = status {
             log!(
                 "volumes",
@@ -1165,7 +1176,7 @@ impl Volumes {
                 request.id
             );
             request.cancellable.cancel();
-            request.operation.borrow_mut().take();
+            dismiss_operation(&request.operation);
             self.notify();
             return;
         }
@@ -1177,7 +1188,7 @@ impl Volumes {
         }
         log!("volumes", "cancelling the mount of {}", request.id());
         request.cancellable.cancel();
-        request.operation.borrow_mut().take();
+        dismiss_operation(&request.operation);
         self.notify();
     }
 
@@ -1195,7 +1206,7 @@ impl Volumes {
         for request in requests {
             request.cancel_requested.set(true);
             request.cancellable.cancel();
-            request.operation.borrow_mut().take();
+            dismiss_operation(&request.operation);
             self.retire_attempt(
                 &request,
                 Some(MountStatus::failed(
@@ -1215,7 +1226,7 @@ impl Volumes {
         for request in removals {
             request.cancel_requested.set(true);
             request.cancellable.cancel();
-            request.operation.borrow_mut().take();
+            dismiss_operation(&request.operation);
             self.retire_removal(
                 &request,
                 RemovalStatus::failed(
@@ -1236,7 +1247,7 @@ impl Volumes {
         let requests: Vec<Rc<MountRequest>> = self.requests.borrow().values().cloned().collect();
         for request in requests {
             request.cancellable.cancel();
-            request.operation.borrow_mut().take();
+            dismiss_operation(&request.operation);
             request.visible.set(false);
             request.slot_released.set(true);
         }
@@ -1244,7 +1255,7 @@ impl Volumes {
         let removals: Vec<Rc<RemovalRequest>> = self.removals.borrow().values().cloned().collect();
         for request in removals {
             request.cancellable.cancel();
-            request.operation.borrow_mut().take();
+            dismiss_operation(&request.operation);
             request.visible.set(false);
             request.slot_released.set(true);
         }

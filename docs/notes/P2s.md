@@ -243,3 +243,61 @@ On a USB stick:
   emptied by the release step come back. [read]
 - Expected trade-off: a search under the stick is closed by the release step even if the unmount
   then fails.
+
+## Hardware check (Kyle, Nov 4, 2026)
+
+Kyle ran these by hand on the USB stick:
+- **Check 5, partly:** Eject removed the stick's row from the Devices list. He did not say whether the
+  "can be removed safely" line appeared.
+- **Re-insertion:** after he pulled the stick and plugged it back in, mounting it worked.
+
+Checks 1–4, 6 and 7 are still unobserved on hardware.
+
+## Hardware checks (Claude, Nov 4, 2026)
+
+Run on stick sdb1 `6BF9-DAAC` ("125 GB Volume") with scratch XDG dirs, `GIMBAL_LOG=1`, a uinput
+pointer and AT-SPI. Each run was ≤9 s; Kyle's instance was closed.
+
+1. **Pass.** Double-click mounted the stick, and a click opened it in the tab. Right-click → Unmount.
+   The row went back to `Not mounted`, the tab moved to `/run/media/kyle` (`relocated tab 2 … after …
+   disappeared`), and `findmnt` stopped listing it. The log shows the release steps (1 folder view)
+   before the backend call.
+2. **Pass.** In one run: mount, then Unmount, then mount again. All three ended OK (attempts 1–3 in
+   the log).
+3. **Pass, with a leftover dialog.** A `sleep` holding its cwd on the stick blocked the unmount. GTK's
+   "Volume is busy" dialog appeared, listing the PID, with Cancel and Unmount Anyway. The row showed
+   `Unmounting…` with Cancel, and the stick stayed mounted. Clicking the row's Cancel ended the
+   attempt as `Cancelled`. The row went back to mounted and the summary read "Unmount cancelled".
+   **But the GTK busy dialog stayed open after that cancel.** The virtual pointer couldn't click
+   inside the dialog (two tries), so its own Cancel button is untested.
+4. **Partly.** The test folder held 20,200 entries and the stick had been remounted cold. The size
+   walk still finished in 0.3 s, before the menu could be driven (about 1.7 s), so the walk was not
+   running when Unmount was pressed. Unmount succeeded right after it. The log shows walks, searches
+   and the folder view released first. A folder big enough to still be counting needs a hand test.
+5. Kyle (above): Eject removes the row.
+6. Not run (needs the stick pulled by hand).
+7. **Pass.** WD-Blue-SSD and Nvme-Storage-1: Open, Open in new tab, Unmount, and no Eject. Right-click
+   on Main Drive opens no menu. `/` has no row. Nothing was clicked on these drives.
+
+Left on the stick: `gimbal-p2s-check/` (20,000 empty test files). Claude's delete was blocked by a
+safety check, so Kyle deletes it. The stick is left unmounted.
+
+## Fix: the busy dialog stayed open after Cancel (Claude, Nov 5, 2026)
+
+- **Cause [read]:** GtkMountOperation closes its process dialog only in its `aborted` class handler
+  (`gimbal-refs/gtk-4.22.4/gtk/gtkmountoperation.c:1689-1709`). Cancelling the GIO call's
+  `Cancellable` doesn't emit `aborted`. Gimbal's cancel also just dropped the operation, so the
+  dialog stayed up.
+- **Fix:** `volumes/mod.rs` `dismiss_operation` takes the request's operation and emits `aborted` on
+  it. All eight places that dropped an operation now use it: cancel, window close, shutdown, and
+  completion. With no dialog showing, the handler does nothing. The take happens before the emit, so
+  no `RefCell` borrow is held during the signal.
+- **Test:** `cancel_aborts_the_operation_so_gtk_closes_its_busy_dialog`. The fake backend now returns
+  a real `gio::MountOperation` for unmount/eject. Cancel emits `aborted` once, and the late Cancelled
+  callback emits nothing more. [observed]
+- **Gates:** `scripts/check.sh` exit 0, 825 passed / 23 ignored. [observed]
+- **Live [observed]:** the stick was busy (a `sleep` held its cwd there). Unmount opened the dialog,
+  with 2 Gimbal windows in niri. After the row's Cancel there was 1 window, the stick was still
+  mounted, the row was back to mounted, and the summary read "Unmount cancelled".
+- **Still untested:** the dialog's own Cancel and Unmount Anyway buttons. The virtual pointer can't
+  click into that dialog.
