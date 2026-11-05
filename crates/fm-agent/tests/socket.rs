@@ -628,6 +628,16 @@ fn repeated_enable_cycles_share_one_fixed_worker_budget() {
     fs::write(&config_file, "[agent]\n").expect("config");
     let entered = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let release = std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+    // Opens the blocked resolvers even if an assertion below panics, so a
+    // failure here cannot leak workers into the tests that run after it.
+    struct OpenOnDrop(std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>);
+    impl Drop for OpenOnDrop {
+        fn drop(&mut self) {
+            *self.0.0.lock().unwrap_or_else(|poison| poison.into_inner()) = true;
+            self.0.1.notify_all();
+        }
+    }
+    let _open_on_drop = OpenOnDrop(std::sync::Arc::clone(&release));
     let hook_entered = std::sync::Arc::clone(&entered);
     let hook_release = std::sync::Arc::clone(&release);
 
@@ -722,11 +732,19 @@ fn repeated_enable_cycles_share_one_fixed_worker_budget() {
     extra
         .set_read_timeout(Some(Duration::from_secs(2)))
         .expect("timeout");
-    protocol::write_frame(
+    // The refusal is written and the connection closed without reading the
+    // request, so this write can race the close and fail with BrokenPipe. The
+    // busy reply is still waiting in the receive buffer either way.
+    if let Err(error) = protocol::write_frame(
         &mut extra,
         &scratch.request("capacity").to_toml().into_bytes(),
-    )
-    .expect("write");
+    ) {
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::BrokenPipe,
+            "write: {error}"
+        );
+    }
     let text = String::from_utf8(read_one(&mut extra).expect("busy reply")).expect("utf8");
     assert!(text.contains("busy"), "{text}");
     assert_eq!(entered.load(std::sync::atomic::Ordering::SeqCst), 8);
