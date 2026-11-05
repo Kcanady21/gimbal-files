@@ -1,0 +1,22 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Template for scripts/build-deb.sh. @MAINTAINER@ and @HOMEPAGE@ are filled in
+# from the environment and the workspace manifest; dpkg-gencontrol adds the
+# version, the shlibdeps Depends and Installed-Size.
+Source: gimbal-files
+Section: utils
+Priority: optional
+Maintainer: @MAINTAINER@
+Homepage: @HOMEPAGE@
+Standards-Version: 4.7.0
+Rules-Requires-Root: no
+
+Package: gimbal-files
+Section: utils
+Priority: optional
+Architecture: amd64
+Depends: ${shlibs:Depends}
+Recommends: baobab
+Description: file manager for Wayland with tabs and a split view
+ Gimbal Files is a GTK 4 and libadwaita file manager for Wayland. It has
+ tabs and a split view, a keyboard-driven command registry, file operations
+ with undo, previews, drag and drop, and drive mounting.

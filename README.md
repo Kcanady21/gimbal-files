@@ -5,26 +5,79 @@ and libadwaita. It has tabs and a split view, a keyboard-driven command
 registry, file operations with undo, previews, drag and drop, drive mounting,
 and a deliberately quiet, transparent look.
 
-## What it needs
+## Install with apt
 
-- Linux with a Wayland compositor.
-- **GTK 4.22 or newer** and **libadwaita 1.9 or newer**. The workspace pins
-  the `v4_22` and `v1_9` features in `Cargo.toml`, which set the minimums.
-- **Rust 1.92 or newer** to build it (`rust-version` in `Cargo.toml`).
+This is the main install for Debian-family systems on x86_64 (amd64). Updates
+then come through apt.
 
-Ubuntu 26.04 ships this stack. Older distributions may not.
+### One-time setup
 
-Optional: **Baobab** (GNOME Disk Usage Analyzer) for **Disk Usage** in the
-folder menu. The row is greyed out without it. When it is missing,
-`install.sh` offers to install it with your distribution's package manager
-(that step asks for your password; Gimbal's own install never does).
-`--no-prompt` skips the question and only prints the command.
+1. Download the archive keyring:
 
-## Install from a release
+   ```sh
+   sudo install -d -m 0755 /etc/apt/keyrings
+   curl -fsSL https://kcanady21.github.io/gimbal-files/apt/gimbal-files-archive-keyring.gpg \
+     | sudo tee /etc/apt/keyrings/gimbal-files.gpg >/dev/null
+   sudo chmod 0644 /etc/apt/keyrings/gimbal-files.gpg
+   ```
 
-Releases are signed prebuilt tarballs for x86_64 Linux. Download one, check
-both signatures with the committed public key, then run its installer. The
-check needs `minisign` (`sudo apt install minisign` on Ubuntu):
+2. Add the repository. Write this deb822-style file to
+   `/etc/apt/sources.list.d/gimbal-files.sources`:
+
+   ```sh
+   sudo tee /etc/apt/sources.list.d/gimbal-files.sources >/dev/null <<'EOF'
+   Types: deb
+   URIs: https://kcanady21.github.io/gimbal-files/apt
+   Suites: stable
+   Components: main
+   Architectures: amd64
+   Signed-By: /etc/apt/keyrings/gimbal-files.gpg
+   EOF
+   ```
+
+3. Install it:
+
+   ```sh
+   sudo apt update
+   sudo apt install gimbal-files
+   ```
+
+`Recommends: baobab` pulls in GNOME Disk Usage Analyzer, which **Disk Usage**
+in the folder menu needs.
+
+### Updates and removal
+
+Update everything, including Gimbal Files, with:
+
+```sh
+sudo apt upgrade
+```
+
+On GimbalOS, `gimbal` runs that for you.
+
+Remove the package with:
+
+```sh
+sudo apt remove gimbal-files
+```
+
+To stop updates as well, remove the two setup files:
+
+```sh
+sudo rm /etc/apt/sources.list.d/gimbal-files.sources \
+  /etc/apt/keyrings/gimbal-files.gpg
+sudo apt update
+```
+
+Your configuration and session are left alone.
+
+## Other distributions
+
+Releases also include a signed prebuilt tarball for x86_64 Linux, for Fedora,
+Arch and other non-Debian distributions. It installs for the current user
+under `~/.local`. Download one, check both signatures with the committed
+public key, then run its installer. The check needs `minisign`
+(`sudo apt install minisign` on Ubuntu):
 
 ```sh
 VERSION=0.1.0
@@ -57,6 +110,10 @@ to `~/.local/share/icons/hicolor/scalable/apps`, and an install marker to
 `PATH`, it tells you; add it to your shell's `PATH` to run `gimbal-files` from
 a terminal.
 
+A per-user install in `~/.local/bin` usually takes precedence over `/usr/bin`
+on `PATH`, so don't use both the apt package and the tarball at the same time.
+Remove one before installing the other.
+
 ## Install from source
 
 With the GTK, libadwaita and Wayland development files installed (on Ubuntu:
@@ -71,6 +128,24 @@ scripts/install.sh
 `scripts/install.sh` never runs cargo. It fails with a clear message if
 `target/release/` has not been built. It also runs from an unpacked release
 tarball, where it uses the binaries beside it.
+
+## What it needs
+
+- Linux with a Wayland compositor.
+- **GTK 4.22 or newer** and **libadwaita 1.9 or newer**. The workspace pins
+  the `v4_22` and `v1_9` features in `Cargo.toml`, which set the minimums.
+- **Rust 1.92 or newer** to build it (`rust-version` in `Cargo.toml`).
+
+Ubuntu 26.04 ships this stack. Older distributions may not. The apt package
+pulls in the runtime libraries it needs; the source build needs the
+development packages listed above.
+
+Optional: **Baobab** (GNOME Disk Usage Analyzer) for **Disk Usage** in the
+folder menu. The apt package recommends it. With the tarball, the row is
+greyed out without it. When it is missing, `install.sh` offers to install it
+with your distribution's package manager (that step asks for your password;
+Gimbal's own install never does). `--no-prompt` skips the question and only
+prints the command.
 
 ## Transparent window on niri
 
@@ -100,7 +175,7 @@ xdg-mime default io.github.kcanady21.GimbalFiles.desktop inode/directory
 This covers applications that ask the XDG MIME database for the handler of
 `inode/directory`.
 
-## Uninstall
+## Uninstall a tarball or source install
 
 From a checkout:
 
@@ -120,17 +195,20 @@ touches your configuration or session.
 - Session (windows, tabs and split layout):
   `$XDG_STATE_HOME/gimbal-files/session.toml`, or
   `~/.local/state/gimbal-files/session.toml`.
-- Install marker:
+- Install marker (tarball and source installs):
   `$XDG_DATA_HOME/gimbal-files/install.toml`, or
   `~/.local/share/gimbal-files/install.toml`; under `--prefix DIR` it is
   `DIR/share/gimbal-files/install.toml`.
 
+The apt package does not write an install marker.
+
 ## Updates
 
-Gimbal Files will check GitHub once a day for a newer signed release and
-offer **Install** in Settings; only correctly signed releases are installed,
-and a development build run from `target/` never updates itself. This check
-is not part of the 0.1.0 build yet.
+Gimbal Files checks GitHub once a day and tells you when a newer version is
+out. The update itself is apt's job for the package (or the tarball's job for
+other distributions); Gimbal does not install anything itself. A development
+build run from `target/` never checks for updates. This notice-only check is
+not part of the 0.1.0 build yet.
 
 ## Contributing
 

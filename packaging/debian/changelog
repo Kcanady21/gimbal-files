@@ -1,0 +1,9 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Template for scripts/build-deb.sh. @VERSION@, @DATE@ and @MAINTAINER@ are
+# filled from the release version, SOURCE_DATE_EPOCH and the maintainer
+# identity. This is a Debian changelog, so the first line is the package line.
+gimbal-files (@VERSION@) stable; urgency=medium
+
+  * Release @VERSION@.
+
+ -- @MAINTAINER@  @DATE@
