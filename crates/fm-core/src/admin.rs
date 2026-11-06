@@ -160,12 +160,16 @@ pub fn admin_uri(family: AppFamily, path: &Path) -> Option<String> {
     Some(format!("{prefix}{encoded}"))
 }
 
+/// The content type GIO gives every empty file, whatever its name. No
+/// application handles it.
+pub const EMPTY_FILE_TYPE: &str = "application/x-zerosize";
+
 /// The content type whose default application opens the file. GIO types every
 /// empty file `application/x-zerosize` regardless of its name, and no
 /// application handles that type, so an empty file falls back to the type its
 /// name suggests.
 pub fn lookup_type<'a>(queried: &'a str, by_name: &'a str) -> &'a str {
-    if queried == "application/x-zerosize" {
+    if queried == EMPTY_FILE_TYPE {
         by_name
     } else {
         queried

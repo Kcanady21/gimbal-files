@@ -83,6 +83,17 @@ pub fn item_menu(items: &[ItemInfo], current_uid: Option<u32>) -> Vec<MenuItem> 
         MenuAction::Command(path_args(&paths)),
     )];
 
+    // P2aa: Open With sits directly under Open, and only when every selected
+    // item is a file. Folders open in Gimbal. The command has no `app`
+    // argument here, so the window opens the submenu instead of launching.
+    if items.iter().all(|item| item.is_file && !item.is_dir) {
+        menu.push(item(
+            "Open With",
+            "file.open-with",
+            MenuAction::Command(path_args(&paths)),
+        ));
+    }
+
     if single
         && items[0].is_file
         && !items[0].is_dir
@@ -291,6 +302,7 @@ mod tests {
             labels(&menu),
             [
                 "Open",
+                "Open With",
                 "Rename…",
                 "Cut",
                 "Copy",
@@ -303,9 +315,38 @@ mod tests {
     }
 
     #[test]
-    fn a_file_the_user_does_not_own_gets_open_as_administrator_after_open() {
+    fn open_with_sits_under_open_for_files_and_not_for_folders_or_mixes() {
+        let one = item_menu(&[owned_file("a.txt")], Some(CURRENT_UID));
+        assert_eq!(labels(&one)[..2], ["Open", "Open With"]);
+        let entry = one
+            .iter()
+            .find(|item| item.command == "file.open-with")
+            .expect("the Open With entry");
+        assert_eq!(
+            entry.action,
+            MenuAction::Command(vec![("paths".to_string(), "/tmp/a.txt".to_string())])
+        );
+
+        let many = item_menu(
+            &[owned_file("a.txt"), owned_file("b.txt")],
+            Some(CURRENT_UID),
+        );
+        assert!(labels(&many).contains(&"Open With"));
+
+        let folder_menu = item_menu(&[folder("docs")], Some(CURRENT_UID));
+        assert!(!labels(&folder_menu).contains(&"Open With"));
+
+        let mixed = item_menu(&[owned_file("a.txt"), folder("docs")], Some(CURRENT_UID));
+        assert!(!labels(&mixed).contains(&"Open With"));
+    }
+
+    #[test]
+    fn a_file_the_user_does_not_own_gets_open_as_administrator_after_open_with() {
         let menu = item_menu(&[unowned_file("root-owned.txt")], Some(CURRENT_UID));
-        assert_eq!(labels(&menu)[..2], ["Open", "Open as Administrator"]);
+        assert_eq!(
+            labels(&menu)[..3],
+            ["Open", "Open With", "Open as Administrator"]
+        );
         let admin = menu
             .iter()
             .find(|item| item.command == "file.open-as-admin")

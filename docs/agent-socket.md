@@ -64,6 +64,7 @@ command keeps `Caller::Cli`, but that does not make the transport trusted.
 Unavailable through the socket (refused by the registry before any handler):
 
 - `preview.edit`, `preview.discard`, `preview.save`, `preview.save-as`
+- `file.open-with`, `file.set-default-app`
 - `file.open-as-admin`
 - `trash.empty`, `trash.delete-permanently`
 - `drive.mount`, `drive.unmount`, `drive.eject`

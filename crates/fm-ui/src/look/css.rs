@@ -203,6 +203,14 @@ dnd .gl-drag-badge, .gl-drag-badge {{ min-width: {tsmall}px; min-height: {tsmall
 .gl-menu-item:disabled {{ color: alpha({FG}, 0.45); }}
 .gl-menu-item:focus-visible {{ box-shadow: 0 0 0 {thin}px {FOCUS_RING}; }}
 .gl-menu-note {{ padding: {gs}px {gm}px; color: alpha({FG}, 0.75); font-size: {tsmall}px; }}
+.gl-app-icon {{ -gtk-icon-size: {irow}px; margin-right: {gs}px; }}
+.gl-openwith-root {{ padding: {gm}px; min-width: {search_w}px; }}
+.gl-openwith-list {{ background-color: transparent; }}
+.gl-openwith-row {{ min-height: {pinrow}px; padding: {gs}px {gm}px; }}
+.gl-openwith-row label {{ font-size: {trow}px; }}
+.gl-openwith-heading {{ font-size: {tsmall}px; color: alpha({FG}, 0.7); padding: {gm}px {gm}px {gs}px {gm}px; }}
+.gl-openwith-actions {{ padding-top: {gm}px; }}
+window.gimbal-look .gl-openwith-list row:selected {{ background-color: alpha(@accent_bg_color, 0.45); border-radius: {r}px; }}
 .gl-trash-view {{ padding: {gm}px; color: {FG}; }}
 .gl-trash-actions {{ min-height: {ch}px; margin-bottom: {gm}px; }}
 .gl-trash-title {{ font-size: {tt}px; color: {FG}; }}

@@ -10,6 +10,9 @@
 #[path = "update.rs"]
 pub mod update;
 
+#[path = "openwith.rs"]
+pub mod openwith;
+
 use adw::prelude::*;
 use fm_core::command::{Caller, CheckedCommand, Effect, Invocation, Outcome, Registry, Value};
 use fm_core::config::{self, Change, ConfigFile};
@@ -60,6 +63,10 @@ pub struct Process {
     /// The typed Trash identities frozen when the item-menu Delete Permanently
     /// was clicked. It is taken once, before the worker starts.
     pending_trash_delete: RefCell<Option<Vec<TrashIdentity>>>,
+    /// The grid widget whose item menu is open. The no-argument
+    /// `file.open-with` handler anchors its submenu here after the item menu
+    /// has closed.
+    openwith_anchor: RefCell<Option<gtk::Widget>>,
     quit: RefCell<QuitCoordinator>,
     /// The local automation listener and its bounded job history. The Settings
     /// switch is the only path that changes it; agents cannot.
@@ -314,6 +321,7 @@ impl Process {
             fresh_home: Cell::new(false),
             suppress_header: Cell::new(false),
             pending_trash_delete: RefCell::new(None),
+            openwith_anchor: RefCell::new(None),
             quit: RefCell::new(QuitCoordinator::default()),
             agent: RefCell::new(crate::agent::AgentRuntime::new(process_tag)),
             agent_poll: RefCell::new(None),
@@ -428,6 +436,7 @@ impl Process {
             fresh_home: Cell::new(false),
             suppress_header: Cell::new(false),
             pending_trash_delete: RefCell::new(None),
+            openwith_anchor: RefCell::new(None),
             quit: RefCell::new(QuitCoordinator::default()),
             agent: RefCell::new(crate::agent::AgentRuntime::new("test".to_string())),
             agent_poll: RefCell::new(None),
@@ -937,7 +946,7 @@ impl Process {
 
     /// The same production path as [`Self::dispatch_for_window`], returning
     /// the registry's outcome for a caller that must react to acceptance.
-    fn dispatch_with_outcome(
+    pub(crate) fn dispatch_with_outcome(
         self: &Rc<Self>,
         window: WindowId,
         caller: Caller,
@@ -1510,8 +1519,34 @@ impl Process {
     /// The one launch path, shared by `file.open` and a double-click. The
     /// command bridge reports the real error; a double-click only logs it.
     pub fn launch_file(&self, path: &Path) -> Result<(), String> {
-        let uri = gio::File::for_path(path).uri().to_string();
-        match gio::AppInfo::launch_default_for_uri(&uri, None::<&gio::AppLaunchContext>) {
+        let file = gio::File::for_path(path);
+        let uri = file.uri().to_string();
+        // GIO types every empty file application/x-zerosize, whatever its
+        // name, and launch_default_for_uri finds no handler for that type. An
+        // empty file still opens: its app is the default for its name's type.
+        let queried = file
+            .query_info(
+                "standard::content-type",
+                gio::FileQueryInfoFlags::NONE,
+                None::<&gio::Cancellable>,
+            )
+            .ok()
+            .and_then(|info| info.content_type())
+            .map(|content_type| content_type.to_string());
+        let launched = match queried.as_deref() {
+            Some(fm_core::admin::EMPTY_FILE_TYPE) => {
+                let by_name = gio::content_type_guess(Some(path), None).0.to_string();
+                match gio::AppInfo::default_for_type(&by_name, false) {
+                    Some(app) => app.launch_uris(&[uri.as_str()], None::<&gio::AppLaunchContext>),
+                    None => Err(glib::Error::new(
+                        gio::IOErrorEnum::NotSupported,
+                        &format!("no application is registered for {by_name}"),
+                    )),
+                }
+            }
+            _ => gio::AppInfo::launch_default_for_uri(&uri, None::<&gio::AppLaunchContext>),
+        };
+        match launched {
             Ok(()) => {
                 crate::log!("open", "launched {}", path.display());
                 Ok(())
@@ -1649,6 +1684,12 @@ impl Process {
             Err(error) => crate::log!("group", "refused {count} folders: {error}"),
         }
         self.finish(result)
+    }
+
+    /// The anchor the item menu used. The Open With submenu opens from the
+    /// same grid cell after the item menu has closed.
+    fn take_openwith_anchor(&self) -> Option<gtk::Widget> {
+        self.openwith_anchor.borrow_mut().take()
     }
 
     pub fn selected_paths(&self, window: WindowId) -> Vec<PathBuf> {
@@ -2869,6 +2910,77 @@ impl Process {
             };
         }
 
+        if command.name() == "file.open-with" {
+            if caller != Caller::Ui {
+                return Outcome::Failed(
+                    "file.open-with is available only from the window".to_string(),
+                );
+            }
+            let paths = argument_paths(command, "paths")
+                .filter(|paths| !paths.is_empty())
+                .unwrap_or_else(|| self.selected_paths(window));
+            if paths.is_empty() {
+                return Outcome::Failed("file.open-with has nothing selected".to_string());
+            }
+            if let Some(folder) =
+                fm_core::openwith::folder_in_selection(&paths, |path| path.is_dir())
+            {
+                let message = fm_core::openwith::OpenWithProblem::Folder(folder).message();
+                crate::log!("openwith", "refused a folder in the selection");
+                if let Some(ui) = self.window(window) {
+                    ui.show_summary(&message, None);
+                }
+                return Outcome::Failed(message);
+            }
+
+            match argument_text(command, "app") {
+                Some(app_id) => {
+                    let Some(ui) = self.window(window) else {
+                        return Outcome::Failed("file.open-with has no window".to_string());
+                    };
+                    return match openwith::launch_with(&ui, &app_id, &paths) {
+                        Ok(()) => Outcome::Done,
+                        Err(error) => Outcome::Failed(error),
+                    };
+                }
+                None => {
+                    // The item menu's row has no application yet: show the
+                    // submenu instead of launching.
+                    let Some(ui) = self.window(window) else {
+                        return Outcome::Failed("file.open-with has no window".to_string());
+                    };
+                    let anchor = self
+                        .take_openwith_anchor()
+                        .unwrap_or_else(|| ui.window().clone().upcast::<gtk::Widget>());
+                    // Open after this click and the closing item menu are
+                    // done, never from inside the popover being torn down.
+                    let ui = ui.clone();
+                    glib::idle_add_local_once(move || {
+                        openwith::show_submenu(&ui, &anchor, paths);
+                    });
+                    return Outcome::Done;
+                }
+            }
+        }
+
+        if command.name() == "file.set-default-app" {
+            if caller != Caller::Ui {
+                return Outcome::Failed(
+                    "file.set-default-app is available only from the chooser".to_string(),
+                );
+            }
+            let Some(app_id) = argument_text(command, "app") else {
+                return Outcome::Failed("file.set-default-app needs an application".to_string());
+            };
+            let Some(content_type) = argument_text(command, "type") else {
+                return Outcome::Failed("file.set-default-app needs a content type".to_string());
+            };
+            return match openwith::set_default_app(&app_id, &content_type) {
+                Ok(()) => Outcome::Done,
+                Err(error) => Outcome::Failed(error),
+            };
+        }
+
         if command.name() == "file.open-as-admin" {
             if caller != Caller::Ui {
                 return Outcome::Failed(
@@ -3540,6 +3652,7 @@ impl Process {
             })
             .collect();
         if let Some(ui) = self.window(window) {
+            *self.openwith_anchor.borrow_mut() = Some(anchor.clone());
             dialogs::show_menu(
                 &ui,
                 anchor,
@@ -4429,6 +4542,7 @@ mod tests {
             fresh_home: Cell::new(false),
             suppress_header: Cell::new(false),
             pending_trash_delete: RefCell::new(None),
+            openwith_anchor: RefCell::new(None),
             quit: RefCell::new(QuitCoordinator::default()),
             agent: RefCell::new(crate::agent::AgentRuntime::new("gtk-test".to_string())),
             agent_poll: RefCell::new(None),

@@ -288,6 +288,46 @@ pub const COMMANDS: &[CommandSpec] = &[
         undo: false,
         arguments: &[PATHS_FROM_SELECTION],
     },
+    // P2aa: with an `app`, launch the selected files with that installed
+    // application. Without one, the UI opens the Open With submenu; the
+    // catalogue keeps the argument optional so that one command can also
+    // describe the menu action. Both this and `file.set-default-app` are
+    // System, so the agent socket and CLI refuse them.
+    CommandSpec {
+        name: "file.open-with",
+        summary: "Open files with an application you choose.",
+        effect: Effect::System,
+        undo: false,
+        arguments: &[
+            ArgSpec {
+                name: "app",
+                kind: ArgKind::Text,
+                presence: Presence::Optional,
+                default: None,
+            },
+            PATHS_FROM_SELECTION,
+        ],
+    },
+    CommandSpec {
+        name: "file.set-default-app",
+        summary: "Make an application the default for a content type.",
+        effect: Effect::System,
+        undo: false,
+        arguments: &[
+            ArgSpec {
+                name: "app",
+                kind: ArgKind::Text,
+                presence: Presence::Required,
+                default: None,
+            },
+            ArgSpec {
+                name: "type",
+                kind: ArgKind::Text,
+                presence: Presence::Required,
+                default: None,
+            },
+        ],
+    },
     // P2y: one file the user does not own, through GVfs's admin:// or KIO's
     // admin: backend. A System effect keeps it off the agent socket and CLI.
     CommandSpec {
@@ -715,6 +755,36 @@ mod tests {
         assert!(matches!(spec.arguments[0].kind, ArgKind::Bool));
         assert!(matches!(spec.arguments[0].presence, Presence::Required));
         assert!(!spec.summary.is_empty());
+    }
+
+    #[test]
+    fn open_with_and_set_default_app_are_system_commands() {
+        let open_with = drive_command("file.open-with");
+        assert_eq!(open_with.effect, Effect::System);
+        assert!(!open_with.undo);
+        assert_eq!(open_with.arguments.len(), 2);
+        assert_eq!(open_with.arguments[0].name, "app");
+        assert!(matches!(open_with.arguments[0].kind, ArgKind::Text));
+        assert!(matches!(
+            open_with.arguments[0].presence,
+            Presence::Optional
+        ));
+        assert_eq!(open_with.arguments[1].name, "paths");
+        assert!(matches!(open_with.arguments[1].kind, ArgKind::Paths));
+        assert!(matches!(
+            open_with.arguments[1].presence,
+            Presence::Context(ContextSource::Selection)
+        ));
+
+        let set_default = drive_command("file.set-default-app");
+        assert_eq!(set_default.effect, Effect::System);
+        assert!(!set_default.undo);
+        assert_eq!(set_default.arguments.len(), 2);
+        for (argument, name) in set_default.arguments.iter().zip(["app", "type"]) {
+            assert_eq!(argument.name, name);
+            assert!(matches!(argument.kind, ArgKind::Text));
+            assert!(matches!(argument.presence, Presence::Required));
+        }
     }
 
     #[test]

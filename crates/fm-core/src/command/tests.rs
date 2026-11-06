@@ -49,6 +49,8 @@ fn the_v1_catalogue_has_every_reviewed_command_in_order() {
         "selection.all",
         "selection.none",
         "file.open",
+        "file.open-with",
+        "file.set-default-app",
         "file.open-as-admin",
         "file.trash",
         "file.copy",
@@ -372,6 +374,77 @@ fn open_as_admin_is_a_system_command_with_the_selection_argument() {
         )
         .is_ok()
     );
+}
+
+#[test]
+fn open_with_and_set_default_app_are_system_commands_with_their_arguments() {
+    let open_with = Registry::new()
+        .command("file.open-with")
+        .expect("the approved Open With command exists");
+    assert_eq!(open_with.effect, Effect::System);
+    assert!(!open_with.undo);
+    let app = open_with.argument("app").expect("an app argument");
+    assert_eq!(app.kind, ArgKind::Text);
+    assert_eq!(app.presence, Presence::Optional);
+    let paths = open_with.argument("paths").expect("a paths argument");
+    assert_eq!(paths.kind, ArgKind::Paths);
+    assert_eq!(paths.presence, Presence::Context(ContextSource::Selection));
+
+    let set_default = Registry::new()
+        .command("file.set-default-app")
+        .expect("the approved default command exists");
+    assert_eq!(set_default.effect, Effect::System);
+    assert!(!set_default.undo);
+    assert_eq!(set_default.arguments.len(), 2);
+    for name in ["app", "type"] {
+        let argument = set_default.argument(name).expect("a required argument");
+        assert_eq!(argument.kind, ArgKind::Text);
+        assert_eq!(argument.presence, Presence::Required);
+        assert!(argument.default.is_none());
+    }
+
+    // The registry accepts the window and the chooser. The local socket
+    // refuses every System effect before dispatch, and the CLI speaks to
+    // Gimbal over that socket, so neither command is available to automation.
+    for name in ["file.open-with", "file.set-default-app"] {
+        assert!(caller_allowed(name, Effect::System, Caller::Ui));
+    }
+
+    assert!(
+        check(
+            Caller::Ui,
+            &[
+                "file.open-with",
+                "app=org.kde.kate.desktop",
+                "paths=/tmp/a.txt",
+            ]
+        )
+        .is_ok()
+    );
+    // The item menu omits `app`: the handler opens the submenu instead.
+    assert!(check(Caller::Ui, &["file.open-with", "paths=/tmp/a.txt"]).is_ok());
+    assert!(
+        check(
+            Caller::Ui,
+            &[
+                "file.set-default-app",
+                "app=org.kde.kate.desktop",
+                "type=text/plain",
+            ]
+        )
+        .is_ok()
+    );
+
+    // The default change requires both the application and the type.
+    assert!(check(Caller::Ui, &["file.set-default-app"]).is_err());
+    assert!(
+        check(
+            Caller::Ui,
+            &["file.set-default-app", "app=org.kde.kate.desktop"]
+        )
+        .is_err()
+    );
+    assert!(check(Caller::Ui, &["file.set-default-app", "type=text/plain"]).is_err());
 }
 
 #[test]
