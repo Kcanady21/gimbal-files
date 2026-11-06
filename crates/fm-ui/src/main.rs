@@ -12,6 +12,7 @@ mod commands;
 mod content;
 mod dnd;
 mod events;
+mod filemanager1;
 mod fileops;
 mod folder;
 mod frame;
@@ -53,14 +54,29 @@ fn main() -> gtk::glib::ExitCode {
         .application_id(fm_core::APP_ID)
         .flags(gio::ApplicationFlags::HANDLES_OPEN)
         .build();
+    app.connect_startup(startup);
     app.connect_activate(activate);
     app.connect_open(open);
     app.run()
 }
 
+/// A `--gapplication-service` launch never activates, so the FileManager1
+/// object and name are handled here, before the first call can arrive.
+fn startup(application: &adw::Application) {
+    // `startup` only runs on the primary instance. A service launch is the
+    // bus's activation file starting us; an ordinary launch reaches activate.
+    filemanager1::start(application);
+}
+
+/// The process, once startup has built it. The FileManager1 object uses this
+/// from `startup`/idle callbacks that run before or after `activate`.
+pub(crate) fn process() -> Option<Rc<Process>> {
+    PROCESS.with(|slot| slot.borrow().clone())
+}
+
 /// The first activation (or open) builds the process and restores the session.
 /// `true` means this call created it.
-fn ensure_process(application: &adw::Application) -> (Rc<Process>, bool) {
+pub(crate) fn ensure_process(application: &adw::Application) -> (Rc<Process>, bool) {
     // GTK has initialized by the time activate/open runs. The installed
     // hicolor icon has the same name as the app id, which is also the Wayland
     // app id and the desktop entry's StartupWMClass.

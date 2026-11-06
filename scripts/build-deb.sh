@@ -94,6 +94,8 @@ deb_build() {
             || deb_error "the desktop entry is missing"
         [[ -f "$repo_root/packaging/icons/io.github.kcanady21.GimbalFiles.svg" ]] \
             || deb_error "the app icon is missing"
+        [[ -f "$repo_root/packaging/dbus/io.github.kcanady21.GimbalFiles.FileManager1.service" ]] \
+            || deb_error "the FileManager1 activation file is missing"
 
         local homepage maintainer epoch
         homepage="$(workspace_repository)"
@@ -110,6 +112,7 @@ deb_build() {
         mkdir -p \
             "$pkg/usr/bin" \
             "$pkg/usr/share/applications" \
+            "$pkg/usr/share/dbus-1/services" \
             "$pkg/usr/share/icons/hicolor/scalable/apps" \
             "$pkg/usr/share/doc/gimbal-files" \
             "$pkg/DEBIAN" \
@@ -124,6 +127,11 @@ deb_build() {
         # Exec=gimbal-files %U works unchanged because /usr/bin is on PATH.
         install -m 0644 "$repo_root/packaging/io.github.kcanady21.GimbalFiles.desktop" \
             "$pkg/usr/share/applications/io.github.kcanady21.GimbalFiles.desktop"
+        # The bus reads this system-wide file; its Exec stays /usr/bin because
+        # that is where the package puts the binary.
+        install -m 0644 \
+            "$repo_root/packaging/dbus/io.github.kcanady21.GimbalFiles.FileManager1.service" \
+            "$pkg/usr/share/dbus-1/services/io.github.kcanady21.GimbalFiles.FileManager1.service"
         install -m 0644 "$repo_root/packaging/icons/io.github.kcanady21.GimbalFiles.svg" \
             "$pkg/usr/share/icons/hicolor/scalable/apps/io.github.kcanady21.GimbalFiles.svg"
         install -m 0644 "$repo_root/packaging/debian/copyright" \

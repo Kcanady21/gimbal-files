@@ -154,6 +154,12 @@ struct UpdateWidgets {
     syncing: Rc<Cell<bool>>,
 }
 
+struct FileManager1Widgets {
+    switch: gtk::Switch,
+    status: gtk::Label,
+    syncing: Rc<Cell<bool>>,
+}
+
 pub struct Header {
     window_id: WindowId,
     handle: gtk::WindowHandle,
@@ -193,6 +199,8 @@ pub struct Header {
     agent_widgets: RefCell<Option<AgentWidgets>>,
     /// The open Settings menu's Updates switch, status and buttons.
     update_widgets: RefCell<Option<UpdateWidgets>>,
+    /// The open Settings menu's Integration switch and status.
+    filemanager1_widgets: RefCell<Option<FileManager1Widgets>>,
     /// The open Settings menu's Sort rows. The header owns them while the menu
     /// is open; the rows' click handlers hold only weak references.
     sort_rows: RefCell<Option<Rc<SortRows>>>,
@@ -322,6 +330,7 @@ impl Header {
             dialogs: Cell::new(0),
             agent_widgets: RefCell::new(None),
             update_widgets: RefCell::new(None),
+            filemanager1_widgets: RefCell::new(None),
             sort_rows: RefCell::new(None),
             ui: RefCell::new(Weak::new()),
         });
@@ -382,6 +391,24 @@ impl Header {
         check.set_sensitive(!development && status.check_enabled && !status.checking);
         releases.set_visible(status.releases_visible());
         label.set_text(&status.status_text());
+    }
+
+    /// Sync the open Settings menu's Integration switch and status line.
+    pub fn refresh_filemanager1_status(&self, status: &crate::filemanager1::Status) {
+        let widgets = self.filemanager1_widgets.borrow().as_ref().map(|widgets| {
+            (
+                widgets.switch.clone(),
+                widgets.status.clone(),
+                widgets.syncing.clone(),
+            )
+        });
+        let Some((switch, label, syncing)) = widgets else {
+            return;
+        };
+        syncing.set(true);
+        switch.set_active(status.enabled);
+        syncing.set(false);
+        label.set_text(&status.text());
     }
 
     /// Sync the open Settings menu's Sort rows with the config, after any sort
@@ -1704,6 +1731,86 @@ fn open_settings_menu(ui: &Rc<WindowUi>, anchor: &gtk::Button) {
                 }
             },
         );
+    });
+
+    let integration_status = crate::filemanager1::status();
+
+    let integration_heading = gtk::Label::builder()
+        .label(crate::filemanager1::text::INTEGRATION)
+        .halign(gtk::Align::Start)
+        .build();
+    integration_heading.add_css_class("gl-menu-item");
+    menu.append(&integration_heading);
+
+    let integration_row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+    integration_row.add_css_class("gl-menu-item");
+    let integration_label = gtk::Label::builder()
+        .label(crate::filemanager1::text::SHOW_IN_FOLDER)
+        .halign(gtk::Align::Start)
+        .hexpand(true)
+        .build();
+    let integration_switch = gtk::Switch::new();
+    integration_switch.update_property(&[gtk::accessible::Property::Label(
+        crate::filemanager1::text::SHOW_IN_FOLDER,
+    )]);
+    integration_switch.update_property(&[gtk::accessible::Property::Description(
+        crate::filemanager1::text::SUBTITLE,
+    )]);
+    integration_row.append(&integration_label);
+    integration_row.append(&integration_switch);
+    menu.append(&integration_row);
+
+    let integration_subtitle = gtk::Label::builder()
+        .label(crate::filemanager1::text::SUBTITLE)
+        .wrap(true)
+        .xalign(0.0)
+        .halign(gtk::Align::Start)
+        .build();
+    integration_subtitle.add_css_class("dim-label");
+    menu.append(&integration_subtitle);
+
+    let integration_status_label = gtk::Label::builder()
+        .label(integration_status.text())
+        .wrap(true)
+        .xalign(0.0)
+        .halign(gtk::Align::Start)
+        .build();
+    integration_status_label.add_css_class("dim-label");
+    menu.append(&integration_status_label);
+
+    let integration_syncing = Rc::new(Cell::new(false));
+    *ui.header().filemanager1_widgets.borrow_mut() = Some(FileManager1Widgets {
+        switch: integration_switch.clone(),
+        status: integration_status_label.clone(),
+        syncing: integration_syncing.clone(),
+    });
+    ui.header().refresh_filemanager1_status(&integration_status);
+
+    let ui_integration = ui.clone();
+    let integration_switch_widget = integration_switch.clone();
+    let integration_syncing_flag = integration_syncing.clone();
+    integration_switch.connect_active_notify(move |_| {
+        if integration_syncing_flag.get() {
+            return;
+        }
+        let requested = integration_switch_widget.is_active();
+        ui_integration.dispatch(
+            Caller::Ui,
+            Invocation::new(
+                "integration.set-show-in-folder",
+                vec![("enabled".to_string(), requested.to_string())],
+            ),
+        );
+        if let Some(process) = ui_integration.process_upgrade() {
+            let status = crate::filemanager1::status();
+            ui_integration.header().refresh_filemanager1_status(&status);
+            process.refresh_filemanager1_status_all();
+            if status.enabled != requested {
+                integration_syncing_flag.set(true);
+                integration_switch_widget.set_active(status.enabled);
+                integration_syncing_flag.set(false);
+            }
+        }
     });
 
     popover.set_child(Some(&menu));

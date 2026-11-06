@@ -288,6 +288,15 @@ pub const COMMANDS: &[CommandSpec] = &[
         undo: false,
         arguments: &[PATHS_FROM_SELECTION],
     },
+    // P2y: one file the user does not own, through GVfs's admin:// or KIO's
+    // admin: backend. A System effect keeps it off the agent socket and CLI.
+    CommandSpec {
+        name: "file.open-as-admin",
+        summary: "Open one file you do not own with its default application as administrator.",
+        effect: Effect::System,
+        undo: false,
+        arguments: &[PATHS_FROM_SELECTION],
+    },
     CommandSpec {
         name: "file.trash",
         summary: "Move files to the trash.",
@@ -578,6 +587,21 @@ pub const COMMANDS: &[CommandSpec] = &[
         undo: false,
         arguments: &[],
     },
+    // P2x: one Settings switch for `org.freedesktop.FileManager1`. Like the
+    // update controls it is a System command, so the socket and CLI refuse it
+    // before any handler.
+    CommandSpec {
+        name: "integration.set-show-in-folder",
+        summary: "Open \"Show in folder\" requests in Gimbal.",
+        effect: Effect::System,
+        undo: false,
+        arguments: &[ArgSpec {
+            name: "enabled",
+            kind: ArgKind::Bool,
+            presence: Presence::Required,
+            default: None,
+        }],
+    },
     CommandSpec {
         name: "pins.add",
         summary: "Pin a folder.",
@@ -679,5 +703,33 @@ mod tests {
         assert_eq!(check.effect, Effect::System);
         assert!(!check.undo);
         assert!(check.arguments.is_empty());
+    }
+
+    #[test]
+    fn show_in_folder_is_a_system_command_with_a_required_bool() {
+        let spec = drive_command("integration.set-show-in-folder");
+        assert_eq!(spec.effect, Effect::System);
+        assert!(!spec.undo);
+        assert_eq!(spec.arguments.len(), 1);
+        assert_eq!(spec.arguments[0].name, "enabled");
+        assert!(matches!(spec.arguments[0].kind, ArgKind::Bool));
+        assert!(matches!(spec.arguments[0].presence, Presence::Required));
+        assert!(!spec.summary.is_empty());
+    }
+
+    #[test]
+    fn open_as_admin_is_a_system_command_over_the_selection() {
+        let spec = drive_command("file.open-as-admin");
+        assert_eq!(spec.effect, Effect::System);
+        assert!(!spec.undo);
+        assert_eq!(spec.arguments.len(), 1);
+        let argument = &spec.arguments[0];
+        assert_eq!(argument.name, "paths");
+        assert!(matches!(argument.kind, ArgKind::Paths));
+        assert!(matches!(
+            argument.presence,
+            Presence::Context(ContextSource::Selection)
+        ));
+        assert!(!spec.summary.is_empty());
     }
 }

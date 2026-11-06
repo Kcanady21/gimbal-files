@@ -9,6 +9,11 @@ use std::ffi::OsStr;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
+use fm_core::admin::needs_admin;
+
+/// The lock shown on administrator entries and, in P2z, administrator tabs.
+pub const ADMIN_LOCK_ICON: &str = "changes-prevent-symbolic";
+
 /// What the UI does when an entry is chosen.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MenuAction {
@@ -31,12 +36,17 @@ pub struct MenuItem {
     pub command: &'static str,
     pub enabled: bool,
     pub action: MenuAction,
+    /// A symbolic icon name shown before the label.
+    pub icon: Option<&'static str>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ItemInfo {
     pub path: PathBuf,
     pub is_dir: bool,
+    pub is_file: bool,
+    /// The target's owner, following a symlink. `None` means missing or broken.
+    pub owner_uid: Option<u32>,
 }
 
 fn path_args(paths: &[PathBuf]) -> Vec<(String, String)> {
@@ -52,11 +62,13 @@ fn item(label: &str, command: &'static str, action: MenuAction) -> MenuItem {
         command,
         enabled: true,
         action,
+        icon: None,
     }
 }
 
-/// The menu for a right-click on selected items.
-pub fn item_menu(items: &[ItemInfo]) -> Vec<MenuItem> {
+/// The menu for a right-click on selected items. `current_uid` is the user's
+/// uid when it could be read; without it no administrator entry is offered.
+pub fn item_menu(items: &[ItemInfo], current_uid: Option<u32>) -> Vec<MenuItem> {
     if items.is_empty() {
         return Vec::new();
     }
@@ -70,6 +82,23 @@ pub fn item_menu(items: &[ItemInfo]) -> Vec<MenuItem> {
         "file.open",
         MenuAction::Command(path_args(&paths)),
     )];
+
+    if single
+        && items[0].is_file
+        && !items[0].is_dir
+        && items[0]
+            .owner_uid
+            .zip(current_uid)
+            .is_some_and(|(owner, current)| needs_admin(owner, current))
+    {
+        let mut admin = item(
+            "Open as Administrator",
+            "file.open-as-admin",
+            MenuAction::Command(path_args(&paths)),
+        );
+        admin.icon = Some(ADMIN_LOCK_ICON);
+        menu.push(admin);
+    }
 
     if items.len() >= 2 && items.iter().all(|item| item.is_dir) {
         menu.push(item(
@@ -222,10 +251,23 @@ mod tests {
     use super::*;
     use fm_core::command::COMMANDS;
 
-    fn file(name: &str) -> ItemInfo {
+    const CURRENT_UID: u32 = 1000;
+
+    fn owned_file(name: &str) -> ItemInfo {
         ItemInfo {
             path: PathBuf::from(format!("/tmp/{name}")),
             is_dir: false,
+            is_file: true,
+            owner_uid: Some(CURRENT_UID),
+        }
+    }
+
+    fn unowned_file(name: &str) -> ItemInfo {
+        ItemInfo {
+            path: PathBuf::from(format!("/tmp/{name}")),
+            is_dir: false,
+            is_file: true,
+            owner_uid: Some(0),
         }
     }
 
@@ -233,6 +275,8 @@ mod tests {
         ItemInfo {
             path: PathBuf::from(format!("/tmp/{name}")),
             is_dir: true,
+            is_file: false,
+            owner_uid: Some(CURRENT_UID),
         }
     }
 
@@ -242,7 +286,7 @@ mod tests {
 
     #[test]
     fn one_file_has_no_folder_only_entries() {
-        let menu = item_menu(&[file("a.txt")]);
+        let menu = item_menu(&[owned_file("a.txt")], Some(CURRENT_UID));
         assert_eq!(
             labels(&menu),
             [
@@ -259,8 +303,70 @@ mod tests {
     }
 
     #[test]
+    fn a_file_the_user_does_not_own_gets_open_as_administrator_after_open() {
+        let menu = item_menu(&[unowned_file("root-owned.txt")], Some(CURRENT_UID));
+        assert_eq!(labels(&menu)[..2], ["Open", "Open as Administrator"]);
+        let admin = menu
+            .iter()
+            .find(|item| item.command == "file.open-as-admin")
+            .expect("the administrator entry");
+        assert_eq!(admin.icon, Some(ADMIN_LOCK_ICON));
+        assert_eq!(
+            admin.action,
+            MenuAction::Command(vec![(
+                "paths".to_string(),
+                "/tmp/root-owned.txt".to_string()
+            )])
+        );
+    }
+
+    #[test]
+    fn a_file_the_user_owns_has_no_administrator_entry() {
+        let menu = item_menu(&[owned_file("mine.txt")], Some(CURRENT_UID));
+        assert!(!labels(&menu).contains(&"Open as Administrator"));
+    }
+
+    #[test]
+    fn a_folder_or_several_files_have_no_administrator_entry() {
+        let folder_menu = item_menu(&[folder("docs")], Some(CURRENT_UID));
+        assert!(!labels(&folder_menu).contains(&"Open as Administrator"));
+
+        let mut root_folder = folder("root-docs");
+        root_folder.owner_uid = Some(0);
+        let root_folder_menu = item_menu(&[root_folder], Some(CURRENT_UID));
+        assert!(!labels(&root_folder_menu).contains(&"Open as Administrator"));
+
+        let many = item_menu(
+            &[unowned_file("a.txt"), unowned_file("b.txt")],
+            Some(CURRENT_UID),
+        );
+        assert!(!labels(&many).contains(&"Open as Administrator"));
+    }
+
+    #[test]
+    fn an_unknown_current_uid_does_not_offer_an_administrator_entry() {
+        let menu = item_menu(&[unowned_file("root-owned.txt")], None);
+        assert!(!labels(&menu).contains(&"Open as Administrator"));
+    }
+
+    #[test]
+    fn a_broken_link_has_no_administrator_entry() {
+        let broken = ItemInfo {
+            path: PathBuf::from("/tmp/broken-link"),
+            is_dir: false,
+            is_file: false,
+            owner_uid: None,
+        };
+        let menu = item_menu(&[broken], Some(CURRENT_UID));
+        assert!(!labels(&menu).contains(&"Open as Administrator"));
+    }
+
+    #[test]
     fn several_files_cannot_be_renamed_or_pinned() {
-        let menu = item_menu(&[file("a.txt"), file("b.txt")]);
+        let menu = item_menu(
+            &[owned_file("a.txt"), owned_file("b.txt")],
+            Some(CURRENT_UID),
+        );
         let labels = labels(&menu);
         assert!(!labels.contains(&"Rename…"));
         assert!(!labels.contains(&"Open in New Tab"));
@@ -270,7 +376,7 @@ mod tests {
 
     #[test]
     fn one_folder_gets_open_in_new_tab_and_pin() {
-        let menu = item_menu(&[folder("docs")]);
+        let menu = item_menu(&[folder("docs")], Some(CURRENT_UID));
         let labels = labels(&menu);
         assert!(labels.contains(&"Open in New Tab"));
         assert!(labels.contains(&"Pin"));
@@ -283,7 +389,7 @@ mod tests {
 
     #[test]
     fn several_folders_get_open_in_new_group_after_open_in_view_order() {
-        let menu = item_menu(&[folder("a"), folder("b"), folder("c")]);
+        let menu = item_menu(&[folder("a"), folder("b"), folder("c")], Some(CURRENT_UID));
         assert_eq!(labels(&menu)[..2], ["Open", "Open in New Group"]);
         let entry = menu
             .iter()
@@ -301,19 +407,22 @@ mod tests {
 
     #[test]
     fn a_file_in_the_selection_has_no_open_in_new_group() {
-        let menu = item_menu(&[folder("docs"), file("a.txt"), folder("more")]);
+        let menu = item_menu(
+            &[folder("docs"), owned_file("a.txt"), folder("more")],
+            Some(CURRENT_UID),
+        );
         assert!(!labels(&menu).contains(&"Open in New Group"));
     }
 
     #[test]
     fn one_folder_alone_has_no_open_in_new_group() {
-        let menu = item_menu(&[folder("docs")]);
+        let menu = item_menu(&[folder("docs")], Some(CURRENT_UID));
         assert!(!labels(&menu).contains(&"Open in New Group"));
     }
 
     #[test]
     fn a_mix_has_no_single_item_entries() {
-        let menu = item_menu(&[file("a.txt"), folder("docs")]);
+        let menu = item_menu(&[owned_file("a.txt"), folder("docs")], Some(CURRENT_UID));
         let labels = labels(&menu);
         assert!(!labels.contains(&"Rename…"));
         assert!(!labels.contains(&"Open in New Tab"));
@@ -367,9 +476,10 @@ mod tests {
     #[test]
     fn every_entry_is_a_registry_command() {
         let menus = [
-            item_menu(&[file("a.txt")]),
-            item_menu(&[folder("docs")]),
-            item_menu(&[file("a.txt"), folder("docs")]),
+            item_menu(&[owned_file("a.txt")], Some(CURRENT_UID)),
+            item_menu(&[unowned_file("root-owned.txt")], Some(CURRENT_UID)),
+            item_menu(&[folder("docs")], Some(CURRENT_UID)),
+            item_menu(&[owned_file("a.txt"), folder("docs")], Some(CURRENT_UID)),
             background_menu(Path::new("/tmp"), Some("restored 1 item"), true, true),
         ];
         for menu in menus {

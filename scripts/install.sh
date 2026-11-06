@@ -113,11 +113,13 @@ fi
 
 desktop_dir="$data_dir/applications"
 icon_dir="$data_dir/icons/hicolor/scalable/apps"
+dbus_dir="$data_dir/dbus-1/services"
 marker="$data_dir/gimbal-files/install.toml"
 
 app_id="io.github.kcanady21.GimbalFiles"
 desktop_name="$app_id.desktop"
 icon_name="$app_id.svg"
+service_name="$app_id.FileManager1.service"
 
 refresh_caches() {
     if command -v update-desktop-database >/dev/null 2>&1; then
@@ -135,6 +137,7 @@ if $uninstall; then
         "$bin_dir/gimbal-files-cli" \
         "$desktop_dir/$desktop_name" \
         "$icon_dir/$icon_name" \
+        "$dbus_dir/$service_name" \
         "$marker"; do
         if [[ -e "$file" || -L "$file" ]]; then
             rm -f -- "$file"
@@ -154,6 +157,7 @@ if [[ -f "$script_dir/latest.toml" && -f "$script_dir/bin/gimbal-files" ]]; then
     bin_src="$script_dir/bin"
     desktop_src="$script_dir/share/applications/$desktop_name"
     icon_src="$script_dir/share/icons/hicolor/scalable/apps/$icon_name"
+    service_src="$script_dir/share/dbus-1/services/$service_name"
     version_file="$script_dir/latest.toml"
 else
     repo_root="$(cd -- "$script_dir/.." && pwd -P)"
@@ -163,6 +167,7 @@ else
     bin_src="$repo_root/target/release"
     desktop_src="$repo_root/packaging/$desktop_name"
     icon_src="$repo_root/packaging/icons/$icon_name"
+    service_src="$repo_root/packaging/dbus/$service_name"
     version_file="$repo_root/Cargo.toml"
 fi
 
@@ -178,6 +183,7 @@ for binary in gimbal-files gimbal-files-cli; do
 done
 [[ -f "$desktop_src" ]] || error "desktop entry not found at $desktop_src"
 [[ -f "$icon_src" ]] || error "app icon not found at $icon_src"
+[[ -f "$service_src" ]] || error "FileManager1 activation file not found at $service_src"
 
 if $tarball_mode; then
     version="$(sed -n 's/^[[:space:]]*version[[:space:]]*=[[:space:]]*"\(.*\)"[[:space:]]*$/\1/p' "$version_file" | head -n 1)"
@@ -186,7 +192,7 @@ else
 fi
 [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || error "could not read a version from $version_file"
 
-mkdir -p -- "$bin_dir" "$desktop_dir" "$icon_dir" "$(dirname -- "$marker")"
+mkdir -p -- "$bin_dir" "$desktop_dir" "$icon_dir" "$dbus_dir" "$(dirname -- "$marker")"
 
 # Record real locations so P2v can compare a canonicalized current_exe with
 # bin_dir. The prefix stays as the absolute directory the caller chose.
@@ -194,6 +200,7 @@ bin_dir="$(cd -- "$bin_dir" && pwd -P)"
 data_dir="$(cd -- "$data_dir" && pwd -P)"
 desktop_dir="$data_dir/applications"
 icon_dir="$data_dir/icons/hicolor/scalable/apps"
+dbus_dir="$data_dir/dbus-1/services"
 marker="$data_dir/gimbal-files/install.toml"
 
 tmp_paths=()
@@ -233,6 +240,32 @@ case "$bin_dir" in
         ;;
 esac
 install_file "$desktop_tmp" "$desktop_dir/$desktop_name" 0644
+
+# dbus-daemon reads a service file in two passes: its desktop-file parser first
+# turns \\ into \ and rejects the whole file on any other backslash escape,
+# then Exec is split with shell-like quoting (_dbus_shell_parse_argv). Single
+# quotes carry spaces, parentheses, $, &, | and " literally. So a backslash is
+# doubled for the first pass, and an embedded single quote is closed, written
+# as "'" and reopened ('"'"'), never as '\'' (whose \' the first pass rejects).
+# Checked against dbus-daemon 1.16.2 on a private bus.
+dbus_quote() {
+    local path="$1"
+    path="${path//\\/\\\\}"
+    path="${path//\'/\'\"\'\"\'}"
+    printf "'%s'" "$path"
+}
+
+service_tmp="$(dirname -- "$dbus_dir/$service_name")/.$service_name.src.$$"
+tmp_paths+=("$service_tmp")
+{
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        case "$line" in
+            Exec=*) printf 'Exec=%s --gapplication-service\n' "$(dbus_quote "$bin_dir/gimbal-files")" ;;
+            *) printf '%s\n' "$line" ;;
+        esac
+    done <"$service_src"
+} >"$service_tmp"
+install_file "$service_tmp" "$dbus_dir/$service_name" 0644
 install_file "$icon_src" "$icon_dir/$icon_name" 0644
 
 toml_escape() {

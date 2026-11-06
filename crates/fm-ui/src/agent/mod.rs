@@ -24,6 +24,7 @@ use fm_agent::protocol::{
     RunKind, SocketInfo, Status, TabInfo, WindowInfo,
 };
 use fm_agent::transport::{Inbound, Server, ServerConfig};
+use fm_core::admin::current_uid;
 use fm_core::command::{
     ArgKind, Caller, Effect, Invocation, Outcome, Presence, Registry, Value, caller_allowed,
     must_supply,
@@ -576,13 +577,6 @@ pub fn set_enabled(process: &Rc<Process>, enabled: bool) -> Outcome {
         }
     }
     Outcome::Done
-}
-
-fn current_uid() -> Result<u32, String> {
-    use std::os::unix::fs::MetadataExt;
-    std::fs::metadata("/proc/self")
-        .map(|metadata| metadata.uid())
-        .map_err(|error| format!("could not read the current uid: {error}"))
 }
 
 pub fn status(process: &Process) -> AgentStatus {

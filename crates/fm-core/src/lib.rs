@@ -8,8 +8,10 @@
 
 #![forbid(unsafe_code)]
 
+pub mod admin;
 pub mod command;
 pub mod config;
+pub mod filemanager1;
 pub mod fileops;
 pub mod folder_size;
 pub(crate) mod fsutil;

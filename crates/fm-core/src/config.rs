@@ -45,7 +45,15 @@ pub const MIN_LEFT_WIDTH: u32 = 300;
 pub const MIN_RIGHT_WIDTH: u32 = 360;
 
 const KNOWN_TOP_LEVEL: &[&str] = &[
-    "look", "sidebars", "sections", "pins", "sort", "hotkeys", "agent", "updates",
+    "look",
+    "sidebars",
+    "sections",
+    "pins",
+    "sort",
+    "hotkeys",
+    "agent",
+    "updates",
+    "integration",
 ];
 
 /// The config path as a pure function of `XDG_CONFIG_HOME` and the home
@@ -477,6 +485,8 @@ pub struct Config {
     pub agent: Agent,
     /// The notice-only update check. On unless the user turned it off.
     pub updates: Updates,
+    /// Desktop integration switches. Off unless the user turns them on.
+    pub integration: Integration,
     /// Runtime context: home for `~` expansion. Not written to the file.
     pub home: PathBuf,
 }
@@ -501,6 +511,15 @@ impl Default for Updates {
     }
 }
 
+/// Desktop integration. Both switches default Off, matching the README's
+/// promise that Gimbal never changes the user's defaults unless asked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Integration {
+    /// Answer `org.freedesktop.FileManager1` while Gimbal runs. A Settings
+    /// switch, `integration.set-show-in-folder`, owns this value.
+    pub show_in_folder: bool,
+}
+
 impl Default for Config {
     fn default() -> Self {
         let home = home_dir();
@@ -521,6 +540,7 @@ impl Config {
             hotkeys: default_hotkeys(),
             agent: Agent::default(),
             updates: Updates::default(),
+            integration: Integration::default(),
             home,
         }
     }
@@ -634,6 +654,8 @@ pub enum Change {
     SetAgentEnabled(bool),
     /// Turn the daily signed-notice check on or off.
     SetUpdatesEnabled(bool),
+    /// Answer `org.freedesktop.FileManager1` while Gimbal runs.
+    SetShowInFolder(bool),
 }
 
 /// What went wrong while loading the config.
@@ -1022,6 +1044,10 @@ pub fn change_for(
             Some(CommandValue::Bool(enabled)) => Some(Change::SetUpdatesEnabled(*enabled)),
             _ => None,
         },
+        "integration.set-show-in-folder" => match command.get("enabled") {
+            Some(CommandValue::Bool(enabled)) => Some(Change::SetShowInFolder(*enabled)),
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -1128,6 +1154,7 @@ impl Loader<'_> {
         self.read_hotkeys(root, config);
         self.read_agent(root, config);
         self.read_updates(root, config);
+        self.read_integration(root, config);
     }
 
     fn unknown_entry(&mut self, table: &dyn TableLike, prefix: &str, key: &str, item: &Item) {
@@ -1555,6 +1582,40 @@ impl Loader<'_> {
         };
     }
 
+    /// `[integration] show_in_folder = true|false`. The default is Off. As
+    /// with `[agent]` and `[updates]`, the whole section must be valid before
+    /// its bool applies.
+    fn read_integration(&mut self, root: &Table, config: &mut Config) {
+        let Some(item) = root.get("integration") else {
+            return;
+        };
+        let Some(table) = table_like(item) else {
+            self.wrong_type("integration", item, "a table");
+            config.integration = Integration::default();
+            return;
+        };
+
+        let mut valid = true;
+        for (key, value) in table.iter() {
+            if key != "show_in_folder" {
+                self.unknown_entry(table, "integration", key, value);
+                valid = false;
+            }
+        }
+
+        let show_in_folder = match table.get("show_in_folder") {
+            Some(item) => match self.read_bool(item, "integration.show_in_folder") {
+                Some(value) => value,
+                None => {
+                    valid = false;
+                    false
+                }
+            },
+            None => false,
+        };
+        config.integration.show_in_folder = valid && show_in_folder;
+    }
+
     fn read_inline_hotkey(&mut self, inline: &InlineTable, key: &str) -> Option<Hotkey> {
         let Some(command_value) = inline.get("command") else {
             self.report(
@@ -1937,6 +1998,7 @@ fn apply_to_config(config: &mut Config, change: &Change) {
         }
         Change::SetAgentEnabled(enabled) => config.agent.enabled = *enabled,
         Change::SetUpdatesEnabled(enabled) => config.updates.check = *enabled,
+        Change::SetShowInFolder(enabled) => config.integration.show_in_folder = *enabled,
     }
 }
 
@@ -2126,6 +2188,14 @@ fn apply_to_document(document: &mut DocumentMut, change: &Change, config: &Confi
         }
         Change::SetUpdatesEnabled(enabled) => {
             set_root_value(document, "updates", "check", Value::from(*enabled));
+        }
+        Change::SetShowInFolder(enabled) => {
+            set_root_value(
+                document,
+                "integration",
+                "show_in_folder",
+                Value::from(*enabled),
+            );
         }
     }
 }
@@ -3592,6 +3662,118 @@ answer = 42
         assert_eq!(
             change_for(&enabled, &config, home),
             Some(Change::SetUpdatesEnabled(true))
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // P2x: the FileManager1 integration switch
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn show_in_folder_defaults_off_and_reads_true_and_false() {
+        let temp = TempDir::new("integration-default");
+        let home = temp.path();
+        let path = temp.write("config.toml", "[look]\nscale = 1.0\n");
+        let (file, problems) = ConfigFile::load_with(&path, home, &SpecialFolders::default());
+        assert!(problems.is_empty(), "{problems:?}");
+        assert!(!file.config().integration.show_in_folder);
+
+        let missing = temp.path().join("absent.toml");
+        let (file, problems) = ConfigFile::load_with(&missing, home, &SpecialFolders::default());
+        assert!(problems.is_empty());
+        assert!(!file.config().integration.show_in_folder);
+
+        let on = temp.write("on.toml", "[integration]\nshow_in_folder = true\n");
+        let (file, problems) = ConfigFile::load_with(&on, home, &SpecialFolders::default());
+        assert!(problems.is_empty(), "{problems:?}");
+        assert!(file.config().integration.show_in_folder);
+
+        let off = temp.write("off.toml", "[integration]\nshow_in_folder = false\n");
+        let (file, problems) = ConfigFile::load_with(&off, home, &SpecialFolders::default());
+        assert!(problems.is_empty());
+        assert!(!file.config().integration.show_in_folder);
+    }
+
+    #[test]
+    fn an_invalid_integration_section_leaves_the_default_off() {
+        let temp = TempDir::new("integration-invalid");
+        let home = temp.path();
+        let cases = [
+            (
+                "unknown-first",
+                "[integration]\nextra = 1\nshow_in_folder = true\n",
+            ),
+            (
+                "unknown-last",
+                "[integration]\nshow_in_folder = true\nextra = 1\n",
+            ),
+            ("wrong-shape", "integration = false\n"),
+            ("array-shape", "integration = [true]\n"),
+            ("wrong-type", "[integration]\nshow_in_folder = \"yes\"\n"),
+            (
+                "nested",
+                "[integration]\nshow_in_folder = true\nnested = { value = 1 }\n",
+            ),
+        ];
+        for (name, text) in cases {
+            let path = temp.write(&format!("{name}.toml"), text);
+            let (file, problems) = ConfigFile::load_with(&path, home, &SpecialFolders::default());
+            assert!(
+                !file.config().integration.show_in_folder,
+                "{name} changed the default despite a problem: {problems:?}"
+            );
+            assert!(!problems.is_empty(), "{name} was not diagnosed");
+        }
+
+        let parse = temp.write("parse.toml", "[integration\nshow_in_folder = true\n");
+        let (file, problems) = ConfigFile::load_with(&parse, home, &SpecialFolders::default());
+        assert!(!file.config().integration.show_in_folder);
+        assert_eq!(problems[0].kind, ConfigProblemKind::Parse);
+    }
+
+    #[test]
+    fn integration_save_one_key_and_preserve_comments_and_other_settings() {
+        let temp = TempDir::new("integration-save");
+        let home = temp.path();
+        let path = temp.write(
+            "config.toml",
+            "# keep this comment\n[look]\nscale = 0.9\n\n[updates]\ncheck = false\n",
+        );
+        let (mut file, problems) = ConfigFile::load_with(&path, home, &SpecialFolders::default());
+        assert!(problems.is_empty(), "{problems:?}");
+        file.apply(Change::SetShowInFolder(true)).expect("saves");
+
+        let text = fs::read_to_string(&path).expect("read");
+        assert!(text.contains("# keep this comment"), "{text}");
+        assert!(text.contains("scale = 0.9"), "{text}");
+        assert!(text.contains("[updates]\ncheck = false"), "{text}");
+        assert!(text.contains("[integration]"), "{text}");
+        assert!(text.contains("show_in_folder = true"), "{text}");
+
+        let (file, problems) = ConfigFile::load_with(&path, home, &SpecialFolders::default());
+        assert!(problems.is_empty());
+        assert!(file.config().integration.show_in_folder);
+    }
+
+    #[test]
+    fn show_in_folder_change_comes_from_the_typed_bool_argument() {
+        let home = Path::new("/tmp/home");
+        let config = default_config(home);
+        let enabled = check(
+            "integration.set-show-in-folder",
+            &["integration.set-show-in-folder", "enabled=true"],
+        );
+        assert_eq!(
+            change_for(&enabled, &config, home),
+            Some(Change::SetShowInFolder(true))
+        );
+        let disabled = check(
+            "integration.set-show-in-folder",
+            &["integration.set-show-in-folder", "enabled=false"],
+        );
+        assert_eq!(
+            change_for(&disabled, &config, home),
+            Some(Change::SetShowInFolder(false))
         );
     }
 }

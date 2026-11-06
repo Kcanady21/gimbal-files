@@ -49,6 +49,7 @@ fn the_v1_catalogue_has_every_reviewed_command_in_order() {
         "selection.all",
         "selection.none",
         "file.open",
+        "file.open-as-admin",
         "file.trash",
         "file.copy",
         "file.move",
@@ -77,6 +78,7 @@ fn the_v1_catalogue_has_every_reviewed_command_in_order() {
         "agent.set-enabled",
         "updates.set-enabled",
         "updates.check",
+        "integration.set-show-in-folder",
         "pins.add",
         "pins.remove",
         "pins.move",
@@ -294,6 +296,82 @@ fn update_commands_are_system_commands_and_the_ui_reaches_their_handler() {
 
     assert!(check(Caller::Ui, &["updates.set-enabled"]).is_err());
     assert!(check(Caller::Ui, &["updates.set-enabled", "enabled=maybe"]).is_err());
+}
+
+#[test]
+fn show_in_folder_is_a_system_command_the_ui_reaches() {
+    let spec = Registry::new()
+        .command("integration.set-show-in-folder")
+        .expect("the approved switch exists");
+    assert_eq!(spec.effect, Effect::System);
+    assert!(!spec.undo);
+    let argument = spec.argument("enabled").expect("a required bool");
+    assert_eq!(argument.kind, ArgKind::Bool);
+    assert_eq!(argument.presence, Presence::Required);
+    assert!(argument.default.is_none());
+
+    // The registry accepts the Settings UI. The local socket refuses every
+    // System effect before dispatch, which is what keeps this UI-only, the
+    // same rule the update commands use.
+    assert!(caller_allowed(
+        "integration.set-show-in-folder",
+        Effect::System,
+        Caller::Ui
+    ));
+    for value in ["true", "false"] {
+        let mut handler = Recorder::new(Outcome::Done);
+        let outcome = Registry::new().dispatch(
+            Caller::Ui,
+            &parse_invocation(&[
+                "integration.set-show-in-folder",
+                &format!("enabled={value}"),
+            ]),
+            &mut handler,
+        );
+        assert_eq!(outcome, Outcome::Done, "enabled={value}");
+        assert_eq!(handler.seen.len(), 1, "enabled={value}");
+    }
+
+    assert!(check(Caller::Ui, &["integration.set-show-in-folder"]).is_err());
+    assert!(
+        check(
+            Caller::Ui,
+            &["integration.set-show-in-folder", "enabled=maybe"]
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn open_as_admin_is_a_system_command_with_the_selection_argument() {
+    let spec = Registry::new()
+        .command("file.open-as-admin")
+        .expect("the approved command exists");
+    assert_eq!(spec.effect, Effect::System);
+    assert!(!spec.undo);
+    let argument = spec.argument("paths").expect("a paths argument");
+    assert_eq!(argument.kind, ArgKind::Paths);
+    assert_eq!(
+        argument.presence,
+        Presence::Context(ContextSource::Selection)
+    );
+
+    // The registry accepts the UI. The socket refuses every System effect
+    // before dispatch, and the CLI speaks to Gimbal over that socket, so this
+    // command is never available to automation.
+    assert!(caller_allowed(
+        "file.open-as-admin",
+        Effect::System,
+        Caller::Ui
+    ));
+    assert!(check(Caller::Ui, &["file.open-as-admin"]).is_ok());
+    assert!(
+        check(
+            Caller::Ui,
+            &["file.open-as-admin", "paths=/tmp/root-owned.txt"]
+        )
+        .is_ok()
+    );
 }
 
 #[test]

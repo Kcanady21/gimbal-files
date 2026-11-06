@@ -546,6 +546,13 @@ impl Process {
         }
     }
 
+    pub fn refresh_filemanager1_status_all(&self) {
+        let status = crate::filemanager1::status();
+        for ui in self.windows.borrow().values() {
+            ui.header().refresh_filemanager1_status(&status);
+        }
+    }
+
     pub fn set_agent_enabled(self: &Rc<Self>, enabled: bool) -> Outcome {
         crate::agent::set_enabled(self, enabled)
     }
@@ -1127,6 +1134,32 @@ impl Process {
         }
     }
 
+    /// A FileManager1 call uses the same grouping as launch arguments, then
+    /// hands its xdg-activation token to the window it presented. GTK's
+    /// `gtk_window_set_startup_id` forwards that token to
+    /// `xdg_activation_v1_activate` on Wayland and must run before `present`
+    /// (`gtk-4.22.4:gtk/gtkwindow.c:5446`; `gdk/wayland/gdktoplevel-wayland.c:1219`).
+    pub fn open_arguments_with_startup(
+        self: &Rc<Self>,
+        paths: &[PathBuf],
+        reuse_fresh: bool,
+        startup_id: Option<&str>,
+    ) {
+        self.open_arguments(paths, reuse_fresh);
+        let Some(window) = self.focused_window_id() else {
+            return;
+        };
+        let Some(ui) = self.window(window) else {
+            return;
+        };
+        if let Some(startup_id) = startup_id
+            && !startup_id.is_empty()
+        {
+            ui.window().set_startup_id(startup_id);
+        }
+        ui.present();
+    }
+
     pub fn tab_folder(&self, window: WindowId, tab: TabId) -> Option<PathBuf> {
         self.window_snapshot(window)
             .and_then(|window| window.tab(tab).map(|tab| tab.folder.clone()))
@@ -1488,6 +1521,99 @@ impl Process {
                 Err(format!("could not launch {}: {error}", path.display()))
             }
         }
+    }
+
+    /// Open one file the user does not own through the default application's
+    /// administrator backend. No root process starts: GVfs or KIO shows the
+    /// desktop's polkit prompt and does the I/O as root.
+    fn launch_file_as_admin(self: &Rc<Self>, window: WindowId, path: &Path) -> Result<(), String> {
+        let content_type = gio::File::for_path(path)
+            .query_info(
+                "standard::content-type",
+                gio::FileQueryInfoFlags::NONE,
+                None::<&gio::Cancellable>,
+            )
+            .ok()
+            .and_then(|info| info.content_type())
+            .map(|content_type| content_type.to_string())
+            .unwrap_or_else(|| gio::content_type_guess(Some(path), None).0.to_string());
+        // GIO types every empty file application/x-zerosize, whatever its
+        // name, and nothing handles that type. An empty root-owned config file
+        // is a common thing to open as administrator, so use the name instead.
+        let by_name = gio::content_type_guess(Some(path), None).0.to_string();
+        let content_type = fm_core::admin::lookup_type(&content_type, &by_name).to_string();
+
+        let Some(app) = gio::AppInfo::default_for_type(&content_type, false) else {
+            return Err(format!(
+                "No default application opens {}.",
+                path.file_name()
+                    .unwrap_or(path.as_os_str())
+                    .to_string_lossy()
+            ));
+        };
+
+        let fields = desktop_entry_fields(&app);
+        let family = fm_core::admin::app_family(
+            fields.categories.as_deref(),
+            fields.exec.as_deref(),
+            fields.flatpak,
+            fields.snap,
+        );
+        let app_name = app.name().to_string();
+        let app_id = app
+            .id()
+            .map_or_else(|| app_name.clone(), |id| id.to_string());
+
+        let kio_missing = family == fm_core::admin::AppFamily::Kio && !kio_admin_installed();
+        let uri = if kio_missing {
+            None
+        } else {
+            fm_core::admin::admin_uri(family, path)
+        };
+
+        let Some(uri) = uri else {
+            let message = match family {
+                fm_core::admin::AppFamily::PathOnly => format!(
+                    "{app_name} can't open administrator files. Open it with a GNOME or KDE editor."
+                ),
+                fm_core::admin::AppFamily::Sandboxed => {
+                    format!("{app_name} runs in a sandbox and can't open administrator files.")
+                }
+                fm_core::admin::AppFamily::Kio => format!(
+                    "{app_name} needs kio-admin to open administrator files (sudo apt install kio-admin)."
+                ),
+                fm_core::admin::AppFamily::Gio => {
+                    format!("{app_name} cannot open an administrator file.")
+                }
+            };
+            if let Some(ui) = self.window(window) {
+                ui.show_summary(&message, None);
+            }
+            crate::log!(
+                "admin",
+                "no launch for {app_id} ({}): {}",
+                family.as_str(),
+                if kio_missing {
+                    "kio-admin is not installed"
+                } else {
+                    "no administrator URL"
+                }
+            );
+            return Ok(());
+        };
+
+        let scheme = uri.split(':').next().unwrap_or("admin");
+        crate::log!(
+            "admin",
+            "launched {app_id} ({}) via {scheme}",
+            family.as_str()
+        );
+        let context = self
+            .window(window)
+            .map(|ui| gtk::prelude::RootExt::display(ui.window()).app_launch_context());
+        app.launch_uris(&[uri.as_str()], context.as_ref())
+            .map_err(|error| format!("could not launch {app_name}: {error}"))?;
+        Ok(())
     }
 
     /// `group.open` validates every folder before the pure model operation,
@@ -2565,6 +2691,9 @@ impl Process {
                     ui.sort_changed(Some(folder));
                 }
             }
+            Change::SetShowInFolder(enabled) => {
+                crate::filemanager1::apply(*enabled);
+            }
             other => crate::log!("command", "change applied: {other:?}"),
         }
     }
@@ -2691,6 +2820,17 @@ impl Process {
                 }
                 return update::command(self, window, command);
             }
+            // A System command that is a plain config write: settings_change
+            // saves it, and after_change applies it to the running service.
+            "integration.set-show-in-folder" => {
+                if caller != Caller::Ui {
+                    return Outcome::Failed(
+                        "integration.set-show-in-folder is available only from Settings"
+                            .to_string(),
+                    );
+                }
+                return self.settings_change(window, command);
+            }
             _ => {}
         }
 
@@ -2726,6 +2866,39 @@ impl Process {
                 Outcome::Done
             } else {
                 Outcome::Failed(failures.join("; "))
+            };
+        }
+
+        if command.name() == "file.open-as-admin" {
+            if caller != Caller::Ui {
+                return Outcome::Failed(
+                    "file.open-as-admin is available only from the window".to_string(),
+                );
+            }
+            let paths = argument_paths(command, "paths")
+                .filter(|paths| !paths.is_empty())
+                .unwrap_or_else(|| self.selected_paths(window));
+            let current_uid = match fm_core::admin::current_uid() {
+                Ok(uid) => uid,
+                Err(error) => return Outcome::Failed(error),
+            };
+            let path = match fm_core::admin::selected_admin_file(&paths, current_uid) {
+                Ok(path) => path,
+                Err(problem) => {
+                    if let Some(ui) = self.window(window) {
+                        ui.show_summary(problem.message(), None);
+                    }
+                    return Outcome::Failed(problem.message().to_string());
+                }
+            };
+            return match self.launch_file_as_admin(window, &path) {
+                Ok(()) => Outcome::Done,
+                Err(error) => {
+                    if let Some(ui) = self.window(window) {
+                        ui.show_summary(&error, None);
+                    }
+                    Outcome::Failed(error)
+                }
             };
         }
         match command.effect() {
@@ -3356,13 +3529,23 @@ impl Process {
         let paths = self.selected_paths(window);
         let items: Vec<fileops::ItemInfo> = paths
             .iter()
-            .map(|path| fileops::ItemInfo {
-                path: path.clone(),
-                is_dir: path.is_dir(),
+            .map(|path| {
+                let (is_dir, is_file, owner_uid) = fm_core::admin::file_facts(path);
+                fileops::ItemInfo {
+                    path: path.clone(),
+                    is_dir,
+                    is_file,
+                    owner_uid,
+                }
             })
             .collect();
         if let Some(ui) = self.window(window) {
-            dialogs::show_menu(&ui, anchor, &menus::item_menu(&items), None);
+            dialogs::show_menu(
+                &ui,
+                anchor,
+                &menus::item_menu(&items, fm_core::admin::current_uid().ok()),
+                None,
+            );
         }
     }
 
@@ -3622,6 +3805,78 @@ fn utf8_path(path: &Path) -> Result<String, String> {
             path.display()
         )
     })
+}
+
+/// The desktop entry fields that decide an application's administrator URL.
+struct DesktopEntryFields {
+    categories: Option<String>,
+    exec: Option<String>,
+    flatpak: bool,
+    snap: bool,
+}
+
+/// The default application's `Categories`, `Exec`, `X-Flatpak` and
+/// `X-SnapInstanceName` fields. GLib 2.88 moved `GDesktopAppInfo` into its
+/// GioUnix namespace, which gio 0.22.10 does not expose, so this reads the
+/// entry named by `AppInfo::id` through the data directories. `commandline`
+/// remains the fallback for an entry that was not found.
+fn desktop_entry_fields(app: &gio::AppInfo) -> DesktopEntryFields {
+    let id = app.id().map(|id| id.to_string());
+    let mut key_file = None;
+    if let Some(id) = &id {
+        let mut directories = vec![glib::user_data_dir().join("applications")];
+        directories.extend(
+            glib::system_data_dirs()
+                .into_iter()
+                .map(|directory| directory.join("applications")),
+        );
+        // Flatpak and Snap export their own desktop entries. They are usually
+        // on XDG_DATA_DIRS too, but not in every session.
+        for directory in [
+            glib::user_data_dir().join("flatpak/exports/share/applications"),
+            PathBuf::from("/var/lib/flatpak/exports/share/applications"),
+            PathBuf::from("/var/lib/snapd/desktop/applications"),
+        ] {
+            if !directories.contains(&directory) {
+                directories.push(directory);
+            }
+        }
+        let file = glib::KeyFile::new();
+        if file
+            .load_from_dirs(Path::new(id), &directories, glib::KeyFileFlags::NONE)
+            .is_ok()
+        {
+            key_file = Some(file);
+        }
+    }
+
+    let value = |key: &str| {
+        key_file
+            .as_ref()
+            .and_then(|file| file.value("Desktop Entry", key).ok())
+            .map(|value| value.to_string())
+    };
+    let has = |key: &str| {
+        key_file
+            .as_ref()
+            .and_then(|file| file.has_key("Desktop Entry", key).ok())
+            .unwrap_or(false)
+    };
+    let exec = value("Exec").or_else(|| {
+        app.commandline()
+            .map(|command| command.to_string_lossy().into_owned())
+    });
+
+    DesktopEntryFields {
+        categories: value("Categories"),
+        exec,
+        flatpak: has("X-Flatpak"),
+        snap: has("X-SnapInstanceName"),
+    }
+}
+
+fn kio_admin_installed() -> bool {
+    Path::new("/usr/share/polkit-1/actions/org.kde.kio.admin.policy").is_file()
 }
 
 fn argument_path(command: &CheckedCommand, name: &str) -> Option<PathBuf> {

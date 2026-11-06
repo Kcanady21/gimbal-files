@@ -247,11 +247,13 @@ cargo metadata --format-version 1 --offline --locked \
 echo "==> staging $stage_name"
 rm -rf -- "$stage"
 rm -f -- "$tarball" "$tarball.minisig" "$latest" "$latest.minisig" "$deb"
-mkdir -p -- "$stage/bin" "$stage/share/applications" "$stage/share/icons/hicolor/scalable/apps"
+mkdir -p -- "$stage/bin" "$stage/share/applications" "$stage/share/dbus-1/services" "$stage/share/icons/hicolor/scalable/apps"
 install -m 0755 target/release/gimbal-files "$stage/bin/gimbal-files"
 install -m 0755 target/release/gimbal-files-cli "$stage/bin/gimbal-files-cli"
 install -m 0644 packaging/io.github.kcanady21.GimbalFiles.desktop \
     "$stage/share/applications/io.github.kcanady21.GimbalFiles.desktop"
+install -m 0644 packaging/dbus/io.github.kcanady21.GimbalFiles.FileManager1.service \
+    "$stage/share/dbus-1/services/io.github.kcanady21.GimbalFiles.FileManager1.service"
 install -m 0644 packaging/icons/io.github.kcanady21.GimbalFiles.svg \
     "$stage/share/icons/hicolor/scalable/apps/io.github.kcanady21.GimbalFiles.svg"
 install -m 0755 scripts/install.sh "$stage/install.sh"

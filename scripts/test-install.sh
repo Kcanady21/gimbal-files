@@ -29,6 +29,7 @@ mkdir -p \
     "$home/.local/state/gimbal-files" \
     "$prefix/bin" \
     "$prefix/share/applications" \
+    "$prefix/share/dbus-1/services" \
     "$prefix/share/icons/hicolor/scalable/apps" \
     "$prefix/share/gimbal-files"
 
@@ -36,6 +37,7 @@ printf 'keep\n' >"$home/.config/gimbal-files/config.toml"
 printf 'keep\n' >"$home/.local/state/gimbal-files/session.toml"
 printf 'keep\n' >"$prefix/bin/keep-me"
 printf 'keep\n' >"$prefix/share/applications/keep-me.desktop"
+printf 'keep\n' >"$prefix/share/dbus-1/services/keep-me.service"
 printf 'keep\n' >"$prefix/share/icons/hicolor/scalable/apps/keep-me.svg"
 printf 'keep\n' >"$prefix/share/gimbal-files/keep-me"
 
@@ -66,6 +68,7 @@ version="$(sed -n '/^\[workspace\.package\]/,/^\[/s/^version[[:space:]]*=[[:spac
 check_mode "$prefix/bin/gimbal-files" 755
 check_mode "$prefix/bin/gimbal-files-cli" 755
 check_mode "$prefix/share/applications/io.github.kcanady21.GimbalFiles.desktop" 644
+check_mode "$prefix/share/dbus-1/services/io.github.kcanady21.GimbalFiles.FileManager1.service" 644
 check_mode "$prefix/share/icons/hicolor/scalable/apps/io.github.kcanady21.GimbalFiles.svg" 644
 check_mode "$prefix/share/gimbal-files/install.toml" 644
 
@@ -89,6 +92,12 @@ if command -v desktop-file-validate >/dev/null 2>&1; then
     desktop-file-validate "$prefix/share/applications/io.github.kcanady21.GimbalFiles.desktop" \
         || fail "the installed desktop entry does not validate"
 fi
+grep -qxF "Exec='$prefix/bin/gimbal-files' --gapplication-service" \
+    "$prefix/share/dbus-1/services/io.github.kcanady21.GimbalFiles.FileManager1.service" \
+    || fail "the FileManager1 Exec is not the absolute, quoted binary"
+grep -qxF "Name=org.freedesktop.FileManager1" \
+    "$prefix/share/dbus-1/services/io.github.kcanady21.GimbalFiles.FileManager1.service" \
+    || fail "the FileManager1 service name is wrong"
 
 [[ -z "$(find "$prefix" \( -name '.*.tmp.*' -o -name '.*.src.*' \) -print -quit)" ]] \
     || fail "a temporary install file was left behind"
@@ -112,6 +121,7 @@ for gone in \
     "$prefix/bin/gimbal-files" \
     "$prefix/bin/gimbal-files-cli" \
     "$prefix/share/applications/io.github.kcanady21.GimbalFiles.desktop" \
+    "$prefix/share/dbus-1/services/io.github.kcanady21.GimbalFiles.FileManager1.service" \
     "$prefix/share/icons/hicolor/scalable/apps/io.github.kcanady21.GimbalFiles.svg" \
     "$prefix/share/gimbal-files/install.toml"; do
     [[ ! -e "$gone" ]] || fail "uninstall left $gone"
@@ -120,6 +130,7 @@ done
 for kept in \
     "$prefix/bin/keep-me" \
     "$prefix/share/applications/keep-me.desktop" \
+    "$prefix/share/dbus-1/services/keep-me.service" \
     "$prefix/share/icons/hicolor/scalable/apps/keep-me.svg" \
     "$prefix/share/gimbal-files/keep-me" \
     "$home/.config/gimbal-files/config.toml" \
@@ -157,10 +168,32 @@ grep -qx "data_dir = \"$data\"" "$data/gimbal-files/install.toml" \
     || fail "--data-dir marker data_dir is wrong"
 [[ -f "$data/applications/io.github.kcanady21.GimbalFiles.desktop" ]] \
     || fail "--data-dir did not place the desktop entry"
+[[ -f "$data/dbus-1/services/io.github.kcanady21.GimbalFiles.FileManager1.service" ]] \
+    || fail "--data-dir did not place the FileManager1 service"
+grep -qxF "Exec='$prefix/bin/gimbal-files' --gapplication-service" \
+    "$data/dbus-1/services/io.github.kcanady21.GimbalFiles.FileManager1.service" \
+    || fail "--data-dir FileManager1 Exec is not the absolute, quoted binary"
 [[ ! -e "$prefix/share/gimbal-files/install.toml" ]] \
     || fail "--data-dir also wrote a marker under the prefix"
 HOME="$home" "$repo_root/scripts/install.sh" --prefix "$prefix" --data-dir "$data" --uninstall
 [[ ! -e "$data/gimbal-files/install.toml" && ! -e "$prefix/bin/gimbal-files" ]] \
     || fail "--data-dir uninstall left files"
+[[ ! -e "$data/dbus-1/services/io.github.kcanady21.GimbalFiles.FileManager1.service" ]] \
+    || fail "--data-dir uninstall left the FileManager1 service"
+
+# A single quote or a backslash in the prefix must still give a service file
+# dbus-daemon accepts: '\'' is rejected by its desktop-file parser, so the
+# quote is written '"'"' and the backslash is doubled.
+odd="$scratch/it's a \\ dir"
+HOME="$home" "$repo_root/scripts/install.sh" --prefix "$odd" --no-prompt >/dev/null
+odd_exec="${odd//\\/\\\\}"
+odd_exec="'${odd_exec//\'/\'\"\'\"\'}/bin/gimbal-files' --gapplication-service"
+grep -qxF "Exec=$odd_exec" \
+    "$odd/share/dbus-1/services/io.github.kcanady21.GimbalFiles.FileManager1.service" \
+    || fail "FileManager1 Exec is not quoted for a prefix with ' and \\"
+if grep -qF "'\\''" "$odd/share/dbus-1/services/io.github.kcanady21.GimbalFiles.FileManager1.service"; then
+    fail "FileManager1 Exec uses the '\\'' escape dbus-daemon rejects"
+fi
+HOME="$home" "$repo_root/scripts/install.sh" --prefix "$odd" --uninstall >/dev/null
 
 echo "PASS: install, reinstall and uninstall in $scratch"

@@ -193,6 +193,15 @@ xdg-mime default io.github.kcanady21.GimbalFiles.desktop inode/directory
 This covers applications that ask the XDG MIME database for the handler of
 `inode/directory`.
 
+"Show in folder" from browsers, the desktop portal and many other apps does
+not use that MIME default. It calls the separate
+`org.freedesktop.FileManager1` desktop service. Gimbal ships an activation
+file for that service, but it only answers while its Settings switch,
+**Open "Show in folder" in Gimbal**, is on. The switch also applies while
+Gimbal is already running, without a restart. With other file managers
+installed, the one the desktop starts while none is running can vary, but a
+running Gimbal with the switch on always takes over.
+
 ## Uninstall a tarball or source install
 
 From a checkout:

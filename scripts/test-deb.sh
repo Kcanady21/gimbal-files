@@ -73,6 +73,9 @@ drwxr-xr-x root/root ./usr/bin/
 drwxr-xr-x root/root ./usr/share/
 drwxr-xr-x root/root ./usr/share/applications/
 -rw-r--r-- root/root ./usr/share/applications/io.github.kcanady21.GimbalFiles.desktop
+drwxr-xr-x root/root ./usr/share/dbus-1/
+drwxr-xr-x root/root ./usr/share/dbus-1/services/
+-rw-r--r-- root/root ./usr/share/dbus-1/services/io.github.kcanady21.GimbalFiles.FileManager1.service
 drwxr-xr-x root/root ./usr/share/doc/
 drwxr-xr-x root/root ./usr/share/doc/gimbal-files/
 -rw-r--r-- root/root ./usr/share/doc/gimbal-files/changelog.Debian.gz
@@ -103,6 +106,14 @@ for binary in gimbal-files gimbal-files-cli; do
 done
 "$scratch/extract/usr/bin/gimbal-files-cli" --version >/dev/null \
     || fail "the extracted CLI does not run"
+
+echo "==> checking the FileManager1 activation file"
+service="$scratch/extract/usr/share/dbus-1/services/io.github.kcanady21.GimbalFiles.FileManager1.service"
+[[ -f "$service" ]] || fail "the .deb does not contain the FileManager1 service file"
+grep -qxF 'Name=org.freedesktop.FileManager1' "$service" \
+    || fail "the FileManager1 service name is wrong"
+grep -qxF 'Exec=/usr/bin/gimbal-files --gapplication-service' "$service" \
+    || fail "the FileManager1 Exec is not the system-wide binary"
 
 echo "==> checking copyright and changelog"
 changelog="$(dpkg-deb --fsys-tarfile "$deb" | tar -xOf - ./usr/share/doc/gimbal-files/changelog.Debian.gz | gzip -dc)"

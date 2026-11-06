@@ -54,13 +54,18 @@ pub fn show_menu(
         let button = gtk::Button::new();
         button.add_css_class("gl-menu-item");
         button.set_sensitive(item.enabled);
-        button.set_child(Some(
+        let row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        if let Some(icon) = item.icon {
+            row.append(&gtk::Image::from_icon_name(icon));
+        }
+        row.append(
             &gtk::Label::builder()
                 .label(&item.label)
                 .halign(gtk::Align::Start)
                 .hexpand(true)
                 .build(),
-        ));
+        );
+        button.set_child(Some(&row));
         let popover_click = popover.clone();
         let ui_click = ui.clone();
         let anchor_click = anchor.clone();
