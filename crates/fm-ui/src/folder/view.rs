@@ -318,7 +318,7 @@ impl FolderView {
         let admin = self.tab_admin();
         self.banner.set_revealed(admin);
         self.grid.set_tooltip_text(admin.then_some(
-            "Dragging, recursive search, thumbnails and preview editing are off in an administrator tab.",
+            "Dragging, recursive search and thumbnails are off in an administrator tab. Alt-click a file you don't own in the preview to edit it as administrator.",
         ));
         let mut parent = self.root.parent();
         while let Some(widget) = parent {

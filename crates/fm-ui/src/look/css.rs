@@ -78,6 +78,7 @@ fn css_impl(
     let hover_ms = motion::ms(120);
     let slide_ms = motion::ms(150);
     let pulse_ms = motion::ms(600);
+    let fade_ms = motion::ms(120);
     let window_bg = fill(BG);
     let pill_bg = fill(RECESSED);
     let pill_active = fill(RAISED);
@@ -192,6 +193,8 @@ gridview > child {{ padding: 0; }}
 dnd .gl-drag-badge, .gl-drag-badge {{ min-width: {tsmall}px; min-height: {tsmall}px; padding: {thin}px {gs}px; border-radius: {rp}px; border: {thin}px solid {OUTLINE}; background-color: {BG}; color: {FG}; font-size: {tsmall}px; font-weight: bold; }}
 .gl-status {{ min-height: {statush}px; font-size: {tc}px; }}
 .gl-status-sep {{ margin: 0 {gs}px; }}
+.gl-fade {{ transition: opacity {fade_ms}ms ease-in-out; }}
+.gl-fade.gl-faded {{ opacity: 0; }}
 @keyframes gl-status-pulse {{
 from {{ background-color: alpha(@accent_bg_color, 0.0); }}
 50% {{ background-color: alpha(@accent_bg_color, 0.35); }}
@@ -210,6 +213,9 @@ to {{ background-color: alpha(@accent_bg_color, 0.0); }}
 .gl-preview-note {{ font-size: {tsmall}px; color: alpha({FG}, 0.75); }}
 .gl-preview-notice {{ font-size: {titem}px; color: {FG}; background-color: alpha(@warning_color, 0.18); border: {thin}px solid alpha(@warning_color, 0.55); border-radius: {r}px; padding: {gs}px {gm}px; }}
 .gl-preview-warning {{ color: @error_color; }}
+.gl-preview-admin {{ border: {thin}px solid @error_bg_color; box-shadow: inset 0 0 0 {thin}px alpha(@error_bg_color, 0.65); }}
+.gl-preview-admin-banner {{ background-color: @error_bg_color; color: @error_fg_color; padding: {gs}px {gm}px; }}
+.gl-preview-admin-banner label, .gl-preview-admin-banner image {{ color: @error_fg_color; }}
 .gl-action-row .gl-icon-button {{ margin-left: {gm}px; }}
 .gl-action-row image {{ color: {FG}; -gtk-icon-palette: {save_as_palette}; }}
 .gl-trash {{ all: unset; min-width: {trash_inner}px; min-height: {trash_inner}px; -gtk-icon-size: {iwin}px; border: {thin}px solid {OUTLINE}; border-radius: {r}px; color: {FG}; margin-left: {gl}px; }}

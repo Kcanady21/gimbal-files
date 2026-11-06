@@ -1591,6 +1591,77 @@ impl Process {
             .unwrap_or(false)
     }
 
+    /// Mount GVfs's administrator location once per process. The polkit prompt
+    /// belongs to the mount; `done` runs on the main thread afterwards. P2z's
+    /// administrator tab and P2ab's administrator save share this path.
+    pub(crate) fn ensure_admin_mount<F>(self: &Rc<Self>, window: WindowId, path: &Path, done: F)
+    where
+        F: FnOnce(Result<(), String>) + 'static,
+    {
+        if self.admin_mounted.get() {
+            done(Ok(()));
+            return;
+        }
+        let Some(ui) = self.window(window) else {
+            done(Err("the window is gone".to_string()));
+            return;
+        };
+        let Some(uri) = fm_core::admin::scoped_uri(path, fm_core::admin::Scope::Admin) else {
+            done(Err(
+                "The administrator path could not be encoded.".to_string()
+            ));
+            return;
+        };
+        let parent: gtk::Window = ui.window().clone().upcast();
+        let operation = gtk::MountOperation::new(Some(&parent));
+        let keep = operation.clone();
+        let cancellable = gio::Cancellable::new();
+        let weak = Rc::downgrade(self);
+        let mount_path = path.to_path_buf();
+        gio::File::for_uri(&uri).mount_enclosing_volume(
+            gio::MountMountFlags::NONE,
+            Some(&operation),
+            Some(&cancellable),
+            move |result| {
+                drop(keep);
+                let Some(process) = weak.upgrade() else {
+                    return;
+                };
+                match result {
+                    Ok(()) => {
+                        process.admin_mounted.set(true);
+                        crate::log!(
+                            "admin",
+                            "mount granted for {} (kept until logout; Gimbal never unmounts it)",
+                            mount_path.display()
+                        );
+                        done(Ok(()));
+                    }
+                    Err(error) => {
+                        let cancelled = error.matches(gio::IOErrorEnum::Cancelled)
+                            || error.message().to_lowercase().contains("cancel");
+                        let message = if cancelled {
+                            "Administrator access was not granted.".to_string()
+                        } else {
+                            format!("Administrator access was not granted: {error}")
+                        };
+                        crate::log!(
+                            "admin",
+                            "mount failed for {}: {}",
+                            mount_path.display(),
+                            if cancelled {
+                                "cancelled"
+                            } else {
+                                error.message()
+                            }
+                        );
+                        done(Err(message));
+                    }
+                }
+            },
+        );
+    }
+
     /// Open a checked folder as an administrator tab. The first request in a
     /// session mounts GVfs's admin backend, which is where polkit asks for the
     /// password. A cancelled or failed mount opens no tab.
@@ -1609,62 +1680,24 @@ impl Process {
         if self.admin_mounted.get() {
             return self.finish_admin_open(window, &folder);
         }
-        let Some(ui) = self.window(window) else {
-            return Outcome::Failed("the window is gone".to_string());
-        };
-        let Some(uri) = fm_core::admin::scoped_uri(&folder, fm_core::admin::Scope::Admin) else {
-            return Outcome::Failed("the administrator path could not be encoded".to_string());
-        };
-        let parent: gtk::Window = ui.window().clone().upcast();
-        let operation = gtk::MountOperation::new(Some(&parent));
-        let keep = operation.clone();
-        let cancellable = gio::Cancellable::new();
         let weak = Rc::downgrade(self);
+        let folder = folder.clone();
         let mount_folder = folder.clone();
-        gio::File::for_uri(&uri).mount_enclosing_volume(
-            gio::MountMountFlags::NONE,
-            Some(&operation),
-            Some(&cancellable),
-            move |result| {
-                drop(keep);
-                let Some(process) = weak.upgrade() else {
-                    return;
-                };
-                match result {
-                    Ok(()) => {
-                        process.admin_mounted.set(true);
-                        crate::log!(
-                            "admin",
-                            "mount granted for {} (kept until logout; Gimbal never unmounts it)",
-                            mount_folder.display()
-                        );
-                        process.finish_admin_open(window, &mount_folder);
-                    }
-                    Err(error) => {
-                        let cancelled = error.matches(gio::IOErrorEnum::Cancelled)
-                            || error.message().to_lowercase().contains("cancel");
-                        let message = if cancelled {
-                            "Administrator access was not granted.".to_string()
-                        } else {
-                            format!("Administrator access was not granted: {error}")
-                        };
-                        crate::log!(
-                            "admin",
-                            "mount failed for {}: {}",
-                            mount_folder.display(),
-                            if cancelled {
-                                "cancelled"
-                            } else {
-                                error.message()
-                            }
-                        );
-                        if let Some(ui) = process.window(window) {
-                            ui.show_summary(&message, None);
-                        }
+        self.ensure_admin_mount(window, &mount_folder, move |result| {
+            let Some(process) = weak.upgrade() else {
+                return;
+            };
+            match result {
+                Ok(()) => {
+                    process.finish_admin_open(window, &folder);
+                }
+                Err(message) => {
+                    if let Some(ui) = process.window(window) {
+                        ui.show_summary(&message, None);
                     }
                 }
-            },
-        );
+            }
+        });
         Outcome::Done
     }
 
@@ -3047,16 +3080,24 @@ impl Process {
         }
 
         if self.focused_admin(window) {
-            let (off, why) = match command.name() {
-                "preview.edit" | "preview.save" | "preview.save-as" | "preview.discard" => (
-                    true,
-                    "Preview editing is off in an administrator tab; the preview stays read-only.",
-                ),
-                "search.open" => (
-                    true,
-                    "Recursive search is off in an administrator tab; browse the folder instead.",
-                ),
-                _ => (false, ""),
+            let preview_allowed = command.name().starts_with("preview.")
+                && self
+                    .window(window)
+                    .is_some_and(|ui| ui.preview().admin_allows(command.name()));
+            let (off, why) = if preview_allowed {
+                (false, "")
+            } else {
+                match command.name() {
+                    "preview.edit" | "preview.save" | "preview.save-as" | "preview.discard" => (
+                        true,
+                        "Preview editing is off in an administrator tab; the preview stays read-only.",
+                    ),
+                    "search.open" => (
+                        true,
+                        "Recursive search is off in an administrator tab; browse the folder instead.",
+                    ),
+                    _ => (false, ""),
+                }
             };
             if off {
                 crate::log!(
@@ -3072,7 +3113,7 @@ impl Process {
         }
 
         if command.name().starts_with("preview.") {
-            return self.preview_command(window, command);
+            return self.preview_command(window, command, caller);
         }
 
         if command.effect() == Effect::Files
@@ -3542,18 +3583,23 @@ impl Process {
         }
     }
 
-    fn preview_command(self: &Rc<Self>, window: WindowId, command: &CheckedCommand) -> Outcome {
+    fn preview_command(
+        self: &Rc<Self>,
+        window: WindowId,
+        command: &CheckedCommand,
+        caller: Caller,
+    ) -> Outcome {
         let Some(ui) = self.window(window) else {
             return Outcome::Done;
         };
         match command.name() {
-            "preview.edit" => ui.preview().begin_edit(),
+            "preview.edit" => ui.preview().begin_edit(caller),
             "preview.discard" => ui.preview().discard(),
             "preview.save" => {
                 if command.dry_run() {
                     return Outcome::DryRun(ui.preview().save_plan(None));
                 }
-                ui.preview().save();
+                ui.preview().save(caller);
             }
             "preview.save-as" => {
                 let Some(path) = argument_path(command, "path") else {
@@ -3563,7 +3609,7 @@ impl Process {
                 if command.dry_run() {
                     return Outcome::DryRun(ui.preview().save_plan(Some(&path)));
                 }
-                ui.preview().save_as(path);
+                ui.preview().save_as(caller, path);
             }
             _ => return Outcome::Done,
         }

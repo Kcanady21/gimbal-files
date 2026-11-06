@@ -29,6 +29,12 @@ use crate::app::Process;
 use crate::image::{self, DecodedImage, ImageProblem};
 use crate::look::icons::{self, MockupIcon};
 use crate::look::tokens::*;
+
+/// Base durations (before the motion setting) for Save As leaving and
+/// returning in administrator edit mode. The fade matches `.gl-fade` in the
+/// look module's stylesheet.
+const SAVE_AS_FADE_MS: u32 = 120;
+const SAVE_AS_SLIDE_MS: u32 = 160;
 use crate::pdf::{self, PdfFailure, PdfOutcome};
 
 const POLL_MS: u64 = 30;
@@ -247,6 +253,13 @@ fn buffer_text(buffer: &gtk::TextBuffer) -> String {
     let start = buffer.start_iter();
     let end = buffer.end_iter();
     buffer.text(&start, &end, true).to_string()
+}
+
+/// The owner recorded when a document is loaded. A text preview is always a
+/// regular file, so following the path's final metadata is enough.
+fn owner_of_path(path: &Path) -> Option<u32> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(path).ok().map(|metadata| metadata.uid())
 }
 
 struct PreviewWorkers {
@@ -690,6 +703,8 @@ pub struct PreviewPanel {
     root: gtk::Box,
     title: gtk::Label,
     notice: gtk::Label,
+    admin_banner: gtk::Box,
+    admin_banner_label: gtk::Label,
     stack: gtk::Stack,
     message: gtk::Label,
     text_page: gtk::Box,
@@ -710,6 +725,13 @@ pub struct PreviewPanel {
     discard: gtk::Button,
     save: gtk::Button,
     save_as: gtk::Button,
+    /// Holds Save As so its slot can collapse: Save then slides into its place
+    /// while editing as administrator (Kyle, Nov 6).
+    save_as_reveal: gtk::Revealer,
+    /// Whether Save As is (or is becoming) shown, and a generation that lets a
+    /// newer fade/slide cancel an older one's pending second step.
+    save_as_shown: Cell<bool>,
+    save_as_generation: Cell<u64>,
 
     process: Weak<Process>,
     window: WindowId,
@@ -728,6 +750,9 @@ pub struct PreviewPanel {
     allow_close: Cell<bool>,
     change_warning: Cell<bool>,
     change_dialog_open: Cell<bool>,
+    admin_warning_open: Cell<bool>,
+    owner_uid: Cell<Option<u32>>,
+    current_uid: Cell<Option<u32>>,
     status_generation: Cell<u64>,
     monitors: RefCell<Option<Monitors>>,
     monitor_timer: Rc<MonitorTimer>,
@@ -894,6 +919,23 @@ impl PreviewPanel {
         notice.set_max_width_chars(1);
         notice.set_visible(false);
 
+        // The administrator mode banner. It reuses the theme's error colours
+        // from P2z's administrator look; no fixed colour lives here.
+        let admin_banner = gtk::Box::new(gtk::Orientation::Horizontal, scaled(GAP_S, scale));
+        admin_banner.add_css_class("gl-preview-admin-banner");
+        admin_banner.set_visible(false);
+        let admin_lock = gtk::Image::from_icon_name(icons::ADMIN_LOCK_ICON);
+        admin_lock.set_valign(gtk::Align::Center);
+        let admin_banner_label = gtk::Label::new(None);
+        admin_banner_label.set_xalign(0.0);
+        admin_banner_label.set_wrap(true);
+        admin_banner_label.set_wrap_mode(pango::WrapMode::WordChar);
+        admin_banner_label.set_hexpand(true);
+        admin_banner_label.set_width_chars(1);
+        admin_banner_label.set_max_width_chars(1);
+        admin_banner.append(&admin_lock);
+        admin_banner.append(&admin_banner_label);
+
         let status = gtk::Label::new(None);
         status.add_css_class("gl-preview-note");
         status.set_xalign(0.0);
@@ -918,8 +960,15 @@ impl PreviewPanel {
         actions.append(&discard);
         actions.append(&spacer);
         actions.append(&save);
-        actions.append(&save_as);
+        save_as.add_css_class("gl-fade");
+        let save_as_reveal = gtk::Revealer::new();
+        save_as_reveal.set_transition_type(gtk::RevealerTransitionType::SlideLeft);
+        save_as_reveal.set_transition_duration(crate::look::motion::ms(SAVE_AS_SLIDE_MS));
+        save_as_reveal.set_child(Some(&save_as));
+        save_as_reveal.set_reveal_child(true);
+        actions.append(&save_as_reveal);
 
+        root.append(&admin_banner);
         root.append(&stack);
         root.append(&notice);
         root.append(&status);
@@ -934,6 +983,8 @@ impl PreviewPanel {
             root,
             title: title.clone(),
             notice,
+            admin_banner,
+            admin_banner_label,
             stack,
             message,
             text_page,
@@ -954,6 +1005,9 @@ impl PreviewPanel {
             discard,
             save,
             save_as,
+            save_as_reveal,
+            save_as_shown: Cell::new(true),
+            save_as_generation: Cell::new(0),
             process: Rc::downgrade(process),
             window,
             self_weak: RefCell::new(Weak::new()),
@@ -971,6 +1025,9 @@ impl PreviewPanel {
             allow_close: Cell::new(false),
             change_warning: Cell::new(false),
             change_dialog_open: Cell::new(false),
+            admin_warning_open: Cell::new(false),
+            owner_uid: Cell::new(None),
+            current_uid: Cell::new(fm_core::admin::current_uid().ok()),
             status_generation: Cell::new(0),
             monitors: RefCell::new(None),
             monitor_timer: MonitorTimer::new(),
@@ -1669,11 +1726,14 @@ impl PreviewPanel {
         {
             self.load_buffer(&text.text);
         }
+        self.record_owner(document);
         self.text_view.set_editable(false);
         self.text_view.set_cursor_visible(false);
         self.stack.set_visible_child_name("text");
         self.clear_status();
-        if let Some(reason) = document.edit_block_reason() {
+        if self.admin_editable_for(document) {
+            self.set_status("Alt-click to edit as administrator.", false);
+        } else if let Some(reason) = document.edit_block_reason() {
             self.set_status(reason.message(), false);
         } else {
             self.set_status("Alt-click the text to edit.", false);
@@ -2122,23 +2182,55 @@ impl PreviewPanel {
     // Editing, discard, save
     // -----------------------------------------------------------------------
 
-    pub fn begin_edit(self: &Rc<Self>) {
+    pub fn begin_edit(self: &Rc<Self>, caller: Caller) {
         if self.session.borrow().saving() {
             self.set_status("Wait for the current save to finish.", false);
             return;
         }
         let revision = self.buffer_revision.get();
-        let result = self.session.borrow_mut().begin_edit(revision);
+        let document = self.session.borrow().current_document().cloned();
+        let Some(document) = document else {
+            self.set_status("Only a text preview can be edited.", false);
+            return;
+        };
+        let owner = self
+            .owner_uid
+            .get()
+            .or_else(|| owner_of_path(&document.path));
+        let current = self.current_uid.get();
+        let admin_editable = match (owner, current) {
+            (Some(owner), Some(current)) => document.admin_editable(owner, current),
+            _ => false,
+        };
+        let result = self.session.borrow_mut().begin_edit_for(
+            caller,
+            revision,
+            owner.unwrap_or(0),
+            current.unwrap_or(0),
+        );
         match result {
             Ok(()) => {
                 self.text_view.set_editable(true);
                 self.text_view.set_cursor_visible(true);
                 self.text_view.grab_focus();
                 self.change_warning.set(false);
-                self.set_status(
-                    "Editing preview — changes are kept until Save or Discard.",
-                    false,
-                );
+                if admin_editable {
+                    crate::log!(
+                        "admin",
+                        "entered administrator edit mode for {} (owner {})",
+                        document.path.display(),
+                        owner.map(preview::owner_name).unwrap_or_default()
+                    );
+                    self.set_status(
+                        "Editing as administrator — saving asks before it changes the file.",
+                        false,
+                    );
+                } else {
+                    self.set_status(
+                        "Editing preview — changes are kept until Save or Discard.",
+                        false,
+                    );
+                }
                 self.update_title();
                 self.update_actions();
             }
@@ -2181,9 +2273,19 @@ impl PreviewPanel {
         let Some(text) = pinned.document.text() else {
             return vec!["Only editable text can be saved.".to_string()];
         };
+        if path.is_some() && session.is_admin_editing() {
+            return vec![
+                "Refuse: Save As isn't available while editing as administrator.".to_string(),
+            ];
+        }
         let body = buffer_text(&self.buffer);
         let target = match path {
             Some(_) => SaveTarget::NewPath { replace: None },
+            None if session.is_admin_editing() => SaveTarget::Admin {
+                expected: preview::SaveExpectation {
+                    revision: pinned.document.revision.clone(),
+                },
+            },
             None => SaveTarget::Original {
                 expected: preview::SaveExpectation {
                     revision: pinned.document.revision.clone(),
@@ -2200,17 +2302,140 @@ impl PreviewPanel {
         })
     }
 
-    pub fn save(self: &Rc<Self>) {
+    pub fn save(self: &Rc<Self>, caller: Caller) {
         if self.change_warning.get() {
             self.show_change_dialog();
             return;
         }
-        let result = self.session.borrow_mut().begin_save_original();
+        if self.session.borrow().is_admin_editing() {
+            if caller != Caller::Ui {
+                crate::log!(
+                    "admin",
+                    "refused administrator save: only the UI may save these edits"
+                );
+                self.set_status(preview::ADMIN_EDIT_UI_ONLY, true);
+                return;
+            }
+            self.show_admin_save_warning();
+            return;
+        }
+        let result = self.session.borrow_mut().begin_save_original_for(caller);
         self.start_save_ticket(result);
     }
 
-    pub fn save_as(self: &Rc<Self>, path: PathBuf) {
+    /// Every administrator Save warns first, and nothing is remembered.
+    fn show_admin_save_warning(self: &Rc<Self>) {
+        if self.admin_warning_open.get() {
+            return;
+        }
+        let Some(pinned) = self.session.borrow().pinned().cloned() else {
+            return;
+        };
+        if pinned.saving {
+            self.set_status("Wait for the current save to finish.", false);
+            return;
+        }
+        self.admin_warning_open.set(true);
+        let path = pinned.document.path.clone();
+        let owner = self
+            .owner_uid
+            .get()
+            .or_else(|| owner_of_path(&path))
+            .map(preview::owner_name)
+            .unwrap_or_else(|| "another user".to_string());
+        crate::log!(
+            "admin",
+            "save warning shown for {} (owner {owner})",
+            path.display()
+        );
+        let dialog = adw::AlertDialog::new(
+            Some("Save as Administrator?"),
+            Some(&format!(
+                "Save changes to {}?\nThis changes a system file owned by {owner}.",
+                path.display()
+            )),
+        );
+        dialog.add_css_class("gimbal-look");
+        dialog.add_response("cancel", "Cancel");
+        dialog.add_response("save", "Save as Administrator");
+        dialog.set_response_appearance("save", adw::ResponseAppearance::Destructive);
+        dialog.set_default_response(Some("cancel"));
+        dialog.set_close_response("cancel");
+        let weak = Rc::downgrade(self);
+        dialog.connect_response(None, move |_, response| {
+            let Some(panel) = weak.upgrade() else {
+                return;
+            };
+            panel.admin_warning_open.set(false);
+            let accepted = response == "save";
+            crate::log!(
+                "admin",
+                "save warning answered {} for {}",
+                if accepted { "save" } else { "cancel" },
+                path.display()
+            );
+            if accepted {
+                panel.start_admin_save_after_mount(path.clone());
+            } else if panel.close_wait.borrow().is_some() {
+                panel.abort_close();
+            }
+        });
+        self.present_dialog(dialog);
+    }
+
+    /// The polkit prompt belongs to the GVfs administrator mount. It is only
+    /// requested after the warning is accepted, so entering edit mode and
+    /// cancelling a save are free.
+    fn start_admin_save_after_mount(self: &Rc<Self>, path: PathBuf) {
+        let Some(process) = self.process.upgrade() else {
+            self.set_status("The window is gone.", true);
+            self.abort_close();
+            return;
+        };
+        let Some(ui) = self.ui() else {
+            self.abort_close();
+            return;
+        };
+        let window = ui.id;
+        let weak = Rc::downgrade(self);
+        let mount_path = path.clone();
+        process.ensure_admin_mount(window, &path, move |result| {
+            let Some(panel) = weak.upgrade() else {
+                return;
+            };
+            match result {
+                Ok(()) => {
+                    let ticket = panel
+                        .session
+                        .borrow_mut()
+                        .begin_save_original_for(Caller::Ui);
+                    panel.start_save_ticket(ticket);
+                }
+                Err(message) => {
+                    crate::log!(
+                        "admin",
+                        "save refused for {}: {message}",
+                        mount_path.display()
+                    );
+                    panel.set_status(&message, true);
+                    panel.abort_close();
+                }
+            }
+        });
+    }
+
+    pub fn save_as(self: &Rc<Self>, _caller: Caller, path: PathBuf) {
         let from_chooser = self.chooser_reply.take();
+        if self.session.borrow().is_admin_editing() {
+            if let Some(id) = from_chooser {
+                self.cancel_save_as_request(id);
+            }
+            self.set_status(
+                "Save As isn't available while editing as administrator.",
+                true,
+            );
+            return;
+        }
         if self.session.borrow().saving() {
             if let Some(id) = from_chooser {
                 self.cancel_save_as_request(id);
@@ -2281,7 +2506,13 @@ impl PreviewPanel {
                 return;
             }
         };
-        let target = if ticket.new_path {
+        let target = if ticket.admin {
+            SaveTarget::Admin {
+                expected: preview::SaveExpectation {
+                    revision: ticket.token.editor.revision.clone(),
+                },
+            }
+        } else if ticket.new_path {
             SaveTarget::NewPath {
                 replace: ticket.replace.clone(),
             }
@@ -2369,9 +2600,12 @@ impl PreviewPanel {
                     size: success.size,
                     revision: success.revision.clone(),
                     access: fm_core::preview::WriteAccess {
-                        file_writable: true,
-                        parent_writable: true,
-                        reason: None,
+                        file_writable: !pending.ticket.admin,
+                        parent_writable: !pending.ticket.admin,
+                        reason: pending
+                            .ticket
+                            .admin
+                            .then_some(fm_core::preview::ReadOnlyReason::NotWritable),
                     },
                     content: fm_core::preview::PreviewContent::Text(
                         fm_core::preview::TextDocument {
@@ -2383,7 +2617,7 @@ impl PreviewPanel {
                 let completion = self
                     .session
                     .borrow_mut()
-                    .save_finished(&pending.ticket, document);
+                    .save_finished(&pending.ticket, document.clone());
                 match completion {
                     SaveCompletion::Stale => {
                         // Never leave a close closure waiting for an event that
@@ -2410,16 +2644,27 @@ impl PreviewPanel {
                     success.path.display(),
                     success.size
                 );
+                if pending.ticket.admin {
+                    crate::log!(
+                        "admin",
+                        "saved {} ({} bytes) as administrator",
+                        success.path.display(),
+                        success.size
+                    );
+                }
                 self.buffer_revision
                     .set(pending.ticket.token.buffer_revision);
                 self.text_view.set_editable(false);
                 self.text_view.set_cursor_visible(false);
                 self.change_warning.set(false);
+                self.record_owner(&document);
                 self.install_monitors(&success.path);
-                self.set_status(
-                    &format!("Saved {} ({}).", name, preview::format_size(success.size)),
-                    false,
-                );
+                let status = if pending.ticket.admin {
+                    "Saved as administrator.".to_string()
+                } else {
+                    format!("Saved {} ({}).", name, preview::format_size(success.size))
+                };
+                self.set_status(&status, false);
                 self.update_title();
                 self.update_actions();
                 self.finish_or_abort_close(&pending.ticket);
@@ -2429,6 +2674,14 @@ impl PreviewPanel {
             }
             Err(error) => {
                 crate::log!("preview", "save failed: {error:?}");
+                if pending.ticket.admin {
+                    crate::log!(
+                        "admin",
+                        "save failed for {}: {}",
+                        pending.request.path.display(),
+                        error.message()
+                    );
+                }
                 if !self
                     .session
                     .borrow_mut()
@@ -2715,7 +2968,7 @@ impl PreviewPanel {
                 "save" => {
                     // `save` arms its own ticket and binds this close request
                     // to that exact job. A failure aborts both.
-                    panel.save();
+                    panel.save(Caller::Ui);
                 }
                 "discard" => {
                     let ticket = panel.session.borrow_mut().discard_preserving_close();
@@ -2841,15 +3094,22 @@ impl PreviewPanel {
             .pinned()
             .map(|pinned| pinned.document.name.clone())
             .unwrap_or_else(|| "this file".to_string());
-        let dialog = adw::AlertDialog::new(
-            Some("File changed on disk"),
-            Some(&format!(
+        let admin = self.admin_editing();
+        let body = if admin {
+            format!(
+                "“{name}” changed after it was loaded. Reload from disk (discarding edits) or cancel."
+            )
+        } else {
+            format!(
                 "“{name}” changed after it was loaded. Reload from disk (discarding edits), save a copy, or cancel."
-            )),
-        );
+            )
+        };
+        let dialog = adw::AlertDialog::new(Some("File changed on disk"), Some(&body));
         dialog.add_css_class("gimbal-look");
         dialog.add_response("cancel", "Cancel");
-        dialog.add_response("save-as", "Save As");
+        if !admin {
+            dialog.add_response("save-as", "Save As");
+        }
         dialog.add_response("reload", "Reload");
         dialog.set_response_appearance("reload", adw::ResponseAppearance::Destructive);
         dialog.set_default_response(Some("cancel"));
@@ -3088,11 +3348,81 @@ impl PreviewPanel {
         (text.replace('\n', " "), tooltip)
     }
 
+    /// Record the owner next to the loaded document, for the administrator
+    /// status, banner and warning.
+    fn record_owner(&self, document: &PreviewDocument) {
+        self.owner_uid.set(owner_of_path(&document.path));
+    }
+
+    fn admin_editable_for(&self, document: &PreviewDocument) -> bool {
+        let Some(owner) = self
+            .owner_uid
+            .get()
+            .or_else(|| owner_of_path(&document.path))
+        else {
+            return false;
+        };
+        let Some(current) = self.current_uid.get() else {
+            return false;
+        };
+        document.admin_editable(owner, current)
+    }
+
+    /// Whether the current clean document can enter administrator edit mode.
+    pub fn admin_editable(&self) -> bool {
+        self.session
+            .borrow()
+            .current_document()
+            .is_some_and(|document| self.admin_editable_for(document))
+    }
+
+    /// Whether the pinned editor is in administrator mode.
+    pub fn admin_editing(&self) -> bool {
+        self.session.borrow().is_admin_editing()
+    }
+
+    /// P2z's administrator-tab dispatcher asks this before applying its
+    /// read-only refusal to the preview commands.
+    pub fn admin_allows(&self, command: &str) -> bool {
+        match command {
+            "preview.edit" => self.admin_editable(),
+            "preview.save" | "preview.discard" | "preview.save-as" => self.admin_editing(),
+            _ => false,
+        }
+    }
+
+    fn refresh_admin_chrome(&self) {
+        let editing = self.admin_editing();
+        self.admin_banner.set_visible(editing);
+        if editing {
+            let owner = self
+                .owner_uid
+                .get()
+                .or_else(|| {
+                    self.session
+                        .borrow()
+                        .current_document()
+                        .and_then(|document| owner_of_path(&document.path))
+                })
+                .map(preview::owner_name)
+                .unwrap_or_else(|| "another user".to_string());
+            let text = format!("Administrator: saving changes a file owned by {owner}.");
+            self.admin_banner_label.set_text(&text);
+            self.admin_banner_label
+                .update_property(&[gtk::accessible::Property::Label(&text)]);
+            self.root.add_css_class("gl-preview-admin");
+        } else {
+            self.admin_banner_label.set_text("");
+            self.root.remove_css_class("gl-preview-admin");
+        }
+    }
+
     fn update_actions(&self) {
         let session = self.session.borrow();
         let editing = session.is_editing();
         let dirty = session.is_dirty();
         let saving = session.saving();
+        let admin_editing = session.is_admin_editing();
         let text_document = session
             .current_document()
             .is_some_and(|document| document.text().is_some());
@@ -3103,16 +3433,25 @@ impl PreviewPanel {
             .current_document()
             .and_then(PreviewDocument::edit_block_reason);
         drop(session);
+        let admin_editable = self.admin_editable();
 
         let discard_enabled = editing && !saving;
         let save_enabled = editing && dirty && !saving;
-        let save_as_enabled = editing && !saving;
+        let save_as_enabled = editing && !saving && !admin_editing;
         self.discard.set_sensitive(discard_enabled);
         self.save.set_sensitive(save_enabled);
         self.save_as.set_sensitive(save_as_enabled);
+        // Save As isn't offered while editing as administrator, so it fades
+        // out and its slot collapses; the spacer before Save then slides Save
+        // into its place (Kyle, Nov 6). Leaving the mode reverses it.
+        self.set_save_as_shown(!admin_editing);
 
         let tip = if !text_document {
             "Preview is read-only."
+        } else if admin_editing {
+            "Administrator edit mode."
+        } else if !can_edit && admin_editable {
+            "Alt-click to edit as administrator."
         } else if !can_edit {
             if let Some(reason) = &reason {
                 reason.message()
@@ -3129,16 +3468,57 @@ impl PreviewPanel {
         } else {
             tip
         }));
-        self.save.set_tooltip_text(Some(if save_enabled {
-            "Save changes to this file"
-        } else {
-            tip
-        }));
-        self.save_as.set_tooltip_text(Some(if save_as_enabled {
+        self.save
+            .set_tooltip_text(Some(if save_enabled && admin_editing {
+                "Save as administrator (asks first)"
+            } else if save_enabled {
+                "Save changes to this file"
+            } else {
+                tip
+            }));
+        self.save_as.set_tooltip_text(Some(if admin_editing {
+            "Save As isn't available while editing as administrator."
+        } else if save_as_enabled {
             "Save a copy to a new file"
         } else {
             tip
         }));
+        self.refresh_admin_chrome();
+    }
+
+    /// Hide: fade Save As out, then collapse its slot so Save slides over.
+    /// Show: open the slot (Save slides back), then fade Save As in. Both
+    /// steps take their durations from the motion setting.
+    fn set_save_as_shown(&self, shown: bool) {
+        if self.save_as_shown.replace(shown) == shown {
+            return;
+        }
+        let generation = self.save_as_generation.get() + 1;
+        self.save_as_generation.set(generation);
+        let weak = self.self_weak.borrow().clone();
+        let (first_ms, second) = if shown {
+            self.save_as_reveal.set_reveal_child(true);
+            (SAVE_AS_SLIDE_MS, false)
+        } else {
+            self.save_as.add_css_class("gl-faded");
+            (SAVE_AS_FADE_MS, true)
+        };
+        glib::timeout_add_local_once(
+            Duration::from_millis(u64::from(crate::look::motion::ms(first_ms))),
+            move || {
+                let Some(panel) = weak.upgrade() else {
+                    return;
+                };
+                if panel.save_as_generation.get() != generation {
+                    return;
+                }
+                if second {
+                    panel.save_as_reveal.set_reveal_child(false);
+                } else {
+                    panel.save_as.remove_css_class("gl-faded");
+                }
+            },
+        );
     }
 
     fn set_status(&self, text: &str, warning: bool) {

@@ -293,6 +293,10 @@ impl FileRevision {
     }
 }
 
+/// The refusal for an agent, CLI or hotkey caller that tries to edit or save
+/// an administrator editor.
+pub const ADMIN_EDIT_UI_ONLY: &str = "administrator edits are UI-only";
+
 /// Why a text preview cannot be edited. The UI shows this verbatim.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ReadOnlyReason {
@@ -332,6 +336,25 @@ pub struct WriteAccess {
 impl WriteAccess {
     pub fn can_edit(&self) -> bool {
         self.reason.is_none() && self.file_writable && self.parent_writable
+    }
+
+    /// Whether this block is only the ordinary Unix permission check and the
+    /// owner is somebody else. Symlinks, hard links and mixed endings are
+    /// never administrator-editable: those blocks are about safe writing, not
+    /// permission. A text document is always a regular file because `load`
+    /// refuses every other kind before it builds one.
+    pub fn admin_editable(&self, owner_uid: u32, current_uid: u32) -> bool {
+        let permission_blocked = !self.file_writable || !self.parent_writable;
+        let permission_only = match &self.reason {
+            Some(ReadOnlyReason::NotWritable | ReadOnlyReason::ParentNotWritable) => true,
+            None => permission_blocked,
+            Some(
+                ReadOnlyReason::Symlink
+                | ReadOnlyReason::MultipleHardLinks
+                | ReadOnlyReason::MixedLineEndings,
+            ) => false,
+        };
+        permission_blocked && permission_only && crate::admin::needs_admin(owner_uid, current_uid)
     }
 }
 
@@ -493,6 +516,36 @@ impl PreviewDocument {
         self.text()
             .and_then(|text| text.edit_block_reason(&self.access))
     }
+
+    /// Whether Alt-click may enter administrator edit mode. The permission
+    /// block must be the only one, the text must be editable apart from
+    /// permission, and the owner must be another user.
+    pub fn admin_editable(&self, owner_uid: u32, current_uid: u32) -> bool {
+        self.text().is_some_and(|text| !text.encoding.is_mixed())
+            && self.access.admin_editable(owner_uid, current_uid)
+    }
+}
+
+/// The user name for an owner uid, for the preview's administrator banner and
+/// warning. `root` is the common case; unknown ids fall back to the number.
+pub fn owner_name(uid: u32) -> String {
+    if uid == 0 {
+        return "root".to_string();
+    }
+    let passwd = fs::read_to_string("/etc/passwd").unwrap_or_default();
+    for line in passwd.lines() {
+        let mut fields = line.split(':');
+        let Some(name) = fields.next() else {
+            continue;
+        };
+        if fields.next().is_none() {
+            continue;
+        }
+        if !name.is_empty() && fields.next().and_then(|id| id.parse::<u32>().ok()) == Some(uid) {
+            return name.to_string();
+        }
+    }
+    uid.to_string()
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -645,6 +698,9 @@ pub struct PinnedDocument {
     pub editor_id: u64,
     pub dirty: bool,
     pub saving: bool,
+    /// Entered by Alt-click on a file owned by another user. Every save asks
+    /// first and writes through GVfs's administrator backend.
+    pub admin: bool,
     /// The buffer revision captured when a save starts. A newer edit makes the
     /// result stale instead of marking unseen bytes as saved.
     pub buffer_revision: u64,
@@ -652,12 +708,13 @@ pub struct PinnedDocument {
 }
 
 impl PinnedDocument {
-    fn new(document: PreviewDocument, editor_id: u64, buffer_revision: u64) -> Self {
+    fn new(document: PreviewDocument, editor_id: u64, buffer_revision: u64, admin: bool) -> Self {
         Self {
             document,
             editor_id,
             dirty: false,
             saving: false,
+            admin,
             buffer_revision,
             saved_buffer_revision: buffer_revision,
         }
@@ -755,6 +812,8 @@ pub struct SaveTicket {
     pub new_path: bool,
     pub replace: Option<ReplaceConfirmation>,
     pub encoding: TextEncoding,
+    /// Written through GVfs's administrator backend on this exact editor.
+    pub admin: bool,
 }
 
 /// What a save result did to the session.
@@ -860,6 +919,11 @@ impl PreviewSession {
 
     pub fn is_editing(&self) -> bool {
         self.pinned.is_some()
+    }
+
+    /// Whether the pinned editor is in administrator mode.
+    pub fn is_admin_editing(&self) -> bool {
+        self.pinned.as_ref().is_some_and(|pinned| pinned.admin)
     }
 
     pub fn saving(&self) -> bool {
@@ -1170,9 +1234,68 @@ impl PreviewSession {
             document,
             self.next_editor,
             buffer_revision,
+            false,
         ));
         self.warning = None;
         Ok(())
+    }
+
+    /// Enter administrator edit mode. The document must be editable apart
+    /// from ordinary Unix permission and owned by another user.
+    pub fn begin_admin_edit(
+        &mut self,
+        buffer_revision: u64,
+        owner_uid: u32,
+        current_uid: u32,
+    ) -> Result<(), String> {
+        if self.pinned.is_some() {
+            return Ok(());
+        }
+        let Some(document) = (match &self.state {
+            ViewState::Document(document) => Some(document.clone()),
+            _ => None,
+        }) else {
+            return Err("Only a text preview can be edited.".to_string());
+        };
+        if !document.admin_editable(owner_uid, current_uid) {
+            return Err(document
+                .edit_block_reason()
+                .map(|reason| reason.message().to_string())
+                .unwrap_or_else(|| {
+                    "Only an editable text preview can use administrator mode.".into()
+                }));
+        }
+        self.next_editor = self.next_editor.wrapping_add(1);
+        self.pinned = Some(PinnedDocument::new(
+            document,
+            self.next_editor,
+            buffer_revision,
+            true,
+        ));
+        self.warning = None;
+        Ok(())
+    }
+
+    /// The caller-aware Alt-click entry. Only the UI may turn an
+    /// administrator-editable document into an administrator editor; an
+    /// ordinary writable document keeps P2m's UI-or-hotkey rule.
+    pub fn begin_edit_for(
+        &mut self,
+        caller: crate::command::Caller,
+        buffer_revision: u64,
+        owner_uid: u32,
+        current_uid: u32,
+    ) -> Result<(), String> {
+        if self
+            .current_document()
+            .is_some_and(|document| document.admin_editable(owner_uid, current_uid))
+        {
+            if caller != crate::command::Caller::Ui {
+                return Err(ADMIN_EDIT_UI_ONLY.to_string());
+            }
+            return self.begin_admin_edit(buffer_revision, owner_uid, current_uid);
+        }
+        self.begin_edit(buffer_revision)
     }
 
     pub fn mark_dirty(&mut self, buffer_revision: u64) {
@@ -1201,6 +1324,9 @@ impl PreviewSession {
         let Some(pinned) = self.pinned.as_ref() else {
             return Err("Alt-click a writable text preview before Save As.".to_string());
         };
+        if pinned.admin {
+            return Err("Save As isn't available while editing as administrator.".to_string());
+        }
         if pinned.saving || self.active_save.is_some() {
             return Err("Wait for the current save to finish.".to_string());
         }
@@ -1348,6 +1474,19 @@ impl PreviewSession {
         self.begin_save_from(token, path, false, None)
     }
 
+    /// The caller-aware Save. An administrator editor may only be saved by the
+    /// UI, even though ordinary preview saves still accept a configured
+    /// hotkey.
+    pub fn begin_save_original_for(
+        &mut self,
+        caller: crate::command::Caller,
+    ) -> Result<SaveTicket, String> {
+        if self.is_admin_editing() && caller != crate::command::Caller::Ui {
+            return Err(ADMIN_EDIT_UI_ONLY.to_string());
+        }
+        self.begin_save_original()
+    }
+
     fn begin_save_from(
         &mut self,
         token: ActionToken,
@@ -1369,6 +1508,7 @@ impl PreviewSession {
             .text()
             .ok_or_else(|| "Only editable text can be saved.".to_string())?
             .encoding;
+        let admin = pinned.admin;
         self.next_request = self.next_request.wrapping_add(1);
         let ticket = SaveTicket {
             id: self.next_request,
@@ -1377,6 +1517,7 @@ impl PreviewSession {
             new_path,
             replace,
             encoding,
+            admin,
         };
         let pinned = self.pinned.as_mut().expect("checked above");
         pinned.saving = true;
@@ -2278,6 +2419,11 @@ pub enum SaveTarget {
     NewPath {
         replace: Option<ReplaceConfirmation>,
     },
+    /// Replace the same path through GVfs's `admin://` backend. The ETag is
+    /// the load-time write precondition, exactly as for an ordinary Save.
+    Admin {
+        expected: SaveExpectation,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2393,6 +2539,142 @@ fn existing_file(path: &Path) -> Result<ExistingFile, SaveError> {
     })
 }
 
+/// The small GIO surface an administrator save needs. Production uses the
+/// real `admin://` file; tests use a fake that records every call.
+trait AdminWriter {
+    fn replace_contents(
+        &mut self,
+        file: &gio::File,
+        bytes: &[u8],
+        etag: Option<&str>,
+        make_backup: bool,
+    ) -> Result<Option<String>, glib::Error>;
+
+    fn set_attribute_uint32(
+        &mut self,
+        file: &gio::File,
+        attribute: &str,
+        value: u32,
+    ) -> Result<(), glib::Error>;
+}
+
+struct GioAdminWriter;
+
+impl AdminWriter for GioAdminWriter {
+    fn replace_contents(
+        &mut self,
+        file: &gio::File,
+        bytes: &[u8],
+        etag: Option<&str>,
+        make_backup: bool,
+    ) -> Result<Option<String>, glib::Error> {
+        file.replace_contents(
+            bytes,
+            etag,
+            make_backup,
+            gio::FileCreateFlags::NONE,
+            None::<&gio::Cancellable>,
+        )
+        .map(|etag| etag.map(|value| value.to_string()))
+    }
+
+    fn set_attribute_uint32(
+        &mut self,
+        file: &gio::File,
+        attribute: &str,
+        value: u32,
+    ) -> Result<(), glib::Error> {
+        file.set_attribute_uint32(
+            attribute,
+            value,
+            gio::FileQueryInfoFlags::NONE,
+            None::<&gio::Cancellable>,
+        )
+    }
+}
+
+/// Write through GVfs's `admin://` backend. GVfs's `do_replace` calls
+/// `g_file_replace` while running as root, so the replacement file is created
+/// with root's ownership and the process umask rather than the original
+/// metadata. Gimbal therefore puts the original uid, gid and mode back through
+/// the same administrator file before reporting success.
+fn save_admin(
+    path: &Path,
+    bytes: &[u8],
+    expected: &SaveExpectation,
+) -> Result<SaveSuccess, SaveError> {
+    save_admin_with(path, bytes, expected, &mut GioAdminWriter)
+}
+
+fn save_admin_with(
+    path: &Path,
+    bytes: &[u8],
+    expected: &SaveExpectation,
+    writer: &mut impl AdminWriter,
+) -> Result<SaveSuccess, SaveError> {
+    let link = fs::symlink_metadata(path).map_err(map_admin_metadata_error)?;
+    if link.file_type().is_symlink() {
+        return Err(SaveError::ReadOnly(ReadOnlyReason::Symlink));
+    }
+    let metadata = fs::metadata(path).map_err(map_admin_metadata_error)?;
+    if !metadata.is_file() {
+        return Err(SaveError::NotRegular);
+    }
+    if metadata.nlink() > 1 {
+        return Err(SaveError::ReadOnly(ReadOnlyReason::MultipleHardLinks));
+    }
+    let owner_uid = metadata.uid();
+    let group_gid = metadata.gid();
+    let mode = metadata.permissions().mode() & 0o7777;
+    let file = crate::admin::gfile(path, crate::admin::Scope::Admin);
+    let new_etag = writer
+        .replace_contents(&file, bytes, expected.revision.etag.as_deref(), false)
+        .map_err(map_admin_error)?;
+    for (attribute, value) in [
+        (gio::FILE_ATTRIBUTE_UNIX_UID.as_str(), owner_uid),
+        (gio::FILE_ATTRIBUTE_UNIX_GID.as_str(), group_gid),
+        (gio::FILE_ATTRIBUTE_UNIX_MODE.as_str(), mode),
+    ] {
+        writer
+            .set_attribute_uint32(&file, attribute, value)
+            .map_err(map_admin_error)?;
+    }
+    let metadata = fs::metadata(path).map_err(map_admin_metadata_error)?;
+    let etag = query_info(path, gio::FILE_ATTRIBUTE_ETAG_VALUE.as_str())
+        .ok()
+        .and_then(|info| {
+            info.attribute_string(gio::FILE_ATTRIBUTE_ETAG_VALUE.as_str())
+                .map(|value| value.to_string())
+        })
+        .filter(|value| !value.is_empty())
+        .or(new_etag);
+    Ok(SaveSuccess {
+        path: path.to_path_buf(),
+        revision: FileRevision::from_metadata(&metadata, etag),
+        size: metadata.len(),
+        mode,
+    })
+}
+
+fn map_admin_metadata_error(error: io::Error) -> SaveError {
+    match error.kind() {
+        io::ErrorKind::NotFound => SaveError::Missing,
+        io::ErrorKind::PermissionDenied => SaveError::ReadOnly(ReadOnlyReason::NotWritable),
+        _ => SaveError::Io(error.to_string()),
+    }
+}
+
+fn map_admin_error(error: glib::Error) -> SaveError {
+    match error.kind::<gio::IOErrorEnum>() {
+        Some(gio::IOErrorEnum::WrongEtag) => SaveError::ChangedOnDisk,
+        Some(gio::IOErrorEnum::NotFound) => SaveError::Missing,
+        Some(gio::IOErrorEnum::PermissionDenied) => {
+            SaveError::ReadOnly(ReadOnlyReason::NotWritable)
+        }
+        _ => SaveError::Io(error.to_string()),
+    }
+}
+
 /// Write through GIO's conditional replacement. `expected` is both the object
 /// identity and the ETag write precondition. The file is never truncated in
 /// place; GIO writes a sibling and renames it into place.
@@ -2436,6 +2718,7 @@ pub fn save(request: &SaveRequest) -> Result<SaveSuccess, SaveError> {
             }
             None => save_as_new(&request.path, &bytes),
         },
+        SaveTarget::Admin { expected } => save_admin(&request.path, &bytes, expected),
     }
 }
 
@@ -2559,10 +2842,10 @@ pub fn save_plan(request: &SaveRequest) -> Vec<String> {
         + if request.encoding.bom { 3 } else { 0 };
     lines.push(format!(
         "{} {} ({} bytes, UTF-8{}, {})",
-        if matches!(&request.target, SaveTarget::Original { .. }) {
-            "Save"
-        } else {
-            "Save As"
+        match &request.target {
+            SaveTarget::Original { .. } => "Save",
+            SaveTarget::Admin { .. } => "Save as Administrator",
+            SaveTarget::NewPath { .. } => "Save As",
         },
         request.path.display(),
         bytes,
@@ -2574,7 +2857,7 @@ pub fn save_plan(request: &SaveRequest) -> Vec<String> {
         ending
     ));
     match &request.target {
-        SaveTarget::Original { expected } => {
+        SaveTarget::Original { expected } | SaveTarget::Admin { expected } => {
             lines.push(format!(
                 "Expected object {} (ETag {})",
                 expected.revision.identity_label(),

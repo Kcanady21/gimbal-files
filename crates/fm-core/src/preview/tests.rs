@@ -226,7 +226,7 @@ fn a_same_selection_refresh_keeps_a_clean_editing_session() {
 #[test]
 fn save_result_revision_only_applies_to_the_starting_buffer() {
     let document = fake_document("/a.txt", "A");
-    let pinned = PinnedDocument::new(document, 1, 4);
+    let pinned = PinnedDocument::new(document, 1, 4, false);
     assert!(pinned.save_applies_to(4));
     assert!(!pinned.save_applies_to(5));
 }
@@ -1001,6 +1001,109 @@ fn symlinks_and_hard_links_are_presented_read_only_with_a_reason() {
 }
 
 #[test]
+fn only_permission_blocks_are_administrator_editable() {
+    let owner = 0;
+    let current = 1000;
+    let access = |file_writable, parent_writable, reason| WriteAccess {
+        file_writable,
+        parent_writable,
+        reason,
+    };
+
+    // NotWritable alone, ParentNotWritable alone, both, and the recorded
+    // reason spelling of either.
+    assert!(access(false, true, None).admin_editable(owner, current));
+    assert!(access(true, false, None).admin_editable(owner, current));
+    assert!(access(false, false, None).admin_editable(owner, current));
+    assert!(access(false, true, Some(ReadOnlyReason::NotWritable)).admin_editable(owner, current));
+    assert!(
+        access(true, false, Some(ReadOnlyReason::ParentNotWritable)).admin_editable(owner, current)
+    );
+    assert!(access(false, false, Some(ReadOnlyReason::NotWritable)).admin_editable(owner, current));
+
+    // Every other reason is a safe-writing block, not a permission block.
+    for reason in [
+        ReadOnlyReason::Symlink,
+        ReadOnlyReason::MultipleHardLinks,
+        ReadOnlyReason::MixedLineEndings,
+    ] {
+        assert!(!access(false, true, Some(reason)).admin_editable(owner, current));
+    }
+
+    // Nothing is blocked: ordinary editing already works.
+    assert!(!access(true, true, None).admin_editable(owner, current));
+    // The owner is the current user.
+    assert!(!access(false, true, None).admin_editable(current, current));
+}
+
+#[test]
+fn mixed_line_endings_are_never_administrator_editable() {
+    let mut document = fake_document("/a.txt", "A");
+    document.access = WriteAccess {
+        file_writable: false,
+        parent_writable: true,
+        reason: Some(ReadOnlyReason::NotWritable),
+    };
+    document.content = PreviewContent::Text(TextDocument {
+        text: "A\r\nB\n".to_string(),
+        encoding: TextEncoding {
+            bom: false,
+            line_ending: None,
+        },
+    });
+    assert!(!document.admin_editable(0, 1000));
+}
+
+#[test]
+fn administrator_owners_are_named_for_the_warning() {
+    assert_eq!(owner_name(0), "root");
+    assert!(!owner_name(crate::admin::current_uid().unwrap_or(1000)).is_empty());
+}
+
+fn admin_document() -> PreviewDocument {
+    let mut document = fake_document("/a.txt", "A");
+    document.access = WriteAccess {
+        file_writable: false,
+        parent_writable: true,
+        reason: Some(ReadOnlyReason::NotWritable),
+    };
+    document
+}
+
+#[test]
+fn administrator_mode_is_ui_only_and_save_as_is_refused() {
+    let mut session = PreviewSession::new();
+    let ticket = session.select(Selection::file("/a.txt")).unwrap();
+    session.load_finished(&ticket, Loaded::Document(admin_document()));
+
+    assert_eq!(
+        session.begin_edit_for(crate::command::Caller::Hotkey, 0, 0, 1000),
+        Err(ADMIN_EDIT_UI_ONLY.to_string())
+    );
+    assert!(!session.is_editing());
+
+    session
+        .begin_edit_for(crate::command::Caller::Ui, 0, 0, 1000)
+        .unwrap();
+    assert!(session.is_admin_editing());
+    assert_eq!(
+        session.begin_save_as(),
+        Err("Save As isn't available while editing as administrator.".to_string())
+    );
+
+    session.mark_dirty(1);
+    assert_eq!(
+        session.begin_save_original_for(crate::command::Caller::Hotkey),
+        Err(ADMIN_EDIT_UI_ONLY.to_string())
+    );
+    assert!(
+        session
+            .begin_save_original_for(crate::command::Caller::Ui)
+            .is_ok()
+    );
+}
+
+#[test]
 fn save_as_refuses_a_file_that_appeared_after_the_check() {
     let scratch = Scratch::new("save-as-race");
     let source = scratch.write("source.txt", b"source\n");
@@ -1644,4 +1747,100 @@ fn a_stale_save_as_completion_does_not_create_an_override() {
         Some(PathBuf::from("/a.txt")),
         "a stale result must not retarget the existing preview"
     );
+}
+
+struct FakeAdminWriter {
+    calls: Vec<String>,
+    fail: Option<gio::IOErrorEnum>,
+}
+
+impl AdminWriter for FakeAdminWriter {
+    fn replace_contents(
+        &mut self,
+        file: &gio::File,
+        bytes: &[u8],
+        etag: Option<&str>,
+        make_backup: bool,
+    ) -> Result<Option<String>, glib::Error> {
+        self.calls.push(format!(
+            "replace {} etag={etag:?} make_backup={make_backup} bytes={}",
+            file.uri(),
+            bytes.len()
+        ));
+        if let Some(kind) = self.fail {
+            return Err(glib::Error::new(kind, "fake administrator failure"));
+        }
+        Ok(Some("new-etag".to_string()))
+    }
+
+    fn set_attribute_uint32(
+        &mut self,
+        _file: &gio::File,
+        attribute: &str,
+        value: u32,
+    ) -> Result<(), glib::Error> {
+        self.calls.push(format!("set {attribute}={value}"));
+        Ok(())
+    }
+}
+
+#[test]
+fn administrator_save_uses_the_admin_scope_load_etag_and_no_backup() {
+    let scratch = Scratch::new("admin-save");
+    let path = scratch.write("root.conf", b"line one\n");
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+    let metadata = fs::metadata(&path).unwrap();
+    let expected = SaveExpectation {
+        revision: FileRevision::from_metadata(&metadata, Some("load-etag".to_string())),
+    };
+    let mut fake = FakeAdminWriter {
+        calls: Vec::new(),
+        fail: None,
+    };
+    let success = save_admin_with(&path, b"line two\n", &expected, &mut fake).unwrap();
+    let admin_uri = crate::admin::gfile(&path, crate::admin::Scope::Admin)
+        .uri()
+        .to_string();
+    assert_eq!(
+        fake.calls[0],
+        format!("replace {admin_uri} etag=Some(\"load-etag\") make_backup=false bytes=9")
+    );
+    assert_eq!(
+        fake.calls[1],
+        format!("set unix::uid={}", metadata.uid()),
+        "the owner is restored before the group"
+    );
+    assert_eq!(
+        fake.calls[2],
+        format!("set unix::gid={}", metadata.gid()),
+        "the group is restored before the mode"
+    );
+    assert_eq!(
+        fake.calls[3],
+        format!("set unix::mode={}", metadata.permissions().mode() & 0o7777),
+        "the mode is restored before success is reported"
+    );
+    assert_eq!(success.mode, 0o640);
+    assert_eq!(success.size, 9);
+    assert!(success.revision.etag.is_some());
+}
+
+#[test]
+fn administrator_save_reports_a_wrong_etag_as_a_conflict() {
+    let scratch = Scratch::new("admin-etag");
+    let path = scratch.write("root.conf", b"line one\n");
+    let metadata = fs::metadata(&path).unwrap();
+    let expected = SaveExpectation {
+        revision: FileRevision::from_metadata(&metadata, Some("load-etag".to_string())),
+    };
+    let mut fake = FakeAdminWriter {
+        calls: Vec::new(),
+        fail: Some(gio::IOErrorEnum::WrongEtag),
+    };
+    assert_eq!(
+        save_admin_with(&path, b"line two\n", &expected, &mut fake),
+        Err(SaveError::ChangedOnDisk)
+    );
+    assert_eq!(fake.calls.len(), 1, "no metadata write follows a conflict");
+    assert_eq!(fs::read(&path).unwrap(), b"line one\n");
 }
