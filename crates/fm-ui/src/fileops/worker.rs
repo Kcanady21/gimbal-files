@@ -686,6 +686,8 @@ mod tests {
             .send(WorkerMsg::Start {
                 id: 1,
                 request: Request::Copy {
+                    scope: fm_core::admin::Scope::User,
+                    target_scope: fm_core::admin::Scope::User,
                     paths: vec![source],
                     to: dest.clone(),
                 },
@@ -789,14 +791,18 @@ mod tests {
             };
             let request = match kind {
                 "move" => Request::Move {
+                    scope: fm_core::admin::Scope::User,
+                    target_scope: fm_core::admin::Scope::User,
                     paths: vec![source],
                     to: dest.clone(),
                 },
                 "rename" => Request::Rename {
+                    scope: fm_core::admin::Scope::User,
                     path: source,
                     name: "renamed".to_string(),
                 },
                 _ => Request::NewFolder {
+                    scope: fm_core::admin::Scope::User,
                     name: "new".to_string(),
                     in_folder: dest.clone(),
                 },
@@ -826,6 +832,8 @@ mod tests {
             .send(WorkerMsg::Start {
                 id: 21,
                 request: Request::Copy {
+                    scope: fm_core::admin::Scope::User,
+                    target_scope: fm_core::admin::Scope::User,
                     paths: vec![source.clone()],
                     to: dest.clone(),
                 },
@@ -921,6 +929,8 @@ mod tests {
             .send(WorkerMsg::Start {
                 id: 2,
                 request: Request::Copy {
+                    scope: fm_core::admin::Scope::User,
+                    target_scope: fm_core::admin::Scope::User,
                     paths: vec![source],
                     to: dest.clone(),
                 },
@@ -963,6 +973,8 @@ mod tests {
 
     fn request() -> Request {
         Request::Copy {
+            scope: fm_core::admin::Scope::User,
+            target_scope: fm_core::admin::Scope::User,
             paths: vec![std::path::PathBuf::from("/tmp/gimbal-agent-test/a")],
             to: std::path::PathBuf::from("/tmp/gimbal-agent-test/dest"),
         }

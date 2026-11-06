@@ -126,6 +126,9 @@ pub struct Tab {
     /// The name of the first visible item. A restore or resize keeps the
     /// place without pixels.
     pub scroll_anchor: Option<OsString>,
+    /// True for an administrator tab browsing through GVfs's `admin://`.
+    /// Administrator tabs are never written to the session.
+    pub admin: bool,
 }
 
 impl Tab {
@@ -137,7 +140,13 @@ impl Tab {
             forward: Vec::new(),
             selection: FileSelection::default(),
             scroll_anchor: None,
+            admin: false,
         }
+    }
+
+    fn with_admin(mut self, admin: bool) -> Self {
+        self.admin = admin;
+        self
     }
 }
 
@@ -347,6 +356,11 @@ pub enum Event {
         folder: PathBuf,
     },
     ScrollAnchorChanged {
+        window: WindowId,
+        tab: TabId,
+    },
+    /// A tab became, or stopped being, an administrator tab in place.
+    TabScopeChanged {
         window: WindowId,
         tab: TabId,
     },
@@ -747,6 +761,7 @@ impl Workspace {
                         forward,
                         selection: source_tab.selection.clone(),
                         scroll_anchor: source_tab.scroll_anchor.clone(),
+                        admin: false,
                     });
                 }
 
@@ -972,33 +987,47 @@ impl Workspace {
     }
 
     /// Open a tab after the focused pill. With no path it opens the focused
-    /// tab's folder, or home when no window is open.
+    /// tab's folder, or home when no window is open. The new tab copies the
+    /// focused tab's administrator scope.
     pub fn tab_new(&mut self, path: Option<PathBuf>) -> Result<Vec<Event>, WorkspaceError> {
+        self.tab_new_scoped(path, None)
+    }
+
+    /// Open a new administrator tab after the focused pill. The caller has
+    /// already checked the folder, the mount and the ownership rule.
+    pub fn tab_new_admin(&mut self, path: PathBuf) -> Result<Vec<Event>, WorkspaceError> {
+        self.tab_new_scoped(Some(path), Some(true))
+    }
+
+    fn tab_new_scoped(
+        &mut self,
+        path: Option<PathBuf>,
+        admin: Option<bool>,
+    ) -> Result<Vec<Event>, WorkspaceError> {
         let Some(window_index) = self.focused_index() else {
             return self.window_new(path);
         };
 
-        let (window_id, folder, position) = {
+        let (window_id, folder, position, admin) = {
             let window = &self.windows[window_index];
             let position = window
                 .focused_pill_index()
                 .ok_or(WorkspaceError::NoFocusedTab)?
                 + 1;
+            let source = window
+                .focused_tab_ref()
+                .ok_or(WorkspaceError::NoFocusedTab)?;
             let folder = match path {
                 Some(path) => path,
-                None => window
-                    .focused_tab_ref()
-                    .ok_or(WorkspaceError::NoFocusedTab)?
-                    .folder
-                    .clone(),
+                None => source.folder.clone(),
             };
-            (window.id, folder, position)
+            (window.id, folder, position, admin.unwrap_or(source.admin))
         };
 
         let tab_id = self.ids.tab();
         let group_id = self.ids.group();
         let number = next_group_number(&self.windows[window_index]);
-        let tab = Tab::new(tab_id, folder);
+        let tab = Tab::new(tab_id, folder).with_admin(admin);
         let group = Group::new(group_id, number, vec![tab], initial_columns(&[tab_id]));
 
         let window = &mut self.windows[window_index];
@@ -1026,6 +1055,29 @@ impl Workspace {
             events.push(Event::SelectionChanged { window: window_id });
         }
         Ok(events)
+    }
+
+    /// Turn the focused administrator tab back into a normal tab at the same
+    /// folder. History, selection and scroll anchor stay untouched.
+    pub fn tab_leave_admin(&mut self) -> Result<Vec<Event>, WorkspaceError> {
+        let window_index = self.focused_index_or_error()?;
+        let window_id = self.windows[window_index].id;
+        let tab_id = self.windows[window_index].focused_tab;
+        let window = &mut self.windows[window_index];
+        let tab = window
+            .groups
+            .values_mut()
+            .flat_map(|group| group.tabs.iter_mut())
+            .find(|tab| tab.id == tab_id)
+            .ok_or(WorkspaceError::NoFocusedTab)?;
+        if !tab.admin {
+            return Ok(Vec::new());
+        }
+        tab.admin = false;
+        Ok(vec![Event::TabScopeChanged {
+            window: window_id,
+            tab: tab_id,
+        }])
     }
 
     /// Close the focused tab. A tab that is the last one in its pill closes
@@ -1281,10 +1333,14 @@ impl Workspace {
             });
         }
 
+        let admin = self
+            .focused()
+            .and_then(|window| window.tab(window.focused_tab))
+            .is_some_and(|tab| tab.admin);
         let mut tabs = Vec::with_capacity(folders.len());
         for folder in folders {
             let tab_id = self.ids.tab();
-            tabs.push(Tab::new(tab_id, folder));
+            tabs.push(Tab::new(tab_id, folder).with_admin(admin));
         }
         let ids: Vec<TabId> = tabs.iter().map(|tab| tab.id).collect();
         let first_tab = ids[0];

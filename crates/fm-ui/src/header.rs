@@ -34,6 +34,9 @@ pub struct PillView {
     pub tabs: usize,
     pub active: bool,
     pub selected: bool,
+    /// The pill shows the administrator red and lock when any tab in it is an
+    /// administrator tab.
+    pub admin: bool,
     /// The folder a drop on this pill goes into: the group's focused tab when
     /// it contains one, else its first tab.
     pub folder: PathBuf,
@@ -105,6 +108,7 @@ pub fn view(window: &Window) -> HeaderView {
                     .get(index)
                     .copied()
                     .unwrap_or(false),
+                admin: group.tabs.iter().any(|tab| tab.admin),
                 folder,
             })
         })
@@ -722,12 +726,27 @@ impl Header {
         if view.selected {
             pill.add_css_class("selected");
         }
+        if view.admin {
+            pill.add_css_class("admin");
+        }
         let name = gtk::Label::builder()
             .label(&view.label)
             .ellipsize(pango::EllipsizeMode::End)
             .max_width_chars(48)
             .build();
-        pill.set_center_widget(Some(&name));
+        if view.admin {
+            let center = gtk::Box::new(
+                gtk::Orientation::Horizontal,
+                scaled(GAP_S, self.scale.get()),
+            );
+            center.append(&gtk::Image::from_icon_name(
+                crate::look::icons::ADMIN_LOCK_ICON,
+            ));
+            center.append(&name);
+            pill.set_center_widget(Some(&center));
+        } else {
+            pill.set_center_widget(Some(&name));
+        }
 
         let close = gtk::Button::new();
         close.add_css_class("gl-pill-close");
@@ -897,16 +916,30 @@ impl Header {
         label.set_label(&format!("{} tabs", view.tab_count));
         for pill in &view.pills {
             let row = hbox(&["gl-accordion-row"]);
+            if pill.admin {
+                row.add_css_class("admin");
+            }
             let choose = gtk::Button::new();
             choose.add_css_class("gl-menu-item");
             choose.set_hexpand(true);
-            choose.set_child(Some(
-                &gtk::Label::builder()
-                    .label(&pill.label)
-                    .halign(gtk::Align::Start)
-                    .hexpand(true)
-                    .build(),
-            ));
+            let label = gtk::Label::builder()
+                .label(&pill.label)
+                .halign(gtk::Align::Start)
+                .hexpand(true)
+                .build();
+            if pill.admin {
+                let content = gtk::Box::new(
+                    gtk::Orientation::Horizontal,
+                    scaled(GAP_S, self.scale.get()),
+                );
+                content.append(&gtk::Image::from_icon_name(
+                    crate::look::icons::ADMIN_LOCK_ICON,
+                ));
+                content.append(&label);
+                choose.set_child(Some(&content));
+            } else {
+                choose.set_child(Some(&label));
+            }
             let header_choose = self.clone();
             let popover_choose = popover.clone();
             let index = pill.index;

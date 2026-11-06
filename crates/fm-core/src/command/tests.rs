@@ -34,6 +34,8 @@ fn the_v1_catalogue_has_every_reviewed_command_in_order() {
         "tab.focus",
         "tab.move",
         "tab.open-in-new-window",
+        "tab.open-as-admin",
+        "tab.leave-admin",
         "group.open",
         "group.split",
         "group.close",
@@ -374,6 +376,23 @@ fn open_as_admin_is_a_system_command_with_the_selection_argument() {
         )
         .is_ok()
     );
+}
+
+#[test]
+fn administrator_tab_commands_are_ui_only_and_take_one_folder() {
+    for name in ["tab.open-as-admin", "tab.leave-admin"] {
+        let spec = Registry::new().command(name).expect("the reviewed command");
+        assert_eq!(spec.effect, Effect::System);
+        assert!(!spec.undo);
+        assert!(caller_allowed(name, Effect::System, Caller::Ui));
+        // The socket refuses every System effect before dispatch; the CLI
+        // speaks to Gimbal through that socket, so neither can run this.
+    }
+
+    assert!(check(Caller::Ui, &["tab.open-as-admin", "path=/etc"]).is_ok());
+    assert!(check(Caller::Ui, &["tab.open-as-admin"]).is_err());
+    assert!(check(Caller::Ui, &["tab.leave-admin"]).is_ok());
+    assert!(check(Caller::Ui, &["tab.leave-admin", "path=/etc"]).is_err());
 }
 
 #[test]

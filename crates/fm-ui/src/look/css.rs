@@ -77,6 +77,7 @@ fn css_impl(
     let pitch = p(PILL_W) + p(GAP_L);
     let hover_ms = motion::ms(120);
     let slide_ms = motion::ms(150);
+    let pulse_ms = motion::ms(600);
     let window_bg = fill(BG);
     let pill_bg = fill(RECESSED);
     let pill_active = fill(RAISED);
@@ -127,6 +128,11 @@ window.gimbal-look, window.gimbal-look.background {{ background-color: {window_b
 .gl-pill.active {{ background-color: {pill_active}; color: {RAISED_FG}; }}
 .gl-pill.selected {{ background-color: {pill_selected}; }}
 .gl-pill.active.selected {{ background-color: {pill_selected_active}; }}
+.gl-pill.admin {{ background-color: @error_bg_color; color: @error_fg_color; border-color: @error_bg_color; }}
+.gl-pill.admin.active, .gl-pill.admin.selected, .gl-pill.admin.active.selected {{ background-color: @error_bg_color; color: @error_fg_color; }}
+.gl-pill.admin label, .gl-pill.admin image {{ color: @error_fg_color; }}
+.gl-pill.admin .gl-pill-close {{ color: @error_fg_color; border-color: @error_fg_color; }}
+.gl-accordion-row.admin .gl-menu-item {{ color: @error_color; }}
 .gl-pill label {{ font-size: {tc}px; }}
 .gl-pill.tab {{ margin-bottom: {gs}px; }}
 .gl-pill.tile {{ min-width: 0; }}
@@ -176,10 +182,22 @@ gridview > child {{ padding: 0; }}
 .gl-cell label {{ font-size: {trow}px; }}
 .gl-tile {{ background-color: {tile}; border: {thin}px solid {OUTLINE}; border-radius: {r}px; color: {FG}; }}
 .gl-tile.focused {{ box-shadow: inset 0 0 0 {thin}px {FOCUS_RING}; }}
+.gl-tile.admin {{ border-color: @error_bg_color; box-shadow: inset 0 0 0 {thin}px alpha(@error_bg_color, 0.65); }}
+.gl-admin-banner > revealer > widget, .gl-admin-banner > revealer > widget:backdrop {{ background-color: @error_bg_color; color: @error_fg_color; }}
+.gl-admin-banner > revealer > widget > label, .gl-admin-banner > revealer > widget:backdrop > label {{ color: @error_fg_color; filter: none; }}
+.gl-admin-banner > revealer > widget > button, .gl-admin-banner > revealer > widget:backdrop > button {{ background-color: alpha(@error_fg_color, 0.18); color: @error_fg_color; filter: none; }}
+.gl-admin-banner > revealer > widget > button:hover {{ background-color: alpha(@error_fg_color, 0.28); }}
 .gl-drop-line {{ background-color: {OUTLINE}; min-height: {thin}px; border-radius: {rp}px; }}
 .gl-drop-target {{ box-shadow: inset 0 0 0 {thin}px {FOCUS_RING}; }}
 dnd .gl-drag-badge, .gl-drag-badge {{ min-width: {tsmall}px; min-height: {tsmall}px; padding: {thin}px {gs}px; border-radius: {rp}px; border: {thin}px solid {OUTLINE}; background-color: {BG}; color: {FG}; font-size: {tsmall}px; font-weight: bold; }}
 .gl-status {{ min-height: {statush}px; font-size: {tc}px; }}
+.gl-status-sep {{ margin: 0 {gs}px; }}
+@keyframes gl-status-pulse {{
+from {{ background-color: alpha(@accent_bg_color, 0.0); }}
+50% {{ background-color: alpha(@accent_bg_color, 0.35); }}
+to {{ background-color: alpha(@accent_bg_color, 0.0); }}
+}}
+.gl-status.notify-a, .gl-status.notify-b {{ border-radius: {r}px; animation: gl-status-pulse {pulse_ms}ms ease-in-out 3; }}
 .gl-progress {{ padding: {gs}px {gl}px; }}
 .gl-progress-label {{ font-size: {tsmall}px; color: alpha({FG}, 0.75); }}
 .gl-progress-bar trough {{ min-height: {thin}px; border-radius: {rp}px; background-color: {track}; }}

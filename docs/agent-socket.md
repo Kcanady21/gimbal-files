@@ -66,6 +66,7 @@ Unavailable through the socket (refused by the registry before any handler):
 - `preview.edit`, `preview.discard`, `preview.save`, `preview.save-as`
 - `file.open-with`, `file.set-default-app`
 - `file.open-as-admin`
+- `tab.open-as-admin`, `tab.leave-admin`
 - `trash.empty`, `trash.delete-permanently`
 - `drive.mount`, `drive.unmount`, `drive.eject`
 - `agent.set-enabled`
@@ -86,6 +87,13 @@ dispatch, so a local script can neither change nor trigger the update check.
 `integration.set-show-in-folder` follows the same rule: its Settings switch is
 the only caller, and no socket request can take over or release the
 `org.freedesktop.FileManager1` name.
+
+Administrator tabs are listed by `state` with `admin = true`, but every `run`
+that names one, or leaves the tab implicit while the window's focused tab is
+one, is refused with the typed error `administrator tabs are UI-only`. This is
+checked after the target resolves and before any handler, plan or filesystem
+work. There is no command, argument or state field that grants a socket client
+administrator access.
 
 Remote file operations must use explicit absolute paths. A relative path is
 rejected, never resolved against Gimbal's working directory. A `dry-run=true`

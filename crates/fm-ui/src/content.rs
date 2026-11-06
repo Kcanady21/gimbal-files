@@ -275,6 +275,12 @@ impl Content {
         self.folder.listed_names()
     }
 
+    /// Re-read every administrator folder view in this window: the single
+    /// view and each split tile. Returns how many were re-read.
+    pub fn reload_admin(&self) -> usize {
+        usize::from(self.folder.reload_if_admin()) + self.split.reload_admin()
+    }
+
     pub fn reload(&self) {
         if self.trash_active.get() || self.search_active.get() {
             return;

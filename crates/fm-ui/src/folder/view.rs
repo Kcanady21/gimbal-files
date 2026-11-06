@@ -45,7 +45,10 @@ pub fn max_columns(view_w: i32, scale: f64) -> i32 {
 }
 
 pub struct FolderView {
-    root: gtk::Overlay,
+    /// The visible root: the administrator banner above the grid body.
+    root: gtk::Box,
+    body: gtk::Overlay,
+    banner: adw::Banner,
     scroller: gtk::ScrolledWindow,
     grid: gtk::GridView,
     dir_list: gtk::DirectoryList,
@@ -194,8 +197,8 @@ impl FolderView {
         scroller.set_vexpand(true);
         scroller.set_hexpand(true);
 
-        let root = gtk::Overlay::new();
-        root.set_child(Some(&scroller));
+        let body = gtk::Overlay::new();
+        body.set_child(Some(&scroller));
         let error = gtk::Label::new(None);
         error.add_css_class("gl-title");
         error.set_justify(gtk::Justification::Center);
@@ -205,10 +208,21 @@ impl FolderView {
         error.set_margin_start(scaled(GAP_L, scale));
         error.set_margin_end(scaled(GAP_L, scale));
         error.set_visible(false);
-        root.add_overlay(&error);
+        body.add_overlay(&error);
+
+        let banner = adw::Banner::new("Administrator: changes here affect the whole system.");
+        banner.add_css_class("gl-admin-banner");
+        banner.set_button_label(Some("Leave"));
+        banner.set_revealed(false);
+
+        let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        root.append(&banner);
+        root.append(&body);
 
         let this = Rc::new(Self {
             root,
+            body,
+            banner,
             scroller,
             grid,
             dir_list,
@@ -255,6 +269,23 @@ impl FolderView {
         this.wire_factory(&factory);
         this.wire_signals();
         this.attach_background_drop_target();
+        {
+            let weak = Rc::downgrade(&this);
+            this.banner.connect_button_clicked(move |_| {
+                let Some(view) = weak.upgrade() else {
+                    return;
+                };
+                let Some(process) = view.process.upgrade() else {
+                    return;
+                };
+                if let Some(ui) = process.window(view.window) {
+                    ui.dispatch(
+                        fm_core::command::Caller::Ui,
+                        fm_core::command::Invocation::new("tab.leave-admin", Vec::new()),
+                    );
+                }
+            });
+        }
         let weak = Rc::downgrade(&this);
         this.root.connect_destroy(move |_| {
             if let Some(view) = weak.upgrade() {
@@ -264,8 +295,43 @@ impl FolderView {
         this
     }
 
-    pub fn widget(&self) -> &gtk::Overlay {
+    pub fn widget(&self) -> &gtk::Box {
         &self.root
+    }
+
+    /// Whether the tab this view shows is an administrator tab. A split tile
+    /// names its own tab; the single grid follows the focused tab.
+    fn tab_admin(&self) -> bool {
+        let Some(process) = self.process.upgrade() else {
+            return false;
+        };
+        let Some(window) = process.window_snapshot(self.window) else {
+            return false;
+        };
+        let id = self.tab.unwrap_or(window.focused_tab);
+        window.tab(id).is_some_and(|tab| tab.admin)
+    }
+
+    /// Show the banner and the red tile border while the tab is an
+    /// administrator tab, and remove both in place when it leaves.
+    fn refresh_admin_scope(&self) {
+        let admin = self.tab_admin();
+        self.banner.set_revealed(admin);
+        self.grid.set_tooltip_text(admin.then_some(
+            "Dragging, recursive search, thumbnails and preview editing are off in an administrator tab.",
+        ));
+        let mut parent = self.root.parent();
+        while let Some(widget) = parent {
+            if widget.has_css_class("gl-tile") {
+                if admin {
+                    widget.add_css_class("admin");
+                } else {
+                    widget.remove_css_class("admin");
+                }
+                break;
+            }
+            parent = widget.parent();
+        }
     }
 
     fn wire_factory(self: &Rc<Self>, factory: &gtk::SignalListItemFactory) {
@@ -608,15 +674,23 @@ impl FolderView {
         if let Some(sorter) = self.sorted.sorter().and_downcast::<gtk::CustomSorter>() {
             sorter.changed(gtk::SorterChange::Different);
         }
+        self.refresh_admin_scope();
+        let scope = if self.tab_admin() {
+            fm_core::admin::Scope::Admin
+        } else {
+            fm_core::admin::Scope::User
+        };
         crate::log!(
             "folder",
-            "listing {} (sort {} {}, folders first {})",
+            "listing {} ({} scope, sort {} {}, folders first {})",
             folder.display(),
+            scope.as_str(),
             rule.by.as_str(),
             rule.order.as_str(),
             rule.folders_first
         );
-        self.dir_list.set_file(Some(&gio::File::for_path(&folder)));
+        self.dir_list
+            .set_file(Some(&fm_core::admin::gfile(&folder, scope)));
     }
 
     /// Drop this view's folder monitor, thumbnail demand and folder-size walk
@@ -651,6 +725,19 @@ impl FolderView {
         true
     }
 
+    /// Re-read the folder if this view shows an administrator tab. GtkDirectoryList
+    /// ignores `G_FILE_MONITOR_EVENT_MOVED` (gtk-4.22.4:gtk/gtkdirectorylist.c:790),
+    /// and GVfs's admin backend reports a rename that way, so after an
+    /// administrator file operation the old name stayed listed beside the new
+    /// one. Re-reading after each administrator job keeps the grid true.
+    pub fn reload_if_admin(&self) -> bool {
+        if !self.tab_admin() {
+            return false;
+        }
+        self.reload();
+        true
+    }
+
     /// Re-read the current folder, keeping the selection and the top item.
     pub fn reload(&self) {
         let Some(folder) = self.current.borrow().clone() else {
@@ -658,6 +745,12 @@ impl FolderView {
         };
         // An explicit Refresh asks for a fresh total immediately.
         size::invalidate_path(&folder);
+        // gtk_directory_list_set_file returns early for an equal GFile
+        // (gtk-4.22.4:gtk/gtkdirectorylist.c, g_file_equal), so setting the
+        // same folder again re-read nothing while set_folder reset this view's
+        // own counts and selection: stale rows and a stuck highlight. Clear the
+        // file first so GTK really enumerates the folder again.
+        self.dir_list.set_file(None::<&gio::File>);
         let rule = self.sort_rule.get();
         let anchor = self.first_visible_name();
         let wanted = self.wanted.borrow().clone();
@@ -1356,6 +1449,10 @@ impl FolderView {
                 dnd::prepare_drag();
                 icon_widget.borrow_mut().take();
                 let view = weak.upgrade()?;
+                if view.tab_admin() {
+                    crate::log!("dnd", "dragging out is off in an administrator tab");
+                    return None;
+                }
                 let item = item.upgrade()?;
                 let info = item.item().and_downcast::<gio::FileInfo>()?;
                 let name = info.name().into_os_string();
@@ -1466,6 +1563,9 @@ impl FolderView {
         let weak = Rc::downgrade(self);
         let folder: Rc<dyn Fn() -> Option<PathBuf>> = Rc::new(move || {
             let view = weak.upgrade()?;
+            if view.tab_admin() {
+                return None;
+            }
             let item = item.upgrade()?;
             let info = item.item().and_downcast::<gio::FileInfo>()?;
             if info.file_type() != gio::FileType::Directory {
@@ -1491,7 +1591,7 @@ impl FolderView {
         let mut rects = Vec::new();
         let mut child = self.grid.first_child();
         while let Some(widget) = child {
-            if let Some(bounds) = widget.compute_bounds(&self.root) {
+            if let Some(bounds) = widget.compute_bounds(&self.body) {
                 rects.push(dnd::DropRect {
                     x: f64::from(bounds.x()),
                     y: f64::from(bounds.y()),
@@ -1506,8 +1606,13 @@ impl FolderView {
 
     fn attach_background_drop_target(self: &Rc<Self>) {
         let weak = Rc::downgrade(self);
-        let folder: Rc<dyn Fn() -> Option<PathBuf>> =
-            Rc::new(move || weak.upgrade()?.current.borrow().clone());
+        let folder: Rc<dyn Fn() -> Option<PathBuf>> = Rc::new(move || {
+            let view = weak.upgrade()?;
+            if view.tab_admin() {
+                return None;
+            }
+            view.current.borrow().clone()
+        });
         // The viewport root owns the background, not the grid: the grid's own
         // allocation ends at its content, which leaves the padding and the
         // space below a short listing without a target. A cell still owns its
@@ -1521,7 +1626,7 @@ impl FolderView {
             dnd::background_owns(x, y, &view.cell_rects())
         });
         dnd::attach_folder_target(
-            &self.root,
+            &self.body,
             self.process.clone(),
             self.window,
             folder,
@@ -2143,6 +2248,9 @@ impl FolderView {
         scale: f64,
     ) {
         self.cancel_thumbnail_for(cell);
+        if self.tab_admin() {
+            return;
+        }
         let Some(kind) = thumb_kind(info) else {
             return;
         };

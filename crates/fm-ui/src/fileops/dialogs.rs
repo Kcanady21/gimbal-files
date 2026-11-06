@@ -110,11 +110,8 @@ pub fn open_rename(ui: &Rc<WindowUi>, anchor: &gtk::Widget, path: &Path) {
     popover.set_parent(anchor);
     let box_ = vbox(&["gl-menu"]);
     let entry = gtk::Entry::new();
-    let stem = path
-        .file_stem()
-        .map(|stem| stem.to_string_lossy().into_owned())
-        .unwrap_or_else(|| path.display().to_string());
-    entry.set_text(&stem);
+    let (name, selection) = rename_prefill(path);
+    entry.set_text(&name);
     entry.set_placeholder_text(Some("Name"));
     box_.append(&entry);
 
@@ -160,8 +157,24 @@ pub fn open_rename(ui: &Rc<WindowUi>, anchor: &gtk::Widget, path: &Path) {
     });
     crate::popup::show(&popover);
     entry.grab_focus();
-    let selection = stem.chars().count() as i32;
     entry.select_region(0, selection);
+}
+
+/// The rename entry's text and how many characters to pre-select. The entry
+/// holds the whole name and selects the part before the extension, so typing
+/// replaces only that. It once held just the stem, and the rename then dropped
+/// the extension.
+fn rename_prefill(path: &Path) -> (String, i32) {
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string());
+    let stem = path
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .unwrap_or_else(|| name.clone());
+    let selection = i32::try_from(stem.chars().count()).unwrap_or(i32::MAX);
+    (name, selection)
 }
 
 fn dispatch_rename(ui: &Rc<WindowUi>, path: &str, name: String) {
@@ -289,6 +302,69 @@ fn choose_folder(ui: &Rc<WindowUi>, command: &'static str, paths: &[PathBuf]) {
     );
 }
 
+/// The administrator tab's irreversible-operation confirmation. It follows
+/// the Trash page's destructive dialog: one title, one body naming the count
+/// and the first names, a destructive response, and Cancel as the close
+/// response.
+pub fn confirm_admin(
+    ui: &Rc<WindowUi>,
+    title: &str,
+    body: &str,
+    confirm: &str,
+    done: Rc<dyn Fn(bool)>,
+) {
+    let dialog = adw::AlertDialog::new(Some(title), Some(body));
+    dialog.add_css_class("gimbal-look");
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("confirm", confirm);
+    dialog.set_response_appearance("confirm", adw::ResponseAppearance::Destructive);
+    dialog.set_close_response("cancel");
+    dialog.set_default_response(Some("cancel"));
+    let answered = Rc::new(std::cell::Cell::new(false));
+    let answered_response = answered.clone();
+    let done_response = done.clone();
+    dialog.connect_response(None, move |_, response| {
+        answered_response.set(true);
+        done_response(response == "confirm");
+    });
+    let done_closed = done;
+    let ui_closed = ui.clone();
+    dialog.connect_closed(move |_| {
+        ui_closed.end_dialog();
+        let answered = answered.clone();
+        let done = done_closed.clone();
+        glib::idle_add_local_once(move || {
+            if !answered.get() {
+                done(false);
+            }
+        });
+    });
+    ui.begin_dialog();
+    dialog.choose(Some(ui.window()), None::<&gio::Cancellable>, |_| {});
+}
+
+/// The permanent-delete confirmation for an administrator tab. The count,
+/// the first names and the word "permanently" are always present.
+pub fn confirm_admin_delete(ui: &Rc<WindowUi>, names: &[String], done: Rc<dyn Fn(bool)>) {
+    let shown: Vec<&str> = names.iter().take(3).map(String::as_str).collect();
+    let mut listed = shown.join(", ");
+    if names.len() > shown.len() {
+        listed.push_str(&format!(" and {} more", names.len() - shown.len()));
+    }
+    if listed.is_empty() {
+        listed = "these items".to_string();
+    }
+    confirm_admin(
+        ui,
+        &format!("Permanently delete {} item(s)?", names.len().max(1)),
+        &format!(
+            "{listed} will be deleted permanently. This cannot be undone and does not use the Trash."
+        ),
+        "Delete Permanently",
+        done,
+    );
+}
+
 /// One dialog per conflict, in the plan's order. "Apply this decision to all
 /// files" answers every remaining conflict; Cancel runs nothing.
 pub fn show_conflicts(ui: &Rc<WindowUi>, flow: ConflictFlow, done: ConflictDone) {
@@ -347,6 +423,46 @@ fn present_conflict(
             _ => Decision::Skip,
         };
         let apply_to_all = apply.as_ref().is_some_and(|check| check.is_active());
+        if decision == Decision::Replace && state_response.borrow().is_admin() {
+            // An administrator overwrite asks once more. The conflict dialog
+            // closes; the confirmation's answer either records Replace or
+            // shows the same question again.
+            let ui_confirm = ui_response.clone();
+            let state_confirm = state_response.clone();
+            let done_confirm = done_response.clone();
+            let item_confirm = item.clone();
+            let name_confirm = name.clone();
+            let ui_inner = ui_confirm.clone();
+            let state_inner = state_confirm.clone();
+            let done_inner = done_confirm.clone();
+            confirm_admin(
+                &ui_confirm,
+                "Replace the existing item?",
+                &format!("“{name_confirm}” already exists and will be replaced permanently."),
+                "Replace",
+                Rc::new(move |confirmed| {
+                    if confirmed {
+                        crate::log!(
+                            "fileops",
+                            "decision {position} {name_confirm}: Replace confirmed"
+                        );
+                        let next = state_confirm.borrow_mut().answer(
+                            &item_confirm,
+                            Decision::Replace,
+                            apply_to_all,
+                        );
+                        if next.is_some() {
+                            present_conflict(&ui_inner, state_inner.clone(), done_inner.clone());
+                        } else {
+                            done_inner(state_confirm.borrow().decisions());
+                        }
+                    } else {
+                        present_conflict(&ui_inner, state_inner.clone(), done_inner.clone());
+                    }
+                }),
+            );
+            return;
+        }
         crate::log!(
             "fileops",
             "decision {position} {name}: {decision:?} (apply to all: {apply_to_all})"
@@ -434,4 +550,33 @@ fn vbox(classes: &[&str]) -> gtk::Box {
         box_.add_css_class(class);
     }
     box_
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_rename_entry_keeps_the_extension_and_selects_the_stem() {
+        assert_eq!(
+            rename_prefill(Path::new("/tmp/a.txt")),
+            ("a.txt".to_string(), 1)
+        );
+        assert_eq!(
+            rename_prefill(Path::new("/tmp/archive.tar.gz")),
+            ("archive.tar.gz".to_string(), 11)
+        );
+        assert_eq!(
+            rename_prefill(Path::new("/tmp/.bashrc")),
+            (".bashrc".to_string(), 7)
+        );
+        assert_eq!(
+            rename_prefill(Path::new("/tmp/Notes")),
+            ("Notes".to_string(), 5)
+        );
+        assert_eq!(
+            rename_prefill(Path::new("/tmp/résumé.pdf")),
+            ("résumé.pdf".to_string(), 6)
+        );
+    }
 }

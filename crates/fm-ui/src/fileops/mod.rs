@@ -743,8 +743,10 @@ impl FileOps {
 
 fn request_touches_root(request: &Request, root: &Path) -> bool {
     match request {
-        Request::Trash { paths } => paths.iter().any(|path| path.starts_with(root)),
-        Request::Copy { paths, to } | Request::Move { paths, to } => {
+        Request::Trash { paths, .. } | Request::DeletePermanent { paths, .. } => {
+            paths.iter().any(|path| path.starts_with(root))
+        }
+        Request::Copy { paths, to, .. } | Request::Move { paths, to, .. } => {
             paths.iter().any(|path| path.starts_with(root)) || to.starts_with(root)
         }
         Request::Rename { path, .. } => path.starts_with(root),

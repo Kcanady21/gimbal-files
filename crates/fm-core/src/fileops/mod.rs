@@ -29,6 +29,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use gio::prelude::*;
 
+use crate::admin::{Scope, gfile};
 use crate::command::{CheckedCommand, Outcome, Value};
 
 pub use trash::{
@@ -56,22 +57,35 @@ const MAX_NAME_BYTES: usize = 255;
 pub enum Request {
     Trash {
         paths: Vec<PathBuf>,
+        scope: Scope,
     },
     Copy {
         paths: Vec<PathBuf>,
         to: PathBuf,
+        scope: Scope,
+        target_scope: Scope,
     },
     Move {
         paths: Vec<PathBuf>,
         to: PathBuf,
+        scope: Scope,
+        target_scope: Scope,
     },
     Rename {
         path: PathBuf,
         name: String,
+        scope: Scope,
     },
     NewFolder {
         name: String,
         in_folder: PathBuf,
+        scope: Scope,
+    },
+    /// Permanently delete native paths. The UI only builds this after its
+    /// irreversible-operation confirmation.
+    DeletePermanent {
+        paths: Vec<PathBuf>,
+        scope: Scope,
     },
     Restore {
         items: Vec<TrashIdentity>,
@@ -94,18 +108,23 @@ impl Request {
     /// A one-line description for a dry-run plan.
     pub fn summary(&self) -> String {
         match self {
-            Request::Trash { paths } => format!("trash {} item(s)", paths.len()),
-            Request::Copy { paths, to } => {
+            Request::Trash { paths, .. } => format!("trash {} item(s)", paths.len()),
+            Request::Copy { paths, to, .. } => {
                 format!("copy {} item(s) to {}", paths.len(), to.display())
             }
-            Request::Move { paths, to } => {
+            Request::Move { paths, to, .. } => {
                 format!("move {} item(s) to {}", paths.len(), to.display())
             }
-            Request::Rename { path, name } => {
+            Request::Rename { path, name, .. } => {
                 format!("rename {} to {name}", path.display())
             }
-            Request::NewFolder { name, in_folder } => {
+            Request::NewFolder {
+                name, in_folder, ..
+            } => {
                 format!("create folder {name} in {}", in_folder.display())
+            }
+            Request::DeletePermanent { paths, .. } => {
+                format!("permanently delete {} item(s)", paths.len())
             }
             Request::Restore { items } => format!("restore {} item(s)", items.len()),
             Request::EmptyTrash => "empty the trash".to_string(),
@@ -120,6 +139,63 @@ impl Request {
     /// requires its own human confirmation.
     pub fn needs_permanent_confirmation(&self) -> bool {
         matches!(self, Request::EmptyTrash | Request::DeleteSelected { .. })
+    }
+
+    /// The source-side access scope. Trash operations are always the user's
+    /// own backend and are reported as `User`.
+    pub fn scope(&self) -> Scope {
+        match self {
+            Request::Trash { scope, .. }
+            | Request::Rename { scope, .. }
+            | Request::NewFolder { scope, .. }
+            | Request::DeletePermanent { scope, .. } => *scope,
+            Request::Copy { scope, .. } | Request::Move { scope, .. } => *scope,
+            Request::Restore { .. }
+            | Request::EmptyTrash
+            | Request::DeleteSelected { .. }
+            | Request::Undo => Scope::User,
+        }
+    }
+
+    /// The destination-side scope for a copy or move, otherwise the source's.
+    pub fn target_scope(&self) -> Scope {
+        match self {
+            Request::Copy { target_scope, .. } | Request::Move { target_scope, .. } => {
+                *target_scope
+            }
+            _ => self.scope(),
+        }
+    }
+
+    /// Fill the scopes after the UI has resolved the source and destination
+    /// tabs. Undo and Trash commands carry their own history and backend.
+    pub fn with_scopes(mut self, scope: Scope, target_scope: Scope) -> Self {
+        match &mut self {
+            Request::Trash { scope: source, .. }
+            | Request::Rename { scope: source, .. }
+            | Request::NewFolder { scope: source, .. }
+            | Request::DeletePermanent { scope: source, .. } => {
+                *source = scope;
+            }
+            Request::Copy {
+                scope: source,
+                target_scope: target,
+                ..
+            }
+            | Request::Move {
+                scope: source,
+                target_scope: target,
+                ..
+            } => {
+                *source = scope;
+                *target = target_scope;
+            }
+            Request::Restore { .. }
+            | Request::EmptyTrash
+            | Request::DeleteSelected { .. }
+            | Request::Undo => {}
+        }
+        self
     }
 }
 
@@ -168,22 +244,31 @@ pub fn request_for(command: &CheckedCommand) -> Result<Option<Request>, RequestE
     };
 
     let request = match command.name() {
-        "file.trash" => Request::Trash { paths: paths()? },
+        "file.trash" => Request::Trash {
+            paths: paths()?,
+            scope: Scope::User,
+        },
         "file.copy" => Request::Copy {
             paths: paths()?,
             to: path("to")?,
+            scope: Scope::User,
+            target_scope: Scope::User,
         },
         "file.move" => Request::Move {
             paths: paths()?,
             to: path("to")?,
+            scope: Scope::User,
+            target_scope: Scope::User,
         },
         "file.rename" => Request::Rename {
             path: path("path")?,
             name: text("name")?,
+            scope: Scope::User,
         },
         "file.new-folder" => Request::NewFolder {
             name: text("name")?,
             in_folder: path("in")?,
+            scope: Scope::User,
         },
         "trash.restore" => Request::Restore {
             items: trash_items()?,
@@ -235,7 +320,11 @@ fn copy_name(name: &OsStr, number: usize) -> OsString {
 
 /// The first free `KeepBoth` target for `target`, honouring names reserved by
 /// earlier items in the same run.
-fn free_copy_name(target: &Path, reserved: &HashSet<PathBuf>) -> Result<PathBuf, String> {
+fn free_copy_name(
+    target: &Path,
+    reserved: &HashSet<PathBuf>,
+    scope: Scope,
+) -> Result<PathBuf, String> {
     let parent = target
         .parent()
         .ok_or_else(|| "the target has no folder".to_string())?;
@@ -245,7 +334,7 @@ fn free_copy_name(target: &Path, reserved: &HashSet<PathBuf>) -> Result<PathBuf,
 
     for number in 0..10_000 {
         let candidate = parent.join(copy_name(name, number));
-        if fs::symlink_metadata(&candidate).is_err() && !reserved.contains(&candidate) {
+        if !path_exists(&candidate, scope) && !reserved.contains(&candidate) {
             return Ok(candidate);
         }
     }
@@ -271,6 +360,8 @@ pub enum Action {
     /// operation kind from Empty Trash so results and confirmation scopes stay
     /// distinct.
     DeleteSelected,
+    /// Permanent deletion of a native path through its tab's scope.
+    PermanentDelete,
 }
 
 impl Action {
@@ -284,6 +375,7 @@ impl Action {
             Action::Restore => "restore",
             Action::Empty => "delete",
             Action::DeleteSelected => "delete selected",
+            Action::PermanentDelete => "permanently delete",
         }
     }
 
@@ -297,6 +389,7 @@ impl Action {
             Action::Restore => "restored",
             Action::Empty => "deleted",
             Action::DeleteSelected => "deleted",
+            Action::PermanentDelete => "deleted",
         }
     }
 }
@@ -337,6 +430,10 @@ pub enum Conflict {
     Unverified,
     /// An undo folder is no longer empty.
     NotEmpty,
+    /// An undo would trash items in an administrator location, which has no
+    /// trash. Refused rather than deleted permanently: the copies may have
+    /// been edited since. The user can delete them, behind a confirmation.
+    NoAdminTrash,
 }
 
 impl Conflict {
@@ -363,6 +460,9 @@ impl Conflict {
             Conflict::Changed => "the item changed",
             Conflict::Unverified => "Cannot verify this Trash item is unchanged",
             Conflict::NotEmpty => "the folder is not empty",
+            Conflict::NoAdminTrash => {
+                "an administrator folder has no trash; delete it yourself to undo"
+            }
         }
     }
 }
@@ -488,11 +588,26 @@ pub struct Plan {
     steps: Vec<Step>,
     undo: Option<UndoRecord>,
     problem: Option<String>,
+    scope: Scope,
+    target_scope: Scope,
 }
 
 impl Plan {
     pub fn request(&self) -> &Request {
         &self.request
+    }
+
+    pub fn scope(&self) -> Scope {
+        self.scope
+    }
+
+    pub fn target_scope(&self) -> Scope {
+        self.target_scope
+    }
+
+    /// Whether this plan acts through GVfs's administrator backend.
+    pub fn is_admin(&self) -> bool {
+        self.scope == Scope::Admin || self.target_scope == Scope::Admin
     }
 
     pub fn steps(&self) -> &[Step] {
@@ -914,6 +1029,8 @@ enum RecordKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct UndoRecord {
     kind: RecordKind,
+    scope: Scope,
+    target_scope: Scope,
 }
 
 impl RecordKind {
@@ -1030,11 +1147,26 @@ impl FileOperations {
     /// anything. Undo plans look at the newest record.
     pub fn plan(&self, request: &Request) -> Plan {
         match request {
-            Request::Trash { paths } => plan_trash(paths),
-            Request::Copy { paths, to } => plan_copy_or_move(paths, to, false),
-            Request::Move { paths, to } => plan_copy_or_move(paths, to, true),
-            Request::Rename { path, name } => plan_rename(path, name),
-            Request::NewFolder { name, in_folder } => plan_new_folder(name, in_folder),
+            Request::Trash { paths, scope } => plan_trash(paths, *scope),
+            Request::Copy {
+                paths,
+                to,
+                scope,
+                target_scope,
+            } => plan_copy_or_move(paths, to, false, *scope, *target_scope),
+            Request::Move {
+                paths,
+                to,
+                scope,
+                target_scope,
+            } => plan_copy_or_move(paths, to, true, *scope, *target_scope),
+            Request::Rename { path, name, scope } => plan_rename(path, name, *scope),
+            Request::NewFolder {
+                name,
+                in_folder,
+                scope,
+            } => plan_new_folder(name, in_folder, *scope),
+            Request::DeletePermanent { paths, scope } => plan_delete_permanent(paths, *scope),
             Request::Restore { items } => plan_restore(self.trash.as_ref(), items),
             Request::EmptyTrash => plan_empty(self.trash.as_ref()),
             Request::DeleteSelected { items } => plan_selected(self.trash.as_ref(), items),
@@ -1127,7 +1259,7 @@ impl FileOperations {
                     reporter.item_finished();
                     continue;
                 };
-                match trash_and_record(&source) {
+                match trash_and_record(&source, plan.scope) {
                     Ok(trashed) => {
                         builder.trashed.push(trashed);
                         report.items.push(done_result(step, None));
@@ -1180,14 +1312,16 @@ impl FileOperations {
                                 report.items.push(cancelled_result(step));
                                 continue;
                             }
-                            Some(Decision::KeepBoth) => match free_copy_name(&target, &claimed) {
-                                Ok(free) => target = free,
-                                Err(error) => {
-                                    report.items.push(failed_result(step, &error));
-                                    reporter.item_finished();
-                                    continue;
+                            Some(Decision::KeepBoth) => {
+                                match free_copy_name(&target, &claimed, plan.target_scope) {
+                                    Ok(free) => target = free,
+                                    Err(error) => {
+                                        report.items.push(failed_result(step, &error));
+                                        reporter.item_finished();
+                                        continue;
+                                    }
                                 }
-                            },
+                            }
                             Some(Decision::Replace) => {}
                         }
                     } else {
@@ -1238,7 +1372,7 @@ impl FileOperations {
                     reporter.item_finished();
                     continue;
                 };
-                if !parent.is_dir() {
+                if !path_facts(parent, plan.target_scope).is_dir {
                     report.items.push(result(
                         step,
                         None,
@@ -1247,7 +1381,7 @@ impl FileOperations {
                     reporter.item_finished();
                     continue;
                 }
-                if !parent_is_writable(parent) {
+                if !parent_is_writable(parent, plan.target_scope) {
                     report.items.push(result(
                         step,
                         None,
@@ -1257,8 +1391,8 @@ impl FileOperations {
                     continue;
                 }
 
-                if decision == Some(Decision::Replace) && fs::symlink_metadata(&target).is_ok() {
-                    match trash_and_record(&target) {
+                if decision == Some(Decision::Replace) && path_exists(&target, plan.target_scope) {
+                    match trash_and_record(&target, plan.target_scope) {
                         Ok(trashed) => builder.replaced.push(trashed),
                         Err(error) => {
                             report.items.push(failed_result(
@@ -1318,6 +1452,25 @@ impl FileOperations {
                 continue;
             };
 
+            if step.action == Action::PermanentDelete {
+                match gfile(&source, plan.scope).delete(gio::Cancellable::NONE) {
+                    Ok(()) => report.items.push(done_result(step, None)),
+                    Err(error) => report.items.push(failed_result(
+                        step,
+                        &format!("could not delete it: {error}"),
+                    )),
+                }
+                reporter.item_finished();
+                log_event(
+                    &report
+                        .items
+                        .last()
+                        .map(ItemResult::line)
+                        .unwrap_or_default(),
+                );
+                continue;
+            }
+
             let mut decision = None;
             if let Some(conflict) = step.conflict {
                 if conflict.needs_decision() {
@@ -1359,14 +1512,14 @@ impl FileOperations {
 
             if step.keep_both {
                 let planned_is_free =
-                    fs::symlink_metadata(&target).is_err() && !claimed.contains(&target);
+                    !path_exists(&target, plan.target_scope) && !claimed.contains(&target);
                 if !planned_is_free {
                     let parent = target.parent().unwrap_or_else(|| Path::new("/"));
                     let base = source
                         .file_name()
                         .map(|name| parent.join(name))
                         .unwrap_or_else(|| target.clone());
-                    match free_copy_name(&base, &claimed) {
+                    match free_copy_name(&base, &claimed, plan.target_scope) {
                         Ok(free) => target = free,
                         Err(error) => {
                             report.items.push(failed_result(step, &error));
@@ -1376,7 +1529,7 @@ impl FileOperations {
                     }
                 }
             } else if decision == Some(Decision::KeepBoth) {
-                match free_copy_name(&target, &claimed) {
+                match free_copy_name(&target, &claimed, plan.target_scope) {
                     Ok(free) => target = free,
                     Err(error) => {
                         report.items.push(failed_result(step, &error));
@@ -1387,8 +1540,8 @@ impl FileOperations {
             }
             claimed.insert(target.clone());
 
-            if decision == Some(Decision::Replace) && fs::symlink_metadata(&target).is_ok() {
-                match trash_and_record(&target) {
+            if decision == Some(Decision::Replace) && path_exists(&target, plan.target_scope) {
+                match trash_and_record(&target, plan.target_scope) {
                     Ok(trashed) => builder.replaced.push(trashed),
                     Err(error) => {
                         report.items.push(failed_result(
@@ -1401,26 +1554,46 @@ impl FileOperations {
                 }
             }
 
-            if fs::symlink_metadata(&source).is_err() {
+            if !path_exists(&source, plan.scope) {
                 report.items.push(failed_result(step, "the source is gone"));
                 reporter.item_finished();
                 continue;
             }
 
             let outcome = match step.action {
-                Action::Copy => copy_tree(&source, &target, &mut reporter).map(|()| {
+                Action::Copy => copy_tree(
+                    &source,
+                    &target,
+                    &mut reporter,
+                    plan.scope,
+                    plan.target_scope,
+                )
+                .map(|()| {
                     builder.copies.push(target.clone());
                 }),
-                Action::Move => move_item(&source, &target, &mut reporter).map(|()| {
+                Action::Move => move_item(
+                    &source,
+                    &target,
+                    &mut reporter,
+                    plan.scope,
+                    plan.target_scope,
+                )
+                .map(|()| {
                     builder.move_pairs.push((source.clone(), target.clone()));
                 }),
-                Action::Rename => rename_item(&source, &target).map(|()| {
-                    builder.rename = Some((source.clone(), target.clone()));
-                }),
-                Action::NewFolder => make_folder(&target).map(|()| {
+                Action::Rename => {
+                    rename_item(&source, &target, plan.scope, plan.target_scope).map(|()| {
+                        builder.rename = Some((source.clone(), target.clone()));
+                    })
+                }
+                Action::NewFolder => make_folder(&target, plan.target_scope).map(|()| {
                     builder.new_folder = Some(target.clone());
                 }),
-                Action::Trash | Action::Restore | Action::Empty | Action::DeleteSelected => {
+                Action::Trash
+                | Action::Restore
+                | Action::Empty
+                | Action::DeleteSelected
+                | Action::PermanentDelete => {
                     Err("the plan has a step that cannot run here".to_string())
                 }
             };
@@ -1454,7 +1627,7 @@ impl FileOperations {
             self.invalidate_trash_entries(&restored);
         }
 
-        if let Some(record) = builder.into_record(&plan.request) {
+        if let Some(record) = builder.into_record(&plan.request, plan.scope, plan.target_scope) {
             self.push_undo(record);
         }
 
@@ -1651,23 +1824,44 @@ impl FileOperations {
                 },
                 Action::Trash => match source {
                     Some(source) => {
-                        if new_folder_undo && !is_empty_dir(&source) {
+                        if new_folder_undo && !is_empty_dir(&source, plan.scope) {
                             Err("the folder is not empty".to_string())
                         } else {
-                            trash_path(&source).map(|()| None)
+                            trash_path(&source, plan.scope).map(|()| None)
                         }
                     }
                     None => Err("the undo step is incomplete".to_string()),
                 },
-                Action::Move => match (source, target) {
-                    (Some(source), Some(target)) => {
-                        move_item(&source, &target, &mut reporter).map(|()| Some(target))
+                // Only an administrator New Folder undo plans this, and only an
+                // empty folder is removed.
+                Action::PermanentDelete => match source {
+                    Some(source) if new_folder_undo => {
+                        if !is_empty_dir(&source, plan.scope) {
+                            Err("the folder is not empty".to_string())
+                        } else {
+                            gfile(&source, plan.scope)
+                                .delete(gio::Cancellable::NONE)
+                                .map(|()| None)
+                                .map_err(|error| format!("could not delete it: {error}"))
+                        }
                     }
+                    _ => Err("undo only deletes an empty new folder".to_string()),
+                },
+                Action::Move => match (source, target) {
+                    (Some(source), Some(target)) => move_item(
+                        &source,
+                        &target,
+                        &mut reporter,
+                        plan.scope,
+                        plan.target_scope,
+                    )
+                    .map(|()| Some(target)),
                     _ => Err("the undo step is incomplete".to_string()),
                 },
                 Action::Rename => match (source, target) {
                     (Some(source), Some(target)) => {
-                        rename_item(&source, &target).map(|()| Some(target))
+                        rename_item(&source, &target, plan.scope, plan.target_scope)
+                            .map(|()| Some(target))
                     }
                     _ => Err("the undo step is incomplete".to_string()),
                 },
@@ -1704,6 +1898,44 @@ impl FileOperations {
 // Planning
 // ---------------------------------------------------------------------------
 
+/// What the planner needs to know about one path. The administrator scope
+/// asks GVfs, because an admin path need not be readable by this process.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct PathFacts {
+    exists: bool,
+    is_dir: bool,
+    is_symlink: bool,
+}
+
+fn path_facts(path: &Path, scope: Scope) -> PathFacts {
+    if scope == Scope::User {
+        return match fs::symlink_metadata(path) {
+            Ok(metadata) => PathFacts {
+                exists: true,
+                is_dir: metadata.is_dir(),
+                is_symlink: metadata.file_type().is_symlink(),
+            },
+            Err(_) => PathFacts::default(),
+        };
+    }
+    match gfile(path, scope).query_info(
+        "standard::type",
+        gio::FileQueryInfoFlags::NOFOLLOW_SYMLINKS,
+        gio::Cancellable::NONE,
+    ) {
+        Ok(info) => PathFacts {
+            exists: true,
+            is_dir: info.file_type() == gio::FileType::Directory,
+            is_symlink: info.file_type() == gio::FileType::SymbolicLink,
+        },
+        Err(_) => PathFacts::default(),
+    }
+}
+
+fn path_exists(path: &Path, scope: Scope) -> bool {
+    path_facts(path, scope).exists
+}
+
 fn unique_paths(paths: &[PathBuf]) -> Vec<PathBuf> {
     let mut unique = Vec::new();
     for path in paths {
@@ -1714,14 +1946,12 @@ fn unique_paths(paths: &[PathBuf]) -> Vec<PathBuf> {
     unique
 }
 
-fn plan_trash(paths: &[PathBuf]) -> Plan {
+fn plan_trash(paths: &[PathBuf], scope: Scope) -> Plan {
     let steps = unique_paths(paths)
         .into_iter()
         .map(|path| Step {
             action: Action::Trash,
-            conflict: fs::symlink_metadata(&path)
-                .err()
-                .map(|_| Conflict::MissingSource),
+            conflict: (!path_exists(&path, scope)).then_some(Conflict::MissingSource),
             source: Some(path),
             target: None,
             keep_both: false,
@@ -1732,20 +1962,54 @@ fn plan_trash(paths: &[PathBuf]) -> Plan {
     Plan {
         request: Request::Trash {
             paths: paths.to_vec(),
+            scope,
         },
         steps,
         undo: None,
         problem: None,
+        scope,
+        target_scope: scope,
     }
 }
 
-fn plan_copy_or_move(paths: &[PathBuf], to: &Path, is_move: bool) -> Plan {
-    let destination_is_folder = to.is_dir();
+fn plan_delete_permanent(paths: &[PathBuf], scope: Scope) -> Plan {
+    let steps = unique_paths(paths)
+        .into_iter()
+        .map(|path| Step {
+            action: Action::PermanentDelete,
+            conflict: (!path_exists(&path, scope)).then_some(Conflict::MissingSource),
+            source: Some(path),
+            target: None,
+            keep_both: false,
+            trash: None,
+        })
+        .collect();
+    Plan {
+        request: Request::DeletePermanent {
+            paths: paths.to_vec(),
+            scope,
+        },
+        steps,
+        undo: None,
+        problem: None,
+        scope,
+        target_scope: scope,
+    }
+}
+
+fn plan_copy_or_move(
+    paths: &[PathBuf],
+    to: &Path,
+    is_move: bool,
+    scope: Scope,
+    target_scope: Scope,
+) -> Plan {
+    let destination_is_folder = path_facts(to, target_scope).is_dir;
     let mut reserved: HashSet<PathBuf> = HashSet::new();
     let mut steps = Vec::new();
 
     for source in unique_paths(paths) {
-        let metadata = fs::symlink_metadata(&source).ok();
+        let facts = path_facts(&source, scope);
         let name = source.file_name().map(OsStr::to_os_string);
         let mut target = name
             .as_deref()
@@ -1754,12 +2018,12 @@ fn plan_copy_or_move(paths: &[PathBuf], to: &Path, is_move: bool) -> Plan {
         let mut conflict = None;
         let mut keep_both = false;
 
-        if metadata.is_none() {
+        if !facts.exists {
             conflict = Some(Conflict::MissingSource);
         } else if !destination_is_folder {
             conflict = Some(Conflict::MissingDestination);
-        } else if let Some(metadata) = &metadata {
-            let is_folder = metadata.is_dir() && !metadata.file_type().is_symlink();
+        } else {
+            let is_folder = facts.is_dir && !facts.is_symlink;
             if is_folder && to.starts_with(&source) {
                 conflict = Some(Conflict::FolderIntoItself);
             } else if source.parent() == Some(to) {
@@ -1767,11 +2031,11 @@ fn plan_copy_or_move(paths: &[PathBuf], to: &Path, is_move: bool) -> Plan {
                     conflict = Some(Conflict::AlreadyThere);
                 } else {
                     keep_both = true;
-                    if let Ok(free) = free_copy_name(&target, &reserved) {
+                    if let Ok(free) = free_copy_name(&target, &reserved, target_scope) {
                         target = free;
                     }
                 }
-            } else if fs::symlink_metadata(&target).is_ok() || reserved.contains(&target) {
+            } else if path_exists(&target, target_scope) || reserved.contains(&target) {
                 conflict = Some(Conflict::TargetExists);
             }
         }
@@ -1794,11 +2058,15 @@ fn plan_copy_or_move(paths: &[PathBuf], to: &Path, is_move: bool) -> Plan {
         Request::Move {
             paths: paths.to_vec(),
             to: to.to_path_buf(),
+            scope,
+            target_scope,
         }
     } else {
         Request::Copy {
             paths: paths.to_vec(),
             to: to.to_path_buf(),
+            scope,
+            target_scope,
         }
     };
 
@@ -1807,18 +2075,20 @@ fn plan_copy_or_move(paths: &[PathBuf], to: &Path, is_move: bool) -> Plan {
         steps,
         undo: None,
         problem: None,
+        scope,
+        target_scope,
     }
 }
 
-fn plan_rename(path: &Path, name: &str) -> Plan {
+fn plan_rename(path: &Path, name: &str, scope: Scope) -> Plan {
     let parent = path.parent().unwrap_or_else(|| Path::new("/"));
     let target = parent.join(name);
 
     let conflict = if !is_valid_name(name) {
         Some(Conflict::InvalidName)
-    } else if fs::symlink_metadata(path).is_err() {
+    } else if !path_exists(path, scope) {
         Some(Conflict::MissingSource)
-    } else if target != path && fs::symlink_metadata(&target).is_ok() {
+    } else if target != path && path_exists(&target, scope) {
         Some(Conflict::NameTaken)
     } else {
         None
@@ -1828,6 +2098,7 @@ fn plan_rename(path: &Path, name: &str) -> Plan {
         request: Request::Rename {
             path: path.to_path_buf(),
             name: name.to_string(),
+            scope,
         },
         steps: vec![Step {
             action: Action::Rename,
@@ -1839,17 +2110,19 @@ fn plan_rename(path: &Path, name: &str) -> Plan {
         }],
         undo: None,
         problem: None,
+        scope,
+        target_scope: scope,
     }
 }
 
-fn plan_new_folder(name: &str, in_folder: &Path) -> Plan {
+fn plan_new_folder(name: &str, in_folder: &Path, scope: Scope) -> Plan {
     let target = in_folder.join(name);
 
     let conflict = if !is_valid_name(name) {
         Some(Conflict::InvalidName)
-    } else if !in_folder.is_dir() {
+    } else if !path_facts(in_folder, scope).is_dir {
         Some(Conflict::MissingDestination)
-    } else if fs::symlink_metadata(&target).is_ok() {
+    } else if path_exists(&target, scope) {
         Some(Conflict::NameTaken)
     } else {
         None
@@ -1859,6 +2132,7 @@ fn plan_new_folder(name: &str, in_folder: &Path) -> Plan {
         request: Request::NewFolder {
             name: name.to_string(),
             in_folder: in_folder.to_path_buf(),
+            scope,
         },
         steps: vec![Step {
             action: Action::NewFolder,
@@ -1870,6 +2144,8 @@ fn plan_new_folder(name: &str, in_folder: &Path) -> Plan {
         }],
         undo: None,
         problem: None,
+        scope,
+        target_scope: scope,
     }
 }
 
@@ -1892,6 +2168,8 @@ fn plan_restore(backend: &dyn TrashBackend, items: &[TrashIdentity]) -> Plan {
                 steps: Vec::new(),
                 undo: None,
                 problem: Some(error.to_string()),
+                scope: Scope::User,
+                target_scope: Scope::User,
             };
         }
     };
@@ -1942,7 +2220,9 @@ fn plan_restore(backend: &dyn TrashBackend, items: &[TrashIdentity]) -> Plan {
         let conflict = match original.parent() {
             None => Some(Conflict::MissingParent),
             Some(parent) if !parent.is_dir() => Some(Conflict::MissingParent),
-            Some(parent) if !parent_is_writable(parent) => Some(Conflict::ParentNotWritable),
+            Some(parent) if !parent_is_writable(parent, Scope::User) => {
+                Some(Conflict::ParentNotWritable)
+            }
             Some(_) if fs::symlink_metadata(&original).is_ok() || reserved.contains(&original) => {
                 Some(Conflict::TargetExists)
             }
@@ -1967,6 +2247,8 @@ fn plan_restore(backend: &dyn TrashBackend, items: &[TrashIdentity]) -> Plan {
         steps,
         undo: None,
         problem: None,
+        scope: Scope::User,
+        target_scope: Scope::User,
     }
 }
 
@@ -1988,12 +2270,16 @@ fn plan_empty(backend: &dyn TrashBackend) -> Plan {
                 .collect(),
             undo: None,
             problem: None,
+            scope: Scope::User,
+            target_scope: Scope::User,
         },
         Err(error) => Plan {
             request,
             steps: Vec::new(),
             undo: None,
             problem: Some(error.to_string()),
+            scope: Scope::User,
+            target_scope: Scope::User,
         },
     }
 }
@@ -2012,6 +2298,8 @@ fn plan_selected(backend: &dyn TrashBackend, items: &[TrashIdentity]) -> Plan {
             steps: Vec::new(),
             undo: None,
             problem: Some("no Trash items were selected".to_string()),
+            scope: Scope::User,
+            target_scope: Scope::User,
         };
     }
 
@@ -2029,6 +2317,8 @@ fn plan_selected(backend: &dyn TrashBackend, items: &[TrashIdentity]) -> Plan {
                     steps: Vec::new(),
                     undo: None,
                     problem: Some("the selected Trash items are inconsistent".to_string()),
+                    scope: Scope::User,
+                    target_scope: Scope::User,
                 };
             }
             continue;
@@ -2062,13 +2352,15 @@ fn plan_selected(backend: &dyn TrashBackend, items: &[TrashIdentity]) -> Plan {
         steps,
         undo: None,
         problem: None,
+        scope: Scope::User,
+        target_scope: Scope::User,
     }
 }
 
 /// Whether the original parent's access metadata says this process may write
 /// there. A failed query is a refusal, never an optimistic guess.
-fn parent_is_writable(path: &Path) -> bool {
-    gio::File::for_path(path)
+fn parent_is_writable(path: &Path, scope: Scope) -> bool {
+    gfile(path, scope)
         .query_info(
             gio::FILE_ATTRIBUTE_ACCESS_CAN_WRITE.as_str(),
             gio::FileQueryInfoFlags::NOFOLLOW_SYMLINKS,
@@ -2080,6 +2372,7 @@ fn parent_is_writable(path: &Path) -> bool {
 
 fn plan_undo(record: Option<&UndoRecord>) -> Plan {
     let mut steps = Vec::new();
+    let undo_scope = record.map(|record| record.scope).unwrap_or(Scope::User);
 
     if let Some(record) = record {
         match &record.kind {
@@ -2090,11 +2383,13 @@ fn plan_undo(record: Option<&UndoRecord>) -> Plan {
             RecordKind::Copy { copies, replaced } => {
                 let mut freed = HashSet::new();
                 for copy in copies {
-                    let conflict = if fs::symlink_metadata(copy).is_ok() {
+                    let conflict = if fs::symlink_metadata(copy).is_err() {
+                        Some(Conflict::MissingSource)
+                    } else if record.target_scope == Scope::Admin {
+                        Some(Conflict::NoAdminTrash)
+                    } else {
                         freed.insert(copy.clone());
                         None
-                    } else {
-                        Some(Conflict::MissingSource)
                     };
                     steps.push(Step {
                         action: Action::Trash,
@@ -2151,13 +2446,20 @@ fn plan_undo(record: Option<&UndoRecord>) -> Plan {
             RecordKind::NewFolder { path } => {
                 let conflict = if fs::symlink_metadata(path).is_err() {
                     Some(Conflict::MissingSource)
-                } else if !is_empty_dir(path) {
+                } else if !is_empty_dir(path, undo_scope) {
                     Some(Conflict::NotEmpty)
                 } else {
                     None
                 };
+                // An administrator location has no trash. The folder is only
+                // removed while it is still empty, so deleting it loses nothing.
+                let action = if undo_scope == Scope::Admin {
+                    Action::PermanentDelete
+                } else {
+                    Action::Trash
+                };
                 steps.push(Step {
-                    action: Action::Trash,
+                    action,
                     source: Some(path.clone()),
                     target: None,
                     conflict,
@@ -2195,6 +2497,10 @@ fn plan_undo(record: Option<&UndoRecord>) -> Plan {
         steps,
         undo: record.cloned(),
         problem: None,
+        scope: record.map(|record| record.scope).unwrap_or(Scope::User),
+        target_scope: record
+            .map(|record| record.target_scope)
+            .unwrap_or(Scope::User),
     }
 }
 
@@ -2253,7 +2559,12 @@ struct RecordBuilder {
 }
 
 impl RecordBuilder {
-    fn into_record(self, request: &Request) -> Option<UndoRecord> {
+    fn into_record(
+        self,
+        request: &Request,
+        scope: Scope,
+        target_scope: Scope,
+    ) -> Option<UndoRecord> {
         let kind = match request {
             Request::Trash { .. } if !self.trashed.is_empty() => RecordKind::Trash {
                 items: self.trashed,
@@ -2286,7 +2597,11 @@ impl RecordBuilder {
             _ => return None,
         };
 
-        Some(UndoRecord { kind })
+        Some(UndoRecord {
+            kind,
+            scope,
+            target_scope,
+        })
     }
 }
 
@@ -2350,11 +2665,28 @@ fn tree_size(path: &Path) -> u64 {
 }
 
 /// Copy a file, symlink or folder tree. A symlink stays a symlink.
-fn copy_tree(src: &Path, dst: &Path, reporter: &mut Reporter<'_>) -> Result<(), String> {
-    let metadata = fs::symlink_metadata(src).map_err(|error| error.to_string())?;
+fn copy_tree(
+    src: &Path,
+    dst: &Path,
+    reporter: &mut Reporter<'_>,
+    scope: Scope,
+    target_scope: Scope,
+) -> Result<(), String> {
+    let facts = path_facts(src, scope);
+    if !facts.exists {
+        return Err("the source is gone".to_string());
+    }
 
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        let flags = gio::FileCopyFlags::NOFOLLOW_SYMLINKS | gio::FileCopyFlags::ALL_METADATA;
+    if facts.is_symlink || !facts.is_dir {
+        // ALL_METADATA includes the owner, and root may set it, so a copy into
+        // an administrator folder kept the user's ownership: a user-owned file
+        // inside a system folder. Into an administrator folder the copy belongs
+        // to root, as `sudo cp` would make it.
+        let flags = if target_scope == Scope::Admin {
+            gio::FileCopyFlags::NOFOLLOW_SYMLINKS
+        } else {
+            gio::FileCopyFlags::NOFOLLOW_SYMLINKS | gio::FileCopyFlags::ALL_METADATA
+        };
         let mut last = 0u64;
         let mut report_progress = |current: i64, _total: i64| {
             let current = current.max(0) as u64;
@@ -2364,27 +2696,46 @@ fn copy_tree(src: &Path, dst: &Path, reporter: &mut Reporter<'_>) -> Result<(), 
                 reporter.report();
             }
         };
-        let result = gio::File::for_path(src).copy(
-            &gio::File::for_path(dst),
+        let result = gfile(src, scope).copy(
+            &gfile(dst, target_scope),
             flags,
             gio::Cancellable::NONE,
             Some(&mut report_progress),
         );
 
         result.map_err(|error| error.to_string())?;
-        let size = metadata.len();
+        let size = gfile(src, scope)
+            .query_info(
+                "standard::size",
+                gio::FileQueryInfoFlags::NOFOLLOW_SYMLINKS,
+                gio::Cancellable::NONE,
+            )
+            .map(|info| info.size().max(0) as u64)
+            .unwrap_or(0);
         if last < size {
             reporter.bytes_done += size - last;
         }
         return Ok(());
     }
 
-    make_folder(dst)?;
-    let entries = fs::read_dir(src).map_err(|error| error.to_string())?;
+    make_folder(dst, target_scope)?;
+    let entries = gfile(src, scope)
+        .enumerate_children(
+            "standard::name",
+            gio::FileQueryInfoFlags::NOFOLLOW_SYMLINKS,
+            gio::Cancellable::NONE,
+        )
+        .map_err(|error| error.to_string())?;
     for entry in entries {
         let entry = entry.map_err(|error| error.to_string())?;
-        let name = entry.file_name();
-        copy_tree(&src.join(&name), &dst.join(&name), reporter)?;
+        let name = entry.name();
+        copy_tree(
+            &src.join(&name),
+            &dst.join(&name),
+            reporter,
+            scope,
+            target_scope,
+        )?;
     }
 
     // Nautilus makes the directory and copies its children; it does not run
@@ -2397,23 +2748,29 @@ fn copy_tree(src: &Path, dst: &Path, reporter: &mut Reporter<'_>) -> Result<(), 
 
 /// Move one item. Never falls back to GIO's copy-and-delete: across a
 /// filesystem boundary the item is copied and its source is trashed.
-fn move_item(src: &Path, dst: &Path, reporter: &mut Reporter<'_>) -> Result<(), String> {
+fn move_item(
+    src: &Path,
+    dst: &Path,
+    reporter: &mut Reporter<'_>,
+    scope: Scope,
+    target_scope: Scope,
+) -> Result<(), String> {
     let flags = gio::FileCopyFlags::NOFOLLOW_SYMLINKS
         | gio::FileCopyFlags::ALL_METADATA
         | gio::FileCopyFlags::NO_FALLBACK_FOR_MOVE;
 
-    match gio::File::for_path(src).move_(
-        &gio::File::for_path(dst),
+    match gfile(src, scope).move_(
+        &gfile(dst, target_scope),
         flags,
         gio::Cancellable::NONE,
         None,
     ) {
         Ok(()) => Ok(()),
         Err(error) if crosses_filesystems(&error) => {
-            copy_tree(src, dst, reporter)?;
+            copy_tree(src, dst, reporter, scope, target_scope)?;
             // If the source can't be trashed, both copies stay: a duplicate
             // is recoverable, a deletion isn't. Nothing here deletes.
-            if let Err(error) = trash_path(src) {
+            if let Err(error) = trash_path(src, scope) {
                 return Err(format!(
                     "copied to {} but could not trash the source, so both copies remain: {error}",
                     dst.display()
@@ -2429,13 +2786,13 @@ fn crosses_filesystems(error: &glib::Error) -> bool {
     error.matches(gio::IOErrorEnum::WouldRecurse) || error.matches(gio::IOErrorEnum::NotSupported)
 }
 
-fn make_folder(path: &Path) -> Result<(), String> {
-    gio::File::for_path(path)
+fn make_folder(path: &Path, scope: Scope) -> Result<(), String> {
+    gfile(path, scope)
         .make_directory(gio::Cancellable::NONE)
         .map_err(|error| error.to_string())
 }
 
-fn rename_item(src: &Path, dst: &Path) -> Result<(), String> {
+fn rename_item(src: &Path, dst: &Path, scope: Scope, target_scope: Scope) -> Result<(), String> {
     let Some(name) = dst.file_name() else {
         return Err("the new name has no file name".to_string());
     };
@@ -2444,13 +2801,13 @@ fn rename_item(src: &Path, dst: &Path) -> Result<(), String> {
     // is; an undo of a rename back to a non-UTF-8 original name is not, so it
     // moves the file instead.
     match name.to_str() {
-        Some(name) => gio::File::for_path(src)
+        Some(name) => gfile(src, scope)
             .set_display_name(name, gio::Cancellable::NONE)
             .map(|_| ())
             .map_err(|error| error.to_string()),
-        None => gio::File::for_path(src)
+        None => gfile(src, scope)
             .move_(
-                &gio::File::for_path(dst),
+                &gfile(dst, target_scope),
                 gio::FileCopyFlags::NOFOLLOW_SYMLINKS,
                 gio::Cancellable::NONE,
                 None,
@@ -2459,14 +2816,24 @@ fn rename_item(src: &Path, dst: &Path) -> Result<(), String> {
     }
 }
 
-fn trash_path(path: &Path) -> Result<(), String> {
-    gio::File::for_path(path)
+fn trash_path(path: &Path, scope: Scope) -> Result<(), String> {
+    gfile(path, scope)
         .trash(gio::Cancellable::NONE)
         .map_err(|error| error.to_string())
 }
 
-fn is_empty_dir(path: &Path) -> bool {
-    fs::read_dir(path)
+fn is_empty_dir(path: &Path, scope: Scope) -> bool {
+    if scope == Scope::User {
+        return fs::read_dir(path)
+            .map(|mut entries| entries.next().is_none())
+            .unwrap_or(false);
+    }
+    gfile(path, scope)
+        .enumerate_children(
+            "standard::name",
+            gio::FileQueryInfoFlags::NOFOLLOW_SYMLINKS,
+            gio::Cancellable::NONE,
+        )
         .map(|mut entries| entries.next().is_none())
         .unwrap_or(false)
 }
@@ -2482,9 +2849,9 @@ struct TrashEntry {
     ino: u64,
 }
 
-fn trash_and_record(path: &Path) -> Result<Trashed, String> {
+fn trash_and_record(path: &Path, scope: Scope) -> Result<Trashed, String> {
     let at = SystemTime::now();
-    trash_path(path)?;
+    trash_path(path, scope)?;
     let entry = find_trash_entry(path, at);
     Ok(Trashed {
         original: path.to_path_buf(),

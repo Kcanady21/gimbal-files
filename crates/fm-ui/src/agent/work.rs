@@ -231,7 +231,10 @@ mod tests {
             7,
             41,
             Work::DryRun {
-                request: Request::Trash { paths: Vec::new() },
+                request: Request::Trash {
+                    paths: Vec::new(),
+                    scope: fm_core::admin::Scope::User,
+                },
                 undo_lines: None,
             },
         )

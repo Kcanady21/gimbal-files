@@ -108,6 +108,9 @@ pub struct Process {
     /// Mount roots the volume listener saw on its previous notification. A
     /// root that vanishes relocates every tab and tile under it.
     known_mount_roots: RefCell<HashSet<PathBuf>>,
+    /// The GVfs administrator mount is asked for once per session. It lives
+    /// until logout; Gimbal never unmounts it.
+    admin_mounted: Cell<bool>,
     /// Headless bridge tests skip GTK window construction and session saves.
     headless: bool,
     /// Test seam for the Trash page's contextual refusal. Production always
@@ -339,6 +342,7 @@ impl Process {
             clipboard_reader: Rc::new(crate::fileops::clipboard::SystemReader),
             volumes: RefCell::new(volumes),
             known_mount_roots: RefCell::new(known_mount_roots),
+            admin_mounted: Cell::new(false),
             headless: false,
             #[cfg(test)]
             trash_pages: RefCell::new(BTreeSet::new()),
@@ -456,6 +460,7 @@ impl Process {
                 crate::volumes::HeadlessBackend,
             ))),
             known_mount_roots: RefCell::new(known_mount_roots),
+            admin_mounted: Cell::new(false),
             headless: true,
             trash_pages: RefCell::new(BTreeSet::new()),
             native_nav_evidence_uses: Cell::new(0),
@@ -489,6 +494,25 @@ impl Process {
             })
             .expect("window id");
         self.apply_events(&events);
+        id
+    }
+
+    #[cfg(test)]
+    pub(crate) fn seed_admin_tab(self: &Rc<Self>, window: WindowId, folder: PathBuf) -> TabId {
+        let events = self
+            .workspace
+            .borrow_mut()
+            .tab_new_admin(folder)
+            .expect("test administrator tab");
+        let id = events
+            .iter()
+            .find_map(|event| match event {
+                Event::TabAdded { tab, .. } => Some(*tab),
+                _ => None,
+            })
+            .expect("tab id");
+        self.apply_events(&events);
+        let _ = window;
         id
     }
 
@@ -1235,13 +1259,46 @@ impl Process {
             self.show_drop_reason(window, &reason);
             return;
         }
+        // Dropping into an administrator tab is off. Spring-loading a pill can
+        // make the admin tab focused mid-drag, and a split tile can show one
+        // unfocused, so check both rather than trust the grid's own state.
+        let into_admin = self.focused_admin(window)
+            || self.window_snapshot(window).is_some_and(|window| {
+                window.groups.values().any(|group| {
+                    group
+                        .tabs
+                        .iter()
+                        .any(|tab| tab.admin && tab.folder == target)
+                })
+            });
+        if into_admin {
+            crate::log!("admin", "refused a drop into an administrator tab");
+            self.show_drop_reason(window, "dropping is off in an administrator tab");
+            return;
+        }
         let count = paths.len();
         let action = intent.action();
         let operation =
             dnd::operation_for_action(&dnd::Target::Grid(target.clone()), &paths, action);
         let (request, chosen) = match operation {
-            Ok(dnd::Operation::Copy { to }) => (Request::Copy { paths, to }, dnd::DropAction::Copy),
-            Ok(dnd::Operation::Move { to }) => (Request::Move { paths, to }, dnd::DropAction::Move),
+            Ok(dnd::Operation::Copy { to }) => (
+                Request::Copy {
+                    paths,
+                    to,
+                    scope: fm_core::admin::Scope::User,
+                    target_scope: fm_core::admin::Scope::User,
+                },
+                dnd::DropAction::Copy,
+            ),
+            Ok(dnd::Operation::Move { to }) => (
+                Request::Move {
+                    paths,
+                    to,
+                    scope: fm_core::admin::Scope::User,
+                    target_scope: fm_core::admin::Scope::User,
+                },
+                dnd::DropAction::Move,
+            ),
             Ok(_) => return,
             Err(reason) => {
                 self.show_drop_reason(window, &reason);
@@ -1272,7 +1329,15 @@ impl Process {
         }
         let count = paths.len();
         if let Some(fileops) = self.fileops() {
-            let id = fileops.submit(window, Request::Trash { paths }, false, None);
+            let id = fileops.submit(
+                window,
+                Request::Trash {
+                    paths,
+                    scope: fm_core::admin::Scope::User,
+                },
+                false,
+                None,
+            );
             crate::log!("dnd", "drop {count} item(s) on the Trash -> job {id}");
         }
     }
@@ -1514,6 +1579,104 @@ impl Process {
                 crate::log!("open", "{} is gone; nothing to open", path.display())
             }
         }
+    }
+
+    /// Whether the window's focused tab is an administrator tab.
+    pub fn focused_admin(&self, window: WindowId) -> bool {
+        self.window_snapshot(window)
+            .and_then(|window| {
+                let tab = window.focused_tab;
+                window.tab(tab).map(|tab| tab.admin)
+            })
+            .unwrap_or(false)
+    }
+
+    /// Open a checked folder as an administrator tab. The first request in a
+    /// session mounts GVfs's admin backend, which is where polkit asks for the
+    /// password. A cancelled or failed mount opens no tab.
+    fn open_admin_tab(self: &Rc<Self>, window: WindowId, folder: PathBuf) -> Outcome {
+        let current_uid = match fm_core::admin::current_uid() {
+            Ok(uid) => uid,
+            Err(error) => return Outcome::Failed(error),
+        };
+        if let Err(problem) = fm_core::admin::check_admin_folder(&folder, current_uid) {
+            let message = problem.message().to_string();
+            if let Some(ui) = self.window(window) {
+                ui.show_summary(&message, None);
+            }
+            return Outcome::Failed(message);
+        }
+        if self.admin_mounted.get() {
+            return self.finish_admin_open(window, &folder);
+        }
+        let Some(ui) = self.window(window) else {
+            return Outcome::Failed("the window is gone".to_string());
+        };
+        let Some(uri) = fm_core::admin::scoped_uri(&folder, fm_core::admin::Scope::Admin) else {
+            return Outcome::Failed("the administrator path could not be encoded".to_string());
+        };
+        let parent: gtk::Window = ui.window().clone().upcast();
+        let operation = gtk::MountOperation::new(Some(&parent));
+        let keep = operation.clone();
+        let cancellable = gio::Cancellable::new();
+        let weak = Rc::downgrade(self);
+        let mount_folder = folder.clone();
+        gio::File::for_uri(&uri).mount_enclosing_volume(
+            gio::MountMountFlags::NONE,
+            Some(&operation),
+            Some(&cancellable),
+            move |result| {
+                drop(keep);
+                let Some(process) = weak.upgrade() else {
+                    return;
+                };
+                match result {
+                    Ok(()) => {
+                        process.admin_mounted.set(true);
+                        crate::log!(
+                            "admin",
+                            "mount granted for {} (kept until logout; Gimbal never unmounts it)",
+                            mount_folder.display()
+                        );
+                        process.finish_admin_open(window, &mount_folder);
+                    }
+                    Err(error) => {
+                        let cancelled = error.matches(gio::IOErrorEnum::Cancelled)
+                            || error.message().to_lowercase().contains("cancel");
+                        let message = if cancelled {
+                            "Administrator access was not granted.".to_string()
+                        } else {
+                            format!("Administrator access was not granted: {error}")
+                        };
+                        crate::log!(
+                            "admin",
+                            "mount failed for {}: {}",
+                            mount_folder.display(),
+                            if cancelled {
+                                "cancelled"
+                            } else {
+                                error.message()
+                            }
+                        );
+                        if let Some(ui) = process.window(window) {
+                            ui.show_summary(&message, None);
+                        }
+                    }
+                }
+            },
+        );
+        Outcome::Done
+    }
+
+    fn finish_admin_open(self: &Rc<Self>, _window: WindowId, folder: &Path) -> Outcome {
+        let result = self
+            .workspace
+            .borrow_mut()
+            .tab_new_admin(folder.to_path_buf());
+        if result.is_ok() {
+            crate::log!("admin", "opened administrator tab at {}", folder.display());
+        }
+        self.finish(result)
     }
 
     /// The one launch path, shared by `file.open` and a double-click. The
@@ -2226,6 +2389,14 @@ impl Process {
             Event::SelectionChanged { window } => self.on_selection_changed(*window),
             Event::Navigated { window, folder, .. } => self.on_navigated(*window, folder),
             Event::ScrollAnchorChanged { window, .. } => self.on_scroll_anchor_changed(*window),
+            Event::TabScopeChanged { window, .. } => {
+                self.refresh(*window, false);
+                // The folder did not change, so re-read it in the new scope;
+                // this also reveals or hides the banner and tile border.
+                if let Some(ui) = self.window(*window) {
+                    ui.reload_folder();
+                }
+            }
         }
     }
 
@@ -2875,6 +3046,31 @@ impl Process {
             _ => {}
         }
 
+        if self.focused_admin(window) {
+            let (off, why) = match command.name() {
+                "preview.edit" | "preview.save" | "preview.save-as" | "preview.discard" => (
+                    true,
+                    "Preview editing is off in an administrator tab; the preview stays read-only.",
+                ),
+                "search.open" => (
+                    true,
+                    "Recursive search is off in an administrator tab; browse the folder instead.",
+                ),
+                _ => (false, ""),
+            };
+            if off {
+                crate::log!(
+                    "admin",
+                    "refused {}: the tab is an administrator tab",
+                    command.name()
+                );
+                if let Some(ui) = self.window(window) {
+                    ui.show_summary(why, None);
+                }
+                return Outcome::Failed(why.to_string());
+            }
+        }
+
         if command.name().starts_with("preview.") {
             return self.preview_command(window, command);
         }
@@ -2897,9 +3093,21 @@ impl Process {
             if paths.is_empty() {
                 return Outcome::Failed("file.open has nothing selected".to_string());
             }
+            let admin_tab = self.focused_admin(window);
+            let current_uid = fm_core::admin::current_uid().ok();
             let mut failures = Vec::new();
             for path in paths {
-                if let Err(error) = self.launch_file(&path) {
+                let owner = fm_core::admin::file_facts(&path).2;
+                let use_admin = admin_tab
+                    && owner
+                        .zip(current_uid)
+                        .is_some_and(|(owner, uid)| fm_core::admin::needs_admin(owner, uid));
+                let result = if use_admin {
+                    self.launch_file_as_admin(window, &path)
+                } else {
+                    self.launch_file(&path)
+                };
+                if let Err(error) = result {
                     failures.push(error);
                 }
             }
@@ -3016,6 +3224,10 @@ impl Process {
         match command.effect() {
             Effect::Settings => return self.settings_change(window, command),
             Effect::View => {}
+            // The two administrator-tab commands are System (UI-only) but are
+            // handled with the other tab commands below.
+            Effect::System if matches!(command.name(), "tab.open-as-admin" | "tab.leave-admin") => {
+            }
             _ => {
                 return Outcome::Failed(format!(
                     "{} is not implemented by this version",
@@ -3058,6 +3270,17 @@ impl Process {
                     }
                 }
                 self.save_now(false);
+                if let Some(window) = self.window_snapshot(window) {
+                    for group in window.groups.values() {
+                        for tab in group.tabs.iter().filter(|tab| tab.admin) {
+                            crate::log!(
+                                "admin",
+                                "closed administrator tab at {} (window closed)",
+                                tab.folder.display()
+                            );
+                        }
+                    }
+                }
                 let result = self.workspace.borrow_mut().window_close();
                 self.finish(result);
             }
@@ -3065,8 +3288,39 @@ impl Process {
                 let result = self.workspace.borrow_mut().tab_new(path);
                 self.finish(result);
             }
+            "tab.open-as-admin" => {
+                if caller != Caller::Ui {
+                    return Outcome::Failed(
+                        "tab.open-as-admin is available only from the window".to_string(),
+                    );
+                }
+                let Some(folder) = path else {
+                    return Outcome::Failed("tab.open-as-admin needs a folder".to_string());
+                };
+                return self.open_admin_tab(window, folder);
+            }
+            "tab.leave-admin" => {
+                if caller != Caller::Ui {
+                    return Outcome::Failed(
+                        "tab.leave-admin is available only from the window".to_string(),
+                    );
+                }
+                let folder = self.current_folder(window);
+                let result = self.workspace.borrow_mut().tab_leave_admin();
+                if result.as_ref().is_ok_and(|events| !events.is_empty())
+                    && let Some(folder) = folder
+                {
+                    crate::log!("admin", "left administrator tab at {}", folder.display());
+                }
+                self.finish(result);
+            }
             "tab.close" => {
                 self.save_now(false);
+                if self.focused_admin(window)
+                    && let Some(folder) = self.current_folder(window)
+                {
+                    crate::log!("admin", "closed administrator tab at {}", folder.display());
+                }
                 let result = self.workspace.borrow_mut().tab_close();
                 self.finish(result);
             }
@@ -3386,7 +3640,16 @@ impl Process {
         let checked = Registry::new()
             .validate(caller, &invocation)
             .map_err(|error| error.to_string())?;
-        fm_core::fileops::request_for(&checked).map_err(|error| error.to_string())
+        let request = fm_core::fileops::request_for(&checked).map_err(|error| error.to_string())?;
+        // The tab a file operation acts on owns its access. A move or copy
+        // started here names a destination elsewhere, which stays the user's
+        // own path unless the operation is a paste into this tab.
+        let scope = if self.focused_admin(window) {
+            fm_core::admin::Scope::Admin
+        } else {
+            fm_core::admin::Scope::User
+        };
+        Ok(request.map(|request| request.with_scopes(scope, fm_core::admin::Scope::User)))
     }
 
     fn run_file_command(
@@ -3417,6 +3680,76 @@ impl Process {
             }
         };
 
+        // Administrator tabs ask before irreversible work. Delete is a
+        // permanent delete there; a move out of the tab's folder tree is the
+        // other operation this path can see before the worker plans it.
+        if self.focused_admin(window) && !command.dry_run() {
+            match &request {
+                fm_core::fileops::Request::Trash { paths, .. } => {
+                    let names: Vec<String> = paths
+                        .iter()
+                        .filter_map(|path| path.file_name())
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .collect();
+                    let paths = paths.clone();
+                    if let Some(ui) = self.window(window) {
+                        let weak = Rc::downgrade(self);
+                        dialogs::confirm_admin_delete(
+                            &ui,
+                            &names,
+                            Rc::new(move |confirmed| {
+                                if !confirmed {
+                                    return;
+                                }
+                                let Some(process) = weak.upgrade() else {
+                                    return;
+                                };
+                                process.submit_admin_permanent(window, &paths);
+                            }),
+                        );
+                    }
+                    return Some(Outcome::Done);
+                }
+                fm_core::fileops::Request::Move { paths, to, .. } => {
+                    let tree = self
+                        .current_folder(window)
+                        .unwrap_or_else(|| PathBuf::from("/"));
+                    if !to.starts_with(&tree) {
+                        let names: Vec<String> = paths
+                            .iter()
+                            .filter_map(|path| path.file_name())
+                            .map(|name| name.to_string_lossy().into_owned())
+                            .collect();
+                        let shown = names.iter().take(3).cloned().collect::<Vec<_>>().join(", ");
+                        if let Some(ui) = self.window(window) {
+                            let weak = Rc::downgrade(self);
+                            let request = request.clone();
+                            dialogs::confirm_admin(
+                                &ui,
+                                "Move outside the administrator folder?",
+                                &format!(
+                                    "{shown} will be moved to {}. The tab's access still applies.",
+                                    to.display()
+                                ),
+                                "Move",
+                                Rc::new(move |confirmed| {
+                                    if !confirmed {
+                                        return;
+                                    }
+                                    let Some(process) = weak.upgrade() else {
+                                        return;
+                                    };
+                                    process.submit_request(window, request.clone(), false);
+                                }),
+                            );
+                        }
+                        return Some(Outcome::Done);
+                    }
+                }
+                _ => {}
+            }
+        }
+
         if command.dry_run() {
             // Every plan is built on the worker. The UI only logs the eventual
             // result through `fileop_dry_run`; GTK never plans a file request.
@@ -3443,6 +3776,67 @@ impl Process {
             crate::log!("fileops", "{} queued as job {id}", command.name());
         }
         Some(Outcome::Done)
+    }
+
+    fn submit_request(
+        self: &Rc<Self>,
+        window: WindowId,
+        request: Request,
+        clear_clipboard: bool,
+    ) -> Option<u64> {
+        let fileops = self.fileops()?;
+        if !fileops.can_accept() {
+            crate::log!("fileops", "too many file jobs are already waiting");
+            return None;
+        }
+        Some(fileops.submit(window, request, clear_clipboard, None))
+    }
+
+    fn submit_admin_permanent(self: &Rc<Self>, window: WindowId, paths: &[PathBuf]) -> Option<u64> {
+        self.submit_request(
+            window,
+            Request::DeletePermanent {
+                paths: paths.to_vec(),
+                scope: fm_core::admin::Scope::Admin,
+            },
+            false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn submit_paste_job(
+        self: &Rc<Self>,
+        window: WindowId,
+        request: Request,
+        mode: clipboard::ClipboardMode,
+        dry_run: bool,
+        authorization: Option<crate::agent::JobAuthorization>,
+        reserved: Option<String>,
+    ) -> Option<u64> {
+        let fileops = self.fileops()?;
+        if !fileops.can_accept() {
+            crate::log!("fileops", "too many file jobs are already waiting");
+            return None;
+        }
+        let id = if dry_run {
+            let id = fileops.submit_dry_run(window, request, authorization);
+            crate::log!("fileops", "paste dry run queued as job {id}");
+            id
+        } else {
+            let id = fileops.submit(
+                window,
+                request,
+                clipboard::clear_after_cut(mode),
+                authorization,
+            );
+            crate::log!("fileops", "paste ({}): job {id}", mode.as_str());
+            id
+        };
+        if let Some(token) = &reserved {
+            let running = fileops.current_id() == Some(id);
+            crate::agent::attach_fileops(self, token, id, running);
+        }
+        Some(id)
     }
 
     fn put_on_clipboard(
@@ -3561,44 +3955,102 @@ impl Process {
                     fail("the clipboard has no local files".to_string());
                     return;
                 }
+                let paste_names: Vec<String> = paths
+                    .iter()
+                    .filter_map(|path| path.file_name())
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .collect();
+                let admin = process
+                    .window_snapshot(window)
+                    .and_then(|window| {
+                        let tab = window.focused_tab;
+                        window.tab(tab).map(|tab| tab.admin)
+                    })
+                    .unwrap_or(false);
+                let scope = if admin {
+                    fm_core::admin::Scope::Admin
+                } else {
+                    fm_core::admin::Scope::User
+                };
+                // A paste can carry files cut or copied from an administrator
+                // tab. Only sources this user can't read (or, for a cut, can't
+                // delete) use the administrator backend; a readable root-owned
+                // file copies as the user, with no mount or password prompt.
+                let cut = payload.mode == clipboard::ClipboardMode::Cut;
+                let source_scope = fm_core::admin::paste_source_scope(
+                    paths.iter().map(|path| source_access(path)),
+                    cut,
+                );
                 let request = match payload.mode {
                     clipboard::ClipboardMode::Cut => Request::Move {
                         paths,
                         to: folder.clone(),
+                        scope: source_scope,
+                        target_scope: scope,
                     },
                     clipboard::ClipboardMode::Copy => Request::Copy {
                         paths,
                         to: folder.clone(),
+                        scope: source_scope,
+                        target_scope: scope,
                     },
                 };
-                let Some(fileops) = process.fileops() else {
-                    fail("the file-operation worker is unavailable".to_string());
-                    return;
-                };
-                if !fileops.can_accept() {
-                    fail("too many file jobs are already waiting".to_string());
-                    return;
-                }
-                if dry_run {
-                    let id = fileops.submit_dry_run(window, request, authorization.clone());
-                    if let Some(token) = &reserved {
-                        let running = fileops.current_id() == Some(id);
-                        crate::agent::attach_fileops(&process, token, id, running);
+                let mode = payload.mode;
+                let tree = process
+                    .current_folder(window)
+                    .unwrap_or_else(|| PathBuf::from("/"));
+                let asks_move_out = scope == fm_core::admin::Scope::Admin
+                    && mode == clipboard::ClipboardMode::Cut
+                    && !folder.starts_with(&tree);
+                if asks_move_out && !dry_run {
+                    let shown = paste_names
+                        .iter()
+                        .take(3)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    if let Some(ui) = process.window(window) {
+                        let submit_process = process.clone();
+                        let submit_request = request.clone();
+                        let submit_authorization = authorization.clone();
+                        let submit_reserved = reserved.clone();
+                        dialogs::confirm_admin(
+                            &ui,
+                            "Move outside the administrator folder?",
+                            &format!(
+                                "{shown} will be moved to {}. The tab's access still applies.",
+                                folder.display()
+                            ),
+                            "Move",
+                            Rc::new(move |confirmed| {
+                                if confirmed {
+                                    submit_process.submit_paste_job(
+                                        window,
+                                        submit_request.clone(),
+                                        mode,
+                                        false,
+                                        submit_authorization.clone(),
+                                        submit_reserved.clone(),
+                                    );
+                                }
+                            }),
+                        );
                     }
-                    crate::log!("fileops", "paste dry run queued as job {id}");
                     return;
                 }
-                let id = fileops.submit(
-                    window,
-                    request,
-                    clipboard::clear_after_cut(payload.mode),
-                    authorization.clone(),
-                );
-                if let Some(token) = &reserved {
-                    let running = fileops.current_id() == Some(id);
-                    crate::agent::attach_fileops(&process, token, id, running);
+                if process
+                    .submit_paste_job(
+                        window,
+                        request,
+                        mode,
+                        dry_run,
+                        authorization.clone(),
+                        reserved.clone(),
+                    )
+                    .is_none()
+                {
+                    fail("the file-operation worker is unavailable".to_string());
                 }
-                crate::log!("fileops", "paste ({}): job {id}", payload.mode.as_str());
             }),
         );
     }
@@ -3656,7 +4108,11 @@ impl Process {
             dialogs::show_menu(
                 &ui,
                 anchor,
-                &menus::item_menu(&items, fm_core::admin::current_uid().ok()),
+                &menus::item_menu_in_scope(
+                    &items,
+                    fm_core::admin::current_uid().ok(),
+                    self.focused_admin(window),
+                ),
                 None,
             );
         }
@@ -3682,7 +4138,17 @@ impl Process {
             .as_ref()
             .is_some_and(|fileops| fileops.baobab_available());
         let has_files = self.clipboard_has_files(window);
-        let items = menus::background_menu(&folder, undo.as_deref(), baobab, has_files);
+        let current_uid = fm_core::admin::current_uid().ok();
+        let needs_admin =
+            current_uid.is_some_and(|uid| fm_core::admin::folder_needs_admin(&folder, uid));
+        let items = menus::background_menu_in_scope(
+            &folder,
+            undo.as_deref(),
+            baobab,
+            has_files,
+            needs_admin,
+            self.focused_admin(window),
+        );
         if let Some(ui) = self.window(window) {
             // The anchor is the whole grid scroller: point at the click, or
             // the popover lands at the scroller's edge, outside the window
@@ -3759,6 +4225,32 @@ impl Process {
         } else {
             progress::summary(request, report)
         };
+        if plan.is_admin() {
+            crate::log!(
+                "admin",
+                "{}: {} item(s), {} done",
+                request.summary(),
+                plan.steps().len(),
+                report
+                    .items
+                    .iter()
+                    .filter(|item| item.outcome == fm_core::fileops::ItemOutcome::Done)
+                    .count()
+            );
+            // GVfs's admin backend reports renames in a form GtkDirectoryList
+            // drops, which once left a deleted name listed beside its new one.
+            // Re-read every administrator view rather than trust its monitor.
+            let reloaded: usize = self
+                .windows
+                .borrow()
+                .values()
+                .map(|ui| ui.reload_admin_folders())
+                .sum();
+            crate::log!(
+                "admin",
+                "re-read {reloaded} administrator view(s) after the job"
+            );
+        }
         let failures = progress::failure_lines(report);
         crate::agent::job_finished(
             self,
@@ -3986,6 +4478,23 @@ fn desktop_entry_fields(app: &gio::AppInfo) -> DesktopEntryFields {
         flatpak: has("X-Flatpak"),
         snap: has("X-SnapInstanceName"),
     }
+}
+
+/// What this user may do with a paste source, from GIO's own access check
+/// (`access::can-read`, `access::can-delete`). `None` when the file can't be
+/// queried at all, as inside a folder only root can enter.
+fn source_access(path: &Path) -> fm_core::admin::SourceAccess {
+    let info = gio::File::for_path(path)
+        .query_info(
+            "access::can-read,access::can-delete",
+            gio::FileQueryInfoFlags::NONE,
+            None::<&gio::Cancellable>,
+        )
+        .ok()?;
+    Some((
+        info.boolean("access::can-read"),
+        info.boolean("access::can-delete"),
+    ))
 }
 
 fn kio_admin_installed() -> bool {
@@ -4562,6 +5071,7 @@ mod tests {
                 crate::volumes::HeadlessBackend,
             ))),
             known_mount_roots: RefCell::new(HashSet::new()),
+            admin_mounted: Cell::new(false),
             headless: false,
             trash_pages: RefCell::new(BTreeSet::new()),
             native_nav_evidence_uses: Cell::new(0),
@@ -6567,5 +7077,42 @@ order = "descending"
             third,
             &["a.txt", "c.txt", "b.txt"],
         );
+    }
+
+    /// Both administrator-tab commands are System commands handled with the
+    /// other tab commands. They once stopped at the effect gate with "not
+    /// implemented by this version", so the menu entry never mounted or
+    /// prompted. A folder the user owns reaches open_admin_tab's own refusal.
+    #[test]
+    fn the_admin_tab_commands_reach_their_handlers() {
+        use fm_core::command::{Caller, Invocation, Registry};
+
+        let scratch = search_scratch("admin-route");
+        let process = Process::headless(
+            scratch.root.join("config.toml"),
+            scratch.root.join("home"),
+            Rc::new(NoClipboard),
+        );
+        let window = process.seed_window(scratch.root.join("home"));
+        let dispatch = |name: &str, arguments: Vec<(String, String)>| {
+            let mut handler = crate::commands::UiHandler {
+                caller: Caller::Ui,
+                window,
+                process: Rc::downgrade(&process),
+            };
+            Registry::new().dispatch(Caller::Ui, &Invocation::new(name, arguments), &mut handler)
+        };
+
+        let owned = scratch.root.join("home").display().to_string();
+        let opened = dispatch("tab.open-as-admin", vec![("path".to_string(), owned)]);
+        assert_eq!(
+            opened,
+            Outcome::Failed(
+                fm_core::admin::AdminFolderProblem::OwnedByUser
+                    .message()
+                    .to_string()
+            )
+        );
+        assert_eq!(dispatch("tab.leave-admin", Vec::new()), Outcome::Done);
     }
 }

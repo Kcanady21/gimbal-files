@@ -237,6 +237,7 @@ fn child_trash_and_undo() {
 
     let mut operations = FileOperations::new();
     let request = Request::Trash {
+        scope: fm_core::admin::Scope::User,
         paths: vec![one.clone(), folder.clone()],
     };
     let plan = operations.plan(&request);
@@ -276,6 +277,8 @@ fn child_replace_copy_and_undo() {
 
     let mut operations = FileOperations::new();
     let request = Request::Copy {
+        scope: fm_core::admin::Scope::User,
+        target_scope: fm_core::admin::Scope::User,
         paths: vec![source.clone()],
         to: scratch.join("dst"),
     };
@@ -322,6 +325,8 @@ fn child_mixed_decisions() {
 
     let mut operations = FileOperations::new();
     let plan = operations.plan(&Request::Copy {
+        scope: fm_core::admin::Scope::User,
+        target_scope: fm_core::admin::Scope::User,
         paths: paths.clone(),
         to: destination.clone(),
     });
@@ -367,6 +372,7 @@ fn child_new_folder_undo() {
 
     let mut operations = FileOperations::new();
     let request = Request::NewFolder {
+        scope: fm_core::admin::Scope::User,
         name: "empty".to_string(),
         in_folder: scratch.clone(),
     };
@@ -376,6 +382,7 @@ fn child_new_folder_undo() {
     assert!(empty.is_dir());
 
     let request = Request::NewFolder {
+        scope: fm_core::admin::Scope::User,
         name: "full".to_string(),
         in_folder: scratch.clone(),
     };
@@ -427,6 +434,8 @@ fn child_cross_filesystem_move() {
 
     let mut operations = FileOperations::new();
     let plan = operations.plan(&Request::Move {
+        scope: fm_core::admin::Scope::User,
+        target_scope: fm_core::admin::Scope::User,
         paths: vec![tree.clone()],
         to: destination.clone(),
     });
@@ -470,6 +479,8 @@ fn child_untrashable_source() {
 
     let mut operations = FileOperations::new();
     let plan = operations.plan(&Request::Move {
+        scope: fm_core::admin::Scope::User,
+        target_scope: fm_core::admin::Scope::User,
         paths: vec![tree.clone()],
         to: scratch.clone(),
     });

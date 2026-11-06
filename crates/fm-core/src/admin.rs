@@ -9,6 +9,135 @@
 
 use std::path::{Path, PathBuf};
 
+/// How a native path reaches the filesystem: as this user, or through GVfs's
+/// administrator mount. Paths in a tab stay native; only the GIO object that
+/// reads or writes them changes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Scope {
+    #[default]
+    User,
+    Admin,
+}
+
+impl Scope {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Admin => "admin",
+        }
+    }
+}
+
+/// The one way fm-core builds a GIO file from a native path. An administrator
+/// path is percent-encoded exactly as P2y's launch path encodes it, so a name
+/// with spaces, `#`, `%`, parentheses or non-UTF-8 bytes keeps one spelling.
+pub fn gfile(path: &Path, scope: Scope) -> gio::File {
+    match scope {
+        Scope::User => gio::File::for_path(path),
+        Scope::Admin => admin_uri(AppFamily::Gio, path)
+            .map(|uri| gio::File::for_uri(&uri))
+            .unwrap_or_else(|| gio::File::for_path(path)),
+    }
+}
+
+/// The URI `gfile` builds, for tests and logs. `None` for a path the encoder
+/// could not read.
+pub fn scoped_uri(path: &Path, scope: Scope) -> Option<String> {
+    match scope {
+        Scope::User => glib::filename_to_uri(path, None)
+            .ok()
+            .map(|uri| uri.to_string()),
+        Scope::Admin => admin_uri(AppFamily::Gio, path),
+    }
+}
+
+/// One irreversible administrator operation. Copy, rename and new folder are
+/// not here: the banner warns, and undo covers them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AdminRisk {
+    /// Deleting without a trash copy.
+    PermanentDelete,
+    /// Replacing an existing target in a conflict.
+    Overwrite,
+    /// Moving an item outside the tab's own folder tree.
+    MoveOutsideTree,
+}
+
+/// What a paste source allows this user, as GIO's `access::can-read` and
+/// `access::can-delete` report it. `None` means GIO could not even query the
+/// file, as inside a folder only root can enter.
+pub type SourceAccess = Option<(bool, bool)>;
+
+/// The scope that reads (and, for a cut, removes) pasted sources. Ownership
+/// is not the test: a root-owned file the user can read, such as a wallpaper
+/// under /usr/share, copies as the user without the administrator mount or a
+/// password prompt. Only a source the user cannot read, or cannot delete when
+/// cutting, needs the administrator backend.
+pub fn paste_source_scope(sources: impl IntoIterator<Item = SourceAccess>, cut: bool) -> Scope {
+    let needs_admin = sources.into_iter().any(|access| match access {
+        Some((can_read, can_delete)) => !can_read || (cut && !can_delete),
+        None => true,
+    });
+    if needs_admin {
+        Scope::Admin
+    } else {
+        Scope::User
+    }
+}
+
+/// Whether this operation asks before it runs. Only administrator tabs ask:
+/// ordinary tabs keep their existing behaviour, including the trash.
+pub fn asks_first(scope: Scope, risk: AdminRisk) -> bool {
+    scope == Scope::Admin
+        && matches!(
+            risk,
+            AdminRisk::PermanentDelete | AdminRisk::Overwrite | AdminRisk::MoveOutsideTree
+        )
+}
+
+/// Whether a folder's owner differs from the current user. Missing metadata is
+/// not an administrator candidate: the command refuses it separately.
+pub fn folder_needs_admin(path: &Path, current_uid: u32) -> bool {
+    file_facts(path)
+        .2
+        .is_some_and(|owner| needs_admin(owner, current_uid))
+}
+
+/// Why `tab.open-as-admin` refuses a folder.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AdminFolderProblem {
+    Missing,
+    NotAFolder,
+    OwnedByUser,
+}
+
+impl AdminFolderProblem {
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::Missing => "Open as Administrator needs an existing folder.",
+            Self::NotAFolder => "Open as Administrator works on folders, not files.",
+            Self::OwnedByUser => "You own this folder; open it normally.",
+        }
+    }
+}
+
+/// Check the folder `tab.open-as-admin` was given. Missing metadata, a file
+/// and a folder the user owns are each refused before a mount is attempted.
+pub fn check_admin_folder(path: &Path, current_uid: u32) -> Result<&Path, AdminFolderProblem> {
+    let (is_dir, is_file, owner) = file_facts(path);
+    if !is_dir {
+        return Err(if is_file {
+            AdminFolderProblem::NotAFolder
+        } else {
+            AdminFolderProblem::Missing
+        });
+    }
+    match owner {
+        Some(owner) if needs_admin(owner, current_uid) => Ok(path),
+        _ => Err(AdminFolderProblem::OwnedByUser),
+    }
+}
+
 /// The current user's uid. `/proc/self` is owned by the process's real uid, so
 /// reading its metadata avoids a dependency on `getuid(2)` or libc.
 pub fn current_uid() -> Result<u32, String> {
@@ -204,8 +333,34 @@ pub fn selected_admin_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gio::prelude::FileExt;
     use std::ffi::OsString;
     use std::os::unix::ffi::OsStringExt;
+
+    #[test]
+    fn a_readable_root_owned_source_pastes_as_the_user() {
+        // Copy: readable is enough, even when the user can't delete it.
+        assert_eq!(
+            paste_source_scope([Some((true, false))], false),
+            Scope::User
+        );
+        // Cut must also remove the source.
+        assert_eq!(
+            paste_source_scope([Some((true, false))], true),
+            Scope::Admin
+        );
+        assert_eq!(paste_source_scope([Some((true, true))], true), Scope::User);
+        // One unreadable or unqueryable source makes the whole paste admin.
+        assert_eq!(
+            paste_source_scope([Some((true, true)), Some((false, false))], false),
+            Scope::Admin
+        );
+        assert_eq!(
+            paste_source_scope([Some((true, true)), None], false),
+            Scope::Admin
+        );
+        assert_eq!(paste_source_scope([], false), Scope::User);
+    }
 
     #[test]
     fn an_empty_file_is_looked_up_by_its_name() {
@@ -314,6 +469,71 @@ mod tests {
             admin_uri(AppFamily::Kio, &path).as_deref(),
             Some("admin:/tmp/nonutf8-%FF.txt")
         );
+    }
+
+    #[test]
+    fn gfile_uses_the_user_path_or_the_admin_uri() {
+        let path = Path::new("/tmp/a b#%()z");
+        assert_eq!(gfile(path, Scope::User).uri(), "file:///tmp/a%20b%23%25()z");
+        assert_eq!(
+            gfile(path, Scope::Admin).uri(),
+            "admin:///tmp/a%20b%23%25()z"
+        );
+
+        let non_utf8 = PathBuf::from(OsString::from_vec(b"/tmp/nonutf8-\xff".to_vec()));
+        assert_eq!(
+            gfile(&non_utf8, Scope::Admin).uri(),
+            "admin:///tmp/nonutf8-%FF"
+        );
+    }
+
+    #[test]
+    fn an_administrator_folder_must_exist_be_a_folder_and_be_unowned() {
+        struct Scratch(PathBuf);
+        impl Drop for Scratch {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let root = PathBuf::from(format!(
+            "/tmp/gimbal-p2z-admin-folder-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("scratch");
+        let scratch = Scratch(root.clone());
+        let folder = root.join("folder");
+        std::fs::create_dir(&folder).expect("folder");
+        let file = root.join("file");
+        std::fs::write(&file, b"x").expect("file");
+        let uid = current_uid().expect("uid");
+
+        assert!(check_admin_folder(&folder, 0).is_ok());
+        assert_eq!(
+            check_admin_folder(&folder, uid),
+            Err(AdminFolderProblem::OwnedByUser)
+        );
+        assert_eq!(
+            check_admin_folder(&file, 0),
+            Err(AdminFolderProblem::NotAFolder)
+        );
+        assert_eq!(
+            check_admin_folder(&root.join("missing"), 0),
+            Err(AdminFolderProblem::Missing)
+        );
+        drop(scratch);
+    }
+
+    #[test]
+    fn only_administrator_tabs_ask_before_irreversible_work() {
+        for risk in [
+            AdminRisk::PermanentDelete,
+            AdminRisk::Overwrite,
+            AdminRisk::MoveOutsideTree,
+        ] {
+            assert!(asks_first(Scope::Admin, risk));
+            assert!(!asks_first(Scope::User, risk));
+        }
     }
 
     #[test]

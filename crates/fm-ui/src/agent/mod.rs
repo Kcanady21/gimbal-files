@@ -1102,6 +1102,7 @@ fn tab_info(window: &Window, tab: &fm_core::workspace::Tab, instance: &str) -> T
         folder: tab.folder.display().to_string(),
         folder_hex: hex(tab.folder.as_os_str().as_bytes()),
         focused: window.focused_tab == tab.id,
+        admin: tab.admin,
         selection_count: count,
         selection: names,
         selection_truncated: truncated,
@@ -1179,12 +1180,12 @@ fn run_prepare(
     let target = match resolve_target(process, instance, window_id, tab) {
         Ok(target) => target,
         Err(message) => {
-            return RunPrepared::Reply(error_reply(
-                request_id,
-                operation,
-                "invalid-target",
-                message,
-            ));
+            let code = if message == "administrator tabs are UI-only" {
+                "forbidden"
+            } else {
+                "invalid-target"
+            };
+            return RunPrepared::Reply(error_reply(request_id, operation, code, message));
         }
     };
 
@@ -1509,6 +1510,16 @@ fn resolve_target(
     let snapshot = process
         .window_snapshot(window)
         .ok_or_else(|| "the requested window no longer exists".to_string())?;
+    if snapshot
+        .tab(snapshot.focused_tab)
+        .is_some_and(|tab| tab.admin)
+    {
+        crate::log!(
+            "admin",
+            "refused an agent request in an administrator window"
+        );
+        return Err("administrator tabs are UI-only".to_string());
+    }
     let tab = match tab {
         Some(text) => {
             let id = parse_tab_id(process, instance, text)
@@ -1525,6 +1536,10 @@ fn resolve_target(
             snapshot.focused_tab
         }
     };
+    if snapshot.tab(tab).is_some_and(|tab| tab.admin) {
+        crate::log!("admin", "refused an agent request in an administrator tab");
+        return Err("administrator tabs are UI-only".to_string());
+    }
     Ok(ExecutionTarget { window, tab })
 }
 

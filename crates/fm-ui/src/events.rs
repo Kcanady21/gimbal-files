@@ -65,6 +65,7 @@ pub fn touch(event: &Event) -> Touch {
         Event::SelectionChanged { window: id } => window(*id, true, false),
         Event::Navigated { window: id, .. } => window(*id, true, true),
         Event::ScrollAnchorChanged { window: id, .. } => window(*id, false, true),
+        Event::TabScopeChanged { window: id, .. } => window(*id, true, true),
     }
 }
 

@@ -102,24 +102,26 @@ pub fn check_request(
     resolved: &ResolvedRoots,
 ) -> Result<(), ProtectedPathError> {
     match request {
-        Request::Trash { paths } => {
+        Request::Trash { paths, .. } | Request::DeletePermanent { paths, .. } => {
             for path in paths {
                 check_source(path, resolved)?;
             }
         }
-        Request::Copy { paths, to } | Request::Move { paths, to } => {
+        Request::Copy { paths, to, .. } | Request::Move { paths, to, .. } => {
             for path in paths {
                 check_source(path, resolved)?;
             }
             check_destination(to, resolved)?;
         }
-        Request::Rename { path, name } => {
+        Request::Rename { path, name, .. } => {
             check_source(path, resolved)?;
             let parent = path.parent().unwrap_or_else(|| Path::new("/"));
             let target = parent.join(name);
             check_destination(&target, resolved)?;
         }
-        Request::NewFolder { name, in_folder } => {
+        Request::NewFolder {
+            name, in_folder, ..
+        } => {
             check_destination(&in_folder.join(name), resolved)?;
         }
         Request::Restore { items } => {
@@ -295,18 +297,23 @@ mod tests {
         assert!(resolve(&roots.config_file).is_ok());
 
         let request = Request::Copy {
+            scope: fm_core::admin::Scope::User,
+            target_scope: fm_core::admin::Scope::User,
             paths: vec![roots.config_file.clone()],
             to: scratch.root.join("dest"),
         };
         assert!(check_request(&request, &resolved).is_err());
 
         let request = Request::Copy {
+            scope: fm_core::admin::Scope::User,
+            target_scope: fm_core::admin::Scope::User,
             paths: vec![scratch.root.join("plain")],
             to: roots.runtime_dir.clone(),
         };
         assert!(check_request(&request, &resolved).is_err());
 
         let request = Request::NewFolder {
+            scope: fm_core::admin::Scope::User,
             name: "new".to_string(),
             in_folder: roots.config_dir.clone(),
         };
@@ -321,11 +328,14 @@ mod tests {
         symlink(&roots.config_dir, &link).expect("symlink");
 
         let request = Request::Trash {
+            scope: fm_core::admin::Scope::User,
             paths: vec![link.join("config.toml")],
         };
         assert!(check_request(&request, &resolved).is_err());
 
         let request = Request::Copy {
+            scope: fm_core::admin::Scope::User,
+            target_scope: fm_core::admin::Scope::User,
             paths: vec![scratch.root.join("plain")],
             to: scratch.root.join("x/../config/gimbal-files"),
         };
@@ -334,6 +344,8 @@ mod tests {
         // Moving a parent directory that contains the control directory would
         // change it as a descendant.
         let request = Request::Move {
+            scope: fm_core::admin::Scope::User,
+            target_scope: fm_core::admin::Scope::User,
             paths: vec![scratch.root.join("config")],
             to: scratch.root.join("elsewhere"),
         };
@@ -347,6 +359,8 @@ mod tests {
         fs::create_dir_all(scratch.root.join("src")).expect("src");
         fs::write(scratch.root.join("src/a.txt"), "a").expect("file");
         let request = Request::Copy {
+            scope: fm_core::admin::Scope::User,
+            target_scope: fm_core::admin::Scope::User,
             paths: vec![scratch.root.join("src/a.txt")],
             to: scratch.root.join("dest"),
         };

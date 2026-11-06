@@ -11,8 +11,8 @@ use std::path::{Path, PathBuf};
 
 use fm_core::admin::needs_admin;
 
-/// The lock shown on administrator entries and, in P2z, administrator tabs.
-pub const ADMIN_LOCK_ICON: &str = "changes-prevent-symbolic";
+/// The lock shown on administrator entries and administrator tabs.
+pub use crate::look::icons::ADMIN_LOCK_ICON;
 
 /// What the UI does when an entry is chosen.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,7 +68,18 @@ fn item(label: &str, command: &'static str, action: MenuAction) -> MenuItem {
 
 /// The menu for a right-click on selected items. `current_uid` is the user's
 /// uid when it could be read; without it no administrator entry is offered.
+#[cfg(test)]
 pub fn item_menu(items: &[ItemInfo], current_uid: Option<u32>) -> Vec<MenuItem> {
+    item_menu_in_scope(items, current_uid, false)
+}
+
+/// The same menu, with the tab's scope. Administrator tabs never offer an
+/// administrator entry: the current location already is one.
+pub fn item_menu_in_scope(
+    items: &[ItemInfo],
+    current_uid: Option<u32>,
+    in_admin: bool,
+) -> Vec<MenuItem> {
     if items.is_empty() {
         return Vec::new();
     }
@@ -86,7 +97,7 @@ pub fn item_menu(items: &[ItemInfo], current_uid: Option<u32>) -> Vec<MenuItem> 
     // P2aa: Open With sits directly under Open, and only when every selected
     // item is a file. Folders open in Gimbal. The command has no `app`
     // argument here, so the window opens the submenu instead of launching.
-    if items.iter().all(|item| item.is_file && !item.is_dir) {
+    if !in_admin && items.iter().all(|item| item.is_file && !item.is_dir) {
         menu.push(item(
             "Open With",
             "file.open-with",
@@ -94,7 +105,8 @@ pub fn item_menu(items: &[ItemInfo], current_uid: Option<u32>) -> Vec<MenuItem> 
         ));
     }
 
-    if single
+    if !in_admin
+        && single
         && items[0].is_file
         && !items[0].is_dir
         && items[0]
@@ -124,8 +136,22 @@ pub fn item_menu(items: &[ItemInfo], current_uid: Option<u32>) -> Vec<MenuItem> 
         menu.push(item(
             "Open in New Tab",
             "tab.new",
-            MenuAction::Command(vec![("path".to_string(), folder)]),
+            MenuAction::Command(vec![("path".to_string(), folder.clone())]),
         ));
+        if !in_admin
+            && items[0]
+                .owner_uid
+                .zip(current_uid)
+                .is_some_and(|(owner, current)| needs_admin(owner, current))
+        {
+            let mut admin = item(
+                "Open as Administrator",
+                "tab.open-as-admin",
+                MenuAction::Command(vec![("path".to_string(), folder)]),
+            );
+            admin.icon = Some(ADMIN_LOCK_ICON);
+            menu.push(admin);
+        }
     }
 
     if single {
@@ -165,7 +191,11 @@ pub fn item_menu(items: &[ItemInfo], current_uid: Option<u32>) -> Vec<MenuItem> 
         },
     ));
     menu.push(item(
-        "Move to Trash",
+        if in_admin {
+            "Delete Permanently…"
+        } else {
+            "Move to Trash"
+        },
         "file.trash",
         MenuAction::Command(path_args(&paths)),
     ));
@@ -183,14 +213,44 @@ pub fn item_menu(items: &[ItemInfo], current_uid: Option<u32>) -> Vec<MenuItem> 
 }
 
 /// The menu for a right-click on empty grid space.
+#[cfg(test)]
 pub fn background_menu(
     folder: &Path,
     undo_summary: Option<&str>,
     baobab: bool,
     clipboard_has_files: bool,
 ) -> Vec<MenuItem> {
+    background_menu_in_scope(
+        folder,
+        undo_summary,
+        baobab,
+        clipboard_has_files,
+        false,
+        false,
+    )
+}
+
+/// The same menu with the folder's ownership and the tab's scope.
+pub fn background_menu_in_scope(
+    folder: &Path,
+    undo_summary: Option<&str>,
+    baobab: bool,
+    clipboard_has_files: bool,
+    folder_needs_admin: bool,
+    in_admin: bool,
+) -> Vec<MenuItem> {
     let folder_text = folder.to_string_lossy().into_owned();
     let mut menu = Vec::new();
+
+    if !in_admin && folder_needs_admin {
+        let mut admin = item(
+            "Open as Administrator",
+            "tab.open-as-admin",
+            MenuAction::Command(vec![("path".to_string(), folder_text.clone())]),
+        );
+        admin.icon = Some(ADMIN_LOCK_ICON);
+        menu.push(admin);
+    }
 
     if let Some(summary) = undo_summary {
         menu.push(item(
@@ -374,8 +434,22 @@ mod tests {
 
         let mut root_folder = folder("root-docs");
         root_folder.owner_uid = Some(0);
-        let root_folder_menu = item_menu(&[root_folder], Some(CURRENT_UID));
-        assert!(!labels(&root_folder_menu).contains(&"Open as Administrator"));
+        let owned_folder_menu = item_menu(&[root_folder], Some(CURRENT_UID));
+        let entry = owned_folder_menu
+            .iter()
+            .find(|item| item.command == "tab.open-as-admin")
+            .expect("a folder the user does not own opens as administrator");
+        assert_eq!(entry.icon, Some(ADMIN_LOCK_ICON));
+        assert_eq!(
+            entry.action,
+            MenuAction::Command(vec![("path".to_string(), "/tmp/root-docs".to_string())])
+        );
+        assert!(
+            !item_menu_in_scope(&[folder("root-docs")], Some(CURRENT_UID), true)
+                .iter()
+                .any(|item| item.command == "tab.open-as-admin"),
+            "no administrator entry inside an administrator tab"
+        );
 
         let many = item_menu(
             &[unowned_file("a.txt"), unowned_file("b.txt")],
@@ -399,6 +473,13 @@ mod tests {
             owner_uid: None,
         };
         let menu = item_menu(&[broken], Some(CURRENT_UID));
+        assert!(!labels(&menu).contains(&"Open as Administrator"));
+    }
+
+    #[test]
+    fn an_administrator_tab_hides_open_with_and_the_admin_entry() {
+        let menu = item_menu_in_scope(&[unowned_file("root.txt")], Some(CURRENT_UID), true);
+        assert!(!labels(&menu).contains(&"Open With"));
         assert!(!labels(&menu).contains(&"Open as Administrator"));
     }
 

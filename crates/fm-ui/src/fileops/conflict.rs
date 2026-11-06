@@ -34,6 +34,8 @@ pub struct ConflictFlow {
     decisions: Decisions,
     total: usize,
     answered: usize,
+    /// An administrator plan asks again before replacing an existing target.
+    admin: bool,
     /// The human-readable destination for each key. It never replaces the key.
     destinations: Vec<(ItemKey, Option<PathBuf>)>,
 }
@@ -55,8 +57,13 @@ impl ConflictFlow {
             decisions: Decisions::new(keys),
             total: destinations.len(),
             answered: 0,
+            admin: plan.is_admin(),
             destinations,
         }
+    }
+
+    pub fn is_admin(&self) -> bool {
+        self.admin
     }
 
     /// For tests and for a plan the UI has already turned into path items.
@@ -82,6 +89,7 @@ impl ConflictFlow {
             total: unique.len(),
             decisions: Decisions::new(keys),
             answered: 0,
+            admin: false,
             destinations: unique,
         }
     }

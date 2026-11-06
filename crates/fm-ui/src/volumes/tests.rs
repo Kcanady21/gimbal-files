@@ -1848,6 +1848,8 @@ fn a_running_file_operation_refuses_unmount_before_the_backend() {
         .submit(
             window,
             fm_core::fileops::Request::Copy {
+                scope: fm_core::admin::Scope::User,
+                target_scope: fm_core::admin::Scope::User,
                 paths: vec![PathBuf::from("/run/media/kyle/USB/file.txt")],
                 to: PathBuf::from("/run/media/kyle/USB/destination"),
             },

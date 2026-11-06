@@ -984,6 +984,18 @@ impl SplitView {
         released
     }
 
+    /// Re-read every administrator tile. Returns how many were re-read.
+    pub fn reload_admin(&self) -> usize {
+        let views: Vec<Rc<FolderView>> = self
+            .inner
+            .tiles
+            .borrow()
+            .iter()
+            .map(|tile| tile.view.clone())
+            .collect();
+        views.iter().filter(|view| view.reload_if_admin()).count()
+    }
+
     pub fn reload_focused(&self) {
         let Some(id) = self.inner.focused.get() else {
             return;

@@ -1994,3 +1994,64 @@ fn a_long_random_sequence_keeps_the_invariants() {
 
     assert!(!workspace.windows.is_empty());
 }
+
+#[test]
+fn administrator_scope_follows_new_tabs_and_splits_and_leaves_in_place() {
+    let mut workspace = workspace();
+    let window_id = workspace.focused_window.unwrap();
+    let normal = workspace.focused().unwrap().focused_tab;
+    assert!(!workspace.focused().unwrap().tab(normal).unwrap().admin);
+
+    workspace
+        .tab_new_admin(folder("/etc"))
+        .expect("administrator tab");
+    let admin = workspace.focused().unwrap().focused_tab;
+    assert!(workspace.focused().unwrap().tab(admin).unwrap().admin);
+
+    // tab.new copies the focused tab's scope.
+    workspace.tab_new(None).unwrap();
+    let inherited = workspace.focused().unwrap().focused_tab;
+    assert!(workspace.focused().unwrap().tab(inherited).unwrap().admin);
+    assert_ne!(inherited, admin);
+
+    // Leaving in place keeps the folder, history and selection.
+    let tab = workspace.focused().unwrap().tab(inherited).unwrap().clone();
+    let events = workspace.tab_leave_admin().unwrap();
+    assert!(matches!(
+        events.as_slice(),
+        [Event::TabScopeChanged { window, tab: id }] if *window == window_id && *id == inherited
+    ));
+    let left = workspace.focused().unwrap().tab(inherited).unwrap();
+    assert!(!left.admin);
+    assert_eq!(left.folder, tab.folder);
+    assert_eq!(left.back, tab.back);
+    assert_eq!(left.selection, tab.selection);
+    assert_eq!(left.scroll_anchor, tab.scroll_anchor);
+
+    // A split keeps each tab's own scope.
+    workspace.pill_ctrl_click(0).unwrap();
+    workspace.pill_ctrl_click(1).unwrap();
+    workspace.group_split().unwrap();
+    let window = workspace.focused().unwrap();
+    let flags: Vec<bool> = window
+        .pills
+        .iter()
+        .flat_map(|id| window.groups[id].tabs.iter())
+        .map(|tab| tab.admin)
+        .collect();
+    assert!(flags.contains(&true));
+    assert!(flags.contains(&false));
+
+    // Opening the focused administrator tab in a new window preserves it.
+    let admin_tab = window
+        .pills
+        .iter()
+        .flat_map(|id| window.groups[id].tabs.iter())
+        .find(|tab| tab.admin)
+        .map(|tab| tab.id)
+        .unwrap();
+    workspace.focus_tab(admin_tab).unwrap();
+    workspace.tab_open_in_new_window().unwrap();
+    let moved = workspace.focused().unwrap();
+    assert!(moved.tab(moved.focused_tab).unwrap().admin);
+}

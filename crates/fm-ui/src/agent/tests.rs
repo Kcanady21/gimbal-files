@@ -480,7 +480,10 @@ fn a_dry_run_result_is_complete_but_writes_nothing() {
         1,
         9,
         work::Work::DryRun {
-            request: FileRequest::Trash { paths: Vec::new() },
+            request: FileRequest::Trash {
+                paths: Vec::new(),
+                scope: fm_core::admin::Scope::User,
+            },
             undo_lines: None,
         },
     )
@@ -498,6 +501,48 @@ fn a_dry_run_result_is_complete_but_writes_nothing() {
         panic!("dry run");
     };
     assert!(lines[0].starts_with("dry run:"), "{lines:?}");
+}
+
+#[test]
+fn an_administrator_tab_is_listed_but_every_run_is_refused() {
+    let harness = Harness::new("admin-refusal");
+    let folder = harness.scratch.root.join("admin-folder");
+    fs::create_dir_all(&folder).expect("folder");
+    let window = harness.process.seed_window(folder.clone());
+    let tab = harness.process.seed_admin_tab(window, folder);
+    let window_snapshot = harness.process.window_snapshot(window).expect("window");
+    assert!(
+        window_snapshot.tab(tab).expect("tab").admin,
+        "the tab is an administrator tab"
+    );
+    harness.enable();
+
+    let reply = harness.reply(
+        &harness.spawn(harness.request("admin-up", Some(window), Some(tab), "nav.up", &[])),
+        Duration::from_secs(5),
+    );
+    assert!(reply.contains("status = \"error\""), "{reply}");
+    assert!(reply.contains("code = \"forbidden\""), "{reply}");
+    assert!(reply.contains("administrator tabs are UI-only"), "{reply}");
+
+    // The default (focused) target is refused too.
+    let reply = harness.reply(
+        &harness.spawn(harness.request("admin-default", Some(window), None, "nav.up", &[])),
+        Duration::from_secs(5),
+    );
+    assert!(reply.contains("administrator tabs are UI-only"), "{reply}");
+
+    let request = WireRequest {
+        request_id: "state".to_string(),
+        instance: Some(harness.instance()),
+        generation: Some(harness.generation()),
+        operation: Operation::State {
+            offset: 0,
+            limit: 20,
+        },
+    };
+    let reply = harness.reply(&harness.spawn(request), Duration::from_secs(5));
+    assert!(reply.contains("admin = true"), "{reply}");
 }
 
 #[test]
@@ -1013,6 +1058,8 @@ fn a_queued_agent_job_behind_ui_work_is_dropped_by_off() {
     let ui_id = fileops.submit(
         a,
         FileRequest::Copy {
+            scope: fm_core::admin::Scope::User,
+            target_scope: fm_core::admin::Scope::User,
             paths: vec![ui_src],
             to: ui_dest.clone(),
         },

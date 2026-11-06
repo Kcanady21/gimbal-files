@@ -27,6 +27,7 @@ pub enum OpKind {
     Restore,
     EmptyTrash,
     DeleteSelected,
+    PermanentDelete,
     Undo,
 }
 
@@ -41,6 +42,7 @@ impl OpKind {
             Request::Restore { .. } => OpKind::Restore,
             Request::EmptyTrash => OpKind::EmptyTrash,
             Request::DeleteSelected { .. } => OpKind::DeleteSelected,
+            Request::DeletePermanent { .. } => OpKind::PermanentDelete,
             Request::Undo => OpKind::Undo,
         }
     }
@@ -55,6 +57,7 @@ impl OpKind {
             OpKind::Restore => "Restoring",
             OpKind::EmptyTrash => "Deleting",
             OpKind::DeleteSelected => "Deleting permanently",
+            OpKind::PermanentDelete => "Deleting permanently",
             OpKind::Undo => "Undoing",
         }
     }
@@ -261,6 +264,20 @@ pub fn summary(request: &Request, report: &Report) -> String {
                 )
             }
         }
+        Request::DeletePermanent { .. } => {
+            if counts.done == 0 && report.cancelled && counts.cancelled == total {
+                "Permanent deletion cancelled".to_string()
+            } else if counts.not_done() == 0 {
+                format!("Permanently deleted {}", items(counts.done))
+            } else {
+                format!(
+                    "Permanently deleted {} of {}{}",
+                    counts.done,
+                    total,
+                    tail(counts)
+                )
+            }
+        }
         Request::Undo => "Undid the last file operation".to_string(),
     }
 }
@@ -320,7 +337,11 @@ pub fn undo_summary(plan: &Plan) -> Option<String> {
             Action::Trash => trash += 1,
             Action::Move => moves += 1,
             Action::Rename => renames += 1,
-            Action::Copy | Action::NewFolder | Action::Empty | Action::DeleteSelected => {}
+            Action::Copy
+            | Action::NewFolder
+            | Action::Empty
+            | Action::DeleteSelected
+            | Action::PermanentDelete => {}
         }
     }
 
@@ -456,7 +477,10 @@ mod tests {
 
     #[test]
     fn summaries_cover_every_outcome_mix() {
-        let trash = Request::Trash { paths: Vec::new() };
+        let trash = Request::Trash {
+            paths: Vec::new(),
+            scope: fm_core::admin::Scope::User,
+        };
         assert_eq!(
             summary(
                 &trash,
@@ -470,6 +494,8 @@ mod tests {
         );
 
         let copy = Request::Copy {
+            scope: fm_core::admin::Scope::User,
+            target_scope: fm_core::admin::Scope::User,
             paths: Vec::new(),
             to: std::path::PathBuf::from("/tmp/dst"),
         };
@@ -571,6 +597,7 @@ mod tests {
         );
 
         let rename = Request::Rename {
+            scope: fm_core::admin::Scope::User,
             path: std::path::PathBuf::from("/tmp/a"),
             name: "b".into(),
         };
@@ -587,6 +614,7 @@ mod tests {
         );
 
         let folder = Request::NewFolder {
+            scope: fm_core::admin::Scope::User,
             name: "new".into(),
             in_folder: std::path::PathBuf::from("/tmp"),
         };

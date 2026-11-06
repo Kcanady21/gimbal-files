@@ -516,6 +516,8 @@ fn no_confirmation_means_no_deletion() {
 
     let wrong = operations.plan(&Request::EmptyTrash);
     let other = operations.plan(&Request::Copy {
+        scope: Scope::User,
+        target_scope: Scope::User,
         paths: vec![scratch.join("a.txt")],
         to: scratch.join("dst"),
     });
@@ -998,6 +1000,7 @@ fn every_files_command_maps_to_its_request() {
             .unwrap()
             .unwrap(),
         Request::Trash {
+            scope: Scope::User,
             paths: vec![PathBuf::from("/tmp/a")]
         }
     );
@@ -1009,6 +1012,8 @@ fn every_files_command_maps_to_its_request() {
         .unwrap()
         .unwrap(),
         Request::Copy {
+            scope: Scope::User,
+            target_scope: Scope::User,
             paths: vec![PathBuf::from("/tmp/a")],
             to: PathBuf::from("/tmp/b"),
         }
@@ -1021,6 +1026,8 @@ fn every_files_command_maps_to_its_request() {
         .unwrap()
         .unwrap(),
         Request::Move {
+            scope: Scope::User,
+            target_scope: Scope::User,
             paths: vec![PathBuf::from("/tmp/a"), PathBuf::from("/tmp/c")],
             to: PathBuf::from("/tmp/b"),
         }
@@ -1030,6 +1037,7 @@ fn every_files_command_maps_to_its_request() {
             .unwrap()
             .unwrap(),
         Request::Rename {
+            scope: Scope::User,
             path: PathBuf::from("/tmp/a"),
             name: "b".to_string(),
         }
@@ -1042,6 +1050,7 @@ fn every_files_command_maps_to_its_request() {
         .unwrap()
         .unwrap(),
         Request::NewFolder {
+            scope: Scope::User,
             name: "new".to_string(),
             in_folder: PathBuf::from("/tmp"),
         }
@@ -1200,6 +1209,8 @@ fn a_copy_with_a_conflict_lists_the_target() {
 
     let operations = FileOperations::new();
     let plan = operations.plan(&Request::Copy {
+        scope: Scope::User,
+        target_scope: Scope::User,
         paths: vec![source.clone()],
         to: scratch.join("dst"),
     });
@@ -1218,6 +1229,8 @@ fn missing_sources_are_refused_for_their_item() {
 
     let operations = FileOperations::new();
     let plan = operations.plan(&Request::Copy {
+        scope: Scope::User,
+        target_scope: Scope::User,
         paths: vec![scratch.join("gone.txt")],
         to: scratch.join("dst"),
     });
@@ -1235,12 +1248,14 @@ fn renaming_to_an_invalid_or_taken_name_is_a_conflict() {
 
     let operations = FileOperations::new();
     let taken = operations.plan(&Request::Rename {
+        scope: Scope::User,
         path: first.clone(),
         name: "b.txt".to_string(),
     });
     assert_eq!(taken.steps()[0].conflict, Some(Conflict::NameTaken));
 
     let invalid = operations.plan(&Request::Rename {
+        scope: Scope::User,
         path: first,
         name: "a/b".to_string(),
     });
@@ -1254,12 +1269,14 @@ fn a_new_folder_with_a_taken_or_invalid_name_is_a_conflict() {
 
     let operations = FileOperations::new();
     let taken = operations.plan(&Request::NewFolder {
+        scope: Scope::User,
         name: "taken".to_string(),
         in_folder: scratch.path.clone(),
     });
     assert_eq!(taken.steps()[0].conflict, Some(Conflict::NameTaken));
 
     let invalid = operations.plan(&Request::NewFolder {
+        scope: Scope::User,
         name: "..".to_string(),
         in_folder: scratch.path.clone(),
     });
@@ -1276,6 +1293,8 @@ fn a_folder_into_itself_is_refused() {
     let mut operations = FileOperations::new();
     let cancellable = gio::Cancellable::new();
     let plan = operations.plan(&Request::Copy {
+        scope: Scope::User,
+        target_scope: Scope::User,
         paths: vec![folder.clone()],
         to: folder.clone(),
     });
@@ -1299,6 +1318,8 @@ fn moving_into_the_folder_an_item_is_already_in_is_refused() {
 
     let operations = FileOperations::new();
     let plan = operations.plan(&Request::Move {
+        scope: Scope::User,
+        target_scope: Scope::User,
         paths: vec![file],
         to: scratch.path.clone(),
     });
@@ -1320,6 +1341,8 @@ fn a_dry_run_changes_nothing_on_disk() {
     let before = snapshot(&scratch.path);
     let operations = FileOperations::new();
     let lines = operations.dry_run(&Request::Copy {
+        scope: Scope::User,
+        target_scope: Scope::User,
         paths: vec![source],
         to: scratch.join("dst"),
     });
@@ -1347,6 +1370,8 @@ fn a_folder_tree_with_a_symlink_is_copied_faithfully() {
     let report = run(
         &mut operations,
         &Request::Copy {
+            scope: Scope::User,
+            target_scope: Scope::User,
             paths: vec![tree],
             to: scratch.join("dst"),
         },
@@ -1384,6 +1409,8 @@ fn copying_into_its_own_folder_uses_copy_and_copy_2() {
     let cancellable = gio::Cancellable::new();
 
     let first = operations.plan(&Request::Copy {
+        scope: Scope::User,
+        target_scope: Scope::User,
         paths: vec![file.clone()],
         to: scratch.path.clone(),
     });
@@ -1395,6 +1422,8 @@ fn copying_into_its_own_folder_uses_copy_and_copy_2() {
     assert!(report.all_succeeded());
 
     let second = operations.plan(&Request::Copy {
+        scope: Scope::User,
+        target_scope: Scope::User,
         paths: vec![file.clone()],
         to: scratch.path.clone(),
     });
@@ -1425,6 +1454,8 @@ fn skip_and_keep_both_are_applied_per_item() {
     let mut operations = FileOperations::new();
     let cancellable = gio::Cancellable::new();
     let plan = operations.plan(&Request::Copy {
+        scope: Scope::User,
+        target_scope: Scope::User,
         paths: vec![a.clone(), b.clone()],
         to: destination.clone(),
     });
@@ -1456,6 +1487,8 @@ fn unanswered_conflicts_refuse_the_whole_operation_and_name_the_items() {
     let mut operations = FileOperations::new();
     let cancellable = gio::Cancellable::new();
     let plan = operations.plan(&Request::Copy {
+        scope: Scope::User,
+        target_scope: Scope::User,
         paths: vec![source.clone()],
         to: destination.clone(),
     });
@@ -1483,6 +1516,8 @@ fn a_cancel_decision_runs_nothing() {
     let mut operations = FileOperations::new();
     let cancellable = gio::Cancellable::new();
     let plan = operations.plan(&Request::Copy {
+        scope: Scope::User,
+        target_scope: Scope::User,
         paths: vec![source.clone()],
         to: destination.clone(),
     });
@@ -1514,6 +1549,8 @@ fn a_cancel_partway_still_runs_nothing() {
     let mut operations = FileOperations::new();
     let cancellable = gio::Cancellable::new();
     let plan = operations.plan(&Request::Copy {
+        scope: Scope::User,
+        target_scope: Scope::User,
         paths: vec![a.clone(), b.clone()],
         to: destination.clone(),
     });
@@ -1553,6 +1590,8 @@ fn cancelling_stops_after_the_current_item() {
     let mut operations = FileOperations::new();
     let cancellable = gio::Cancellable::new();
     let plan = operations.plan(&Request::Copy {
+        scope: Scope::User,
+        target_scope: Scope::User,
         paths,
         to: destination.clone(),
     });
@@ -1597,6 +1636,8 @@ fn a_failed_item_does_not_stop_the_others() {
     let report = run(
         &mut operations,
         &Request::Copy {
+            scope: Scope::User,
+            target_scope: Scope::User,
             paths: vec![good, bad.clone()],
             to: destination.clone(),
         },
@@ -1628,6 +1669,8 @@ fn undo_a_move_moves_the_item_back() {
     run(
         &mut operations,
         &Request::Move {
+            scope: Scope::User,
+            target_scope: Scope::User,
             paths: vec![source.clone()],
             to: destination.clone(),
         },
@@ -1661,6 +1704,7 @@ fn undo_a_rename_renames_it_back() {
     run(
         &mut operations,
         &Request::Rename {
+            scope: Scope::User,
             path: original.clone(),
             name: "b.txt".to_string(),
         },
@@ -1697,6 +1741,8 @@ fn undo_refuses_only_the_item_that_changed() {
     run(
         &mut operations,
         &Request::Move {
+            scope: Scope::User,
+            target_scope: Scope::User,
             paths: vec![a.clone(), b.clone()],
             to: destination.clone(),
         },
@@ -1749,6 +1795,7 @@ fn the_undo_stack_keeps_at_most_fifty_records() {
         run(
             &mut operations,
             &Request::NewFolder {
+                scope: Scope::User,
                 name: format!("folder-{index}"),
                 in_folder: scratch.path.clone(),
             },
@@ -1768,6 +1815,7 @@ fn new_folder_and_rename_run_and_the_plan_lists_them() {
     let cancellable = gio::Cancellable::new();
 
     let plan = operations.plan(&Request::NewFolder {
+        scope: Scope::User,
         name: "made".to_string(),
         in_folder: scratch.path.clone(),
     });
@@ -1775,6 +1823,7 @@ fn new_folder_and_rename_run_and_the_plan_lists_them() {
     run(
         &mut operations,
         &Request::NewFolder {
+            scope: Scope::User,
             name: "made".to_string(),
             in_folder: scratch.path.clone(),
         },
@@ -1788,6 +1837,7 @@ fn new_folder_and_rename_run_and_the_plan_lists_them() {
     run(
         &mut operations,
         &Request::Rename {
+            scope: Scope::User,
             path: original.clone(),
             name: "other.txt".to_string(),
         },
@@ -2189,4 +2239,132 @@ fn cancellation_during_the_last_empty_item_is_not_a_failure() {
     assert_eq!(report.items[0].outcome, ItemOutcome::Cancelled);
     assert!(backend.deleted().is_empty());
     assert_eq!(backend.remaining(), vec!["trash:///cancelled.txt"]);
+}
+
+#[test]
+fn every_native_operation_keeps_both_sides_scopes_and_undo_remembers_them() {
+    let scratch = Scratch::new("scopes");
+    let source = scratch.join("a.txt");
+    write(&source, "a");
+    let folder = scratch.join("dst");
+    fs::create_dir(&folder).unwrap();
+
+    let operations = FileOperations::new();
+    let user = Scope::User;
+    let admin = Scope::Admin;
+    let requests = [
+        Request::Trash {
+            paths: vec![source.clone()],
+            scope: admin,
+        },
+        Request::Copy {
+            paths: vec![source.clone()],
+            to: folder.clone(),
+            scope: admin,
+            target_scope: user,
+        },
+        Request::Move {
+            paths: vec![source.clone()],
+            to: folder.clone(),
+            scope: user,
+            target_scope: admin,
+        },
+        Request::Rename {
+            path: source.clone(),
+            name: "b.txt".to_string(),
+            scope: admin,
+        },
+        Request::NewFolder {
+            name: "new".to_string(),
+            in_folder: folder.clone(),
+            scope: admin,
+        },
+        Request::DeletePermanent {
+            paths: vec![source.clone()],
+            scope: admin,
+        },
+    ];
+    for request in &requests {
+        let plan = operations.plan(request);
+        assert_eq!(plan.scope(), request.scope());
+        assert_eq!(plan.target_scope(), request.target_scope());
+        if request.scope() == admin || request.target_scope() == admin {
+            assert!(plan.is_admin());
+        }
+        assert_eq!(
+            crate::admin::scoped_uri(&source, request.scope()),
+            Some(
+                format!(
+                    "{}{}",
+                    if request.scope() == admin {
+                        "admin://"
+                    } else {
+                        "file://"
+                    },
+                    "/tmp/"
+                ) + crate::admin::scoped_uri(&source, request.scope())
+                    .unwrap()
+                    .split("/tmp/")
+                    .nth(1)
+                    .unwrap()
+            )
+        );
+    }
+
+    // The undo stack records the scope of the operation that produced it.
+    let mut operations = FileOperations::new();
+    operations.push_undo(UndoRecord {
+        kind: RecordKind::Rename {
+            from: scratch.join("old.txt"),
+            to: scratch.join("new.txt"),
+        },
+        scope: admin,
+        target_scope: user,
+    });
+    let undo = operations.plan(&Request::Undo);
+    assert_eq!(undo.scope(), admin);
+    assert_eq!(undo.target_scope(), user);
+}
+
+/// An administrator location has no trash (GVfs's admin backend reports
+/// "Operation not supported"). Undoing an administrator New Folder deletes the
+/// still-empty folder; undoing a copy into an administrator folder is refused
+/// with a reason instead of deleting what may have been edited since.
+#[test]
+fn administrator_undo_never_plans_a_trash() {
+    let scratch = Scratch::new("admin-undo");
+    let folder = scratch.join("New Folder");
+    fs::create_dir(&folder).expect("new folder");
+    let copy = scratch.join("copy.txt");
+    fs::write(&copy, "x").expect("copy");
+
+    let undo_of = |kind: RecordKind, scope: Scope, target_scope: Scope| {
+        let mut operations = FileOperations::new();
+        operations.push_undo(UndoRecord {
+            kind,
+            scope,
+            target_scope,
+        });
+        operations.plan(&Request::Undo)
+    };
+    let new_folder = || RecordKind::NewFolder {
+        path: folder.clone(),
+    };
+    let copied = || RecordKind::Copy {
+        copies: vec![copy.clone()],
+        replaced: Vec::new(),
+    };
+
+    let admin = undo_of(new_folder(), Scope::Admin, Scope::Admin);
+    assert_eq!(admin.steps()[0].action, Action::PermanentDelete);
+    // Without a GVfs admin mount (as in this test) the emptiness check can't
+    // read the folder and refuses it as not empty: the safe default.
+    assert_eq!(admin.steps()[0].conflict, Some(Conflict::NotEmpty));
+    let user = undo_of(new_folder(), Scope::User, Scope::User);
+    assert_eq!(user.steps()[0].action, Action::Trash);
+
+    let admin = undo_of(copied(), Scope::User, Scope::Admin);
+    assert_eq!(admin.steps()[0].conflict, Some(Conflict::NoAdminTrash));
+    let user = undo_of(copied(), Scope::User, Scope::User);
+    assert_eq!(user.steps()[0].conflict, None);
 }

@@ -45,8 +45,13 @@ impl StatusCache {
 pub struct StatusLine {
     root: gtk::Box,
     primary: gtk::Label,
+    /// The dash between the name and the size/counts, shown only with a suffix.
+    separator: gtk::Label,
     suffix: gtk::Label,
     cache: RefCell<StatusCache>,
+    /// Which pulse class the last message used. GTK restarts a CSS animation
+    /// only when the class changes, so back-to-back messages alternate.
+    pulse_b: std::cell::Cell<bool>,
 }
 
 impl StatusLine {
@@ -54,23 +59,32 @@ impl StatusLine {
         let root = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         root.add_css_class("gl-status");
         root.set_hexpand(true);
+        // The name, a dash and the size/counts sit together as one centered
+        // group (Kyle, Nov 6). The name once filled the width and pushed the
+        // size to the far right, leaving a wide gap between them.
+        let group = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        group.set_hexpand(true);
+        group.set_halign(gtk::Align::Center);
         let primary = gtk::Label::new(Some(&status_text(0, 0, 0)));
-        primary.set_hexpand(true);
-        primary.set_xalign(0.0);
         primary.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        let separator = gtk::Label::new(Some("—"));
+        separator.add_css_class("gl-status-sep");
+        separator.set_visible(false);
         let suffix = gtk::Label::new(None);
-        suffix.set_xalign(1.0);
-        suffix.set_hexpand(false);
         // The size is the first suffix field, so End ellipsis keeps it before
         // the counts when the window is narrow.
         suffix.set_ellipsize(gtk::pango::EllipsizeMode::End);
-        root.append(&primary);
-        root.append(&suffix);
+        group.append(&primary);
+        group.append(&separator);
+        group.append(&suffix);
+        root.append(&group);
         Rc::new(Self {
             root,
             primary,
+            separator,
             suffix,
             cache: RefCell::new(StatusCache::default()),
+            pulse_b: std::cell::Cell::new(false),
         })
     }
 
@@ -92,15 +106,30 @@ impl StatusLine {
         });
     }
 
+    /// A message for the user. The bar pulses (the look module's
+    /// `gl-status-pulse`, timed by the motion setting) to draw the eye.
     pub fn show_summary(&self, text: &str) {
         self.cache.borrow_mut().hold();
         self.primary.set_text(text);
         self.primary.set_tooltip_text(None);
+        self.separator.set_visible(false);
         self.suffix.set_text("");
+        self.suffix.set_visible(false);
+        let next_b = !self.pulse_b.get();
+        self.pulse_b.set(next_b);
+        let (on, off) = if next_b {
+            ("notify-b", "notify-a")
+        } else {
+            ("notify-a", "notify-b")
+        };
+        self.root.remove_css_class(off);
+        self.root.add_css_class(on);
     }
 
     pub fn end_summary(&self) {
         let status = self.cache.borrow_mut().release();
+        self.root.remove_css_class("notify-a");
+        self.root.remove_css_class("notify-b");
         self.apply(&status);
     }
 
@@ -113,6 +142,7 @@ impl StatusLine {
         );
         self.suffix.set_text(&text.suffix);
         self.suffix.set_visible(!text.suffix.is_empty());
+        self.separator.set_visible(!text.suffix.is_empty());
     }
 }
 

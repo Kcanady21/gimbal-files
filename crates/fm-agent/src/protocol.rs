@@ -195,6 +195,9 @@ pub struct TabInfo {
     pub folder: String,
     pub folder_hex: String,
     pub focused: bool,
+    /// An administrator tab is listed for state, but every run against it is
+    /// refused: it is UI-only.
+    pub admin: bool,
     pub selection_count: usize,
     pub selection: Vec<NameInfo>,
     pub selection_truncated: bool,
@@ -812,6 +815,7 @@ fn window_table(window: &WindowInfo) -> Table {
             tab_table.insert("folder", Item::Value(Value::from(&tab.folder)));
             tab_table.insert("folder_hex", Item::Value(Value::from(&tab.folder_hex)));
             tab_table.insert("focused", Item::Value(Value::from(tab.focused)));
+            tab_table.insert("admin", Item::Value(Value::from(tab.admin)));
             tab_table.insert(
                 "selection_count",
                 Item::Value(Value::from(tab.selection_count as i64)),
@@ -1212,6 +1216,55 @@ mod tests {
         let text = reply.to_toml();
         assert!(text.contains("[[data.command]]"));
         assert!(text.contains("[[data.command.argument]]"));
+        let state = Reply {
+            request_id: request_id(),
+            operation: "state".to_string(),
+            status: Status::Ok,
+            instance: Some("i1".to_string()),
+            generation: Some(2),
+            data: Data::State {
+                offset: 0,
+                total: 1,
+                next: None,
+                socket: SocketInfo {
+                    status: "on".to_string(),
+                    path: None,
+                    detail: None,
+                    generation: 2,
+                },
+                windows: vec![WindowInfo {
+                    id: "i1/w1".to_string(),
+                    focused: true,
+                    focused_tab: "i1/t1".to_string(),
+                    groups_total: 1,
+                    groups_truncated: false,
+                    groups: vec![GroupInfo {
+                        id: "i1/g1".to_string(),
+                        name: None,
+                        number: 1,
+                        focused: true,
+                        split: false,
+                        tabs_total: 1,
+                        tabs_truncated: false,
+                        tabs: vec![TabInfo {
+                            id: "i1/t1".to_string(),
+                            folder: "/etc".to_string(),
+                            folder_hex: "2f657463".to_string(),
+                            focused: true,
+                            admin: true,
+                            selection_count: 0,
+                            selection: Vec::new(),
+                            selection_truncated: false,
+                        }],
+                    }],
+                }],
+                jobs: Vec::new(),
+            },
+            error: None,
+        };
+        let text = state.to_toml();
+        assert!(text.contains("admin = true"), "{text}");
+
         let error = Reply::error("r", "run", "disabled", "off");
         assert!(error.to_toml().contains("[error]"));
     }

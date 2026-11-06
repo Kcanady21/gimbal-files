@@ -292,34 +292,52 @@ fn document_for(workspace: &Workspace) -> DocumentMut {
 
     let mut windows = ArrayOfTables::new();
     for window in &workspace.windows {
-        windows.push(window_table(window));
+        windows.push(window_table(window, workspace.home()));
     }
     root.insert("window", Item::ArrayOfTables(windows));
     document
 }
 
-fn window_table(window: &Window) -> Table {
+/// One window, minus every administrator tab. A window left with no tabs gets
+/// one ordinary home tab, the same fallback restore uses for a missing folder.
+fn window_table(window: &Window, home: &Path) -> Table {
     let mut table = Table::new();
 
-    let group_positions: BTreeMap<GroupId, usize> = window
-        .groups
-        .keys()
+    let mut saved: Vec<(GroupId, Group)> = Vec::new();
+    for group_id in &window.pills {
+        let Some(group) = window.groups.get(group_id) else {
+            continue;
+        };
+        if let Some(group) = saved_group(group) {
+            saved.push((*group_id, group));
+        }
+    }
+    if saved.is_empty() {
+        saved.push((
+            GroupId::from_raw(0),
+            home_group(
+                home,
+                window.groups.values().next().map(|g| g.number).unwrap_or(1),
+            ),
+        ));
+    }
+
+    let group_positions: BTreeMap<GroupId, usize> = saved
+        .iter()
         .enumerate()
-        .map(|(index, id)| (*id, index))
+        .map(|(index, (id, _))| (*id, index))
         .collect();
     let mut pills = Array::new();
-    for group_id in &window.pills {
+    for (group_id, _) in &saved {
         pills.push(Value::from(
             group_positions.get(group_id).copied().unwrap_or(0) as i64,
         ));
     }
     table.insert("pills", Item::Value(Value::Array(pills)));
 
-    let flat: Vec<TabId> = window
-        .pills
+    let flat: Vec<TabId> = saved
         .iter()
-        .filter_map(|group_id| window.groups.get(group_id))
-        .flat_map(|group| group.tabs.iter().map(|tab| tab.id))
+        .flat_map(|(_, group)| group.tabs.iter().map(|tab| tab.id))
         .collect();
     let focused = flat
         .iter()
@@ -328,11 +346,51 @@ fn window_table(window: &Window) -> Table {
     table.insert("focused_tab", Item::Value(Value::from(focused as i64)));
 
     let mut groups = ArrayOfTables::new();
-    for group in window.groups.values() {
+    for (_, group) in &saved {
         groups.push(group_table(group));
     }
     table.insert("group", Item::ArrayOfTables(groups));
     table
+}
+
+/// A group without its administrator tabs. Empty groups disappear.
+fn saved_group(group: &Group) -> Option<Group> {
+    if group.tabs.iter().all(|tab| !tab.admin) {
+        return Some(group.clone());
+    }
+    let mut saved = group.clone();
+    saved.tabs.retain(|tab| !tab.admin);
+    if saved.tabs.is_empty() {
+        return None;
+    }
+    let ids: Vec<TabId> = saved.tabs.iter().map(|tab| tab.id).collect();
+    saved.layout.columns = crate::workspace::initial_columns(&ids);
+    saved.layout.heights = [Heights::Default, Heights::Default];
+    Some(saved)
+}
+
+fn home_group(home: &Path, number: u32) -> Group {
+    let id = TabId::from_raw(0);
+    let tab = Tab {
+        id,
+        folder: home.to_path_buf(),
+        back: Vec::new(),
+        forward: Vec::new(),
+        selection: FileSelection::default(),
+        scroll_anchor: None,
+        admin: false,
+    };
+    Group {
+        id: GroupId::from_raw(0),
+        tabs: vec![tab],
+        layout: crate::workspace::SplitLayout {
+            columns: crate::workspace::initial_columns(&[id]),
+            heights: [Heights::Default, Heights::Default],
+            width_permille: DEFAULT_WIDTH_PERMILLE,
+        },
+        name: None,
+        number,
+    }
 }
 
 fn group_table(group: &Group) -> Table {
@@ -834,6 +892,67 @@ mod tests {
         for window in &loaded.windows {
             assert!(window.selection.selected.iter().all(|selected| !selected));
         }
+    }
+
+    #[test]
+    fn administrator_tabs_are_never_saved_and_empty_groups_or_windows_fall_back() {
+        let temp = TempDir::new("admin-save");
+        let home = temp.path().to_path_buf();
+        let mut workspace = Workspace::with_home(home.clone());
+        workspace.window_new(Some(home.join("mixed"))).unwrap();
+        workspace.tab_new(Some(home.join("normal"))).unwrap();
+        workspace.tab_new_admin(home.join("admin")).unwrap();
+        // Make one tab inside the first split group an administrator tab.
+        let window_id = workspace.focused_window.unwrap();
+        let window = workspace
+            .windows
+            .iter_mut()
+            .find(|window| window.id == window_id)
+            .unwrap();
+        let first_group = window.pills[0];
+        window
+            .groups
+            .get_mut(&first_group)
+            .unwrap()
+            .tabs
+            .last_mut()
+            .unwrap()
+            .admin = true;
+
+        // A window made only of administrator tabs falls back to one home tab.
+        workspace.window_new(Some(home.join("admin-only"))).unwrap();
+        let only_window = workspace.focused_window.unwrap();
+        let window = workspace
+            .windows
+            .iter_mut()
+            .find(|window| window.id == only_window)
+            .unwrap();
+        for group in window.groups.values_mut() {
+            for tab in &mut group.tabs {
+                tab.admin = true;
+            }
+        }
+
+        let path = temp.path().join("session.toml");
+        save(&path, &workspace).unwrap();
+        let (loaded, problems) = load(&path, &home, |_| true);
+        assert!(problems.is_empty(), "{problems:?}");
+        loaded.check_invariants().unwrap();
+
+        assert_eq!(loaded.windows.len(), 2);
+        let mixed = &loaded.windows[0];
+        assert_eq!(mixed.tab_count(), 1, "the mixed group lost its admin tab");
+        assert!(!mixed.tab(mixed.focused_tab).unwrap().admin);
+        assert!(loaded.windows.iter().all(|window| {
+            window
+                .groups
+                .values()
+                .flat_map(|group| group.tabs.iter())
+                .all(|tab| !tab.admin)
+        }));
+        let fallback = &loaded.windows[1];
+        assert_eq!(fallback.tab_count(), 1, "the empty window got a home tab");
+        assert_eq!(fallback.tab(fallback.focused_tab).unwrap().folder, home);
     }
 
     #[test]

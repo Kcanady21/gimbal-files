@@ -26,6 +26,9 @@ pub const SAVE_AS_PALETTE: &str = "error @window_bg_color";
 /// The float icon's front-window fill hides the window behind it.
 pub const FLOAT_PALETTE: &str = "error @window_bg_color";
 
+/// The lock on administrator menu entries and tabs.
+pub const ADMIN_LOCK_ICON: &str = "changes-prevent-symbolic";
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MockupIcon {
     Folder,

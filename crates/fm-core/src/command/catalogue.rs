@@ -170,6 +170,23 @@ pub const COMMANDS: &[CommandSpec] = &[
         undo: false,
         arguments: &[],
     },
+    // P2z: an administrator folder tab. A System effect keeps both commands
+    // off the agent socket and CLI; inside the UI, a tab is only ever opened
+    // after the folder, its owner and the GVfs mount have been checked.
+    CommandSpec {
+        name: "tab.open-as-admin",
+        summary: "Open a folder you do not own as an administrator tab.",
+        effect: Effect::System,
+        undo: false,
+        arguments: &[REQUIRED_PATH],
+    },
+    CommandSpec {
+        name: "tab.leave-admin",
+        summary: "Turn the administrator tab back into a normal tab in place.",
+        effect: Effect::System,
+        undo: false,
+        arguments: &[],
+    },
     CommandSpec {
         name: "group.open",
         summary: "Open folders as one tiled group.",
@@ -785,6 +802,24 @@ mod tests {
             assert!(matches!(argument.kind, ArgKind::Text));
             assert!(matches!(argument.presence, Presence::Required));
         }
+    }
+
+    #[test]
+    fn administrator_tab_commands_are_system_commands() {
+        let open = drive_command("tab.open-as-admin");
+        assert_eq!(open.effect, Effect::System);
+        assert!(!open.undo);
+        assert_eq!(open.arguments.len(), 1);
+        assert_eq!(open.arguments[0].name, "path");
+        assert!(matches!(open.arguments[0].kind, ArgKind::Path));
+        assert!(matches!(open.arguments[0].presence, Presence::Required));
+
+        let leave = drive_command("tab.leave-admin");
+        assert_eq!(leave.effect, Effect::System);
+        assert!(!leave.undo);
+        assert!(leave.arguments.is_empty());
+        assert!(!open.summary.is_empty());
+        assert!(!leave.summary.is_empty());
     }
 
     #[test]

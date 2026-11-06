@@ -490,6 +490,11 @@ impl WindowUi {
         self.content.reload();
     }
 
+    /// Re-read this window's administrator folder views.
+    pub fn reload_admin_folders(&self) -> usize {
+        self.content.reload_admin()
+    }
+
     /// Open the one Trash page, or present the page this window already owns.
     /// The page lives in the central stack; opening it never creates a tab,
     /// model window or folder-history entry.
