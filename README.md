@@ -202,6 +202,12 @@ Gimbal is already running, without a restart. With other file managers
 installed, the one the desktop starts while none is running can vary, but a
 running Gimbal with the switch on always takes over.
 
+When the switch is off and the desktop starts Gimbal's service anyway while a
+Gimbal is already running, the started process hands the call to that running
+Gimbal, so the folder or item still opens in the window you have. The extra
+process makes no window, holds the service name only for the call and a
+two-second grace window, then exits.
+
 ## Uninstall a tarball or source install
 
 From a checkout:
@@ -219,6 +225,11 @@ touches your configuration or session.
 
 - Configuration: `$XDG_CONFIG_HOME/gimbal-files/config.toml`, or
   `~/.config/gimbal-files/config.toml`.
+- System defaults (optional, read-only):
+  `$XDG_CONFIG_DIRS/gimbal-files/config.toml`, or
+  `/etc/xdg/gimbal-files/config.toml` when `XDG_CONFIG_DIRS` is unset. A key
+  your own file does not set comes from there; your file wins, and Settings
+  only writes your file.
 - Session (windows, tabs and split layout):
   `$XDG_STATE_HOME/gimbal-files/session.toml`, or
   `~/.local/state/gimbal-files/session.toml`.

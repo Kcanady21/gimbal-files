@@ -74,6 +74,37 @@ pub fn default_config_path() -> Option<PathBuf> {
     config_path(xdg.as_deref(), Some(home.as_path()))
 }
 
+/// The candidate paths for the system-wide defaults file, in the order
+/// `$XDG_CONFIG_DIRS` lists them. The variable is a colon-separated list;
+/// with it unset (or empty) the XDG default is `/etc/xdg`. Relative entries
+/// are ignored, as the XDG Base Directory specification requires.
+pub fn defaults_config_paths(xdg_config_dirs: Option<&str>) -> Vec<PathBuf> {
+    match xdg_config_dirs {
+        Some(dirs) if !dirs.is_empty() => dirs
+            .split(':')
+            .filter(|dir| !dir.is_empty())
+            .map(Path::new)
+            .filter(|dir| dir.is_absolute())
+            .map(|dir| dir.join(CONFIG_DIR).join(CONFIG_FILE))
+            .collect(),
+        _ => vec![Path::new("/etc/xdg").join(CONFIG_DIR).join(CONFIG_FILE)],
+    }
+}
+
+/// The first defaults file that exists, or `None`. A later entry is used
+/// only when no earlier one has the file.
+pub fn defaults_config_path(xdg_config_dirs: Option<&str>) -> Option<PathBuf> {
+    defaults_config_paths(xdg_config_dirs)
+        .into_iter()
+        .find(|path| path.is_file())
+}
+
+/// The defaults file named by the process environment.
+pub fn default_defaults_config_path() -> Option<PathBuf> {
+    let dirs = std::env::var("XDG_CONFIG_DIRS").ok();
+    defaults_config_path(dirs.as_deref())
+}
+
 fn home_dir() -> PathBuf {
     std::env::var_os("HOME")
         .map(PathBuf::from)
@@ -674,6 +705,10 @@ pub enum ConfigProblemKind {
     InvalidHotkeyArguments,
     EmptyAccelerator,
     RelativePin,
+    /// A known section the defaults file cannot layer.
+    NotLayered,
+    /// A key the defaults file may not set.
+    IgnoredInDefaults,
 }
 
 impl ConfigProblemKind {
@@ -692,11 +727,16 @@ impl ConfigProblemKind {
             Self::InvalidHotkeyArguments => "invalid hotkey arguments",
             Self::EmptyAccelerator => "empty accelerator",
             Self::RelativePin => "relative pin path",
+            Self::NotLayered => "not layered",
+            Self::IgnoredInDefaults => "ignored in the defaults file",
         }
     }
 
     pub fn is_warning(self) -> bool {
-        matches!(self, Self::UnknownKey | Self::UnknownTable)
+        matches!(
+            self,
+            Self::UnknownKey | Self::UnknownTable | Self::NotLayered | Self::IgnoredInDefaults
+        )
     }
 }
 
@@ -772,22 +812,48 @@ pub struct ConfigFile {
 }
 
 impl ConfigFile {
-    /// Load a config using `HOME` and GLib's special folders.
+    /// Load a config using `HOME`, GLib's special folders and the defaults
+    /// file named by `XDG_CONFIG_DIRS`.
     pub fn load(path: impl AsRef<Path>) -> (Self, Vec<ConfigProblem>) {
         let home = home_dir();
         let special = special_folders();
-        Self::load_with(path.as_ref(), &home, &special)
+        let defaults = default_defaults_config_path();
+        Self::load_with_defaults(path.as_ref(), defaults.as_deref(), &home, &special)
     }
 
-    /// Load a config with explicit home and special folders. Tests use this so
-    /// they never read the real desktop settings.
+    /// Load a user config with explicit home and special folders, without a
+    /// defaults file. Tests that are not about layering use this so they never
+    /// read the real desktop settings or `/etc/xdg`.
     pub fn load_with(
         path: &Path,
         home: &Path,
         special: &SpecialFolders,
     ) -> (Self, Vec<ConfigProblem>) {
+        Self::load_with_defaults(path, None, home, special)
+    }
+
+    /// Load the system-wide defaults first, then the user's file over them.
+    /// A key in the user's file wins; a key only in the defaults file applies.
+    /// A key in neither keeps its built-in default.
+    ///
+    /// Only `[integration]`, `[updates]` and `[agent]` are layered. The other
+    /// sections are ignored in the defaults file with a problem line, because
+    /// their shapes are not simple key/value pairs. `[agent] enabled` is never
+    /// taken from the defaults file: the local automation socket stays the
+    /// user's own choice.
+    pub fn load_with_defaults(
+        path: &Path,
+        defaults: Option<&Path>,
+        home: &Path,
+        special: &SpecialFolders,
+    ) -> (Self, Vec<ConfigProblem>) {
         let path = path.to_path_buf();
         let mut config = Config::with_defaults(home, special);
+        let mut problems = Vec::new();
+
+        if let Some(defaults) = defaults {
+            problems.extend(read_defaults_file(defaults, &mut config));
+        }
 
         let text = match fs::read_to_string(&path) {
             Ok(text) => text,
@@ -797,7 +863,7 @@ impl ConfigFile {
                     config,
                     document: Some(DocumentMut::new()),
                 };
-                return (file, Vec::new());
+                return (file, problems);
             }
             Err(error) => {
                 let problem = ConfigProblem::new(
@@ -813,7 +879,8 @@ impl ConfigFile {
                     config,
                     document: None,
                 };
-                return (file, vec![problem]);
+                problems.push(problem);
+                return (file, problems);
             }
         };
 
@@ -837,7 +904,8 @@ impl ConfigFile {
                     config,
                     document: None,
                 };
-                return (file, vec![problem]);
+                problems.push(problem);
+                return (file, problems);
             }
         };
 
@@ -846,6 +914,7 @@ impl ConfigFile {
             text: &text,
             home: config.home.clone(),
             problems: Vec::new(),
+            defaults: false,
         };
         loader.read_document(&document, &mut config);
         loader
@@ -857,7 +926,8 @@ impl ConfigFile {
             config,
             document: Some(document.into_mut()),
         };
-        (file, loader.problems)
+        problems.extend(loader.problems);
+        (file, problems)
     }
 
     pub fn path(&self) -> &Path {
@@ -1094,11 +1164,73 @@ fn path_argument(value: &CommandValue) -> Option<PathBuf> {
 // Loading
 // -------------------------------------------------------------------------
 
+/// Which file a loader is reading. The defaults file may only contribute the
+/// three simple sections, and may never enable the automation socket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Layer {
+    User,
+    Defaults,
+}
+
+/// Read the optional system-wide defaults file into `config`. A missing file
+/// is not a problem. A file that cannot be read or parsed is reported with
+/// its path and otherwise ignored, so Gimbal still starts with its built-in
+/// and user settings.
+fn read_defaults_file(path: &Path, config: &mut Config) -> Vec<ConfigProblem> {
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Vec::new(),
+        Err(error) => {
+            return vec![ConfigProblem::new(
+                path,
+                1,
+                1,
+                "",
+                ConfigProblemKind::Read,
+                format!("could not read the defaults file: {error}"),
+            )];
+        }
+    };
+
+    let document = match Document::parse(text.as_str()) {
+        Ok(document) => document,
+        Err(error) => {
+            let (line, column) = error
+                .span()
+                .map(|span| line_column(&text, span.start))
+                .unwrap_or((1, 1));
+            return vec![ConfigProblem::new(
+                path,
+                line,
+                column,
+                "",
+                ConfigProblemKind::Parse,
+                error.message(),
+            )];
+        }
+    };
+
+    let mut loader = Loader {
+        path: path.to_path_buf(),
+        text: &text,
+        home: config.home.clone(),
+        problems: Vec::new(),
+        defaults: true,
+    };
+    loader.read_defaults_document(&document, config);
+    loader
+        .problems
+        .sort_by_key(|problem| (problem.line, problem.column));
+    loader.problems
+}
+
 struct Loader<'a> {
     path: PathBuf,
     text: &'a str,
     home: PathBuf,
     problems: Vec<ConfigProblem>,
+    /// True while reading the system-wide defaults file.
+    defaults: bool,
 }
 
 impl Loader<'_> {
@@ -1152,9 +1284,32 @@ impl Loader<'_> {
         self.read_pins(root, config);
         self.read_sort(root, config);
         self.read_hotkeys(root, config);
-        self.read_agent(root, config);
-        self.read_updates(root, config);
-        self.read_integration(root, config);
+        self.read_agent(root, config, Layer::User);
+        self.read_updates(root, config, Layer::User);
+        self.read_integration(root, config, Layer::User);
+    }
+
+    /// The defaults file version of [`Self::read_document`]. Only the three
+    /// simple sections apply; everything else is reported and left alone.
+    fn read_defaults_document(&mut self, document: &Document<&str>, config: &mut Config) {
+        let root = document.as_table();
+
+        for (key, item) in root.iter() {
+            match key {
+                "integration" => self.read_integration(root, config, Layer::Defaults),
+                "updates" => self.read_updates(root, config, Layer::Defaults),
+                "agent" => self.read_agent(root, config, Layer::Defaults),
+                _ if KNOWN_TOP_LEVEL.contains(&key) => {
+                    self.report_item(
+                        ConfigProblemKind::NotLayered,
+                        key,
+                        item,
+                        "only [integration], [updates] and [agent] are layered from the defaults file; this section is ignored",
+                    );
+                }
+                _ => self.unknown_entry(root, "", key, item),
+            }
+        }
     }
 
     fn unknown_entry(&mut self, table: &dyn TableLike, prefix: &str, key: &str, item: &Item) {
@@ -1168,10 +1323,15 @@ impl Loader<'_> {
             .and_then(toml_edit::Key::span)
             .or_else(|| item.span());
         let key_path = join_key(prefix, key);
-        let message = if kind == ConfigProblemKind::UnknownTable {
-            "unknown table; kept in the file"
+        let kept = if self.defaults {
+            "ignored in the defaults file"
         } else {
-            "unknown key; kept in the file"
+            "kept in the file"
+        };
+        let message = if kind == ConfigProblemKind::UnknownTable {
+            format!("unknown table; {kept}")
+        } else {
+            format!("unknown key; {kept}")
         };
         self.report(kind, key_path, span, message);
     }
@@ -1511,13 +1671,18 @@ impl Loader<'_> {
     /// must be valid before its bool applies: a wrong shape, an unknown key, a
     /// wrong type or a section that did not parse leaves it Off and keeps the
     /// existing readable diagnostics.
-    fn read_agent(&mut self, root: &Table, config: &mut Config) {
+    ///
+    /// In the defaults file the whole section is ignored. Automation is the
+    /// user's own choice, even on a distro that ships defaults.
+    fn read_agent(&mut self, root: &Table, config: &mut Config, layer: Layer) {
         let Some(item) = root.get("agent") else {
             return;
         };
         let Some(table) = table_like(item) else {
             self.wrong_type("agent", item, "a table");
-            config.agent.enabled = false;
+            if layer == Layer::User {
+                config.agent.enabled = false;
+            }
             return;
         };
 
@@ -1529,15 +1694,30 @@ impl Loader<'_> {
             }
         }
 
-        let enabled = match table.get("enabled") {
-            Some(item) => match self.read_bool(item, "agent.enabled") {
-                Some(value) => value,
-                None => {
-                    valid = false;
-                    false
-                }
-            },
-            None => false,
+        if layer == Layer::Defaults {
+            if let Some(item) = table.get("enabled") {
+                self.report_item(
+                    ConfigProblemKind::IgnoredInDefaults,
+                    "agent.enabled",
+                    item,
+                    "automation stays the user's own choice; this key is ignored in the defaults file",
+                );
+            }
+            return;
+        }
+
+        let Some(item) = table.get("enabled") else {
+            if !valid {
+                config.agent.enabled = false;
+            }
+            return;
+        };
+        let enabled = match self.read_bool(item, "agent.enabled") {
+            Some(value) => value,
+            None => {
+                valid = false;
+                false
+            }
         };
         // Any defect anywhere in the section wins over the typed bool, even
         // when `enabled` itself came first and parsed cleanly.
@@ -1546,14 +1726,15 @@ impl Loader<'_> {
 
     /// `[updates] check = true|false`. The default is On. As with `[agent]`,
     /// the whole section must be valid before its bool applies: a wrong shape,
-    /// unknown key or wrong type leaves the default On.
-    fn read_updates(&mut self, root: &Table, config: &mut Config) {
+    /// unknown key or wrong type leaves the default On. A missing key keeps
+    /// the value from the defaults file (or the built-in default).
+    fn read_updates(&mut self, root: &Table, config: &mut Config, _layer: Layer) {
         let Some(item) = root.get("updates") else {
             return;
         };
         let Some(table) = table_like(item) else {
             self.wrong_type("updates", item, "a table");
-            config.updates.check = Updates::default().check;
+            config.updates = Updates::default();
             return;
         };
 
@@ -1565,15 +1746,18 @@ impl Loader<'_> {
             }
         }
 
-        let check = match table.get("check") {
-            Some(item) => match self.read_bool(item, "updates.check") {
-                Some(value) => value,
-                None => {
-                    valid = false;
-                    true
-                }
-            },
-            None => true,
+        let Some(item) = table.get("check") else {
+            if !valid {
+                config.updates = Updates::default();
+            }
+            return;
+        };
+        let check = match self.read_bool(item, "updates.check") {
+            Some(value) => value,
+            None => {
+                valid = false;
+                true
+            }
         };
         config.updates.check = if valid {
             check
@@ -1584,8 +1768,9 @@ impl Loader<'_> {
 
     /// `[integration] show_in_folder = true|false`. The default is Off. As
     /// with `[agent]` and `[updates]`, the whole section must be valid before
-    /// its bool applies.
-    fn read_integration(&mut self, root: &Table, config: &mut Config) {
+    /// its bool applies. A missing key keeps the value from the defaults file
+    /// (or the built-in default).
+    fn read_integration(&mut self, root: &Table, config: &mut Config, _layer: Layer) {
         let Some(item) = root.get("integration") else {
             return;
         };
@@ -1603,15 +1788,18 @@ impl Loader<'_> {
             }
         }
 
-        let show_in_folder = match table.get("show_in_folder") {
-            Some(item) => match self.read_bool(item, "integration.show_in_folder") {
-                Some(value) => value,
-                None => {
-                    valid = false;
-                    false
-                }
-            },
-            None => false,
+        let Some(item) = table.get("show_in_folder") else {
+            if !valid {
+                config.integration = Integration::default();
+            }
+            return;
+        };
+        let show_in_folder = match self.read_bool(item, "integration.show_in_folder") {
+            Some(value) => value,
+            None => {
+                valid = false;
+                false
+            }
         };
         config.integration.show_in_folder = valid && show_in_folder;
     }
@@ -3774,6 +3962,192 @@ answer = 42
         assert_eq!(
             change_for(&disabled, &config, home),
             Some(Change::SetShowInFolder(false))
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // P2ac: system-wide defaults
+    // ---------------------------------------------------------------------
+
+    fn load_layered(
+        user: &Path,
+        defaults: Option<&Path>,
+        home: &Path,
+    ) -> (ConfigFile, Vec<ConfigProblem>) {
+        ConfigFile::load_with_defaults(user, defaults, home, &SpecialFolders::default())
+    }
+
+    #[test]
+    fn the_defaults_file_layers_under_the_user_file() {
+        let temp = TempDir::new("defaults-layer");
+        let home = temp.path();
+        let user_missing = temp.path().join("absent-user.toml");
+        let defaults = temp.write("defaults.toml", "[integration]\nshow_in_folder = true\n");
+
+        let (file, problems) = load_layered(&user_missing, Some(&defaults), home);
+        assert!(problems.is_empty(), "{problems:?}");
+        assert!(file.config().integration.show_in_folder);
+
+        let user_only = temp.write("on.toml", "[integration]\nshow_in_folder = true\n");
+        let (file, problems) = load_layered(&user_only, None, home);
+        assert!(problems.is_empty(), "{problems:?}");
+        assert!(file.config().integration.show_in_folder);
+
+        let user_off = temp.write("off.toml", "[integration]\nshow_in_folder = false\n");
+        let (file, problems) = load_layered(&user_off, Some(&defaults), home);
+        assert!(problems.is_empty(), "{problems:?}");
+        assert!(
+            !file.config().integration.show_in_folder,
+            "the user's false must win over the defaults file"
+        );
+    }
+
+    #[test]
+    fn the_defaults_file_is_taken_from_the_first_xdg_entry_that_has_one() {
+        let temp = TempDir::new("defaults-xdg");
+        let first = temp.path().join("first");
+        let second = temp.path().join("second");
+        fs::create_dir_all(second.join(CONFIG_DIR)).expect("second config dir");
+        let defaults = second.join(CONFIG_DIR).join(CONFIG_FILE);
+        fs::write(&defaults, "[integration]\nshow_in_folder = true\n").expect("defaults");
+
+        let dirs = format!("{}:{}", first.display(), second.display());
+        assert_eq!(defaults_config_path(Some(&dirs)), Some(defaults.clone()));
+
+        let home = temp.path();
+        let user = temp.path().join("absent-user.toml");
+        let (file, problems) = load_layered(&user, Some(&defaults), home);
+        assert!(problems.is_empty(), "{problems:?}");
+        assert!(file.config().integration.show_in_folder);
+    }
+
+    #[test]
+    fn a_bad_defaults_file_is_reported_and_gimbal_still_loads() {
+        let temp = TempDir::new("defaults-bad");
+        let home = temp.path();
+        let user = temp.write("user.toml", "[integration]\nshow_in_folder = true\n");
+        let parse = temp.write("parse-defaults.toml", "[integration\n");
+        let (file, problems) = load_layered(&user, Some(&parse), home);
+        assert!(file.config().integration.show_in_folder);
+        assert!(
+            problems
+                .iter()
+                .any(|problem| problem.file == parse && problem.kind == ConfigProblemKind::Parse),
+            "{problems:?}"
+        );
+
+        let wrong = temp.write(
+            "wrong-defaults.toml",
+            "[integration]\nshow_in_folder = \"yes\"\n",
+        );
+        let missing_user = temp.path().join("absent-user.toml");
+        let (file, problems) = load_layered(&missing_user, Some(&wrong), home);
+        assert!(!file.config().integration.show_in_folder);
+        assert!(
+            problems
+                .iter()
+                .any(|problem| problem.file == wrong && !problem.is_warning()),
+            "{problems:?}"
+        );
+    }
+
+    #[test]
+    fn the_agent_switch_is_never_taken_from_the_defaults_file() {
+        let temp = TempDir::new("defaults-agent");
+        let home = temp.path();
+        let user = temp.path().join("absent-user.toml");
+        let defaults = temp.write(
+            "defaults.toml",
+            "[agent]\nenabled = true\n\n[integration]\nshow_in_folder = true\n",
+        );
+
+        let (file, problems) = load_layered(&user, Some(&defaults), home);
+        assert!(!file.config().agent.enabled, "automation stayed on");
+        assert!(file.config().integration.show_in_folder);
+        assert!(
+            problems.iter().any(|problem| {
+                problem.file == defaults
+                    && problem.kind == ConfigProblemKind::IgnoredInDefaults
+                    && problem.key == "agent.enabled"
+            }),
+            "{problems:?}"
+        );
+    }
+
+    #[test]
+    fn the_user_can_still_turn_the_agent_on_over_the_defaults_file() {
+        let temp = TempDir::new("defaults-agent-user");
+        let home = temp.path();
+        let defaults = temp.write("defaults.toml", "[agent]\nenabled = true\n");
+        let user = temp.write("user.toml", "[agent]\nenabled = true\n");
+
+        let (file, problems) = load_layered(&user, Some(&defaults), home);
+        assert!(file.config().agent.enabled);
+        assert!(
+            problems.iter().any(|problem| {
+                problem.file == defaults && problem.kind == ConfigProblemKind::IgnoredInDefaults
+            }),
+            "{problems:?}"
+        );
+    }
+
+    #[test]
+    fn updates_layer_and_non_simple_sections_are_reported_and_ignored() {
+        let temp = TempDir::new("defaults-updates");
+        let home = temp.path();
+        let user = temp.path().join("absent-user.toml");
+        let defaults = temp.write(
+            "defaults.toml",
+            "[updates]\ncheck = false\n\n[look]\nscale = 0.5\n",
+        );
+
+        let (file, problems) = load_layered(&user, Some(&defaults), home);
+        assert!(!file.config().updates.check);
+        assert_eq!(file.config().look.scale, DEFAULT_SCALE);
+        assert!(
+            problems.iter().any(|problem| {
+                problem.file == defaults
+                    && problem.kind == ConfigProblemKind::NotLayered
+                    && problem.key == "look"
+            }),
+            "{problems:?}"
+        );
+
+        let user_on = temp.write("user-on.toml", "[updates]\ncheck = true\n");
+        let (file, problems) = load_layered(&user_on, Some(&defaults), home);
+        assert!(file.config().updates.check);
+        assert!(
+            problems.iter().all(|problem| problem.file != user_on),
+            "the user file has no problems: {problems:?}"
+        );
+    }
+
+    #[test]
+    fn a_settings_write_after_a_default_only_touches_the_user_file() {
+        let temp = TempDir::new("defaults-save");
+        let home = temp.path();
+        let defaults = temp.write("defaults.toml", "[integration]\nshow_in_folder = true\n");
+        let user = temp.path().join("user.toml");
+
+        let (mut file, problems) = load_layered(&user, Some(&defaults), home);
+        assert!(problems.is_empty(), "{problems:?}");
+        assert!(file.config().integration.show_in_folder);
+        file.apply(Change::SetShowInFolder(false))
+            .expect("the user file is created and written");
+
+        let defaults_text = fs::read_to_string(&defaults).expect("defaults");
+        assert!(
+            defaults_text.contains("show_in_folder = true"),
+            "the defaults file changed: {defaults_text}"
+        );
+        let user_text = fs::read_to_string(&user).expect("user file");
+        assert!(user_text.contains("show_in_folder = false"), "{user_text}");
+
+        let (file, problems) = load_layered(&user, Some(&defaults), home);
+        assert!(problems.is_empty(), "{problems:?}");
+        assert!(
+            !file.config().integration.show_in_folder,
+            "the user's off must survive a restart"
         );
     }
 }

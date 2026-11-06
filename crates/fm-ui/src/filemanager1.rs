@@ -13,8 +13,10 @@
 //! arguments, so folder/file grouping stays identical everywhere.
 
 use std::cell::{Cell, RefCell};
+use std::ffi::OsString;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 use adw::prelude::*;
 use gtk::gio;
@@ -31,6 +33,11 @@ pub const INTERFACE: &str = "org.freedesktop.FileManager1";
 /// A call that arrives within this many seconds of the previous one is part
 /// of the same burst when the bus started Gimbal with the switch off.
 const SERVICE_GRACE_SECONDS: u32 = 2;
+
+/// A forwarding process that is never called still exits on the same
+/// 10-second inactivity timeout as GApplication's service mode
+/// (`glib 2.88.0:gio/gapplication.c:2728-2734`).
+const SERVICE_IDLE_SECONDS: u32 = 10;
 
 /// The three reviewed methods. Dolphin's KDE-only `SortOrderForUrl` is
 /// deliberately absent.
@@ -84,6 +91,97 @@ pub fn plan(method: Method, uris: &[String]) -> CallPlan {
         method,
         paths,
         refused,
+    }
+}
+
+/// The activation argument the D-Bus service file passes. GApplication parses
+/// it itself inside `run`, but by then a service launch beside a running
+/// Gimbal has already failed to take the app id. `main` checks the raw
+/// arguments first so it can decide between the primary and forwarding paths.
+pub fn is_service_launch(arguments: &[OsString]) -> bool {
+    arguments
+        .iter()
+        .skip(1)
+        .any(|argument| argument.to_str() == Some("--gapplication-service"))
+}
+
+/// The hand-off to the already-running Gimbal. Production uses
+/// GApplication's remote `open`; tests use a recorder.
+pub trait RemoteOpen {
+    fn open(&self, paths: &[PathBuf], startup_id: Option<&str>) -> Result<(), String>;
+}
+
+/// The 2-second grace window. Each call starts a new generation; only the
+/// newest timeout may release the name and exit. This is the same timing as
+/// P2x's bus-started service path.
+#[derive(Debug, Default)]
+pub struct Grace {
+    generation: u64,
+    deadline: Option<Instant>,
+}
+
+impl Grace {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Register one call and return the generation that owns the new
+    /// deadline.
+    pub fn note_call(&mut self, now: Instant) -> u64 {
+        self.generation = self.generation.wrapping_add(1);
+        self.deadline = Some(now + Duration::from_secs(u64::from(SERVICE_GRACE_SECONDS)));
+        self.generation
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub fn expired(&self, now: Instant) -> bool {
+        self.deadline.is_some_and(|deadline| now >= deadline)
+    }
+}
+
+/// What one forwarded call did, for tests and the one log line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForwardResult {
+    pub generation: u64,
+    pub forwarded: bool,
+    /// Present when the running instance could not be asked.
+    pub error: Option<String>,
+}
+
+/// Answer the caller first, then forward only the accepted paths. An empty
+/// plan still answers and still keeps the process alive for the grace window,
+/// but never calls the running Gimbal.
+pub fn answer_and_forward(
+    plan: &CallPlan,
+    startup_id: Option<&str>,
+    answer: impl FnOnce(),
+    gimbal: &dyn RemoteOpen,
+    grace: &mut Grace,
+    now: Instant,
+) -> ForwardResult {
+    answer();
+    let generation = grace.note_call(now);
+    if plan.paths.is_empty() {
+        return ForwardResult {
+            generation,
+            forwarded: false,
+            error: None,
+        };
+    }
+    match gimbal.open(&plan.paths, startup_id) {
+        Ok(()) => ForwardResult {
+            generation,
+            forwarded: true,
+            error: None,
+        },
+        Err(error) => ForwardResult {
+            generation,
+            forwarded: false,
+            error: Some(error),
+        },
     }
 }
 
@@ -194,6 +292,8 @@ thread_local! {
 
 /// Read the switch without building the process. `startup` runs before the
 /// first `activate`, so `Process::start` has not loaded the config yet.
+/// `ConfigFile::load` applies the system-wide defaults file under the user's
+/// file, so this is the same layered value the Settings row will show.
 fn config_enabled() -> bool {
     let Some(path) = fm_core::config::default_config_path() else {
         return false;
@@ -207,13 +307,11 @@ fn config_enabled() -> bool {
 
 /// Called from `main.rs`'s `startup` handler, on the primary instance only.
 ///
-/// With the switch on, or when `--gapplication-service` started us, export
-/// the object and ask for the name before the first call can arrive.
-pub fn start(application: &adw::Application) {
+/// `service` is true when the raw arguments contained
+/// `--gapplication-service`. With the switch on, or for a service launch,
+/// export the object and ask for the name before the first call can arrive.
+pub fn start(application: &adw::Application, service: bool) {
     let enabled = config_enabled();
-    let service = application
-        .flags()
-        .contains(gio::ApplicationFlags::IS_SERVICE);
 
     let Some(connection) = application.dbus_connection() else {
         crate::log!(
@@ -579,6 +677,321 @@ impl Runtime {
     }
 }
 
+// -------------------------------------------------------------------------
+// Forwarding to the already-running Gimbal
+// -------------------------------------------------------------------------
+
+/// The production hand-off: GApplication's remote `open` on the registered
+/// remote instance. The primary then runs its ordinary `open` ->
+/// `open_arguments_with_startup` path. The startup id travels in the open
+/// hint, because GTK 4.22 builds the remote platform data from the
+/// environment captured before `main`, not from a per-call argument.
+struct RunningGimbal {
+    application: adw::Application,
+}
+
+impl RemoteOpen for RunningGimbal {
+    fn open(&self, paths: &[PathBuf], startup_id: Option<&str>) -> Result<(), String> {
+        let files: Vec<gio::File> = paths.iter().map(gio::File::for_path).collect();
+        if files.is_empty() {
+            return Ok(());
+        }
+        self.application.open(&files, startup_id.unwrap_or(""));
+        Ok(())
+    }
+}
+
+struct Forwarder {
+    application: adw::Application,
+    connection: gio::DBusConnection,
+    registration: RefCell<Option<gio::RegistrationId>>,
+    grace: RefCell<Grace>,
+    main_loop: glib::MainLoop,
+}
+
+/// The remote-service path: own `org.freedesktop.FileManager1` with
+/// `DO_NOT_QUEUE`, answer each call, hand the accepted paths to the running
+/// Gimbal, and exit after the grace window. It never creates a window, loads
+/// the session or writes config.
+pub fn forward(application: adw::Application) -> glib::ExitCode {
+    let Some(connection) = application.dbus_connection() else {
+        crate::log!(
+            "filemanager1",
+            "no session-bus connection; the forwarding process exits"
+        );
+        return glib::ExitCode::SUCCESS;
+    };
+
+    let main_loop = glib::MainLoop::new(None, false);
+    let forwarder = Rc::new(Forwarder {
+        application,
+        connection,
+        registration: RefCell::new(None),
+        grace: RefCell::new(Grace::new()),
+        main_loop: main_loop.clone(),
+    });
+    if !forwarder.install() {
+        crate::log!(
+            "filemanager1",
+            "could not export the forwarding object; exiting"
+        );
+        return glib::ExitCode::FAILURE;
+    }
+
+    match forwarder.request_name() {
+        Ok(true) => {}
+        Ok(false) => {
+            crate::log!(
+                "filemanager1",
+                "{BUS_NAME} already has an owner; the forwarding process exits quietly"
+            );
+            forwarder.unregister();
+            return glib::ExitCode::SUCCESS;
+        }
+        Err(error) => {
+            crate::log!(
+                "filemanager1",
+                "could not own {BUS_NAME}: {error}; the forwarding process exits"
+            );
+            forwarder.unregister();
+            return glib::ExitCode::FAILURE;
+        }
+    }
+
+    crate::log!(
+        "filemanager1",
+        "forwarding to the running Gimbal while {BUS_NAME} is held"
+    );
+    forwarder.arm_idle_exit();
+    main_loop.run();
+    glib::ExitCode::SUCCESS
+}
+
+impl Forwarder {
+    fn install(self: &Rc<Self>) -> bool {
+        let node = match gio::DBusNodeInfo::for_xml(INTROSPECTION_XML) {
+            Ok(node) => node,
+            Err(error) => {
+                crate::log!("filemanager1", "bad introspection XML: {error}");
+                return false;
+            }
+        };
+        let Some(interface) = node.lookup_interface(INTERFACE) else {
+            crate::log!("filemanager1", "the introspection XML has no {INTERFACE}");
+            return false;
+        };
+
+        let weak = Rc::downgrade(self);
+        let builder = self
+            .connection
+            .register_object(OBJECT_PATH, &interface)
+            .method_call(
+                move |_connection,
+                      sender,
+                      _object_path,
+                      _interface,
+                      method,
+                      parameters,
+                      invocation| match weak.upgrade() {
+                    Some(forwarder) => {
+                        forwarder.handle_call(sender, method, parameters, invocation);
+                    }
+                    None => invocation.return_dbus_error(
+                        "org.freedesktop.DBus.Error.Failed",
+                        "Gimbal Files is shutting down.",
+                    ),
+                },
+            );
+        match builder.build() {
+            Ok(registration) => {
+                *self.registration.borrow_mut() = Some(registration);
+                true
+            }
+            Err(error) => {
+                crate::log!("filemanager1", "could not export {OBJECT_PATH}: {error}");
+                false
+            }
+        }
+    }
+
+    /// `RequestName` with `DO_NOT_QUEUE`, matching GApplication's own
+    /// registration call. `1` is PRIMARY_OWNER and `4` is ALREADY_OWNER;
+    /// anything else (notably `3`, EXISTS) means another process has it.
+    fn request_name(&self) -> Result<bool, glib::Error> {
+        let flags = gio::BusNameOwnerFlags::DO_NOT_QUEUE.bits();
+        let parameters = (BUS_NAME, flags).to_variant();
+        let reply = self.connection.call_sync(
+            Some("org.freedesktop.DBus"),
+            "/org/freedesktop/DBus",
+            "org.freedesktop.DBus",
+            "RequestName",
+            Some(&parameters),
+            Some(glib::VariantTy::new("(u)").expect("valid signature")),
+            gio::DBusCallFlags::NONE,
+            1000,
+            None::<&gio::Cancellable>,
+        )?;
+        let (result,) = reply
+            .get::<(u32,)>()
+            .ok_or_else(|| glib::Error::new(gio::IOErrorEnum::Failed, "unexpected reply"))?;
+        Ok(matches!(result, 1 | 4))
+    }
+
+    fn handle_call(
+        self: &Rc<Self>,
+        sender: Option<&str>,
+        method_name: &str,
+        parameters: glib::Variant,
+        invocation: gio::DBusMethodInvocation,
+    ) {
+        let caller = sender.unwrap_or("unknown caller");
+        let Some(method) = Method::parse(method_name) else {
+            crate::log!(
+                "filemanager1",
+                "{caller} called {method_name}: unknown method"
+            );
+            invocation.return_dbus_error(
+                "org.freedesktop.DBus.Error.UnknownMethod",
+                text::UNKNOWN_METHOD,
+            );
+            self.arm_exit(self.note_grace());
+            return;
+        };
+
+        let Some((uris, startup_id)) = parameters.get::<(Vec<String>, String)>() else {
+            crate::log!(
+                "filemanager1",
+                "{caller} called {method_name}: malformed signature"
+            );
+            invocation.return_dbus_error(
+                "org.freedesktop.DBus.Error.InvalidArgs",
+                text::MALFORMED_CALL,
+            );
+            self.arm_exit(self.note_grace());
+            return;
+        };
+
+        let plan = plan(method, &uris);
+        if plan.paths.is_empty() {
+            crate::log!(
+                "filemanager1",
+                "{}",
+                fm_core::filemanager1::call_log_line(
+                    caller,
+                    method.as_str(),
+                    plan.paths.len(),
+                    &plan.refused
+                )
+            );
+        } else {
+            crate::log!(
+                "filemanager1",
+                "{}; forwarded to the running Gimbal",
+                fm_core::filemanager1::call_log_line(
+                    caller,
+                    method.as_str(),
+                    plan.paths.len(),
+                    &plan.refused
+                )
+            );
+        }
+        if plan.properties_unsupported() {
+            crate::log!("filemanager1", "{}", text::PROPERTIES_NOT_SUPPORTED);
+        }
+
+        let startup = (!startup_id.is_empty()).then_some(startup_id);
+        let gimbal = RunningGimbal {
+            application: self.application.clone(),
+        };
+        let result = {
+            let mut grace = self.grace.borrow_mut();
+            answer_and_forward(
+                &plan,
+                startup.as_deref(),
+                || invocation.return_value(None),
+                &gimbal,
+                &mut grace,
+                Instant::now(),
+            )
+        };
+        if let Some(error) = result.error {
+            crate::log!(
+                "filemanager1",
+                "could not forward to the running Gimbal: {error}"
+            );
+        }
+        self.arm_exit(result.generation);
+    }
+
+    fn note_grace(&self) -> u64 {
+        self.grace.borrow_mut().note_call(Instant::now())
+    }
+
+    fn arm_idle_exit(self: &Rc<Self>) {
+        let weak = Rc::downgrade(self);
+        glib::timeout_add_seconds_local_once(SERVICE_IDLE_SECONDS, move || {
+            let Some(forwarder) = weak.upgrade() else {
+                return;
+            };
+            if forwarder.grace.borrow().generation() != 0 {
+                return;
+            }
+            forwarder.release();
+            crate::log!(
+                "filemanager1",
+                "no call arrived; released {BUS_NAME} and the forwarding process exits"
+            );
+            forwarder.main_loop.quit();
+        });
+    }
+
+    fn arm_exit(self: &Rc<Self>, generation: u64) {
+        let weak = Rc::downgrade(self);
+        glib::timeout_add_seconds_local_once(SERVICE_GRACE_SECONDS, move || {
+            let Some(forwarder) = weak.upgrade() else {
+                return;
+            };
+            let (current, expired) = {
+                let grace = forwarder.grace.borrow();
+                (grace.generation(), grace.expired(Instant::now()))
+            };
+            if current != generation || !expired {
+                return;
+            }
+            forwarder.release();
+            crate::log!(
+                "filemanager1",
+                "released {BUS_NAME} after the grace window; the forwarding process exits"
+            );
+            forwarder.main_loop.quit();
+        });
+    }
+
+    fn release(&self) {
+        let parameters = (BUS_NAME,).to_variant();
+        let _ = self.connection.call_sync(
+            Some("org.freedesktop.DBus"),
+            "/org/freedesktop/DBus",
+            "org.freedesktop.DBus",
+            "ReleaseName",
+            Some(&parameters),
+            Some(glib::VariantTy::new("(u)").expect("valid signature")),
+            gio::DBusCallFlags::NONE,
+            1000,
+            None::<&gio::Cancellable>,
+        );
+        self.unregister();
+    }
+
+    fn unregister(&self) {
+        if let Some(registration) = self.registration.borrow_mut().take()
+            && let Err(error) = self.connection.unregister_object(registration)
+        {
+            crate::log!("filemanager1", "could not unexport {OBJECT_PATH}: {error}");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -666,6 +1079,172 @@ mod tests {
         );
         assert_eq!(Method::parse("SortOrderForUrl"), None);
         assert_eq!(Method::parse("showitems"), None);
+    }
+
+    #[test]
+    fn only_the_service_argument_wins() {
+        let args =
+            |values: &[&str]| -> Vec<OsString> { values.iter().map(OsString::from).collect() };
+        assert!(is_service_launch(&args(&[
+            "gimbal-files",
+            "--gapplication-service"
+        ])));
+        assert!(!is_service_launch(&args(&["gimbal-files"])));
+        assert!(!is_service_launch(&args(&[
+            "gimbal-files",
+            "--gapplication-service=yes"
+        ])));
+        assert!(!is_service_launch(&args(&[
+            "gimbal-files",
+            "/tmp/gimbal-p2ac"
+        ])));
+    }
+
+    #[derive(Default)]
+    struct Recorder {
+        events: Rc<RefCell<Vec<String>>>,
+        calls: RefCell<Vec<(Vec<PathBuf>, Option<String>)>>,
+    }
+
+    impl RemoteOpen for Recorder {
+        fn open(&self, paths: &[PathBuf], startup_id: Option<&str>) -> Result<(), String> {
+            self.events.borrow_mut().push("open".to_string());
+            self.calls
+                .borrow_mut()
+                .push((paths.to_vec(), startup_id.map(str::to_string)));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn only_the_accepted_paths_are_forwarded() {
+        let plan = plan(
+            Method::Items,
+            &uris(&[
+                "file:///tmp/gimbal-p2ac/folder",
+                "sftp://host/tmp/refused",
+                "file:///tmp/gimbal-p2ac/folder/file.txt",
+            ]),
+        );
+        assert_eq!(plan.refused.len(), 1);
+
+        let recorder = Recorder::default();
+        let events = recorder.events.clone();
+        let mut grace = Grace::new();
+        let result = answer_and_forward(
+            &plan,
+            Some("token-1"),
+            || events.borrow_mut().push("answer".to_string()),
+            &recorder,
+            &mut grace,
+            Instant::now(),
+        );
+
+        assert!(result.forwarded);
+        assert_eq!(result.error, None);
+        assert_eq!(
+            recorder.calls.borrow().as_slice(),
+            &[(
+                vec![
+                    PathBuf::from("/tmp/gimbal-p2ac/folder"),
+                    PathBuf::from("/tmp/gimbal-p2ac/folder/file.txt"),
+                ],
+                Some("token-1".to_string()),
+            )]
+        );
+    }
+
+    #[test]
+    fn refused_uris_are_never_forwarded() {
+        let plan = plan(
+            Method::Items,
+            &uris(&["sftp://host/tmp/a", "trash:///b", "relative"]),
+        );
+        assert!(plan.paths.is_empty());
+
+        let recorder = Recorder::default();
+        let events = recorder.events.clone();
+        let mut grace = Grace::new();
+        let result = answer_and_forward(
+            &plan,
+            None,
+            || events.borrow_mut().push("answer".to_string()),
+            &recorder,
+            &mut grace,
+            Instant::now(),
+        );
+
+        assert!(!result.forwarded);
+        assert_eq!(result.error, None);
+        assert!(recorder.calls.borrow().is_empty());
+    }
+
+    #[test]
+    fn the_empty_result_goes_back_before_the_hand_off() {
+        let first_plan = plan(Method::Items, &uris(&["file:///tmp/gimbal-p2ac/a"]));
+        let recorder = Recorder::default();
+        let events = recorder.events.clone();
+        let mut grace = Grace::new();
+        answer_and_forward(
+            &first_plan,
+            None,
+            || events.borrow_mut().push("answer".to_string()),
+            &recorder,
+            &mut grace,
+            Instant::now(),
+        );
+        assert_eq!(
+            events.borrow().as_slice(),
+            &["answer".to_string(), "open".to_string()]
+        );
+
+        let empty = plan(Method::Items, &uris(&["sftp://host/tmp/a"]));
+        let recorder = Recorder::default();
+        let events = recorder.events.clone();
+        answer_and_forward(
+            &empty,
+            None,
+            || events.borrow_mut().push("answer".to_string()),
+            &recorder,
+            &mut grace,
+            Instant::now(),
+        );
+        assert_eq!(events.borrow().as_slice(), &["answer".to_string()]);
+    }
+
+    #[test]
+    fn every_call_resets_the_grace_window() {
+        let start = Instant::now();
+        let mut grace = Grace::new();
+        let first = grace.note_call(start);
+        assert!(!grace.expired(start + Duration::from_millis(1500)));
+        assert!(grace.expired(start + Duration::from_secs(2)));
+
+        let second = grace.note_call(start + Duration::from_millis(1500));
+        assert!(second > first);
+        assert!(!grace.expired(start + Duration::from_millis(3000)));
+        assert!(grace.expired(start + Duration::from_millis(3500)));
+    }
+
+    #[test]
+    fn a_forwarded_call_uses_the_newest_generation() {
+        let plan = plan(Method::Items, &uris(&["file:///tmp/gimbal-p2ac/a"]));
+        let recorder = Recorder::default();
+        let mut grace = Grace::new();
+        let now = Instant::now();
+        let first = answer_and_forward(&plan, None, || {}, &recorder, &mut grace, now);
+        let second = answer_and_forward(
+            &plan,
+            None,
+            || {},
+            &recorder,
+            &mut grace,
+            now + Duration::from_secs(1),
+        );
+        assert_eq!(grace.generation(), second.generation);
+        assert!(second.generation > first.generation);
+        assert!(!grace.expired(now + Duration::from_millis(2900)));
+        assert!(grace.expired(now + Duration::from_secs(3)));
     }
 
     struct NoClipboard;

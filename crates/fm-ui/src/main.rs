@@ -50,22 +50,41 @@ thread_local! {
 
 fn main() -> gtk::glib::ExitCode {
     log::start();
+    let service = filemanager1::is_service_launch(&std::env::args_os().collect::<Vec<_>>());
     let app = adw::Application::builder()
         .application_id(fm_core::APP_ID)
         .flags(gio::ApplicationFlags::HANDLES_OPEN)
         .build();
-    app.connect_startup(startup);
+    app.connect_startup(move |application| startup(application, service));
     app.connect_activate(activate);
     app.connect_open(open);
+
+    if service {
+        // GApplication makes "cannot own the app id" fatal in service mode.
+        // Register without IS_SERVICE first: a remote result means another
+        // Gimbal is already running, and this process forwards to it instead
+        // of printing "Failed to register".
+        match app.register(None::<&gio::Cancellable>) {
+            Ok(()) if app.is_remote() => return filemanager1::forward(app),
+            Ok(()) => return app.run(),
+            Err(error) => {
+                crate::log!("fm_ui", "Failed to register: {error}");
+                return gtk::glib::ExitCode::FAILURE;
+            }
+        }
+    }
+
     app.run()
 }
 
 /// A `--gapplication-service` launch never activates, so the FileManager1
 /// object and name are handled here, before the first call can arrive.
-fn startup(application: &adw::Application) {
+/// `service` comes from the raw arguments because a primary service registers
+/// before `run` parses the flag.
+fn startup(application: &adw::Application, service: bool) {
     // `startup` only runs on the primary instance. A service launch is the
     // bus's activation file starting us; an ordinary launch reaches activate.
-    filemanager1::start(application);
+    filemanager1::start(application, service);
 }
 
 /// The process, once startup has built it. The FileManager1 object uses this
@@ -118,7 +137,13 @@ fn open(application: &adw::Application, files: &[gio::File], hint: &str) {
         );
     }
     if !paths.is_empty() {
-        process.open_arguments(&paths, created);
+        // A forwarded FileManager1 call carries its xdg-activation token in
+        // the open hint. GApplication's own launches pass "".
+        if hint.is_empty() {
+            process.open_arguments(&paths, created);
+        } else {
+            process.open_arguments_with_startup(&paths, created, Some(hint));
+        }
     } else {
         process.clear_fresh_home();
     }
