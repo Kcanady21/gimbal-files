@@ -38,6 +38,10 @@ pub struct MenuItem {
     pub action: MenuAction,
     /// A symbolic icon name shown before the label.
     pub icon: Option<&'static str>,
+    /// The explanation shown when the entry is disabled, or on hover.
+    pub tooltip: Option<&'static str>,
+    /// A thin rule instead of a button. Separators carry no command.
+    pub separator: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -63,22 +67,41 @@ fn item(label: &str, command: &'static str, action: MenuAction) -> MenuItem {
         enabled: true,
         action,
         icon: None,
+        tooltip: None,
+        separator: false,
     }
 }
+
+fn separator() -> MenuItem {
+    MenuItem {
+        label: String::new(),
+        command: "",
+        enabled: false,
+        action: MenuAction::Command(Vec::new()),
+        icon: None,
+        tooltip: None,
+        separator: true,
+    }
+}
+
+/// The one explanation a missing Baobab shows on both Disk Usage entries.
+pub const BAOBAB_MISSING: &str = "Install baobab to see what uses the space";
 
 /// The menu for a right-click on selected items. `current_uid` is the user's
 /// uid when it could be read; without it no administrator entry is offered.
 #[cfg(test)]
 pub fn item_menu(items: &[ItemInfo], current_uid: Option<u32>) -> Vec<MenuItem> {
-    item_menu_in_scope(items, current_uid, false)
+    item_menu_in_scope(items, current_uid, false, true)
 }
 
-/// The same menu, with the tab's scope. Administrator tabs never offer an
-/// administrator entry: the current location already is one.
+/// The same menu, with the tab's scope and whether Baobab is installed.
+/// Administrator tabs never offer an administrator entry: the current location
+/// already is one.
 pub fn item_menu_in_scope(
     items: &[ItemInfo],
     current_uid: Option<u32>,
     in_admin: bool,
+    baobab: bool,
 ) -> Vec<MenuItem> {
     if items.is_empty() {
         return Vec::new();
@@ -205,9 +228,28 @@ pub fn item_menu_in_scope(
         menu.push(item(
             "Pin",
             "pins.add",
-            MenuAction::Command(vec![("path".to_string(), folder)]),
+            MenuAction::Command(vec![("path".to_string(), folder.clone())]),
         ));
+
+        // P2af: Disk Usage is next to Properties, for exactly one folder. It
+        // stays visible when Baobab is missing, with the reason on hover.
+        let mut usage = item(
+            "Disk Usage",
+            "app.disk-usage",
+            MenuAction::Command(vec![("path".to_string(), folder)]),
+        );
+        usage.enabled = baobab;
+        usage.tooltip = (!baobab).then_some(BAOBAB_MISSING);
+        menu.push(usage);
     }
+
+    // Properties is always the last entry, for files and folders and any
+    // selection size.
+    menu.push(item(
+        "Properties",
+        "file.properties",
+        MenuAction::Command(path_args(&paths)),
+    ));
 
     menu
 }
@@ -252,6 +294,22 @@ pub fn background_menu_in_scope(
         menu.push(admin);
     }
 
+    // New Tab and New Window always open normal tabs and windows at this
+    // folder, even inside an administrator tab (P2af). The handler enforces
+    // that; the menu only names the ordinary commands.
+    menu.push(item(
+        "New Tab",
+        "tab.new",
+        MenuAction::Command(vec![("path".to_string(), folder_text.clone())]),
+    ));
+    menu.push(item(
+        "New Window",
+        "window.new",
+        MenuAction::Command(vec![("path".to_string(), folder_text.clone())]),
+    ));
+
+    menu.push(separator());
+
     if let Some(summary) = undo_summary {
         menu.push(item(
             &format!("Undo {summary}"),
@@ -276,6 +334,8 @@ pub fn background_menu_in_scope(
     paste.enabled = clipboard_has_files;
     menu.push(paste);
 
+    menu.push(separator());
+
     menu.push(item(
         "Pin This Folder",
         "pins.add",
@@ -290,10 +350,25 @@ pub fn background_menu_in_scope(
     let mut usage = item(
         "Disk Usage",
         "app.disk-usage",
-        MenuAction::Command(vec![("path".to_string(), folder_text)]),
+        MenuAction::Command(vec![("path".to_string(), folder_text.clone())]),
     );
     usage.enabled = baobab;
+    usage.tooltip = (!baobab).then_some(BAOBAB_MISSING);
     menu.push(usage);
+
+    menu.push(item(
+        "Properties",
+        "file.properties",
+        MenuAction::Command(vec![("paths".to_string(), folder_text)]),
+    ));
+
+    menu.push(separator());
+
+    menu.push(item(
+        "Settings…",
+        "app.settings",
+        MenuAction::Command(Vec::new()),
+    ));
 
     menu
 }
@@ -352,7 +427,24 @@ mod tests {
     }
 
     fn labels(menu: &[MenuItem]) -> Vec<&str> {
-        menu.iter().map(|item| item.label.as_str()).collect()
+        menu.iter()
+            .filter(|item| !item.separator)
+            .map(|item| item.label.as_str())
+            .collect()
+    }
+
+    /// Labels and separators in order, so the background menu's shape is one
+    /// readable assertion.
+    fn shape(menu: &[MenuItem]) -> Vec<String> {
+        menu.iter()
+            .map(|item| {
+                if item.separator {
+                    "|".to_string()
+                } else {
+                    item.label.clone()
+                }
+            })
+            .collect()
     }
 
     #[test]
@@ -369,6 +461,7 @@ mod tests {
                 "Copy To…",
                 "Move To…",
                 "Move to Trash",
+                "Properties",
             ]
         );
         assert!(menu.iter().all(|item| item.enabled));
@@ -445,7 +538,7 @@ mod tests {
             MenuAction::Command(vec![("path".to_string(), "/tmp/root-docs".to_string())])
         );
         assert!(
-            !item_menu_in_scope(&[folder("root-docs")], Some(CURRENT_UID), true)
+            !item_menu_in_scope(&[folder("root-docs")], Some(CURRENT_UID), true, true)
                 .iter()
                 .any(|item| item.command == "tab.open-as-admin"),
             "no administrator entry inside an administrator tab"
@@ -478,7 +571,7 @@ mod tests {
 
     #[test]
     fn an_administrator_tab_hides_open_with_and_the_admin_entry() {
-        let menu = item_menu_in_scope(&[unowned_file("root.txt")], Some(CURRENT_UID), true);
+        let menu = item_menu_in_scope(&[unowned_file("root.txt")], Some(CURRENT_UID), true, true);
         assert!(!labels(&menu).contains(&"Open With"));
         assert!(!labels(&menu).contains(&"Open as Administrator"));
     }
@@ -502,9 +595,50 @@ mod tests {
         let labels = labels(&menu);
         assert!(labels.contains(&"Open in New Tab"));
         assert!(labels.contains(&"Pin"));
+        assert!(labels.contains(&"Disk Usage"));
+        assert_eq!(labels.last().copied(), Some("Properties"));
         let new_tab = menu.iter().find(|item| item.command == "tab.new").unwrap();
         assert_eq!(
             new_tab.action,
+            MenuAction::Command(vec![("path".to_string(), "/tmp/docs".to_string())])
+        );
+    }
+
+    #[test]
+    fn properties_is_last_for_every_selection_and_disk_usage_needs_one_folder() {
+        let selections = [
+            vec![owned_file("a.txt")],
+            vec![owned_file("a.txt"), owned_file("b.txt")],
+            vec![folder("docs")],
+            vec![folder("docs"), folder("more")],
+            vec![owned_file("a.txt"), folder("docs")],
+        ];
+        for selection in selections {
+            let menu = item_menu(&selection, Some(CURRENT_UID));
+            assert_eq!(
+                menu.last().map(|item| (item.label.as_str(), item.command)),
+                Some(("Properties", "file.properties"))
+            );
+            let disk = menu
+                .iter()
+                .filter(|item| item.command == "app.disk-usage")
+                .count();
+            let expected = usize::from(selection.len() == 1 && selection[0].is_dir);
+            assert_eq!(disk, expected, "{selection:?}");
+        }
+    }
+
+    #[test]
+    fn a_folder_disk_usage_entry_is_disabled_with_the_reason_when_baobab_is_missing() {
+        let menu = item_menu_in_scope(&[folder("docs")], Some(CURRENT_UID), false, false);
+        let usage = menu
+            .iter()
+            .find(|item| item.command == "app.disk-usage")
+            .expect("Disk Usage stays visible");
+        assert!(!usage.enabled);
+        assert_eq!(usage.tooltip, Some(BAOBAB_MISSING));
+        assert_eq!(
+            usage.action,
             MenuAction::Command(vec![("path".to_string(), "/tmp/docs".to_string())])
         );
     }
@@ -553,46 +687,114 @@ mod tests {
     }
 
     #[test]
-    fn empty_space_gets_the_background_menu() {
+    fn empty_space_gets_the_reviewed_background_menu_in_order() {
         let menu = background_menu(Path::new("/tmp"), None, true, false);
         assert_eq!(
-            labels(&menu),
+            shape(&menu),
             [
+                "New Tab",
+                "New Window",
+                "|",
                 "New Folder…",
                 "Paste",
+                "|",
                 "Pin This Folder",
                 "Refresh",
                 "Disk Usage",
+                "Properties",
+                "|",
+                "Settings…",
             ]
         );
+        let paste = menu
+            .iter()
+            .find(|item| item.command == "file.paste")
+            .unwrap();
         assert!(
-            !menu[1].enabled,
+            !paste.enabled,
             "paste is insensitive with no clipboard files"
         );
-        assert!(menu[4].enabled);
+        let usage = menu
+            .iter()
+            .find(|item| item.command == "app.disk-usage")
+            .unwrap();
+        assert!(usage.enabled);
         assert!(
             menu.iter()
+                .filter(|item| !item.separator)
                 .all(|item| COMMANDS.iter().any(|command| command.name == item.command)),
             "every entry is a registry command"
         );
     }
 
     #[test]
-    fn undo_is_first_when_there_is_something_to_undo() {
-        let menu = background_menu(Path::new("/tmp"), Some("restored 2 items"), true, true);
-        assert_eq!(menu[0].label, "Undo restored 2 items");
-        assert_eq!(menu[0].command, "file.undo");
-        assert!(menu[1].enabled);
+    fn new_tab_and_new_window_carry_this_folder_even_inside_an_admin_tab() {
+        for in_admin in [false, true] {
+            let menu =
+                background_menu_in_scope(Path::new("/tmp/docs"), None, true, true, false, in_admin);
+            for (command, label) in [("tab.new", "New Tab"), ("window.new", "New Window")] {
+                let entry = menu
+                    .iter()
+                    .find(|item| item.command == command)
+                    .unwrap_or_else(|| panic!("{label} inside an admin tab: {in_admin}"));
+                assert_eq!(
+                    entry.action,
+                    MenuAction::Command(vec![("path".to_string(), "/tmp/docs".to_string())])
+                );
+                assert!(entry.enabled);
+            }
+            assert!(
+                !menu.iter().any(|item| item.command == "tab.open-as-admin"),
+                "New Tab and New Window are the ordinary commands"
+            );
+        }
     }
 
     #[test]
-    fn disk_usage_is_insensitive_when_baobab_is_missing() {
+    fn undo_is_first_in_its_section_when_there_is_something_to_undo() {
+        let menu = background_menu(Path::new("/tmp"), Some("restored 2 items"), true, true);
+        assert_eq!(
+            shape(&menu)[..5],
+            [
+                "New Tab",
+                "New Window",
+                "|",
+                "Undo restored 2 items",
+                "New Folder…"
+            ]
+        );
+        let undo = menu
+            .iter()
+            .find(|item| item.command == "file.undo")
+            .unwrap();
+        assert!(undo.enabled);
+    }
+
+    #[test]
+    fn disk_usage_stays_visible_and_explains_a_missing_baobab() {
         let menu = background_menu(Path::new("/tmp"), None, false, true);
         let usage = menu
             .iter()
             .find(|item| item.command == "app.disk-usage")
             .unwrap();
         assert!(!usage.enabled);
+        assert_eq!(usage.tooltip, Some(BAOBAB_MISSING));
+    }
+
+    #[test]
+    fn settings_is_the_last_background_entry_and_the_folder_properties_entry_is_last_before_it() {
+        let menu = background_menu(Path::new("/tmp"), None, true, true);
+        assert_eq!(shape(&menu).last().unwrap(), "Settings…");
+        assert_eq!(menu.last().unwrap().command, "app.settings");
+        let properties = menu
+            .iter()
+            .find(|item| item.command == "file.properties")
+            .expect("the folder Properties entry");
+        assert_eq!(properties.label, "Properties");
+        assert_eq!(
+            properties.action,
+            MenuAction::Command(vec![("paths".to_string(), "/tmp".to_string())])
+        );
     }
 
     #[test]
@@ -605,7 +807,7 @@ mod tests {
             background_menu(Path::new("/tmp"), Some("restored 1 item"), true, true),
         ];
         for menu in menus {
-            for item in menu {
+            for item in menu.into_iter().filter(|item| !item.separator) {
                 assert!(
                     COMMANDS.iter().any(|command| command.name == item.command),
                     "{} is not in the catalogue",

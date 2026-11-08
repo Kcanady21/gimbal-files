@@ -2160,7 +2160,7 @@ impl FolderView {
             self.grid.grab_focus();
             return glib::Propagation::Stop;
         }
-        if matches!(key, gdk::Key::Return | gdk::Key::KP_Enter) {
+        if grid_owns_enter(key, modifiers) {
             self.open_position(position);
             return glib::Propagation::Stop;
         }
@@ -2446,6 +2446,19 @@ fn result_label(result: &fm_core::folder_size::ScanResult) -> &'static str {
     }
 }
 
+fn grid_owns_enter(key: gdk::Key, modifiers: gdk::ModifierType) -> bool {
+    // The grid handles keys in capture. Modified Enter must continue to the
+    // window's configured shortcuts, including Alt+Enter for Properties.
+    let keyboard_modifiers = gdk::ModifierType::SHIFT_MASK
+        | gdk::ModifierType::CONTROL_MASK
+        | gdk::ModifierType::ALT_MASK
+        | gdk::ModifierType::SUPER_MASK
+        | gdk::ModifierType::HYPER_MASK
+        | gdk::ModifierType::META_MASK;
+    matches!(key, gdk::Key::Return | gdk::Key::KP_Enter)
+        && !modifiers.intersects(keyboard_modifiers)
+}
+
 fn label_mode(selected: bool) -> (i32, gtk::pango::EllipsizeMode) {
     if selected {
         (0, gtk::pango::EllipsizeMode::None)
@@ -2632,6 +2645,17 @@ fn compare_objects(a: &glib::Object, b: &glib::Object, rule: SortRule) -> gtk::O
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn modified_enter_reaches_the_window_shortcuts() {
+        for key in [gdk::Key::Return, gdk::Key::KP_Enter] {
+            assert!(grid_owns_enter(key, gdk::ModifierType::empty()));
+            assert!(grid_owns_enter(key, gdk::ModifierType::LOCK_MASK));
+            assert!(!grid_owns_enter(key, gdk::ModifierType::ALT_MASK));
+            assert!(!grid_owns_enter(key, gdk::ModifierType::CONTROL_MASK));
+            assert!(!grid_owns_enter(key, gdk::ModifierType::SHIFT_MASK));
+        }
+    }
 
     #[test]
     fn the_column_cap_follows_the_viewport_and_never_is_g_maxuint() {

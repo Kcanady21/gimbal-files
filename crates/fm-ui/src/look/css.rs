@@ -253,6 +253,16 @@ to {{ box-shadow: 0 0 0 {mid}px {FOCUS_RING}; }}
 .gl-openwith-heading {{ font-size: {tsmall}px; color: alpha({FG}, 0.7); padding: {gm}px {gm}px {gs}px {gm}px; }}
 .gl-openwith-actions {{ padding-top: {gm}px; }}
 window.gimbal-look .gl-openwith-list row:selected {{ background-color: alpha(@accent_bg_color, 0.45); border-radius: {r}px; }}
+.gl-properties-root {{ padding: {gm}px; min-width: {search_w}px; }}
+.gl-properties-header {{ padding-bottom: {gm}px; }}
+.gl-properties-icon {{ -gtk-icon-size: {igrid}px; color: {FG}; -gtk-icon-palette: {folder_palette}; }}
+.gl-properties-title {{ font-size: {tt}px; font-weight: bold; }}
+.gl-properties-name {{ font-size: {trow}px; }}
+.gl-properties-label {{ color: alpha({FG}, 0.7); font-size: {tsmall}px; padding-top: {gs}px; }}
+.gl-properties-value {{ font-size: {tsmall}px; padding-top: {gs}px; }}
+.gl-properties-link {{ font-size: {tsmall}px; padding: 0; }}
+.gl-properties-button {{ min-height: {ch}px; padding: 0 {gm}px; border-radius: {ri}px; }}
+.gl-properties .gl-icon-button:disabled {{ color: alpha({FG}, 0.45); }}
 .gl-trash-view {{ padding: {gm}px; color: {FG}; }}
 .gl-trash-actions {{ min-height: {ch}px; margin-bottom: {gm}px; }}
 .gl-trash-title {{ font-size: {tt}px; color: {FG}; }}

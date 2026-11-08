@@ -39,6 +39,10 @@ const SERVICE_GRACE_SECONDS: u32 = 2;
 /// (`glib 2.88.0:gio/gapplication.c:2728-2734`).
 const SERVICE_IDLE_SECONDS: u32 = 10;
 
+/// The GApplication open hint a forwarding process uses to ask the running
+/// Gimbal for a Properties window instead of a folder tab.
+pub(crate) const PROPERTIES_HINT: &str = "gimbal:properties";
+
 /// The three reviewed methods. Dolphin's KDE-only `SortOrderForUrl` is
 /// deliberately absent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,7 +84,9 @@ pub struct CallPlan {
 }
 
 impl CallPlan {
-    pub fn properties_unsupported(&self) -> bool {
+    /// ShowItemProperties opens the Properties window instead of only showing
+    /// the item.
+    pub fn opens_properties(&self) -> bool {
         self.method == Method::ItemProperties
     }
 }
@@ -109,6 +115,12 @@ pub fn is_service_launch(arguments: &[OsString]) -> bool {
 /// GApplication's remote `open`; tests use a recorder.
 pub trait RemoteOpen {
     fn open(&self, paths: &[PathBuf], startup_id: Option<&str>) -> Result<(), String>;
+
+    /// Ask the running instance for a Properties window. The default keeps
+    /// test fakes simple while `RunningGimbal` sends its reserved open hint.
+    fn properties(&self, paths: &[PathBuf]) -> Result<(), String> {
+        self.open(paths, Some(PROPERTIES_HINT))
+    }
 }
 
 /// The 2-second grace window. Each call starts a new generation; only the
@@ -171,7 +183,11 @@ pub fn answer_and_forward(
             error: None,
         };
     }
-    match gimbal.open(&plan.paths, startup_id) {
+    match if plan.opens_properties() {
+        gimbal.properties(&plan.paths)
+    } else {
+        gimbal.open(&plan.paths, startup_id)
+    } {
         Ok(()) => ForwardResult {
             generation,
             forwarded: true,
@@ -226,7 +242,7 @@ pub mod text {
     pub const OFF: &str = "Off";
     pub const ANOTHER_APP: &str = "another app";
     pub const SERVICE_OFF_LOG: &str = "started by the bus with the switch off; served one call";
-    pub const PROPERTIES_NOT_SUPPORTED: &str = "properties are not supported; showing the item";
+    pub const PROPERTIES_WINDOW: &str = "opening the Properties window for the item";
     pub const MALFORMED_CALL: &str = "Expected an array of URIs and a startup id.";
     pub const UNKNOWN_METHOD: &str = "Unknown FileManager1 method.";
 
@@ -627,8 +643,8 @@ impl Runtime {
                 &plan.refused
             )
         );
-        if plan.properties_unsupported() {
-            crate::log!("filemanager1", "{}", text::PROPERTIES_NOT_SUPPORTED);
+        if plan.opens_properties() {
+            crate::log!("filemanager1", "{}", text::PROPERTIES_WINDOW);
         }
 
         // Reply before any GTK work: creating the process and restoring the
@@ -641,7 +657,11 @@ impl Runtime {
             let startup = (!startup_id.is_empty()).then_some(startup_id);
             glib::idle_add_local_once(move || {
                 let (process, created) = crate::ensure_process(&application);
-                process.open_arguments_with_startup(&plan.paths, created, startup.as_deref());
+                if plan.opens_properties() {
+                    process.open_properties(&plan.paths);
+                } else {
+                    process.open_arguments_with_startup(&plan.paths, created, startup.as_deref());
+                }
             });
         }
 
@@ -895,8 +915,8 @@ impl Forwarder {
                 )
             );
         }
-        if plan.properties_unsupported() {
-            crate::log!("filemanager1", "{}", text::PROPERTIES_NOT_SUPPORTED);
+        if plan.opens_properties() {
+            crate::log!("filemanager1", "{}", text::PROPERTIES_WINDOW);
         }
 
         let startup = (!startup_id.is_empty()).then_some(startup_id);
@@ -1021,11 +1041,11 @@ mod tests {
     }
 
     #[test]
-    fn only_show_item_properties_reports_the_missing_window() {
+    fn only_show_item_properties_opens_the_properties_window() {
         let properties = plan(Method::ItemProperties, &[]);
-        assert!(properties.properties_unsupported());
-        assert!(!plan(Method::Items, &[]).properties_unsupported());
-        assert!(!plan(Method::Folders, &[]).properties_unsupported());
+        assert!(properties.opens_properties());
+        assert!(!plan(Method::Items, &[]).opens_properties());
+        assert!(!plan(Method::Folders, &[]).opens_properties());
     }
 
     #[test]

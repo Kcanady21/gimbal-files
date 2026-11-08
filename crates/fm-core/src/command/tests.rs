@@ -26,6 +26,7 @@ fn the_v1_catalogue_has_every_reviewed_command_in_order() {
     let expected = [
         "app.quit",
         "app.disk-usage",
+        "app.settings",
         "window.new",
         "window.close",
         "tab.new",
@@ -51,6 +52,7 @@ fn the_v1_catalogue_has_every_reviewed_command_in_order() {
         "selection.all",
         "selection.none",
         "file.open",
+        "file.properties",
         "file.open-with",
         "file.set-default-app",
         "file.open-as-admin",
@@ -464,6 +466,59 @@ fn open_with_and_set_default_app_are_system_commands_with_their_arguments() {
         .is_err()
     );
     assert!(check(Caller::Ui, &["file.set-default-app", "type=text/plain"]).is_err());
+}
+
+#[test]
+fn properties_and_settings_are_ui_only_with_the_reviewed_caller_rules() {
+    let properties = Registry::new()
+        .command("file.properties")
+        .expect("the Properties command exists");
+    assert_eq!(properties.effect, Effect::System);
+    assert!(!properties.undo);
+    let paths = properties.argument("paths").expect("a paths argument");
+    assert_eq!(paths.kind, ArgKind::Paths);
+    assert_eq!(paths.presence, Presence::Context(ContextSource::Selection));
+
+    let settings = Registry::new()
+        .command("app.settings")
+        .expect("the Settings command exists");
+    assert_eq!(settings.effect, Effect::System);
+    assert!(!settings.undo);
+    assert!(settings.arguments().is_empty());
+
+    // The window and the <Alt>Return hotkey may show Properties. The socket
+    // refuses every System effect, and the CLI speaks to Gimbal through that
+    // socket, so automation never reaches either handler.
+    assert!(caller_allowed(
+        "file.properties",
+        Effect::System,
+        Caller::Ui
+    ));
+    assert!(caller_allowed(
+        "file.properties",
+        Effect::System,
+        Caller::Hotkey
+    ));
+    assert!(caller_allowed("app.settings", Effect::System, Caller::Ui));
+
+    assert!(
+        check(
+            Caller::Ui,
+            &["file.properties", "paths=/tmp/a.txt", "paths=/tmp/b.txt"]
+        )
+        .is_ok()
+    );
+    assert!(check(Caller::Hotkey, &["file.properties"]).is_ok());
+    assert!(check(Caller::Ui, &["app.settings"]).is_ok());
+    assert!(check(Caller::Ui, &["app.settings", "path=/tmp"]).is_err());
+
+    for name in ["file.properties", "app.settings"] {
+        let mut handler = Recorder::new(Outcome::Done);
+        let outcome =
+            Registry::new().dispatch(Caller::Ui, &parse_invocation(&[name]), &mut handler);
+        assert_eq!(outcome, Outcome::Done, "{name}");
+        assert_eq!(handler.seen.len(), 1, "{name}");
+    }
 }
 
 #[test]

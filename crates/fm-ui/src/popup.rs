@@ -1,16 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Show a popover so a popup the compositor refused can never lock the window.
 //!
-//! An autohide popover takes a window-group grab when it maps
-//! (gtk-4.22.4 gtk/gtkpopover.c:1222) and drops it only on unmap, which GTK
-//! triggers from the popup surface's `mapped` notify (gtkpopover.c:927–932).
-//! A Wayland popup becomes mapped on its first configure
-//! (gdk/wayland/gdksurface-wayland.c:970 `maybe_notify_mapped`). When the
-//! compositor sends `xdg_popup.done` before that configure, `gdk_surface_hide`
-//! moves `mapped` from FALSE to FALSE (gdk/gdksurface.c
-//! `gdk_surface_queue_set_is_mapped`), no notify fires, and the popover stays
-//! "visible" with its grab: every click in the window goes to an invisible
-//! widget. The watchdog below pops such a popover down, which releases the grab.
+//! Wayland GDK takes a seat grab while presenting the surface. If presentation
+//! fails before the first configure, GTK can leave the popover visible but
+//! unmapped (gtk-4.22.4 gtk/gtkpopover.c:1152). Popdown then skips the widget's
+//! unmap handler, so it never hides the surface to release the seat grab.
 
 use std::time::Duration;
 
@@ -30,13 +24,19 @@ pub fn show(popover: &impl IsA<gtk::Popover>) {
         let Some(popover) = weak.upgrade() else {
             return;
         };
-        let surface_mapped = popover.surface().is_some_and(|surface| surface.is_mapped());
-        if popover.is_visible() && !surface_mapped {
-            crate::log!(
-                "popup",
-                "the compositor never showed a popover; closing it to release its grab"
-            );
-            popover.popdown();
+        let surface = popover.surface();
+        if !popover.is_visible() || surface.as_ref().is_some_and(|surface| surface.is_mapped()) {
+            return;
         }
+        crate::log!(
+            "popup",
+            "the compositor never showed a popover; closing it to release its grab"
+        );
+        // Wayland's surface hide releases the seat grab even if the surface
+        // never mapped (gtk-4.22.4 gdk/wayland/gdksurface-wayland.c:1148).
+        if let Some(surface) = surface {
+            surface.hide();
+        }
+        popover.popdown();
     });
 }

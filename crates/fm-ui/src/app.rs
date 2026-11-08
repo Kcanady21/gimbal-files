@@ -13,6 +13,9 @@ pub mod update;
 #[path = "openwith.rs"]
 pub mod openwith;
 
+#[path = "properties.rs"]
+pub mod properties;
+
 use adw::prelude::*;
 use fm_core::command::{Caller, CheckedCommand, Effect, Invocation, Outcome, Registry, Value};
 use fm_core::config::{self, Change, ConfigFile};
@@ -1181,6 +1184,12 @@ impl Process {
         reuse_fresh: bool,
         startup_id: Option<&str>,
     ) {
+        // A bus-started FileManager1 process hands a ShowItemProperties call to
+        // this running instance with a reserved hint instead of a tab request.
+        if startup_id == Some(crate::filemanager1::PROPERTIES_HINT) {
+            self.open_properties(paths);
+            return;
+        }
         self.open_arguments(paths, reuse_fresh);
         let Some(window) = self.focused_window_id() else {
             return;
@@ -1194,6 +1203,27 @@ impl Process {
             ui.window().set_startup_id(startup_id);
         }
         ui.present();
+    }
+
+    /// Show Properties for a `ShowItemProperties` call. The primary instance
+    /// restores its session first, so there is always a window to be
+    /// transient for; a fresh process with no session gets a home window.
+    pub fn open_properties(self: &Rc<Self>, paths: &[PathBuf]) {
+        if paths.is_empty() {
+            return;
+        }
+        if self.focused_window_id().is_none() {
+            self.open_request(&[]);
+        }
+        let Some(window) = self.focused_window_id() else {
+            return;
+        };
+        self.leave_trash_for_navigation(window);
+        self.focus_model_window(window);
+        if let Some(ui) = self.window(window) {
+            ui.present();
+            properties::show(&ui, paths, fm_core::admin::Scope::User);
+        }
     }
 
     pub fn tab_folder(&self, window: WindowId, tab: TabId) -> Option<PathBuf> {
@@ -3060,6 +3090,44 @@ impl Process {
                     Err(error) => Outcome::Failed(error),
                 };
             }
+            "app.settings" => {
+                if !matches!(caller, Caller::Ui | Caller::Hotkey) {
+                    return Outcome::Failed(
+                        "app.settings is available only from the window".to_string(),
+                    );
+                }
+                let Some(ui) = self.window(window) else {
+                    return Outcome::Failed("app.settings has no window".to_string());
+                };
+                // Open after the background menu's popover is gone, the same
+                // way the main menu opens its Settings submenu.
+                let ui = ui.clone();
+                glib::idle_add_local_once(move || ui.header().open_settings());
+                return Outcome::Done;
+            }
+            "file.properties" => {
+                if !matches!(caller, Caller::Ui | Caller::Hotkey) {
+                    return Outcome::Failed(
+                        "file.properties is available only from the window".to_string(),
+                    );
+                }
+                let paths = argument_paths(command, "paths")
+                    .filter(|paths| !paths.is_empty())
+                    .unwrap_or_else(|| self.selected_paths(window));
+                if paths.is_empty() {
+                    return Outcome::Failed("file.properties has nothing selected".to_string());
+                }
+                let Some(ui) = self.window(window) else {
+                    return Outcome::Failed("file.properties has no window".to_string());
+                };
+                let scope = if self.focused_admin(window) {
+                    fm_core::admin::Scope::Admin
+                } else {
+                    fm_core::admin::Scope::User
+                };
+                properties::show(&ui, &paths, scope);
+                return Outcome::Done;
+            }
             "drive.mount" => return self.mount_device(window, command),
             "drive.unmount" => return self.remove_device(window, command, DriveAction::Unmount),
             "drive.eject" => return self.remove_device(window, command, DriveAction::Eject),
@@ -3330,7 +3398,15 @@ impl Process {
                 self.finish(result);
             }
             "tab.new" => {
-                let result = self.workspace.borrow_mut().tab_new(path);
+                let was_admin = self.focused_admin(window);
+                let mut result = self.workspace.borrow_mut().tab_new(path);
+                if was_admin && let Ok(events) = &mut result {
+                    // P2af: New Tab from an administrator tab is an ordinary
+                    // tab at the same folder, never another administrator tab.
+                    if let Ok(scope_events) = self.workspace.borrow_mut().tab_leave_admin() {
+                        events.extend(scope_events);
+                    }
+                }
                 self.finish(result);
             }
             "tab.open-as-admin" => {
@@ -4154,6 +4230,10 @@ impl Process {
             })
             .collect();
         if let Some(ui) = self.window(window) {
+            let baobab = self
+                .fileops()
+                .as_ref()
+                .is_some_and(|fileops| fileops.baobab_available());
             *self.openwith_anchor.borrow_mut() = Some(anchor.clone());
             dialogs::show_menu(
                 &ui,
@@ -4162,6 +4242,7 @@ impl Process {
                     &items,
                     fm_core::admin::current_uid().ok(),
                     self.focused_admin(window),
+                    baobab,
                 ),
                 None,
             );
@@ -6072,6 +6153,125 @@ mod tests {
     fn gtk_test_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    #[test]
+    fn new_folder_menu_keeps_the_click_position_and_creates_the_folder() {
+        let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                "app::tests::new_folder_menu_keeps_the_click_position_and_creates_the_folder_inner",
+                "--ignored",
+                "--nocapture",
+            ])
+            .output()
+            .expect("the owned New Folder widget process");
+        assert!(
+            output.status.success(),
+            "the New Folder regression failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    #[ignore = "runs in its own process through the subprocess widget regression"]
+    fn new_folder_menu_keeps_the_click_position_and_creates_the_folder_inner() {
+        let _guard = gtk_test_lock();
+        gtk::init().expect("the New Folder regression needs a GTK display");
+        adw::init().expect("libadwaita init");
+        let application = adw::Application::builder()
+            .application_id("org.gimbal.Files.NewFolderWidgetTest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        application
+            .register(None::<&gio::Cancellable>)
+            .expect("register the owned non-unique test application");
+        let scratch = search_scratch("new-folder");
+        let folder = scratch.root.join("home");
+        let process = gtk_search_process(
+            &scratch,
+            &application,
+            Rc::new(crate::search::SearchRuntime::production()),
+        );
+        let window = seed_gtk_window(&process, folder.clone());
+        let ui = process.window(window).expect("real window");
+        ui.present();
+        let context = glib::MainContext::default();
+        let anchor = ui.content().widget().upcast_ref::<gtk::Widget>();
+        let (x, y) = (40, 60);
+        process.right_click_background(
+            window,
+            None,
+            folder.clone(),
+            anchor,
+            (f64::from(x), f64::from(y)),
+        );
+        let menu = anchor
+            .last_child()
+            .and_downcast::<gtk::Popover>()
+            .expect("background menu");
+        let menu_body = menu.child().expect("menu body");
+        let new_folder = menu_body
+            .observe_children()
+            .snapshot()
+            .into_iter()
+            .filter_map(|widget| widget.downcast::<gtk::Button>().ok())
+            .find(|button| {
+                button
+                    .child()
+                    .and_then(|row| row.last_child())
+                    .and_downcast::<gtk::Label>()
+                    .is_some_and(|label| label.text() == "New Folder…")
+            })
+            .expect("New Folder menu item");
+        new_folder.emit_clicked();
+        assert!(
+            menu.parent().is_none(),
+            "the menu closes before the name form opens"
+        );
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let popover = loop {
+            context.iteration(false);
+            if let Some(popover) = anchor.last_child().and_downcast::<gtk::Popover>() {
+                break popover;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the name form never opened"
+            );
+        };
+        assert_eq!(
+            popover.pointing_to(),
+            (true, gtk::gdk::Rectangle::new(x, y, 1, 1))
+        );
+        let body = popover.child().expect("name form");
+        body.first_child()
+            .and_downcast::<gtk::Entry>()
+            .expect("folder name")
+            .set_text("fresh");
+        body.last_child()
+            .and_then(|row| row.last_child())
+            .and_downcast::<gtk::Button>()
+            .expect("Create button")
+            .emit_clicked();
+        assert!(
+            popover.parent().is_none(),
+            "the name form closes after Create"
+        );
+
+        let fileops = process.fileops().expect("file operation worker");
+        let created = folder.join("fresh");
+        while !created.is_dir() {
+            let _ = fileops.poll_for_tests();
+            assert!(
+                std::time::Instant::now() < deadline,
+                "Create never made the folder"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        ui.window().close();
     }
 
     /// The real widget/main-loop regression runs in its own process. GTK's

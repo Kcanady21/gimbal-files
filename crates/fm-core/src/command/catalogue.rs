@@ -114,6 +114,16 @@ pub const COMMANDS: &[CommandSpec] = &[
         undo: false,
         arguments: &[PATH_FROM_CURRENT_FOLDER],
     },
+    // P2af: the empty-space menu's Settings… row. It is UI-only: the handler
+    // opens the same popover as the main menu, anchored on the main menu
+    // button.
+    CommandSpec {
+        name: "app.settings",
+        summary: "Open the Settings menu.",
+        effect: Effect::System,
+        undo: false,
+        arguments: &[],
+    },
     CommandSpec {
         name: "window.new",
         summary: "Open a new window, optionally at a folder.",
@@ -302,6 +312,16 @@ pub const COMMANDS: &[CommandSpec] = &[
         name: "file.open",
         summary: "Open files with their default application.",
         effect: Effect::Launch,
+        undo: false,
+        arguments: &[PATHS_FROM_SELECTION],
+    },
+    // P2af: a read-only Properties window for the selected items. It is a
+    // System command, so the agent socket and CLI never reach its handler;
+    // the UI and the configurable <Alt>Return hotkey do.
+    CommandSpec {
+        name: "file.properties",
+        summary: "Show the selected items' properties.",
+        effect: Effect::System,
         undo: false,
         arguments: &[PATHS_FROM_SELECTION],
     },
@@ -836,5 +856,24 @@ mod tests {
             Presence::Context(ContextSource::Selection)
         ));
         assert!(!spec.summary.is_empty());
+    }
+
+    #[test]
+    fn properties_and_settings_are_ui_only_system_commands() {
+        let properties = drive_command("file.properties");
+        assert_eq!(properties.effect, Effect::System);
+        assert!(!properties.undo);
+        assert_eq!(properties.arguments.len(), 1);
+        assert_eq!(properties.arguments[0].name, "paths");
+        assert!(matches!(properties.arguments[0].kind, ArgKind::Paths));
+        assert!(matches!(
+            properties.arguments[0].presence,
+            Presence::Context(ContextSource::Selection)
+        ));
+
+        let settings = drive_command("app.settings");
+        assert_eq!(settings.effect, Effect::System);
+        assert!(!settings.undo);
+        assert!(settings.arguments.is_empty());
     }
 }

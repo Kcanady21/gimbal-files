@@ -18,6 +18,7 @@ pub(crate) mod fsutil;
 pub mod logfile;
 pub mod openwith;
 pub mod preview;
+pub mod properties;
 pub mod search;
 pub mod session;
 pub mod update;

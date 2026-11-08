@@ -65,6 +65,8 @@ Unavailable through the socket (refused by the registry before any handler):
 
 - `preview.edit`, `preview.discard`, `preview.save`, `preview.save-as`
 - `file.open-with`, `file.set-default-app`
+- `file.properties`
+- `app.settings`
 - `file.open-as-admin`
 - `tab.open-as-admin`, `tab.leave-admin`
 - `trash.empty`, `trash.delete-permanently`
@@ -74,6 +76,10 @@ Unavailable through the socket (refused by the registry before any handler):
 - `integration.set-show-in-folder`
 - unknown commands, unknown/duplicate arguments, context-filled `Files` paths
   that an agent did not supply, and every malformed invocation
+
+`file.properties` is the read-only Properties window and `app.settings` opens
+the Settings submenu; both are `System` commands, so a socket client is refused
+before any handler.
 
 There is no generic eval, shell execution or raw config write. Clipboard,
 `Launch` and `System` operations keep their existing policy; `System` is listed

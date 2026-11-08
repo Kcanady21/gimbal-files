@@ -631,6 +631,7 @@ pub fn default_hotkeys() -> BTreeMap<String, Hotkey> {
         ("<Alt>Left", "nav.back"),
         ("<Alt>Right", "nav.forward"),
         ("<Alt>Up", "nav.up"),
+        ("<Alt>Return", "file.properties"),
         ("F5", "nav.refresh"),
         ("Delete", "file.trash"),
     ];
@@ -2648,7 +2649,7 @@ mod tests {
         assert_eq!(config.sort.order, SortOrder::Ascending);
         assert!(config.sort.folders_first);
         assert!(config.sort.folders.is_empty());
-        assert_eq!(config.hotkeys.len(), 18);
+        assert_eq!(config.hotkeys.len(), 19);
         assert_eq!(config.home, PathBuf::from("/home/kyle"));
 
         let expected = [
@@ -2665,6 +2666,7 @@ mod tests {
             ("<Alt>Left", "nav.back"),
             ("<Alt>Right", "nav.forward"),
             ("<Alt>Up", "nav.up"),
+            ("<Alt>Return", "file.properties"),
             ("F5", "nav.refresh"),
             ("Delete", "file.trash"),
         ];

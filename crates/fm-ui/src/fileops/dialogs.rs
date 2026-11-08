@@ -29,16 +29,7 @@ pub fn show_menu(
     items: &[MenuItem],
     at: Option<(f64, f64)>,
 ) {
-    let popover = gtk::Popover::new();
-    popover.set_parent(anchor);
-    if let Some((x, y)) = at {
-        popover.set_pointing_to(Some(&gdk::Rectangle::new(
-            x.round() as i32,
-            y.round() as i32,
-            1,
-            1,
-        )));
-    }
+    let popover = popover_at(anchor, at);
     let menu = vbox(&["gl-menu"]);
 
     if items.is_empty() {
@@ -51,9 +42,20 @@ pub fn show_menu(
     }
 
     for item in items {
+        if item.separator {
+            let rule = gtk::Box::new(gtk::Orientation::Vertical, 0);
+            rule.add_css_class("gl-rule");
+            rule.add_css_class("inset");
+            rule.set_hexpand(true);
+            menu.append(&rule);
+            continue;
+        }
         let button = gtk::Button::new();
         button.add_css_class("gl-menu-item");
         button.set_sensitive(item.enabled);
+        if let Some(tooltip) = item.tooltip {
+            button.set_tooltip_text(Some(tooltip));
+        }
         let row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         if let Some(icon) = item.icon {
             row.append(&gtk::Image::from_icon_name(icon));
@@ -66,13 +68,31 @@ pub fn show_menu(
                 .build(),
         );
         button.set_child(Some(&row));
-        let popover_click = popover.clone();
+        let popover_click = popover.downgrade();
         let ui_click = ui.clone();
-        let anchor_click = anchor.clone();
+        let anchor_click = anchor.downgrade();
         let item = item.clone();
         button.connect_clicked(move |_| {
+            let Some(popover_click) = popover_click.upgrade() else {
+                return;
+            };
+            let Some(anchor) = anchor_click.upgrade() else {
+                return;
+            };
             take_down(&popover_click);
-            run_action(&ui_click, &anchor_click, &item);
+            if matches!(item.action, MenuAction::Command(_)) {
+                run_action(&ui_click, &anchor, &item, at);
+            } else {
+                // Finish the menu button's event before opening another popup
+                // or a chooser that can take input focus.
+                let ui = ui_click.clone();
+                let item = item.clone();
+                glib::idle_add_local_once(move || {
+                    if anchor.is_mapped() {
+                        run_action(&ui, &anchor, &item, at);
+                    }
+                });
+            }
         });
         menu.append(&button);
     }
@@ -82,13 +102,13 @@ pub fn show_menu(
     crate::popup::show(&popover);
 }
 
-fn run_action(ui: &Rc<WindowUi>, anchor: &gtk::Widget, item: &MenuItem) {
+fn run_action(ui: &Rc<WindowUi>, anchor: &gtk::Widget, item: &MenuItem, at: Option<(f64, f64)>) {
     match &item.action {
         MenuAction::Command(arguments) => {
             ui.dispatch(Caller::Ui, Invocation::new(item.command, arguments.clone()));
         }
         MenuAction::Rename { path } => open_rename(ui, anchor, path),
-        MenuAction::NewFolder { folder } => open_new_folder(ui, anchor, folder),
+        MenuAction::NewFolder { folder } => open_new_folder(ui, anchor, folder, at),
         MenuAction::ChooseFolder { command, paths } => {
             choose_folder(ui, command, paths);
         }
@@ -195,10 +215,11 @@ fn dispatch_rename(ui: &Rc<WindowUi>, path: &str, name: String) {
 }
 
 /// New Folder through an entry popover.
-pub fn open_new_folder(ui: &Rc<WindowUi>, anchor: &gtk::Widget, folder: &Path) {
+fn open_new_folder(ui: &Rc<WindowUi>, anchor: &gtk::Widget, folder: &Path, at: Option<(f64, f64)>) {
     let folder_text = folder.to_string_lossy().into_owned();
-    let popover = gtk::Popover::new();
-    popover.set_parent(anchor);
+    // Keep the menu's click position. Anchoring to the whole scroller can
+    // put the entry popover against the edge of the window.
+    let popover = popover_at(anchor, at);
     let box_ = vbox(&["gl-menu"]);
     let entry = gtk::Entry::new();
     entry.set_placeholder_text(Some("Folder name"));
@@ -519,6 +540,20 @@ pub fn show_details(ui: &Rc<WindowUi>, text: &str) {
     let ui_closed = ui.clone();
     dialog.connect_closed(move |_| ui_closed.end_dialog());
     dialog.choose(Some(ui.window()), None::<&gio::Cancellable>, |_| {});
+}
+
+fn popover_at(anchor: &gtk::Widget, at: Option<(f64, f64)>) -> gtk::Popover {
+    let popover = gtk::Popover::new();
+    popover.set_parent(anchor);
+    if let Some((x, y)) = at {
+        popover.set_pointing_to(Some(&gdk::Rectangle::new(
+            x.round() as i32,
+            y.round() as i32,
+            1,
+            1,
+        )));
+    }
+    popover
 }
 
 fn take_down(popover: &gtk::Popover) {

@@ -820,7 +820,7 @@ pub fn prepare_drag() {
         cell.set(next);
         next
     });
-    crate::log!(
+    crate::log_verbose!(
         "dnd",
         "prepare modifiers: seat {} -> {}",
         seat.text(),
@@ -855,7 +855,7 @@ pub fn install_modifier_tracking(window: &gtk::Window) {
                 cell.set(next);
                 next
             });
-            crate::log!(
+            crate::log_verbose!(
                 "dnd",
                 "window active: seat {} -> {}",
                 seat.text(),
@@ -863,7 +863,7 @@ pub fn install_modifier_tracking(window: &gtk::Window) {
             );
         } else {
             TRACKED_KEYS.with(|cell| cell.set(TrackedKeys::UNKNOWN));
-            crate::log!("dnd", "window inactive: modifiers unknown");
+            crate::log_verbose!("dnd", "window inactive: modifiers unknown");
         }
     });
 }

@@ -1802,6 +1802,14 @@ impl Header {
         });
     }
 
+    /// Open the Settings submenu from a named command, anchored on the same
+    /// main-menu button the header uses. P2af's `app.settings` is the caller.
+    pub fn open_settings(&self) {
+        if let Some(ui) = self.window_ui() {
+            open_settings_menu(&ui, &self.menu_button);
+        }
+    }
+
     pub fn wire(self: &Rc<Self>, ui: &Rc<WindowUi>) {
         *self.ui.borrow_mut() = Rc::downgrade(ui);
 
