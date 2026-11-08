@@ -320,11 +320,17 @@ pub const PREVIEW_EDITING_COMMANDS: &[&str] = &[
 /// agent, even when the value is unchanged.
 pub const UI_ONLY_SETTINGS_COMMANDS: &[&str] = &["agent.set-enabled"];
 
+/// Commands that only an explicitly clicked menu entry may call. `file.new-file`
+/// is here because a hotkey, CLI or agent must never invent a file name and
+/// create it. The UI's background menu is its only caller.
+pub const UI_ONLY_MENU_COMMANDS: &[&str] = &["file.new-file"];
+
 /// Whether this caller may run this command at all. The two approved permanent
 /// deletions are explicitly clicked UI operations; the preview commands may
-/// also come from a hotkey. `agent.set-enabled` is only the Settings switch.
+/// also come from a hotkey. `agent.set-enabled` and the menu-only new-file
+/// command are UI-only.
 pub fn caller_allowed(name: &str, effect: Effect, caller: Caller) -> bool {
-    if UI_ONLY_SETTINGS_COMMANDS.contains(&name) {
+    if UI_ONLY_SETTINGS_COMMANDS.contains(&name) || UI_ONLY_MENU_COMMANDS.contains(&name) {
         return caller == Caller::Ui;
     }
     if PREVIEW_EDITING_COMMANDS.contains(&name) {

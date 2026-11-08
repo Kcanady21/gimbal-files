@@ -81,6 +81,13 @@ pub enum Request {
         in_folder: PathBuf,
         scope: Scope,
     },
+    /// Create one zero-byte file. The create itself is exclusive and happens
+    /// only at execution time.
+    NewFile {
+        name: String,
+        in_folder: PathBuf,
+        scope: Scope,
+    },
     /// Permanently delete native paths. The UI only builds this after its
     /// irreversible-operation confirmation.
     DeletePermanent {
@@ -123,6 +130,11 @@ impl Request {
             } => {
                 format!("create folder {name} in {}", in_folder.display())
             }
+            Request::NewFile {
+                name, in_folder, ..
+            } => {
+                format!("create file {name} in {}", in_folder.display())
+            }
             Request::DeletePermanent { paths, .. } => {
                 format!("permanently delete {} item(s)", paths.len())
             }
@@ -148,6 +160,7 @@ impl Request {
             Request::Trash { scope, .. }
             | Request::Rename { scope, .. }
             | Request::NewFolder { scope, .. }
+            | Request::NewFile { scope, .. }
             | Request::DeletePermanent { scope, .. } => *scope,
             Request::Copy { scope, .. } | Request::Move { scope, .. } => *scope,
             Request::Restore { .. }
@@ -174,6 +187,7 @@ impl Request {
             Request::Trash { scope: source, .. }
             | Request::Rename { scope: source, .. }
             | Request::NewFolder { scope: source, .. }
+            | Request::NewFile { scope: source, .. }
             | Request::DeletePermanent { scope: source, .. } => {
                 *source = scope;
             }
@@ -270,6 +284,11 @@ pub fn request_for(command: &CheckedCommand) -> Result<Option<Request>, RequestE
             in_folder: path("in")?,
             scope: Scope::User,
         },
+        "file.new-file" => Request::NewFile {
+            name: text("name")?,
+            in_folder: path("in")?,
+            scope: Scope::User,
+        },
         "trash.restore" => Request::Restore {
             items: trash_items()?,
         },
@@ -354,6 +373,7 @@ pub enum Action {
     Move,
     Rename,
     NewFolder,
+    NewFile,
     Restore,
     Empty,
     /// Permanent deletion of one selected Trash item. It is a different
@@ -372,6 +392,7 @@ impl Action {
             Action::Move => "move",
             Action::Rename => "rename",
             Action::NewFolder => "new-folder",
+            Action::NewFile => "new-file",
             Action::Restore => "restore",
             Action::Empty => "delete",
             Action::DeleteSelected => "delete selected",
@@ -386,6 +407,7 @@ impl Action {
             Action::Move => "moved",
             Action::Rename => "renamed",
             Action::NewFolder => "created",
+            Action::NewFile => "created",
             Action::Restore => "restored",
             Action::Empty => "deleted",
             Action::DeleteSelected => "deleted",
@@ -411,9 +433,9 @@ pub enum Conflict {
     AlreadyThere,
     /// The source is missing. Always refused.
     MissingSource,
-    /// A rename or new-folder name is not a legal path component.
+    /// A rename, new-folder or new-file name is not a legal path component.
     InvalidName,
-    /// A rename or new-folder target already exists. Always refused.
+    /// A rename, new-folder or new-file target already exists. Always refused.
     NameTaken,
     /// The destination folder is missing or is not a folder.
     MissingDestination,
@@ -1166,6 +1188,11 @@ impl FileOperations {
                 in_folder,
                 scope,
             } => plan_new_folder(name, in_folder, *scope),
+            Request::NewFile {
+                name,
+                in_folder,
+                scope,
+            } => plan_new_file(name, in_folder, *scope),
             Request::DeletePermanent { paths, scope } => plan_delete_permanent(paths, *scope),
             Request::Restore { items } => plan_restore(self.trash.as_ref(), items),
             Request::EmptyTrash => plan_empty(self.trash.as_ref()),
@@ -1540,6 +1567,40 @@ impl FileOperations {
             }
             claimed.insert(target.clone());
 
+            if step.action == Action::NewFile {
+                match create_empty_file(&target, plan.target_scope) {
+                    Ok(()) => {
+                        report.items.push(done_result(step, Some(target)));
+                    }
+                    Err(CreateFileError::Exists) => report.items.push(result(
+                        step,
+                        Some(target),
+                        ItemOutcome::Refused(Conflict::NameTaken.text().to_string()),
+                    )),
+                    Err(CreateFileError::Create(error)) => report.items.push(result(
+                        step,
+                        Some(target),
+                        ItemOutcome::Failed(format!("could not create it: {error}")),
+                    )),
+                    Err(CreateFileError::Close(error)) => report.items.push(result(
+                        step,
+                        Some(target),
+                        ItemOutcome::Failed(format!(
+                            "created the file but could not close it; the file may already exist and was left alone: {error}"
+                        )),
+                    )),
+                }
+                reporter.item_finished();
+                log_event(
+                    &report
+                        .items
+                        .last()
+                        .map(ItemResult::line)
+                        .unwrap_or_default(),
+                );
+                continue;
+            }
+
             if decision == Some(Decision::Replace) && path_exists(&target, plan.target_scope) {
                 match trash_and_record(&target, plan.target_scope) {
                     Ok(trashed) => builder.replaced.push(trashed),
@@ -1593,6 +1654,7 @@ impl FileOperations {
                 | Action::Restore
                 | Action::Empty
                 | Action::DeleteSelected
+                | Action::NewFile
                 | Action::PermanentDelete => {
                     Err("the plan has a step that cannot run here".to_string())
                 }
@@ -2136,6 +2198,43 @@ fn plan_new_folder(name: &str, in_folder: &Path, scope: Scope) -> Plan {
         },
         steps: vec![Step {
             action: Action::NewFolder,
+            source: Some(in_folder.to_path_buf()),
+            target: Some(target),
+            conflict,
+            keep_both: false,
+            trash: None,
+        }],
+        undo: None,
+        problem: None,
+        scope,
+        target_scope: scope,
+    }
+}
+
+/// Plan one zero-byte file. The collision check is only a preview: the
+/// exclusive create at execution time is the final guard against a name that
+/// appears after this plan.
+fn plan_new_file(name: &str, in_folder: &Path, scope: Scope) -> Plan {
+    let target = in_folder.join(name);
+
+    let conflict = if !is_valid_name(name) {
+        Some(Conflict::InvalidName)
+    } else if !path_facts(in_folder, scope).is_dir {
+        Some(Conflict::MissingDestination)
+    } else if path_exists(&target, scope) {
+        Some(Conflict::NameTaken)
+    } else {
+        None
+    };
+
+    Plan {
+        request: Request::NewFile {
+            name: name.to_string(),
+            in_folder: in_folder.to_path_buf(),
+            scope,
+        },
+        steps: vec![Step {
+            action: Action::NewFile,
             source: Some(in_folder.to_path_buf()),
             target: Some(target),
             conflict,
@@ -2790,6 +2889,35 @@ fn make_folder(path: &Path, scope: Scope) -> Result<(), String> {
     gfile(path, scope)
         .make_directory(gio::Cancellable::NONE)
         .map_err(|error| error.to_string())
+}
+
+#[derive(Debug)]
+enum CreateFileError {
+    /// A file, directory or symlink is already at the target. No existing
+    /// object was truncated or followed.
+    Exists,
+    Create(String),
+    /// The exclusive create succeeded, but closing its stream failed. The
+    /// path is left exactly as it is.
+    Close(String),
+}
+
+/// Create an empty file exclusively. `FileCreateFlags::NONE` is GIO's plain
+/// `g_file_create`, which fails with `EXISTS` rather than opening or truncating
+/// an existing object (including a dangling symlink).
+fn create_empty_file(path: &Path, scope: Scope) -> Result<(), CreateFileError> {
+    let stream = gfile(path, scope)
+        .create(gio::FileCreateFlags::NONE, gio::Cancellable::NONE)
+        .map_err(|error| {
+            if error.matches(gio::IOErrorEnum::Exists) {
+                CreateFileError::Exists
+            } else {
+                CreateFileError::Create(error.to_string())
+            }
+        })?;
+    stream
+        .close(gio::Cancellable::NONE)
+        .map_err(|error| CreateFileError::Close(error.to_string()))
 }
 
 fn rename_item(src: &Path, dst: &Path, scope: Scope, target_scope: Scope) -> Result<(), String> {

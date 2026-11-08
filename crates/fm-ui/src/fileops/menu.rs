@@ -23,6 +23,8 @@ pub enum MenuAction {
     Rename { path: PathBuf },
     /// Open the new-folder popover in this folder.
     NewFolder { folder: PathBuf },
+    /// Open the new-file popover in this folder.
+    NewFile { folder: PathBuf },
     /// Choose a folder, then dispatch `command` with these sources and `to=`.
     ChooseFolder {
         command: &'static str,
@@ -322,6 +324,13 @@ pub fn background_menu_in_scope(
         "New Folder…",
         "file.new-folder",
         MenuAction::NewFolder {
+            folder: folder.to_path_buf(),
+        },
+    ));
+    menu.push(item(
+        "New File…",
+        "file.new-file",
+        MenuAction::NewFile {
             folder: folder.to_path_buf(),
         },
     ));
@@ -696,6 +705,7 @@ mod tests {
                 "New Window",
                 "|",
                 "New Folder…",
+                "New File…",
                 "Paste",
                 "|",
                 "Pin This Folder",
@@ -728,6 +738,28 @@ mod tests {
     }
 
     #[test]
+    fn new_file_sits_beside_new_folder_and_stays_bound_to_this_folder() {
+        let menu = background_menu(Path::new("/tmp/docs"), None, true, false);
+        let labels = labels(&menu);
+        let folder = labels
+            .iter()
+            .position(|label| *label == "New Folder…")
+            .expect("New Folder…");
+        assert_eq!(labels.get(folder + 1), Some(&"New File…"));
+        let new_file = menu
+            .iter()
+            .find(|item| item.command == "file.new-file")
+            .expect("New File…");
+        assert_eq!(
+            new_file.action,
+            MenuAction::NewFile {
+                folder: PathBuf::from("/tmp/docs")
+            }
+        );
+        assert!(new_file.enabled);
+    }
+
+    #[test]
     fn new_tab_and_new_window_carry_this_folder_even_inside_an_admin_tab() {
         for in_admin in [false, true] {
             let menu =
@@ -754,13 +786,14 @@ mod tests {
     fn undo_is_first_in_its_section_when_there_is_something_to_undo() {
         let menu = background_menu(Path::new("/tmp"), Some("restored 2 items"), true, true);
         assert_eq!(
-            shape(&menu)[..5],
+            shape(&menu)[..6],
             [
                 "New Tab",
                 "New Window",
                 "|",
                 "Undo restored 2 items",
-                "New Folder…"
+                "New Folder…",
+                "New File…"
             ]
         );
         let undo = menu

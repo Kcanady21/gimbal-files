@@ -180,6 +180,8 @@ window.gimbal-look, window.gimbal-look.background {{ background-color: {window_b
 .gl-grid.tile {{ margin: {gm}px; }}
 gridview > child {{ padding: 0; }}
 .gl-cell {{ min-width: {cellw}px; min-height: {cellh}px; }}
+.gl-cell.gl-rubber-hit {{ background-color: alpha(@accent_bg_color, 0.30); border-radius: {r}px; }}
+.gl-rubber-band {{ background-color: alpha(@accent_bg_color, 0.18); border: {thin}px solid @accent_color; border-radius: {ri}px; }}
 .gl-cell image {{ -gtk-icon-size: {igrid}px; color: {FG}; -gtk-icon-palette: {folder_palette}; }}
 .gl-cell label {{ font-size: {trow}px; }}
 .gl-tile {{ background-color: {tile}; border: {thin}px solid {OUTLINE}; border-radius: {r}px; color: {FG}; }}
@@ -444,6 +446,33 @@ mod tests {
         // The icon and the name keep their normal colours (Kyle, Nov 2).
         assert!(!plain.contains("child:selected .gl-cell"));
         assert!(selected > transparent, "the selected rule must come later");
+    }
+
+    #[test]
+    fn the_rubber_band_uses_theme_colours_and_scaled_tokens() {
+        let plain = css(1.0, None, PLAIN);
+        let band = plain
+            .lines()
+            .find(|line| line.contains(".gl-rubber-band"))
+            .expect("the selection rectangle rule");
+        assert!(band.contains("alpha(@accent_bg_color, 0.18)"), "{band}");
+        assert!(band.contains("border: 2px solid @accent_color"), "{band}");
+        assert!(band.contains("border-radius: 4px"), "{band}");
+        let hit = plain
+            .lines()
+            .find(|line| line.contains(".gl-rubber-hit"))
+            .expect("the temporary highlight rule");
+        assert!(hit.contains("alpha(@accent_bg_color, 0.30)"), "{hit}");
+        for line in [band, hit] {
+            assert!(!line.contains('#') && !line.contains("rgb("), "{line}");
+        }
+        let half = css(0.5, None, PLAIN);
+        let band = half
+            .lines()
+            .find(|line| line.contains(".gl-rubber-band"))
+            .expect("the scaled rectangle rule");
+        assert!(band.contains("border: 1px solid @accent_color"), "{band}");
+        assert!(band.contains("border-radius: 2px"), "{band}");
     }
 
     #[test]

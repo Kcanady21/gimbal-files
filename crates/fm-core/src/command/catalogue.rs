@@ -180,6 +180,13 @@ pub const COMMANDS: &[CommandSpec] = &[
         undo: false,
         arguments: &[],
     },
+    CommandSpec {
+        name: "tab.open-in-own-tab",
+        summary: "Copy a split tile into its own tab.",
+        effect: Effect::View,
+        undo: false,
+        arguments: &[],
+    },
     // P2z: an administrator folder tab. A System effect keeps both commands
     // off the agent socket and CLI; inside the UI, a tab is only ever opened
     // after the folder, its owner and the GVfs mount have been checked.
@@ -415,6 +422,24 @@ pub const COMMANDS: &[CommandSpec] = &[
         summary: "Create a new folder.",
         effect: Effect::Files,
         undo: true,
+        arguments: &[
+            REQUIRED_NAME,
+            ArgSpec {
+                name: "in",
+                kind: ArgKind::Path,
+                presence: Presence::Context(ContextSource::CurrentFolder),
+                default: None,
+            },
+        ],
+    },
+    // P2ai: a zero-byte file from the background menu. It is UI-only so a
+    // hotkey, CLI or agent can never choose a name to create. Creation adds no
+    // undo record, so the previous entry stays available.
+    CommandSpec {
+        name: "file.new-file",
+        summary: "Create a new empty file.",
+        effect: Effect::Files,
+        undo: false,
         arguments: &[
             REQUIRED_NAME,
             ArgSpec {

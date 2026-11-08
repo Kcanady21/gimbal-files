@@ -820,6 +820,61 @@ mod tests {
     }
 
     #[test]
+    fn a_new_file_that_appears_after_planning_is_refused_by_the_worker() {
+        let scratch = Scratch::new("new-file-race");
+        let folder = scratch.root.join("home");
+        fs::create_dir_all(&folder).expect("folder");
+        let target = folder.join("empty.txt");
+        let (events, received) = channel();
+        let senders = spawn_with_pause(events, None);
+        let executing = Arc::new(AtomicBool::new(false));
+        senders
+            .jobs
+            .send(WorkerMsg::Start {
+                id: 31,
+                request: Request::NewFile {
+                    scope: fm_core::admin::Scope::User,
+                    name: "empty.txt".to_string(),
+                    in_folder: folder.clone(),
+                },
+                cancellable: gio::Cancellable::new(),
+                dry_run: false,
+                authorization: None,
+                executing,
+            })
+            .expect("start");
+        let WorkerEvent::Planned { plan, .. } = next_event(&received, "planned") else {
+            panic!("expected the plan");
+        };
+        fs::write(&target, "already here").expect("collision");
+        senders
+            .control
+            .send(WorkerMsg::Answer {
+                id: 31,
+                decisions: Decisions::from_plan(&plan),
+            })
+            .expect("answer");
+        loop {
+            match next_event(&received, "finished") {
+                WorkerEvent::Finished { report, .. } => {
+                    assert_eq!(
+                        report.items[0].outcome,
+                        ItemOutcome::Refused("the name is taken".to_string())
+                    );
+                    break;
+                }
+                WorkerEvent::Refused { message, .. } => panic!("refused: {message}"),
+                _ => continue,
+            }
+        }
+        assert_eq!(
+            fs::read_to_string(&target).expect("existing contents"),
+            "already here"
+        );
+        let _ = senders.jobs.send(WorkerMsg::Shutdown);
+    }
+
+    #[test]
     fn an_undo_plan_is_revalidated_after_the_decision_wait() {
         let scratch = Scratch::new("undo-revalidate");
         let (authorization, source, dest) = fixture(&scratch);

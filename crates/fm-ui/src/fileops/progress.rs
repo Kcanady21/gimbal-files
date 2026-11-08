@@ -24,6 +24,7 @@ pub enum OpKind {
     Move,
     Rename,
     NewFolder,
+    NewFile,
     Restore,
     EmptyTrash,
     DeleteSelected,
@@ -39,6 +40,7 @@ impl OpKind {
             Request::Move { .. } => OpKind::Move,
             Request::Rename { .. } => OpKind::Rename,
             Request::NewFolder { .. } => OpKind::NewFolder,
+            Request::NewFile { .. } => OpKind::NewFile,
             Request::Restore { .. } => OpKind::Restore,
             Request::EmptyTrash => OpKind::EmptyTrash,
             Request::DeleteSelected { .. } => OpKind::DeleteSelected,
@@ -54,6 +56,7 @@ impl OpKind {
             OpKind::Move => "Moving",
             OpKind::Rename => "Renaming",
             OpKind::NewFolder => "Creating a folder",
+            OpKind::NewFile => "Creating a file",
             OpKind::Restore => "Restoring",
             OpKind::EmptyTrash => "Deleting",
             OpKind::DeleteSelected => "Deleting permanently",
@@ -229,6 +232,20 @@ pub fn summary(request: &Request, report: &Report) -> String {
                 format!("Created 0 of 1 folder{}", tail(counts))
             }
         }
+        Request::NewFile { .. } => {
+            let name = report
+                .items
+                .first()
+                .and_then(|item| item.target.as_deref())
+                .and_then(Path::file_name)
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "file".to_string());
+            if counts.not_done() == 0 {
+                format!("Created file “{name}”")
+            } else {
+                format!("Created 0 of 1 file{}", tail(counts))
+            }
+        }
         Request::Restore { .. } => {
             if counts.not_done() == 0 {
                 format!("Restored {}", items(counts.done))
@@ -339,6 +356,7 @@ pub fn undo_summary(plan: &Plan) -> Option<String> {
             Action::Rename => renames += 1,
             Action::Copy
             | Action::NewFolder
+            | Action::NewFile
             | Action::Empty
             | Action::DeleteSelected
             | Action::PermanentDelete => {}
@@ -629,6 +647,25 @@ mod tests {
             }],
         };
         assert_eq!(summary(&folder, &made), "Created folder “new”");
+
+        let file = Request::NewFile {
+            scope: fm_core::admin::Scope::User,
+            name: "empty.txt".into(),
+            in_folder: std::path::PathBuf::from("/tmp"),
+        };
+        let made = Report {
+            cancelled: false,
+            items: vec![ItemResult {
+                action: Action::NewFile,
+                source: std::path::PathBuf::from("/tmp"),
+                target: Some(std::path::PathBuf::from("/tmp/empty.txt")),
+                trash: None,
+                outcome: ItemOutcome::Done,
+            }],
+        };
+        assert_eq!(summary(&file, &made), "Created file “empty.txt”");
+        assert_eq!(OpKind::from_request(&file), OpKind::NewFile);
+        assert_eq!(OpKind::NewFile.verb(), "Creating a file");
     }
 
     #[test]

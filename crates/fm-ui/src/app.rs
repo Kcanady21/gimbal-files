@@ -863,6 +863,28 @@ impl Process {
             .cloned()
     }
 
+    /// Whether an in-progress pointer gesture still belongs to its tab and
+    /// folder. This reads the model in place instead of cloning the window on
+    /// every motion event; a single folder page also follows the focused tab.
+    pub(crate) fn drag_source_valid(
+        &self,
+        id: WindowId,
+        tab: TabId,
+        folder: &Path,
+        follows_focus: bool,
+    ) -> bool {
+        let workspace = self.workspace.borrow();
+        let Some(window) = workspace.windows.iter().find(|window| window.id == id) else {
+            return false;
+        };
+        if follows_focus && window.focused_tab != tab {
+            return false;
+        }
+        window
+            .tab(tab)
+            .is_some_and(|candidate| candidate.folder == folder)
+    }
+
     pub fn forget_window(&self, id: WindowId) {
         self.volumes().cancel_window(id);
         self.search.close(id);
@@ -1434,6 +1456,43 @@ impl Process {
         // A pointer or keyboard selection is explicit user intent, even when
         // it re-selects the item already selected after Save As. Apply it
         // after the model refresh so a saved preview override is released.
+        self.sync_preview_user(window);
+        self.schedule_save();
+    }
+
+    /// Apply one rubber-band result to its originating tile. Focus that tab
+    /// first, so a drag in a non-focused split tile updates that tile and not
+    /// its sibling; both model events are delivered as one refresh. This is
+    /// the pointer equivalent of `file_click_tab`, including the user preview
+    /// update and the debounced session save.
+    pub fn selection_drag_tab(
+        self: &Rc<Self>,
+        window: WindowId,
+        tab: TabId,
+        hits: &[OsString],
+        ctrl: bool,
+        shift: bool,
+    ) {
+        self.focus_model_window(window);
+        let mut events = Vec::new();
+        {
+            let mut workspace = self.workspace.borrow_mut();
+            match workspace.focus_tab(tab) {
+                Ok(mut focus) => events.append(&mut focus),
+                Err(error) => {
+                    crate::log!("workspace", "{error}");
+                    return;
+                }
+            }
+            match workspace.selection_drag(hits, ctrl, shift) {
+                Ok(mut selection) => events.append(&mut selection),
+                Err(error) => crate::log!("workspace", "{error}"),
+            }
+        }
+        if events.is_empty() {
+            return;
+        }
+        self.apply_events(&events);
         self.sync_preview_user(window);
         self.schedule_save();
     }
@@ -3475,6 +3534,18 @@ impl Process {
                 let result = self.workspace.borrow_mut().tab_open_in_new_window();
                 self.finish(result);
             }
+            "tab.open-in-own-tab" => {
+                let target = self
+                    .workspace
+                    .borrow()
+                    .focused()
+                    .map(|window| window.focused_tab);
+                let result = match target {
+                    Some(tab) => self.workspace.borrow_mut().tab_open_in_own_tab(tab),
+                    None => Err(fm_core::workspace::WorkspaceError::NoWindow),
+                };
+                self.finish(result);
+            }
             "group.split" => {
                 let result = self.workspace.borrow_mut().group_split();
                 self.finish(result);
@@ -3742,7 +3813,7 @@ impl Process {
                         arguments.push(("path".to_string(), utf8_path(path)?));
                     }
                 }
-                "file.new-folder" | "file.paste" => {
+                "file.new-folder" | "file.new-file" | "file.paste" => {
                     if command.get("in").is_none()
                         && let Some(folder) = self.current_folder(window)
                     {
@@ -6274,6 +6345,130 @@ mod tests {
         ui.window().close();
     }
 
+    #[test]
+    fn new_file_menu_creates_a_zero_byte_file_through_the_ui_and_worker() {
+        let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                "app::tests::new_file_menu_creates_a_zero_byte_file_through_the_ui_and_worker_inner",
+                "--ignored",
+                "--nocapture",
+            ])
+            .output()
+            .expect("the owned New File widget process");
+        assert!(
+            output.status.success(),
+            "the New File regression failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    #[ignore = "runs in its own process through the subprocess widget regression"]
+    fn new_file_menu_creates_a_zero_byte_file_through_the_ui_and_worker_inner() {
+        let _guard = gtk_test_lock();
+        gtk::init().expect("the New File regression needs a GTK display");
+        adw::init().expect("libadwaita init");
+        let application = adw::Application::builder()
+            .application_id("org.gimbal.Files.NewFileWidgetTest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        application
+            .register(None::<&gio::Cancellable>)
+            .expect("register the owned non-unique test application");
+        let scratch = search_scratch("new-file");
+        let folder = scratch.root.join("home");
+        let process = gtk_search_process(
+            &scratch,
+            &application,
+            Rc::new(crate::search::SearchRuntime::production()),
+        );
+        let window = seed_gtk_window(&process, folder.clone());
+        let ui = process.window(window).expect("real window");
+        ui.present();
+        let context = glib::MainContext::default();
+        let anchor = ui.content().widget().upcast_ref::<gtk::Widget>();
+        let (x, y) = (40, 60);
+        process.right_click_background(
+            window,
+            None,
+            folder.clone(),
+            anchor,
+            (f64::from(x), f64::from(y)),
+        );
+        let menu = anchor
+            .last_child()
+            .and_downcast::<gtk::Popover>()
+            .expect("background menu");
+        let menu_body = menu.child().expect("menu body");
+        let new_file = menu_body
+            .observe_children()
+            .snapshot()
+            .into_iter()
+            .filter_map(|widget| widget.downcast::<gtk::Button>().ok())
+            .find(|button| {
+                button
+                    .child()
+                    .and_then(|row| row.last_child())
+                    .and_downcast::<gtk::Label>()
+                    .is_some_and(|label| label.text() == "New File…")
+            })
+            .expect("New File menu item");
+        new_file.emit_clicked();
+        assert!(
+            menu.parent().is_none(),
+            "the menu closes before the file name form opens"
+        );
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let popover = loop {
+            context.iteration(false);
+            if let Some(popover) = anchor.last_child().and_downcast::<gtk::Popover>() {
+                break popover;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the file name form never opened"
+            );
+        };
+        assert_eq!(
+            popover.pointing_to(),
+            (true, gtk::gdk::Rectangle::new(x, y, 1, 1))
+        );
+        let body = popover.child().expect("file name form");
+        body.first_child()
+            .and_downcast::<gtk::Entry>()
+            .expect("file name")
+            .set_text("empty.txt");
+        body.last_child()
+            .and_then(|row| row.last_child())
+            .and_downcast::<gtk::Button>()
+            .expect("Create button")
+            .emit_clicked();
+        assert!(
+            popover.parent().is_none(),
+            "the file name form closes after Create"
+        );
+
+        let fileops = process.fileops().expect("file operation worker");
+        let created = folder.join("empty.txt");
+        while !created.is_file() {
+            let _ = fileops.poll_for_tests();
+            assert!(
+                std::time::Instant::now() < deadline,
+                "Create never made the file"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(
+            std::fs::metadata(&created).expect("created file").len(),
+            0,
+            "New File… must create a zero-byte file"
+        );
+        ui.window().close();
+    }
+
     /// The real widget/main-loop regression runs in its own process. GTK's
     /// `gtk::init` intentionally owns the process default main context for its
     /// lifetime, which would starve the other in-process GLib timer tests if
@@ -7327,6 +7522,162 @@ order = "descending"
             third,
             &["a.txt", "c.txt", "b.txt"],
         );
+    }
+
+    /// A rubber-band result from a split tile goes through the same focus and
+    /// selection path as a click: the source tile receives the selection and
+    /// focus, while the sibling's selection is untouched.
+    #[test]
+    fn a_split_tile_drag_bridge_focuses_the_source_and_leaves_its_sibling_alone() {
+        let scratch = search_scratch("rubber-bridge");
+        let process = Process::headless(
+            scratch.root.join("config.toml"),
+            scratch.root.join("home"),
+            Rc::new(NoClipboard),
+        );
+        let window = process.seed_window(scratch.root.join("home"));
+        let (group, source, sibling) = {
+            let mut workspace = process.workspace.borrow_mut();
+            workspace.tab_new(Some(scratch.root.join("one"))).unwrap();
+            workspace.tab_new(Some(scratch.root.join("two"))).unwrap();
+            workspace.pill_ctrl_click(0).unwrap();
+            workspace.pill_ctrl_click(1).unwrap();
+            workspace.group_split().unwrap();
+            let window = workspace.focused().unwrap();
+            let group = window.pills[0];
+            let tabs: Vec<TabId> = window.groups[&group]
+                .tabs
+                .iter()
+                .map(|tab| tab.id)
+                .collect();
+            (group, tabs[0], tabs[1])
+        };
+        {
+            let mut workspace = process.workspace.borrow_mut();
+            workspace.focus_tab(sibling).unwrap();
+            workspace.file_click(OsString::from("keep")).unwrap();
+            workspace.focus_tab(source).unwrap();
+            workspace.file_click(OsString::from("old")).unwrap();
+            workspace.focus_tab(sibling).unwrap();
+        }
+
+        process.selection_drag_tab(
+            window,
+            source,
+            &[OsString::from("a"), OsString::from("b")],
+            false,
+            false,
+        );
+
+        let window = process.window_snapshot(window).expect("window");
+        assert_eq!(window.focused_tab, source);
+        assert_eq!(
+            window.groups[&group].tab(source).unwrap().selection.names,
+            BTreeSet::from([OsString::from("a"), OsString::from("b")])
+        );
+        assert_eq!(
+            window.groups[&group].tab(sibling).unwrap().selection.names,
+            BTreeSet::from([OsString::from("keep")]),
+            "the sibling tile keeps its own selection"
+        );
+    }
+
+    /// The split tile menu focuses the pill it came from and dispatches the
+    /// no-argument command through the real `UiHandler`. A standalone tab is
+    /// refused and leaves the workspace alone.
+    #[test]
+    fn the_open_in_own_tab_command_targets_the_clicked_split_tile() {
+        use fm_core::command::{Caller, Invocation, Outcome};
+
+        let scratch = search_scratch("own-tab");
+        let process = Process::headless(
+            scratch.root.join("config.toml"),
+            scratch.root.join("home"),
+            Rc::new(NoClipboard),
+        );
+        let window = process.seed_window(scratch.root.join("home"));
+        let (source_group, target, other) = {
+            let mut workspace = process.workspace.borrow_mut();
+            workspace.tab_new(Some(scratch.root.join("one"))).unwrap();
+            workspace.tab_new(Some(scratch.root.join("two"))).unwrap();
+            workspace.pill_ctrl_click(0).unwrap();
+            workspace.pill_ctrl_click(1).unwrap();
+            workspace.group_split().unwrap();
+            let window = workspace.focused().unwrap();
+            let group = window.pills[0];
+            let tiles: Vec<TabId> = window.groups[&group]
+                .tabs
+                .iter()
+                .map(|tab| tab.id)
+                .collect();
+            (group, tiles[1], tiles[0])
+        };
+        let source_group_before = {
+            let mut workspace = process.workspace.borrow_mut();
+            workspace.focus_tab(target).unwrap();
+            workspace.file_click(OsString::from("copied.txt")).unwrap();
+            workspace.focus_tab(other).unwrap();
+            workspace.focused().unwrap().groups[&source_group].clone()
+        };
+
+        process.focus_tab_and_dispatch(
+            window,
+            target,
+            Invocation::new("tab.open-in-own-tab", Vec::new()),
+        );
+
+        let window_snapshot = process.window_snapshot(window).expect("window");
+        let source_position = window_snapshot
+            .pill_index(source_group)
+            .expect("source pill");
+        let new_group = window_snapshot.pills[source_position + 1];
+        assert_ne!(new_group, source_group);
+        assert_eq!(
+            window_snapshot.focused_tab,
+            window_snapshot.groups[&new_group].tabs[0].id
+        );
+        assert_eq!(
+            window_snapshot.groups[&new_group].tabs[0].selection.names,
+            BTreeSet::from([OsString::from("copied.txt")])
+        );
+        assert_eq!(
+            window_snapshot.groups[&source_group], source_group_before,
+            "the clicked tile stays in the split unchanged"
+        );
+
+        // A standalone tab is refused through the same handler path.
+        let (events, _standalone) = {
+            let mut workspace = process.workspace.borrow_mut();
+            let events = workspace
+                .tab_new(Some(scratch.root.join("standalone")))
+                .expect("standalone tab");
+            let id = workspace.focused().unwrap().focused_tab;
+            (events, id)
+        };
+        process.apply_events(&events);
+        let before = process.workspace.borrow().clone();
+        let outcome = process.dispatch_with_outcome(
+            window,
+            Caller::Ui,
+            &Invocation::new("tab.open-in-own-tab", Vec::new()),
+        );
+        assert!(
+            matches!(outcome, Outcome::Failed(ref message) if message.contains("not split")),
+            "{outcome:?}"
+        );
+        assert_eq!(*process.workspace.borrow(), before);
+
+        // Registry validation refuses an argument before the handler runs.
+        let outcome = process.dispatch_with_outcome(
+            window,
+            Caller::Ui,
+            &Invocation::new(
+                "tab.open-in-own-tab",
+                vec![("index".to_string(), "0".to_string())],
+            ),
+        );
+        assert!(matches!(outcome, Outcome::Error(_)), "{outcome:?}");
+        assert_eq!(*process.workspace.borrow(), before);
     }
 
     /// Both administrator-tab commands are System commands handled with the

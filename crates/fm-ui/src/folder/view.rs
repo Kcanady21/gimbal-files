@@ -3,7 +3,7 @@
 //! `MultiSelection` -> `GridView`, with the spike's cell and the P1e column cap.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::rc::{Rc, Weak};
@@ -23,8 +23,9 @@ use fm_core::workspace::{FileSelection, TabId, WindowId};
 use crate::app::Process;
 use crate::dnd::{self, DragItem};
 use crate::folder::{
-    ClickRequest, GridKey, KeyboardFocus, NavMode, SelectionEntry, StatusLine, click_request,
-    details_text, is_hidden_name, keyboard_move, nav_mode, size, sort, visible_page_rows,
+    ClickRequest, GridKey, KeyboardFocus, NavMode, RubberRect, SelectionEntry, StatusLine, cell_at,
+    click_request, clip_rect, details_text, drag_passes_threshold, is_hidden_name, keyboard_move,
+    nav_mode, normalize_rect, rubber_hits, size, sort, visible_page_rows,
 };
 use crate::look::icons::{self, MockupIcon};
 use crate::look::tokens::*;
@@ -115,6 +116,11 @@ pub struct FolderView {
     /// Set by a right press on a cell so the scroller's background gesture
     /// does not open a second menu for the same press.
     context_on_item: Rc<Cell<bool>>,
+    /// The rubber-band rectangle is parented once in a transparent overlay
+    /// layer; only its position, size and visibility change during a drag.
+    rubber_layer: gtk::Fixed,
+    rubber_rect: gtk::Box,
+    rubber: RefCell<Option<RubberDrag>>,
     /// The keyboard's place in the visible order. It is a file name and
     /// separate from the model's selection, so applying a model selection never
     /// looks like a new user move and a re-sort never moves it to another file.
@@ -143,6 +149,15 @@ struct CellBinding {
     root: RootIdentity,
     details: String,
     folder: bool,
+}
+
+/// One rubber-band gesture in this viewport. It starts on an empty-space
+/// press; a press on a cell belongs to that cell's existing drag source.
+struct RubberDrag {
+    start: (f64, f64),
+    tab: TabId,
+    folder: PathBuf,
+    started: bool,
 }
 
 #[derive(Clone)]
@@ -234,6 +249,23 @@ impl FolderView {
         error.set_visible(false);
         body.add_overlay(&error);
 
+        // The layer spans the viewport but never takes a press: the gesture is
+        // on the viewport itself and cells keep their own controllers. The
+        // rectangle is parented inside the layer for the view's whole life, so
+        // no widget is reparented while a sequence is active.
+        let rubber_layer = gtk::Fixed::new();
+        rubber_layer.set_can_target(false);
+        rubber_layer.set_hexpand(true);
+        rubber_layer.set_vexpand(true);
+        let rubber_rect = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        rubber_rect.add_css_class("gl-rubber-band");
+        rubber_rect.set_can_target(false);
+        rubber_rect.set_visible(false);
+        rubber_layer.put(&rubber_rect, 0.0, 0.0);
+        body.add_overlay(&rubber_layer);
+        body.set_measure_overlay(&rubber_layer, false);
+        body.set_clip_overlay(&rubber_layer, true);
+
         let banner = adw::Banner::new("Administrator: changes here affect the whole system.");
         banner.add_css_class("gl-admin-banner");
         banner.set_button_label(Some("Leave"));
@@ -282,6 +314,9 @@ impl FolderView {
             settle_pending: Rc::new(Cell::new(false)),
             cap_pending: Rc::new(Cell::new(false)),
             context_on_item: Rc::new(Cell::new(false)),
+            rubber_layer,
+            rubber_rect,
+            rubber: RefCell::new(None),
             cursor: RefCell::new(KeyboardFocus::default()),
             thumbnails: Rc::new(RefCell::new(Thumbnailer::new())),
             thumb_bindings: RefCell::new(HashMap::new()),
@@ -300,6 +335,7 @@ impl FolderView {
         this.wire_factory(&factory);
         this.wire_signals();
         this.attach_background_drop_target();
+        this.attach_rubber_band();
         {
             let weak = Rc::downgrade(&this);
             this.banner.connect_button_clicked(move |_| {
@@ -383,6 +419,17 @@ impl FolderView {
                 let Some(view) = weak.upgrade() else {
                     return;
                 };
+                // GTK can move a bound item after an insertion without
+                // emitting bind again. Keep its hit-test position current.
+                let weak = Rc::downgrade(&view);
+                item.connect_position_notify(move |item| {
+                    if item.item().is_some()
+                        && let Some(view) = weak.upgrade()
+                        && let Some(cell) = item.child()
+                    {
+                        view.map_cell(&cell, item.position());
+                    }
+                });
                 let click = gtk::GestureClick::new();
                 click.set_button(1);
                 let right_item = item.downgrade();
@@ -464,6 +511,9 @@ impl FolderView {
                     return;
                 };
                 cell.set_size_request(scaled(CELL_W, scale.get()), -1);
+                // A recycled cell never keeps another item's temporary
+                // rubber-band highlight.
+                cell.remove_css_class("gl-rubber-hit");
                 let details = details_for(&info);
                 cell.set_has_tooltip(true);
                 cell.update_property(&[gtk::accessible::Property::Description(&details)]);
@@ -504,6 +554,7 @@ impl FolderView {
                 positions
                     .borrow_mut()
                     .retain(|(candidate, _)| candidate != &widget);
+                cell.remove_css_class("gl-rubber-hit");
                 if let Some(view) = weak.upgrade() {
                     view.cancel_thumbnail_for(&widget);
                     view.unbind_size_cell(&widget);
@@ -810,6 +861,7 @@ impl FolderView {
         restore: bool,
         folder_memory: bool,
     ) {
+        self.cancel_rubber();
         let folder = folder.to_path_buf();
         // The per-folder memory is for back/forward only, where the model has
         // cleared the tab's anchor. A tab switch uses the tab's own anchor or
@@ -874,6 +926,7 @@ impl FolderView {
     /// when its folder is under a mount that is about to be unmounted. The
     /// relocation or a terminal-failure refresh gives it a new folder.
     pub fn release_root(&self, root: &Path) -> bool {
+        self.cancel_rubber();
         let Some(current) = self.current.borrow().clone() else {
             self.cancel_size_all();
             self.cancel_all_thumbnails();
@@ -1815,6 +1868,242 @@ impl FolderView {
         );
     }
 
+    /// A press in empty space starts a rubber band. A press on a cell is left
+    /// to the cell's existing `DragSource`; the sequence is claimed only once
+    /// the pointer passes GTK's drag threshold, so a short press still reaches
+    /// the normal click and double-click handlers.
+    fn attach_rubber_band(self: &Rc<Self>) {
+        let gesture = gtk::GestureDrag::new();
+        gesture.set_button(1);
+        {
+            let weak = Rc::downgrade(self);
+            gesture.connect_drag_begin(move |gesture, _, _| {
+                let Some(view) = weak.upgrade() else {
+                    return;
+                };
+                view.cancel_rubber();
+                let Some((x, y)) = pointer_in_body(&view.body, gesture.current_event().as_ref())
+                else {
+                    return;
+                };
+                let cells = view.cell_hit_rects();
+                if cell_at(x, y, &cells).is_some() {
+                    // The cell's own drag source owns this press.
+                    return;
+                }
+                let Some(tab) = view.source_tab() else {
+                    return;
+                };
+                let Some(folder) = view.current.borrow().clone() else {
+                    return;
+                };
+                crate::log_verbose!(
+                    "rubber",
+                    "press in empty space at ({x:.1}, {y:.1}) in {}",
+                    folder.display()
+                );
+                *view.rubber.borrow_mut() = Some(RubberDrag {
+                    start: (x, y),
+                    tab,
+                    folder,
+                    started: false,
+                });
+            });
+        }
+        {
+            let weak = Rc::downgrade(self);
+            gesture.connect_drag_update(move |gesture, _, _| {
+                let Some(view) = weak.upgrade() else {
+                    return;
+                };
+                let Some(mut drag) = view.rubber.borrow_mut().take() else {
+                    return;
+                };
+                if !view.source_still_valid(&drag) {
+                    view.cancel_rubber();
+                    return;
+                }
+                let Some((x, y)) = pointer_in_body(&view.body, gesture.current_event().as_ref())
+                else {
+                    *view.rubber.borrow_mut() = Some(drag);
+                    return;
+                };
+                if !drag.started {
+                    let threshold = gtk::Settings::default()
+                        .map_or(8.0, |settings| f64::from(settings.gtk_dnd_drag_threshold()));
+                    if !drag_passes_threshold(x - drag.start.0, y - drag.start.1, threshold) {
+                        *view.rubber.borrow_mut() = Some(drag);
+                        return;
+                    }
+                    if !gesture.set_state(gtk::EventSequenceState::Claimed) {
+                        return;
+                    }
+                    drag.started = true;
+                    crate::log_verbose!("rubber", "claimed the empty-space drag");
+                }
+                let rect = view.visible_rubber_rect(drag.start, (x, y));
+                let cells = view.cell_hit_rects();
+                let hits = rubber_hits(rect, &cells);
+                view.update_rubber_overlay(rect);
+                view.show_rubber_hits(&hits);
+                *view.rubber.borrow_mut() = Some(drag);
+            });
+        }
+        {
+            let weak = Rc::downgrade(self);
+            gesture.connect_drag_end(move |gesture, _, _| {
+                let Some(view) = weak.upgrade() else {
+                    return;
+                };
+                let Some(drag) = view.rubber.borrow_mut().take() else {
+                    return;
+                };
+                if !drag.started {
+                    return;
+                }
+                let Some((x, y)) = pointer_in_body(&view.body, gesture.current_event().as_ref())
+                else {
+                    view.cancel_rubber();
+                    return;
+                };
+                let rect = view.visible_rubber_rect(drag.start, (x, y));
+                let cells = view.cell_hit_rects();
+                let mut positions = rubber_hits(rect, &cells);
+                positions.sort_unstable();
+                let hits: Vec<OsString> = positions
+                    .iter()
+                    .filter_map(|position| view.name_at(*position))
+                    .collect();
+                let modifiers = gesture
+                    .current_event()
+                    .map(|event| event.modifier_state())
+                    .unwrap_or_else(gdk::ModifierType::empty);
+                let ctrl = modifiers.contains(gdk::ModifierType::CONTROL_MASK);
+                let shift = modifiers.contains(gdk::ModifierType::SHIFT_MASK);
+                view.clear_rubber();
+                if !view.source_still_valid(&drag) {
+                    crate::log_verbose!("rubber", "source tab or folder changed; cancelled");
+                    return;
+                }
+                crate::log!(
+                    "rubber",
+                    "release at ({x:.1}, {y:.1}): {} hit(s), ctrl={ctrl}, shift={shift}",
+                    hits.len()
+                );
+                if let Some(process) = view.process.upgrade() {
+                    process.selection_drag_tab(view.window, drag.tab, &hits, ctrl, shift);
+                }
+            });
+        }
+        {
+            let weak = Rc::downgrade(self);
+            gesture.connect_cancel(move |_, _| {
+                if let Some(view) = weak.upgrade() {
+                    view.cancel_rubber();
+                }
+            });
+        }
+        self.body.add_controller(gesture);
+    }
+
+    /// The tab this view acts on: its own tile id, or the focused tab for the
+    /// single folder page.
+    fn source_tab(&self) -> Option<TabId> {
+        if let Some(tab) = self.tab {
+            return Some(tab);
+        }
+        let process = self.process.upgrade()?;
+        process
+            .window_snapshot(self.window)
+            .map(|window| window.focused_tab)
+    }
+
+    /// Whether the gesture still belongs to the tab and folder it started in.
+    fn source_still_valid(&self, drag: &RubberDrag) -> bool {
+        let Some(process) = self.process.upgrade() else {
+            return false;
+        };
+        // The single folder page follows the model's focused tab. A split tile
+        // has its own tab id and remains valid while another tile is focused.
+        process.drag_source_valid(self.window, drag.tab, &drag.folder, self.tab.is_none())
+    }
+
+    /// Realized cells with their current viewport bounds. Recycled cells are
+    /// read from the live binding map on every motion, never from a stale
+    /// snapshot.
+    fn cell_hit_rects(&self) -> Vec<(u32, RubberRect)> {
+        let cells = self.cell_positions.borrow().clone();
+        cells
+            .into_iter()
+            .filter_map(|(cell, position)| {
+                cell.compute_bounds(&self.body).map(|bounds| {
+                    (
+                        position,
+                        RubberRect {
+                            x: f64::from(bounds.x()),
+                            y: f64::from(bounds.y()),
+                            width: f64::from(bounds.width()),
+                            height: f64::from(bounds.height()),
+                        },
+                    )
+                })
+            })
+            .collect()
+    }
+
+    fn visible_rubber_rect(&self, start: (f64, f64), current: (f64, f64)) -> RubberRect {
+        clip_rect(
+            normalize_rect(start.0, start.1, current.0, current.1),
+            f64::from(self.body.width()),
+            f64::from(self.body.height()),
+        )
+    }
+
+    fn update_rubber_overlay(&self, rect: RubberRect) {
+        if rect.width <= 0.0 || rect.height <= 0.0 {
+            self.rubber_rect.set_visible(false);
+            return;
+        }
+        self.rubber_rect.set_visible(true);
+        self.rubber_layer.move_(&self.rubber_rect, rect.x, rect.y);
+        self.rubber_rect.set_size_request(
+            rect.width.round().max(1.0) as i32,
+            rect.height.round().max(1.0) as i32,
+        );
+    }
+
+    fn show_rubber_hits(&self, hits: &[u32]) {
+        let hits: HashSet<u32> = hits.iter().copied().collect();
+        let cells = self.cell_positions.borrow().clone();
+        for (cell, position) in cells {
+            if hits.contains(&position) {
+                cell.add_css_class("gl-rubber-hit");
+            } else {
+                cell.remove_css_class("gl-rubber-hit");
+            }
+        }
+    }
+
+    fn clear_rubber_highlights(&self) {
+        for (cell, _) in self.cell_positions.borrow().iter() {
+            cell.remove_css_class("gl-rubber-hit");
+        }
+    }
+
+    fn clear_rubber(&self) {
+        let had = self.rubber.borrow_mut().take().is_some();
+        self.rubber_rect.set_visible(false);
+        self.clear_rubber_highlights();
+        if had {
+            crate::log_verbose!("rubber", "cleared the rectangle and temporary highlights");
+        }
+    }
+
+    /// Cancel the gesture and overlay without touching the model selection.
+    fn cancel_rubber(&self) {
+        self.clear_rubber();
+    }
+
     fn click_item(&self, name: OsString, modifiers: gdk::ModifierType) {
         let order = self.listed_names();
         let request = click_request(
@@ -2606,6 +2895,20 @@ impl Drop for FolderView {
             self.size_service.cancel(started);
         }
     }
+}
+
+fn pointer_in_body(body: &gtk::Overlay, event: Option<&gdk::Event>) -> Option<(f64, f64)> {
+    let (sx, sy) = event?.position()?;
+    let transform = body
+        .native()
+        .map(|native| native.surface_transform())
+        .unwrap_or((0.0, 0.0));
+    let root = body.root()?;
+    let bounds = body.compute_bounds(&root)?;
+    Some((
+        sx - transform.0 - f64::from(bounds.x()),
+        sy - transform.1 - f64::from(bounds.y()),
+    ))
 }
 
 fn modified_text(info: &gio::FileInfo) -> String {

@@ -3,7 +3,8 @@
 //!
 //! Kyle's config file, its Gimbal control directory and the active runtime
 //! control/socket directory are not agent-writable. The check covers sources,
-//! destinations, rename targets, new-folder parents and undo steps, resolves
+//! destinations, rename targets, new-folder parents, new-file targets and undo
+//! steps, resolves
 //! `..` and symbolic-link aliases, and fails closed when a path cannot be
 //! resolved. The transport runs it on its worker thread, before the bridge
 //! sees the request, so the GTK thread does no filesystem work for it.
@@ -120,6 +121,9 @@ pub fn check_request(
             check_destination(&target, resolved)?;
         }
         Request::NewFolder {
+            name, in_folder, ..
+        }
+        | Request::NewFile {
             name, in_folder, ..
         } => {
             check_destination(&in_folder.join(name), resolved)?;
@@ -315,6 +319,13 @@ mod tests {
         let request = Request::NewFolder {
             scope: fm_core::admin::Scope::User,
             name: "new".to_string(),
+            in_folder: roots.config_dir.clone(),
+        };
+        assert!(check_request(&request, &resolved).is_err());
+
+        let request = Request::NewFile {
+            scope: fm_core::admin::Scope::User,
+            name: "new.txt".to_string(),
             in_folder: roots.config_dir.clone(),
         };
         assert!(check_request(&request, &resolved).is_err());

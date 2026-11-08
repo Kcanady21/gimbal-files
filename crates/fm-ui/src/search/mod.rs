@@ -1554,6 +1554,7 @@ pub fn refusal_for(command: &str) -> Option<&'static str> {
         | "file.move"
         | "file.rename"
         | "file.new-folder"
+        | "file.new-file"
         | "file.undo"
         | "file.cut"
         | "file.copy-to-clipboard"

@@ -67,6 +67,7 @@ Unavailable through the socket (refused by the registry before any handler):
 - `file.open-with`, `file.set-default-app`
 - `file.properties`
 - `app.settings`
+- `file.new-file`
 - `file.open-as-admin`
 - `tab.open-as-admin`, `tab.leave-admin`
 - `trash.empty`, `trash.delete-permanently`
@@ -80,6 +81,10 @@ Unavailable through the socket (refused by the registry before any handler):
 `file.properties` is the read-only Properties window and `app.settings` opens
 the Settings submenu; both are `System` commands, so a socket client is refused
 before any handler.
+
+`file.new-file` is a menu-only `Effect::Files` command: the registry permits
+only `Caller::Ui`, so a hotkey, the CLI and the socket are refused before a
+handler or dry run, and no agent can choose a name to create.
 
 There is no generic eval, shell execution or raw config write. Clipboard,
 `Launch` and `System` operations keep their existing policy; `System` is listed
@@ -111,9 +116,9 @@ A socket file request may not touch:
 - its containing control directory (`.../gimbal-files`),
 - the active runtime control/socket directory (`$XDG_RUNTIME_DIR/gimbal-files`).
 
-Sources, destinations, rename targets, new-folder parents, undo/restore plan
-steps and ancestor directories are checked. `..` and symbolic-link aliases are
-resolved; an unresolvable path fails closed. The declared request is checked on
+Sources, destinations, rename targets, new-folder parents, new-file targets,
+undo/restore plan steps and ancestor directories are checked. `..` and
+symbolic-link aliases are resolved; an unresolvable path fails closed. The declared request is checked on
 the transport worker before the bridge sees it. The file-op worker checks the
 actual request (including clipboard sources/destination) before `Planned`, then
 repeats the request and full planned-step protection after the answer or

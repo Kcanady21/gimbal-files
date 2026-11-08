@@ -109,6 +109,7 @@ fn run_action(ui: &Rc<WindowUi>, anchor: &gtk::Widget, item: &MenuItem, at: Opti
         }
         MenuAction::Rename { path } => open_rename(ui, anchor, path),
         MenuAction::NewFolder { folder } => open_new_folder(ui, anchor, folder, at),
+        MenuAction::NewFile { folder } => open_new_file(ui, anchor, folder, at),
         MenuAction::ChooseFolder { command, paths } => {
             choose_folder(ui, command, paths);
         }
@@ -216,13 +217,65 @@ fn dispatch_rename(ui: &Rc<WindowUi>, path: &str, name: String) {
 
 /// New Folder through an entry popover.
 fn open_new_folder(ui: &Rc<WindowUi>, anchor: &gtk::Widget, folder: &Path, at: Option<(f64, f64)>) {
-    let folder_text = folder.to_string_lossy().into_owned();
+    open_name_form(ui, anchor, folder, at, NameKind::Folder);
+}
+
+/// New File through the same entry popover. The destination is bound to the
+/// folder whose background menu was opened.
+fn open_new_file(ui: &Rc<WindowUi>, anchor: &gtk::Widget, folder: &Path, at: Option<(f64, f64)>) {
+    open_name_form(ui, anchor, folder, at, NameKind::File);
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NameKind {
+    Folder,
+    File,
+}
+
+impl NameKind {
+    fn command(self) -> &'static str {
+        match self {
+            NameKind::Folder => "file.new-folder",
+            NameKind::File => "file.new-file",
+        }
+    }
+
+    fn placeholder(self) -> &'static str {
+        match self {
+            NameKind::Folder => "Folder name",
+            NameKind::File => "File name",
+        }
+    }
+
+    fn empty_log(self) -> &'static str {
+        match self {
+            NameKind::Folder => "an empty folder name was ignored",
+            NameKind::File => "an empty file name was ignored",
+        }
+    }
+}
+
+/// The shared New Folder / New File name form: the original click rectangle,
+/// an idle after the menu closes (P2af), Enter / Create / Cancel, and a
+/// destination captured from the menu that opened it.
+fn open_name_form(
+    ui: &Rc<WindowUi>,
+    anchor: &gtk::Widget,
+    folder: &Path,
+    at: Option<(f64, f64)>,
+    kind: NameKind,
+) {
+    let Some(folder_text) = folder.to_str() else {
+        crate::log!("fileops", "cannot create an item in a non-UTF-8 path");
+        ui.show_summary("This folder's path cannot be used to create an item.", None);
+        return;
+    };
     // Keep the menu's click position. Anchoring to the whole scroller can
     // put the entry popover against the edge of the window.
     let popover = popover_at(anchor, at);
     let box_ = vbox(&["gl-menu"]);
     let entry = gtk::Entry::new();
-    entry.set_placeholder_text(Some("Folder name"));
+    entry.set_placeholder_text(Some(kind.placeholder()));
     box_.append(&entry);
 
     let row = hbox(&[]);
@@ -236,11 +289,11 @@ fn open_new_folder(ui: &Rc<WindowUi>, anchor: &gtk::Widget, folder: &Path, at: O
     let ui_create = ui.clone();
     let popover_create = popover.clone();
     let entry_create = entry.clone();
-    let folder_create = folder_text.clone();
+    let folder_create = folder_text.to_owned();
     create.connect_clicked(move |_| {
         let name = entry_create.text().trim().to_string();
         take_down(&popover_create);
-        dispatch_new_folder(&ui_create, &folder_create, name);
+        dispatch_new_name(&ui_create, &folder_create, name, kind);
     });
     row.append(&cancel);
     row.append(&create);
@@ -250,11 +303,11 @@ fn open_new_folder(ui: &Rc<WindowUi>, anchor: &gtk::Widget, folder: &Path, at: O
     let ui_enter = ui.clone();
     let popover_enter = popover.clone();
     let entry_enter = entry.clone();
-    let folder_enter = folder_text;
+    let folder_enter = folder_text.to_owned();
     entry.connect_activate(move |_| {
         let name = entry_enter.text().trim().to_string();
         take_down(&popover_enter);
-        dispatch_new_folder(&ui_enter, &folder_enter, name);
+        dispatch_new_name(&ui_enter, &folder_enter, name, kind);
     });
 
     ui.set_editing(true);
@@ -269,15 +322,15 @@ fn open_new_folder(ui: &Rc<WindowUi>, anchor: &gtk::Widget, folder: &Path, at: O
     entry.grab_focus();
 }
 
-fn dispatch_new_folder(ui: &Rc<WindowUi>, folder: &str, name: String) {
+fn dispatch_new_name(ui: &Rc<WindowUi>, folder: &str, name: String, kind: NameKind) {
     if name.is_empty() {
-        crate::log!("fileops", "an empty folder name was ignored");
+        crate::log!("fileops", "{}", kind.empty_log());
         return;
     }
     ui.dispatch(
         Caller::Ui,
         Invocation::new(
-            "file.new-folder",
+            kind.command(),
             vec![
                 ("name".to_string(), name),
                 ("in".to_string(), folder.to_string()),

@@ -35,6 +35,7 @@ fn the_v1_catalogue_has_every_reviewed_command_in_order() {
         "tab.focus",
         "tab.move",
         "tab.open-in-new-window",
+        "tab.open-in-own-tab",
         "tab.open-as-admin",
         "tab.leave-admin",
         "group.open",
@@ -61,6 +62,7 @@ fn the_v1_catalogue_has_every_reviewed_command_in_order() {
         "file.move",
         "file.rename",
         "file.new-folder",
+        "file.new-file",
         "file.undo",
         "file.cut",
         "file.copy-to-clipboard",
@@ -120,6 +122,33 @@ fn names_are_area_dot_verb_in_lowercase_kebab_case() {
     assert!(!is_well_formed_name("nav.go_now"));
     assert!(is_well_formed_name("tab.close-selected"));
     assert!(is_well_formed_name("preview.save-as"));
+}
+
+#[test]
+fn open_in_own_tab_is_a_no_argument_view_command_for_every_caller() {
+    let registry = Registry::new();
+    let spec = registry
+        .command("tab.open-in-own-tab")
+        .expect("the split-tile command exists");
+    assert_eq!(spec.effect, Effect::View);
+    assert!(!spec.undo);
+    assert!(spec.arguments().is_empty());
+
+    for caller in [Caller::Ui, Caller::Hotkey, Caller::Cli, Caller::Agent] {
+        let command = check(caller, &["tab.open-in-own-tab"]).unwrap_or_else(|error| {
+            panic!("{caller} should be allowed to open a tile in its own tab: {error}")
+        });
+        assert_eq!(command.name(), "tab.open-in-own-tab");
+        assert_eq!(command.effect(), Effect::View);
+        assert!(command.arguments().is_empty());
+        assert!(!command.undoable());
+
+        let error = check(caller, &["tab.open-in-own-tab", "index=0"])
+            .expect_err("the command takes no arguments");
+        assert_eq!(error.command(), Some("tab.open-in-own-tab"));
+        assert_eq!(error.argument(), Some("index"));
+        assert!(matches!(error.kind(), CommandErrorKind::UnknownArgument));
+    }
 }
 
 #[test]
@@ -1112,6 +1141,45 @@ fn cli_and_agent_may_not_fill_files_paths_from_context() {
         assert!(text.contains(caller.as_str()));
         assert!(text.contains("may not fill a Files path from context"));
     }
+}
+
+#[test]
+fn new_file_is_a_menu_only_files_command_with_name_and_current_folder() {
+    let spec = Registry::new()
+        .command("file.new-file")
+        .expect("the reviewed command exists");
+    assert_eq!(spec.effect, Effect::Files);
+    assert!(
+        !spec.undo,
+        "creation leaves the previous undo entry available"
+    );
+    assert_eq!(spec.arguments().len(), 3, "name, in and the added dry-run");
+    let name = spec.argument("name").expect("a required name");
+    assert_eq!(name.kind, ArgKind::Text);
+    assert_eq!(name.presence, Presence::Required);
+    let folder = spec.argument("in").expect("the folder");
+    assert_eq!(folder.kind, ArgKind::Path);
+    assert_eq!(
+        folder.presence,
+        Presence::Context(ContextSource::CurrentFolder)
+    );
+
+    assert!(UI_ONLY_MENU_COMMANDS.contains(&"file.new-file"));
+    assert!(caller_allowed("file.new-file", Effect::Files, Caller::Ui));
+    for caller in [Caller::Hotkey, Caller::Cli, Caller::Agent] {
+        assert!(!caller_allowed("file.new-file", Effect::Files, caller));
+        let error = check(caller, &["file.new-file", "name=a.txt", "in=/tmp"])
+            .expect_err("only the background menu may create a file");
+        assert!(matches!(
+            error.kind(),
+            CommandErrorKind::ForbiddenCaller { caller: actual } if *actual == caller
+        ));
+    }
+
+    assert!(check(Caller::Ui, &["file.new-file", "name=a.txt", "in=/tmp"]).is_ok());
+    assert!(check(Caller::Ui, &["file.new-file", "name=a.txt"]).is_ok());
+    assert!(check(Caller::Ui, &["file.new-file", "in=/tmp"]).is_err());
+    assert!(check(Caller::Ui, &["file.new-file", "name=", "in=/tmp"]).is_err());
 }
 
 #[test]

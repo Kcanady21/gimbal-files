@@ -383,12 +383,22 @@ pub enum WorkspaceError {
     NoSuchWindow(WindowId),
     NoSuchGroup(GroupId),
     NoSuchTab(TabId),
-    IndexOutOfRange { index: usize, len: usize },
-    NotEnoughTabs { selected: usize },
+    /// The tab exists, but its group no longer shows as a split.
+    GroupNotSplit(GroupId),
+    IndexOutOfRange {
+        index: usize,
+        len: usize,
+    },
+    NotEnoughTabs {
+        selected: usize,
+    },
     AlreadyInGroup,
     EmptyGroupName,
     ColumnOutOfRange(usize),
-    HeightsLength { expected: usize, got: usize },
+    HeightsLength {
+        expected: usize,
+        got: usize,
+    },
     WidthShareOutOfRange(u16),
     DropRefused,
 }
@@ -401,6 +411,7 @@ impl fmt::Display for WorkspaceError {
             WorkspaceError::NoSuchWindow(id) => write!(f, "window {id} does not exist"),
             WorkspaceError::NoSuchGroup(id) => write!(f, "group {id} does not exist"),
             WorkspaceError::NoSuchTab(id) => write!(f, "tab {id} does not exist"),
+            WorkspaceError::GroupNotSplit(id) => write!(f, "group {id} is not split"),
             WorkspaceError::IndexOutOfRange { index, len } => {
                 write!(f, "index {index} is past the end of {len} pills")
             }
@@ -1008,7 +1019,7 @@ impl Workspace {
             return self.window_new(path);
         };
 
-        let (window_id, folder, position, admin) = {
+        let (folder, position, admin) = {
             let window = &self.windows[window_index];
             let position = window
                 .focused_pill_index()
@@ -1021,16 +1032,26 @@ impl Workspace {
                 Some(path) => path,
                 None => source.folder.clone(),
             };
-            (window.id, folder, position, admin.unwrap_or(source.admin))
+            (folder, position, admin.unwrap_or(source.admin))
         };
 
-        let tab_id = self.ids.tab();
+        let tab = Tab::new(self.ids.tab(), folder).with_admin(admin);
+        Ok(self.insert_standalone_tab(window_index, position, tab))
+    }
+
+    fn insert_standalone_tab(
+        &mut self,
+        window_index: usize,
+        position: usize,
+        tab: Tab,
+    ) -> Vec<Event> {
+        let tab_id = tab.id;
         let group_id = self.ids.group();
         let number = next_group_number(&self.windows[window_index]);
-        let tab = Tab::new(tab_id, folder).with_admin(admin);
         let group = Group::new(group_id, number, vec![tab], initial_columns(&[tab_id]));
 
         let window = &mut self.windows[window_index];
+        let window_id = window.id;
         window.groups.insert(group_id, group);
         window.pills.insert(position, group_id);
         window.selection.selected.insert(position, false);
@@ -1054,7 +1075,40 @@ impl Workspace {
         if had_selection {
             events.push(Event::SelectionChanged { window: window_id });
         }
-        Ok(events)
+        events
+    }
+
+    /// Copy one split tile into a new single-tab group after its own group.
+    /// The copy takes the tile's folder, both history stacks and its whole
+    /// `FileSelection` by value, with a fresh tab and group id, the usual empty
+    /// scroll anchor and normal access. The source group is not changed, so
+    /// the tile stays in the split.
+    pub fn tab_open_in_own_tab(&mut self, tab: TabId) -> Result<Vec<Event>, WorkspaceError> {
+        let window_index = self.focused_index_or_error()?;
+        let (position, source) = {
+            let window = &self.windows[window_index];
+            let group = window.group_of(tab).ok_or(WorkspaceError::NoSuchTab(tab))?;
+            if !group.is_split() {
+                return Err(WorkspaceError::GroupNotSplit(group.id));
+            }
+            let position = window
+                .pill_index(group.id)
+                .ok_or(WorkspaceError::NoSuchGroup(group.id))?
+                + 1;
+            let source = group.tab(tab).ok_or(WorkspaceError::NoSuchTab(tab))?;
+            (position, source.clone())
+        };
+
+        let tab = Tab {
+            id: self.ids.tab(),
+            folder: source.folder,
+            back: source.back,
+            forward: source.forward,
+            selection: source.selection,
+            scroll_anchor: None,
+            admin: false,
+        };
+        Ok(self.insert_standalone_tab(window_index, position, tab))
     }
 
     /// Turn the focused administrator tab back into a normal tab at the same
@@ -2026,6 +2080,43 @@ impl Workspace {
             tab.selection.anchor = Some(name.clone());
         }
         tab.selection.focused = Some(name);
+        Ok(vec![Event::SelectionChanged { window: window_id }])
+    }
+
+    /// Apply one rubber-band result to the focused tab. `hits` are the names
+    /// of intersected cells in visible order. A plain drag replaces the
+    /// selection, Shift adds the hits, and Ctrl removes them. Ctrl takes
+    /// precedence when both modifiers are held.
+    pub fn selection_drag(
+        &mut self,
+        hits: &[OsString],
+        ctrl: bool,
+        shift: bool,
+    ) -> Result<Vec<Event>, WorkspaceError> {
+        let (window_id, _, tab) = self.focused_tab_mut()?;
+        let selection = &mut tab.selection;
+        if ctrl {
+            for name in hits {
+                selection.names.remove(name);
+            }
+            if selection
+                .focused
+                .as_ref()
+                .is_some_and(|name| hits.contains(name))
+            {
+                selection.focused = None;
+            }
+        } else if shift {
+            selection.names.extend(hits.iter().cloned());
+            if let Some(name) = hits.first() {
+                selection.focused = Some(name.clone());
+            }
+        } else {
+            selection.names = hits.iter().cloned().collect();
+            selection.focused = hits.first().cloned();
+            selection.anchor = selection.focused.clone();
+        }
+
         Ok(vec![Event::SelectionChanged { window: window_id }])
     }
 

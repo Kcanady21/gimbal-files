@@ -2106,6 +2106,20 @@ impl Inner {
             }
         });
         let weak = Rc::downgrade(self);
+        menu_item(&popover, &menu, "Open in Own Tab", move || {
+            if let Some(inner) = weak.upgrade()
+                && let Some(process) = inner.process.upgrade()
+                && let Some(window) = process.window_snapshot(inner.window)
+                && window.group_of(id).is_some_and(|group| group.is_split())
+            {
+                process.focus_tab_and_dispatch(
+                    inner.window,
+                    id,
+                    fm_core::command::Invocation::new("tab.open-in-own-tab", Vec::new()),
+                );
+            }
+        });
+        let weak = Rc::downgrade(self);
         menu_item(&popover, &menu, "Close Group", move || {
             if let Some(inner) = weak.upgrade()
                 && let Some(process) = inner.process.upgrade()

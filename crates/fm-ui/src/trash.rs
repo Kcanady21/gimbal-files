@@ -111,7 +111,8 @@ pub fn route_on_trash_page(command: &str, trash_active: bool) -> PageRoute {
         | "file.move"
         | "file.paste"
         | "file.rename"
-        | "file.new-folder" => {
+        | "file.new-folder"
+        | "file.new-file" => {
             PageRoute::Refuse("This file action is unavailable while Trash is shown.")
         }
         "search.open" => PageRoute::Refuse("Search is unavailable while Trash is shown."),
@@ -1562,6 +1563,7 @@ mod tests {
             "file.paste",
             "file.rename",
             "file.new-folder",
+            "file.new-file",
         ] {
             assert!(
                 matches!(route_on_trash_page(command, true), PageRoute::Refuse(_)),

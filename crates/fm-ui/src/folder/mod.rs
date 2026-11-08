@@ -397,6 +397,89 @@ impl KeyboardFocus {
     }
 }
 
+/// A rectangle in the folder viewport's coordinates. Rubber-band geometry is
+/// pure so the press, the overlay and the final hits all agree.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RubberRect {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
+impl RubberRect {
+    pub fn contains(self, x: f64, y: f64) -> bool {
+        self.width > 0.0
+            && self.height > 0.0
+            && x >= self.x
+            && x < self.x + self.width
+            && y >= self.y
+            && y < self.y + self.height
+    }
+}
+
+/// The rectangle between two points, in either direction.
+pub fn normalize_rect(ax: f64, ay: f64, bx: f64, by: f64) -> RubberRect {
+    RubberRect {
+        x: ax.min(bx),
+        y: ay.min(by),
+        width: (bx - ax).abs(),
+        height: (by - ay).abs(),
+    }
+}
+
+/// The visible part of a rectangle inside a viewport. A drag that leaves the
+/// tile therefore cannot draw or select beyond it.
+pub fn clip_rect(rect: RubberRect, width: f64, height: f64) -> RubberRect {
+    let left = rect.x.max(0.0);
+    let top = rect.y.max(0.0);
+    let right = (rect.x + rect.width).min(width.max(0.0));
+    let bottom = (rect.y + rect.height).min(height.max(0.0));
+    RubberRect {
+        x: left,
+        y: top,
+        width: (right - left).max(0.0),
+        height: (bottom - top).max(0.0),
+    }
+}
+
+/// Positive-area intersection. An edge or a corner that merely touches is not
+/// a hit, so a rectangle exactly at a cell's edge selects nothing from it.
+pub fn rects_intersect(a: RubberRect, b: RubberRect) -> bool {
+    a.width > 0.0
+        && a.height > 0.0
+        && b.width > 0.0
+        && b.height > 0.0
+        && a.x < b.x + b.width
+        && b.x < a.x + a.width
+        && a.y < b.y + b.height
+        && b.y < a.y + a.height
+}
+
+/// Which realized cell owns a press. Gaps between cells and the space below
+/// the last row own no cell, so a press there belongs to the viewport.
+pub fn cell_at(x: f64, y: f64, cells: &[(u32, RubberRect)]) -> Option<u32> {
+    cells
+        .iter()
+        .find(|(_, rect)| rect.contains(x, y))
+        .map(|(position, _)| *position)
+}
+
+/// Every realized cell the rectangle intersects.
+pub fn rubber_hits(rect: RubberRect, cells: &[(u32, RubberRect)]) -> Vec<u32> {
+    cells
+        .iter()
+        .filter(|(_, cell)| rects_intersect(rect, *cell))
+        .map(|(position, _)| *position)
+        .collect()
+}
+
+/// GTK's own drag threshold test. A movement exactly equal to the threshold is
+/// still a press, matching `gtk_drag_check_threshold_double`'s strict `>`.
+pub fn drag_passes_threshold(dx: f64, dy: f64, threshold: f64) -> bool {
+    dx.abs() > threshold || dy.abs() > threshold
+}
+
 /// One click's meaning, before it reaches the model. Shift carries the visible
 /// order because the model has no listing of its own.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -552,6 +635,159 @@ mod tests {
             click_request(true, true, OsString::from("c"), &[]),
             ClickRequest::Ctrl(OsString::from("c"))
         );
+    }
+
+    #[test]
+    fn empty_space_and_item_bounds_decide_the_press_owner() {
+        let cells = [
+            (
+                0,
+                RubberRect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 100.0,
+                    height: 80.0,
+                },
+            ),
+            (
+                1,
+                RubberRect {
+                    x: 120.0,
+                    y: 0.0,
+                    width: 100.0,
+                    height: 80.0,
+                },
+            ),
+            (
+                2,
+                RubberRect {
+                    x: 0.0,
+                    y: 100.0,
+                    width: 100.0,
+                    height: 80.0,
+                },
+            ),
+        ];
+        assert_eq!(cell_at(50.0, 50.0, &cells), Some(0));
+        // A gap between cells owns no item.
+        assert_eq!(cell_at(110.0, 50.0, &cells), None);
+        // The gap between rows owns no item.
+        assert_eq!(cell_at(50.0, 90.0, &cells), None);
+        // The space below the last row owns no item.
+        assert_eq!(cell_at(50.0, 200.0, &cells), None);
+        // A point exactly on a cell's right edge belongs to the viewport.
+        assert_eq!(cell_at(100.0, 50.0, &cells), None);
+        assert_eq!(cell_at(0.0, 0.0, &cells), Some(0));
+    }
+
+    #[test]
+    fn drag_rectangles_normalize_in_every_direction() {
+        let expected = RubberRect {
+            x: 10.0,
+            y: 20.0,
+            width: 90.0,
+            height: 60.0,
+        };
+        assert_eq!(normalize_rect(10.0, 20.0, 100.0, 80.0), expected);
+        assert_eq!(normalize_rect(100.0, 20.0, 10.0, 80.0), expected);
+        assert_eq!(normalize_rect(10.0, 80.0, 100.0, 20.0), expected);
+        assert_eq!(normalize_rect(100.0, 80.0, 10.0, 20.0), expected);
+        let point = normalize_rect(7.0, 9.0, 7.0, 9.0);
+        assert_eq!((point.width, point.height), (0.0, 0.0));
+    }
+
+    #[test]
+    fn intersection_stops_at_cell_and_viewport_edges() {
+        let cell = RubberRect {
+            x: 100.0,
+            y: 50.0,
+            width: 80.0,
+            height: 60.0,
+        };
+        // A rectangle ending exactly at the cell's left edge does not hit it.
+        assert!(!rects_intersect(
+            RubberRect {
+                x: 20.0,
+                y: 50.0,
+                width: 80.0,
+                height: 60.0,
+            },
+            cell
+        ));
+        // One pixel into the cell does.
+        assert!(rects_intersect(
+            RubberRect {
+                x: 20.0,
+                y: 50.0,
+                width: 81.0,
+                height: 60.0,
+            },
+            cell
+        ));
+        // A drag past the viewport is clipped to its edge, and a cell that
+        // begins exactly there stays untouched.
+        let clipped = clip_rect(
+            RubberRect {
+                x: -20.0,
+                y: -10.0,
+                width: 140.0,
+                height: 80.0,
+            },
+            120.0,
+            70.0,
+        );
+        assert_eq!(
+            clipped,
+            RubberRect {
+                x: 0.0,
+                y: 0.0,
+                width: 120.0,
+                height: 70.0,
+            }
+        );
+        let at_edge = RubberRect {
+            x: 120.0,
+            y: 0.0,
+            width: 30.0,
+            height: 30.0,
+        };
+        assert!(!rects_intersect(clipped, at_edge));
+        // The rectangle is clipped, not discarded, when the pointer leaves.
+        assert_eq!(
+            clip_rect(
+                RubberRect {
+                    x: 50.0,
+                    y: 50.0,
+                    width: 300.0,
+                    height: 300.0,
+                },
+                120.0,
+                70.0
+            ),
+            RubberRect {
+                x: 50.0,
+                y: 50.0,
+                width: 70.0,
+                height: 20.0,
+            }
+        );
+        assert!(rects_intersect(
+            clipped,
+            RubberRect {
+                x: 119.0,
+                y: 0.0,
+                width: 30.0,
+                height: 30.0,
+            }
+        ));
+    }
+
+    #[test]
+    fn the_drag_threshold_is_strict_like_gtk() {
+        assert!(!drag_passes_threshold(8.0, 8.0, 8.0));
+        assert!(!drag_passes_threshold(-8.0, 0.0, 8.0));
+        assert!(drag_passes_threshold(8.1, 0.0, 8.0));
+        assert!(drag_passes_threshold(0.0, -8.1, 8.0));
     }
 
     #[test]

@@ -1056,6 +1056,19 @@ fn every_files_command_maps_to_its_request() {
         }
     );
     assert_eq!(
+        request_for(&check(
+            "file.new-file",
+            &[("name", "empty.txt"), ("in", "/tmp")]
+        ))
+        .unwrap()
+        .unwrap(),
+        Request::NewFile {
+            scope: Scope::User,
+            name: "empty.txt".to_string(),
+            in_folder: PathBuf::from("/tmp"),
+        }
+    );
+    assert_eq!(
         request_for(&check("file.undo", &[])).unwrap().unwrap(),
         Request::Undo
     );
@@ -1095,6 +1108,9 @@ fn request_mapping_refuses_unfilled_context_paths() {
     assert_eq!(error, RequestError::MissingArgument("path"));
 
     let error = request_for(&check("file.new-folder", &[("name", "new")])).unwrap_err();
+    assert_eq!(error, RequestError::MissingArgument("in"));
+
+    let error = request_for(&check("file.new-file", &[("name", "empty.txt")])).unwrap_err();
     assert_eq!(error, RequestError::MissingArgument("in"));
 }
 
@@ -1281,6 +1297,154 @@ fn a_new_folder_with_a_taken_or_invalid_name_is_a_conflict() {
         in_folder: scratch.path.clone(),
     });
     assert_eq!(invalid.steps()[0].conflict, Some(Conflict::InvalidName));
+}
+
+#[test]
+fn a_new_file_with_an_invalid_name_or_any_existing_target_is_a_conflict() {
+    let scratch = Scratch::new("plan-new-file");
+    write(&scratch.join("file.txt"), "keep");
+    fs::create_dir(scratch.join("folder")).unwrap();
+    let dangling = scratch.join("dangling");
+    symlink(&scratch.join("missing.txt"), &dangling);
+
+    let operations = FileOperations::new();
+    for name in ["", ".", "..", "a/b", "a\0b"] {
+        let plan = operations.plan(&Request::NewFile {
+            scope: Scope::User,
+            name: name.to_string(),
+            in_folder: scratch.path.clone(),
+        });
+        assert_eq!(
+            plan.steps()[0].conflict,
+            Some(Conflict::InvalidName),
+            "{name:?}"
+        );
+    }
+
+    let missing = operations.plan(&Request::NewFile {
+        scope: Scope::User,
+        name: "a.txt".to_string(),
+        in_folder: scratch.join("missing-folder"),
+    });
+    assert_eq!(
+        missing.steps()[0].conflict,
+        Some(Conflict::MissingDestination)
+    );
+
+    for name in ["file.txt", "folder", "dangling"] {
+        let plan = operations.plan(&Request::NewFile {
+            scope: Scope::User,
+            name: name.to_string(),
+            in_folder: scratch.path.clone(),
+        });
+        assert_eq!(
+            plan.steps()[0].conflict,
+            Some(Conflict::NameTaken),
+            "{name}"
+        );
+    }
+
+    // The collision check neither truncated the file nor followed the link.
+    assert_eq!(read(&scratch.join("file.txt")), "keep");
+    assert_eq!(
+        fs::read_link(&dangling).unwrap(),
+        scratch.join("missing.txt")
+    );
+}
+
+#[test]
+fn a_new_file_is_zero_bytes_and_a_dry_run_only_reports_the_plan() {
+    let scratch = Scratch::new("new-file-run");
+    let mut operations = FileOperations::new();
+    let cancellable = gio::Cancellable::new();
+    let request = Request::NewFile {
+        scope: Scope::User,
+        name: "empty.txt".to_string(),
+        in_folder: scratch.path.clone(),
+    };
+
+    let dry = operations.dry_run(&request);
+    assert!(dry[0].contains("create file empty.txt"));
+    assert!(dry[1].contains("new-file"));
+    assert!(!scratch.join("empty.txt").exists(), "dry run wrote a file");
+
+    let report = run(
+        &mut operations,
+        &request,
+        &Decisions::new(Vec::new()),
+        &cancellable,
+    );
+    assert_eq!(report.items[0].outcome, ItemOutcome::Done);
+    let metadata = fs::metadata(scratch.join("empty.txt")).expect("created file");
+    assert!(metadata.is_file());
+    assert_eq!(metadata.len(), 0);
+}
+
+#[test]
+fn a_name_that_appears_after_planning_is_refused_without_touching_it() {
+    let scratch = Scratch::new("new-file-race");
+    let target = scratch.join("empty.txt");
+    let mut operations = FileOperations::new();
+    let cancellable = gio::Cancellable::new();
+    let request = Request::NewFile {
+        scope: Scope::User,
+        name: "empty.txt".to_string(),
+        in_folder: scratch.path.clone(),
+    };
+
+    let plan = operations.plan(&request);
+    assert_eq!(plan.steps()[0].conflict, None);
+    write(&target, "already here");
+
+    let report = operations
+        .execute(&plan, &Decisions::new(Vec::new()), &cancellable, |_| {})
+        .unwrap();
+    assert_eq!(
+        report.items[0].outcome,
+        ItemOutcome::Refused(Conflict::NameTaken.text().to_string())
+    );
+    assert_eq!(read(&target), "already here");
+}
+
+#[test]
+fn creating_a_file_leaves_the_previous_undo_entry_available() {
+    let scratch = Scratch::new("new-file-undo");
+    let mut operations = FileOperations::new();
+    let cancellable = gio::Cancellable::new();
+
+    run(
+        &mut operations,
+        &Request::NewFolder {
+            scope: Scope::User,
+            name: "older".to_string(),
+            in_folder: scratch.path.clone(),
+        },
+        &Decisions::new(Vec::new()),
+        &cancellable,
+    );
+    assert_eq!(operations.undo.len(), 1);
+
+    run(
+        &mut operations,
+        &Request::NewFile {
+            scope: Scope::User,
+            name: "empty.txt".to_string(),
+            in_folder: scratch.path.clone(),
+        },
+        &Decisions::new(Vec::new()),
+        &cancellable,
+    );
+    assert!(scratch.join("empty.txt").is_file());
+    assert_eq!(operations.undo.len(), 1);
+    assert!(matches!(
+        operations.undo[0].kind,
+        RecordKind::NewFolder { .. }
+    ));
+    let undo = operations.plan(&Request::Undo);
+    assert_eq!(
+        undo.steps()[0].source.as_deref(),
+        Some(scratch.join("older").as_path())
+    );
 }
 
 #[test]

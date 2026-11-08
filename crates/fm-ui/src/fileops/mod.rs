@@ -750,7 +750,9 @@ fn request_touches_root(request: &Request, root: &Path) -> bool {
             paths.iter().any(|path| path.starts_with(root)) || to.starts_with(root)
         }
         Request::Rename { path, .. } => path.starts_with(root),
-        Request::NewFolder { in_folder, .. } => in_folder.starts_with(root),
+        Request::NewFolder { in_folder, .. } | Request::NewFile { in_folder, .. } => {
+            in_folder.starts_with(root)
+        }
         Request::Restore { items } | Request::DeleteSelected { items } => items
             .iter()
             .filter_map(|item| item.original())

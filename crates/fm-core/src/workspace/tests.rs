@@ -1000,6 +1000,194 @@ fn tab_open_in_new_window_moves_the_tab_out() {
 }
 
 #[test]
+fn tab_open_in_own_tab_copies_a_split_tile_after_its_group() {
+    let mut workspace = workspace();
+    workspace.tab_new(Some(folder("/tmp/one"))).unwrap();
+    workspace.tab_new(Some(folder("/tmp/two"))).unwrap();
+    workspace.tab_new(Some(folder("/tmp/three"))).unwrap();
+    let (source_group, tiles) = split_first(&mut workspace, 3);
+    let target = tiles[1];
+
+    // A non-first tile with its own folder, both history stacks and a full
+    // selection (names, focused name and Shift anchor).
+    workspace.focus_tab(target).unwrap();
+    workspace.nav_go(folder("/tmp/history-a"), None).unwrap();
+    workspace.nav_go(folder("/tmp/history-b"), None).unwrap();
+    workspace.nav_back().unwrap();
+    workspace.file_click(os("alpha.txt")).unwrap();
+    workspace.file_ctrl_click(os("beta.txt")).unwrap();
+
+    let source_tab = workspace.focused().unwrap().tab(target).unwrap().clone();
+    let source_group_before = workspace.focused().unwrap().groups[&source_group].clone();
+    let pills_before = workspace.focused().unwrap().pills.clone();
+    let source_position = workspace
+        .focused()
+        .unwrap()
+        .pill_index(source_group)
+        .unwrap();
+    let group_ids: BTreeSet<GroupId> = workspace
+        .focused()
+        .unwrap()
+        .groups
+        .keys()
+        .copied()
+        .collect();
+    let tab_ids: BTreeSet<TabId> = workspace
+        .focused()
+        .unwrap()
+        .groups
+        .values()
+        .flat_map(|group| group.tabs.iter().map(|tab| tab.id))
+        .collect();
+
+    // Another tile has focus when the menu asks for this one.
+    workspace.focus_tab(tiles[0]).unwrap();
+    let events = workspace.tab_open_in_own_tab(target).unwrap();
+
+    let window = workspace.focused().unwrap();
+    assert_eq!(window.pills.len(), pills_before.len() + 1);
+    let new_group = window.pills[source_position + 1];
+    assert!(!group_ids.contains(&new_group), "the group id is fresh");
+    let mut expected_pills = pills_before;
+    expected_pills.insert(source_position + 1, new_group);
+    assert_eq!(
+        window.pills, expected_pills,
+        "the new pill follows the split"
+    );
+    let new_tab = window.groups[&new_group].tabs[0].id;
+    assert!(!tab_ids.contains(&new_tab), "the tab id is fresh");
+    assert_eq!(window.focused_tab, new_tab);
+    assert!(!window.groups[&new_group].is_split());
+
+    let copied = &window.groups[&new_group].tabs[0];
+    assert_eq!(copied.folder, source_tab.folder);
+    assert_eq!(copied.back, source_tab.back);
+    assert_eq!(copied.forward, source_tab.forward);
+    assert_eq!(copied.selection, source_tab.selection);
+    assert_eq!(
+        copied.selection.names,
+        BTreeSet::from([os("alpha.txt"), os("beta.txt")])
+    );
+    assert_eq!(copied.selection.focused, Some(os("beta.txt")));
+    assert_eq!(copied.selection.anchor, Some(os("alpha.txt")));
+    assert_eq!(copied.scroll_anchor, None);
+    assert!(!copied.admin);
+    assert_eq!(
+        window.groups[&source_group], source_group_before,
+        "the source group keeps its order, layout, ids, folders and selections"
+    );
+    assert_eq!(
+        events,
+        vec![
+            Event::TabAdded {
+                window: window.id,
+                group: new_group,
+                tab: new_tab,
+                index: source_position + 1,
+            },
+            Event::FocusChanged {
+                window: window.id,
+                tab: new_tab,
+            },
+        ]
+    );
+    workspace.check_invariants().unwrap();
+
+    // Back and Forward act on the copy alone.
+    workspace.nav_back().unwrap();
+    let window = workspace.focused().unwrap();
+    let copied = window.tab(new_tab).unwrap();
+    assert_eq!(copied.folder, folder("/tmp/two"));
+    assert!(copied.back.is_empty());
+    assert_eq!(
+        copied.forward,
+        vec![folder("/tmp/history-b"), folder("/tmp/history-a")]
+    );
+    assert!(copied.selection.names.is_empty());
+    assert_eq!(copied.selection.focused, None);
+    assert_eq!(copied.selection.anchor, None);
+    assert_eq!(window.groups[&source_group], source_group_before);
+
+    workspace.nav_forward().unwrap();
+    let window = workspace.focused().unwrap();
+    let copied = window.tab(new_tab).unwrap();
+    assert_eq!(copied.folder, folder("/tmp/history-a"));
+    assert_eq!(copied.back, vec![folder("/tmp/two")]);
+    assert_eq!(copied.forward, vec![folder("/tmp/history-b")]);
+    assert_eq!(window.groups[&source_group], source_group_before);
+
+    // A selection in the copy leaves the source selection untouched.
+    workspace.file_click(os("gamma.txt")).unwrap();
+    let window = workspace.focused().unwrap();
+    let copied = window.tab(new_tab).unwrap();
+    assert_eq!(copied.selection.names, BTreeSet::from([os("gamma.txt")]));
+    assert_eq!(copied.selection.focused, Some(os("gamma.txt")));
+    assert_eq!(copied.selection.anchor, Some(os("gamma.txt")));
+    assert_eq!(
+        window.groups[&source_group], source_group_before,
+        "selection in the copy does not reach the source"
+    );
+    workspace.check_invariants().unwrap();
+}
+
+#[test]
+fn tab_open_in_own_tab_refuses_a_standalone_or_missing_tile_unchanged() {
+    let mut workspace = workspace();
+    let standalone = workspace.focused().unwrap().focused_tab;
+    let standalone_group = workspace
+        .focused()
+        .unwrap()
+        .group_of(standalone)
+        .unwrap()
+        .id;
+    let before = workspace.clone();
+
+    assert_eq!(
+        workspace.tab_open_in_own_tab(standalone),
+        Err(WorkspaceError::GroupNotSplit(standalone_group))
+    );
+    assert_eq!(workspace, before, "a standalone tab changes nothing");
+
+    let missing = TabId::from_raw(9999);
+    assert_eq!(
+        workspace.tab_open_in_own_tab(missing),
+        Err(WorkspaceError::NoSuchTab(missing))
+    );
+    assert_eq!(workspace, before, "a stale menu target changes nothing");
+}
+
+#[test]
+fn tab_open_in_own_tab_gives_the_copy_normal_access() {
+    let mut workspace = workspace();
+    workspace.tab_new_admin(folder("/etc")).unwrap();
+    let admin_tab = workspace.focused().unwrap().focused_tab;
+    workspace.pill_ctrl_click(0).unwrap();
+    workspace.pill_ctrl_click(1).unwrap();
+    workspace.group_split().unwrap();
+    assert!(workspace.focused().unwrap().tab(admin_tab).unwrap().admin);
+
+    let events = workspace.tab_open_in_own_tab(admin_tab).unwrap();
+    let new_tab = events
+        .iter()
+        .find_map(|event| match event {
+            Event::TabAdded { tab, .. } => Some(*tab),
+            _ => None,
+        })
+        .expect("the copy's id");
+
+    let window = workspace.focused().unwrap();
+    assert!(
+        window.tab(admin_tab).unwrap().admin,
+        "the source stays admin"
+    );
+    let copied = window.tab(new_tab).unwrap();
+    assert!(!copied.admin, "the copy is a normal tab");
+    assert_eq!(copied.folder, folder("/etc"));
+    assert_eq!(window.focused_tab, new_tab);
+    workspace.check_invariants().unwrap();
+}
+
+#[test]
 fn nav_go_pushes_history_and_clears_selection_and_anchor() {
     let mut workspace = workspace();
     workspace.file_click(os("keep")).unwrap();
@@ -1249,6 +1437,150 @@ fn nav_up_stops_at_the_root() {
     let before = workspace.clone();
     assert_eq!(workspace.nav_up().unwrap(), Vec::new());
     assert_eq!(workspace, before);
+}
+
+#[test]
+fn rubber_band_selection_replaces_adds_and_subtracts() {
+    let mut workspace = workspace();
+    let selection = |workspace: &Workspace| {
+        let window = workspace.focused().unwrap();
+        window.tab(window.focused_tab).unwrap().selection.clone()
+    };
+
+    workspace.file_click(os("old")).unwrap();
+    let events = workspace
+        .selection_drag(&[os("b"), os("d")], false, false)
+        .unwrap();
+    assert!(matches!(
+        events.as_slice(),
+        [Event::SelectionChanged { .. }]
+    ));
+    let plain = selection(&workspace);
+    assert_eq!(plain.names, BTreeSet::from([os("b"), os("d")]));
+    assert_eq!(plain.focused, Some(os("b")));
+    assert_eq!(plain.anchor, Some(os("b")));
+
+    // Shift adds exactly the hits, including disjoint ones.
+    workspace
+        .selection_drag(&[os("a"), os("f")], false, true)
+        .unwrap();
+    let added = selection(&workspace);
+    assert_eq!(
+        added.names,
+        BTreeSet::from([os("a"), os("b"), os("d"), os("f")])
+    );
+    assert_eq!(added.focused, Some(os("a")));
+    assert_eq!(added.anchor, plain.anchor);
+
+    // Ctrl removes selected hits and leaves unselected hits alone.
+    workspace
+        .selection_drag(&[os("a"), os("c")], true, false)
+        .unwrap();
+    let subtracted = selection(&workspace);
+    assert_eq!(
+        subtracted.names,
+        BTreeSet::from([os("b"), os("d"), os("f")])
+    );
+    assert_eq!(subtracted.focused, None);
+    assert_eq!(subtracted.anchor, plain.anchor);
+
+    // Ctrl wins when both modifiers are held.
+    workspace
+        .selection_drag(&[os("d"), os("e")], true, true)
+        .unwrap();
+    let both = selection(&workspace);
+    assert_eq!(both.names, BTreeSet::from([os("b"), os("f")]));
+
+    for (ctrl, shift) in [(true, false), (false, true), (true, true)] {
+        workspace.selection_drag(&[], ctrl, shift).unwrap();
+        assert_eq!(selection(&workspace), both);
+    }
+    workspace.selection_drag(&[], false, false).unwrap();
+    assert_eq!(selection(&workspace), FileSelection::default());
+}
+
+#[test]
+fn rubber_band_selection_carries_non_utf8_names() {
+    use std::os::unix::ffi::OsStringExt;
+
+    let weird = OsString::from_vec(vec![b'f', b'o', 0xE9]);
+    let mut workspace = workspace();
+
+    workspace
+        .selection_drag(std::slice::from_ref(&weird), false, false)
+        .unwrap();
+    let tab = workspace
+        .focused()
+        .unwrap()
+        .tab(workspace.focused().unwrap().focused_tab)
+        .unwrap();
+    assert_eq!(tab.selection.names, BTreeSet::from([weird.clone()]));
+    assert_eq!(tab.selection.anchor, Some(weird.clone()));
+
+    workspace.file_click(os("a")).unwrap();
+    workspace
+        .selection_drag(std::slice::from_ref(&weird), false, true)
+        .unwrap();
+    let tab = workspace
+        .focused()
+        .unwrap()
+        .tab(workspace.focused().unwrap().focused_tab)
+        .unwrap();
+    assert_eq!(
+        tab.selection.names,
+        BTreeSet::from([os("a"), weird.clone()])
+    );
+    assert_eq!(tab.selection.focused, Some(weird));
+}
+
+#[test]
+fn a_drag_from_a_non_focused_split_tile_focuses_and_selects_that_tile_only() {
+    let mut workspace = Workspace::with_home(home());
+    workspace
+        .window_new(Some(PathBuf::from("/tmp/start")))
+        .unwrap();
+    let (group, tabs) = split_first(&mut workspace, 2);
+    let source = tabs[0];
+    let sibling = tabs[1];
+
+    workspace.focus_tab(sibling).unwrap();
+    workspace.file_click(os("keep")).unwrap();
+    workspace.focus_tab(source).unwrap();
+    workspace.file_click(os("old")).unwrap();
+    // The drag starts while the sibling owns the focus.
+    workspace.focus_tab(sibling).unwrap();
+
+    let mut events = workspace.focus_tab(source).unwrap();
+    let mut selection = workspace
+        .selection_drag(&[os("a"), os("b")], false, false)
+        .unwrap();
+    events.append(&mut selection);
+
+    let window = workspace.focused().unwrap();
+    assert_eq!(window.focused_tab, source);
+    assert_eq!(
+        window.groups[&group].tab(source).unwrap().selection.names,
+        BTreeSet::from([os("a"), os("b")])
+    );
+    assert_eq!(
+        window.groups[&group].tab(sibling).unwrap().selection.names,
+        BTreeSet::from([os("keep")]),
+        "the sibling keeps its own selection"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, Event::FocusChanged { tab, .. } if *tab == source)),
+        "{events:?}"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, Event::SelectionChanged { .. }))
+            .count(),
+        1,
+        "the drag is one selection update"
+    );
 }
 
 #[test]

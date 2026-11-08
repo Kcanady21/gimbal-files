@@ -130,6 +130,7 @@ fn file_actions_are_refused_but_navigation_and_refresh_are_allowed() {
         "file.move",
         "file.rename",
         "file.new-folder",
+        "file.new-file",
         "file.undo",
         "file.cut",
         "file.copy-to-clipboard",
