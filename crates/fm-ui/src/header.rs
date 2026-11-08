@@ -876,10 +876,15 @@ impl Header {
         let menu = vbox(&["gl-menu"]);
         self.fill_accordion(&popover, &menu, &label, view);
         popover.set_child(Some(&menu));
+        // The pill owns this popover for its whole life; only the pill's
+        // destroy unparents it. Showing a popover with no parent realizes it
+        // outside any window, which crashed GTK (Nov 8), so both openers check.
         let motion = gtk::EventControllerMotion::new();
         let weak = popover.downgrade();
         motion.connect_enter(move |_, _, _| {
-            if let Some(popover) = weak.upgrade() {
+            if let Some(popover) = weak.upgrade()
+                && popover.parent().is_some()
+            {
                 crate::popup::show(&popover);
             }
         });
@@ -888,7 +893,9 @@ impl Header {
         click.set_button(1);
         let weak = popover.downgrade();
         click.connect_released(move |_, _, _, _| {
-            if let Some(popover) = weak.upgrade() {
+            if let Some(popover) = weak.upgrade()
+                && popover.parent().is_some()
+            {
                 crate::popup::show(&popover);
             }
         });
@@ -943,8 +950,12 @@ impl Header {
             let header_choose = self.clone();
             let popover_choose = popover.clone();
             let index = pill.index;
+            // Close the menu but keep it on its pill. take_down() unparented
+            // it, and when the click changed nothing (the tab was already
+            // focused) the header kept this pill, so the next hover showed a
+            // parentless popover and GTK crashed.
             choose.connect_clicked(move |_| {
-                take_down(&popover_choose);
+                popover_choose.popdown();
                 if let Some(ui) = header_choose.window_ui() {
                     ui.focus_pill(index);
                 }
@@ -957,7 +968,7 @@ impl Header {
             let header_close = self.clone();
             let popover_close = popover.clone();
             close.connect_clicked(move |_| {
-                take_down(&popover_close);
+                popover_close.popdown();
                 if let Some(ui) = header_close.window_ui() {
                     ui.close_pill(index);
                 }
