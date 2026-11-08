@@ -5,7 +5,7 @@ Codename: stable
 Architectures: amd64
 Components: main
 Description: Gimbal Files apt repository
-Date: Fri, 06 Nov 2026 17:21:08 +0000
+Date: Sun, 08 Nov 2026 16:32:45 +0000
 SHA256:
- 775a6298506b243ab75889ec95c8c712991434f4bbaca47e85306ec9309d29ac 3057 main/binary-amd64/Packages
- 1e2fcf948d5f46a63ab89f5ad0a1ad72b3a322e03868830217fb307ff8a7ae76 873 main/binary-amd64/Packages.gz
+ bf31c24011e7a392391ce1652cfd1c2768068024ab00dfad870dfe64d799643d 3719 main/binary-amd64/Packages
+ e90b8851cb83d50d47ff931f10ec64ea3d51a0c73ad6d453b851942011a718b4 1118 main/binary-amd64/Packages.gz
