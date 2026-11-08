@@ -28,6 +28,17 @@ use crate::folder::{
 };
 use crate::look::icons::{self, MockupIcon};
 use crate::look::tokens::*;
+
+/// How long after a change Gimbal first compares GTK's listing with the disk,
+/// and how long it waits before treating a disagreement as a stall.
+const STALL_FIRST: Duration = Duration::from_millis(800);
+const STALL_SECOND: Duration = Duration::from_millis(1500);
+
+/// Whether any changed name is listed when it's gone from disk, or missing
+/// from the list when it's on disk. Each pair is (listed, on disk).
+fn listing_disagrees(checks: &[(bool, bool)]) -> bool {
+    checks.iter().any(|(listed, on_disk)| listed != on_disk)
+}
 use crate::thumbs::{self, ThumbKey, ThumbKind, Thumbnailer};
 
 const MAX_COLUMNS: u32 = 64;
@@ -51,7 +62,20 @@ pub struct FolderView {
     banner: adw::Banner,
     scroller: gtk::ScrolledWindow,
     grid: gtk::GridView,
-    dir_list: gtk::DirectoryList,
+    /// GTK's listing of the shown folder. Replaced by a fresh list on reload:
+    /// a `GtkDirectoryList` whose event queue has stalled never recovers
+    /// (see `watch_folder`).
+    dir_list: RefCell<gtk::DirectoryList>,
+    dir_list_handlers: RefCell<Vec<glib::SignalHandlerId>>,
+    filtered: gtk::FilterListModel,
+    /// This view, for handlers wired to a replacement `dir_list`.
+    me: RefCell<Weak<FolderView>>,
+    /// Gimbal's own watch on the shown folder. It only notices when GTK's
+    /// listing has stopped applying changes; it never edits the list.
+    watch: RefCell<Option<gio::FileMonitor>>,
+    /// Names changed since the last stall check.
+    stall_names: RefCell<Vec<OsString>>,
+    stall_gen: Cell<u64>,
     sorted: gtk::SortListModel,
     selection: gtk::MultiSelection,
     status: Rc<StatusLine>,
@@ -174,7 +198,7 @@ impl FolderView {
             let rule = sort_rule.clone();
             move |a, b| compare_objects(a, b, rule.get())
         });
-        let sorted = gtk::SortListModel::new(Some(filtered), Some(sorter));
+        let sorted = gtk::SortListModel::new(Some(filtered.clone()), Some(sorter));
         // Off, as in P1e-r1: each batch is sorted before the next lands, so the
         // grid's anchor can be an item position when `loading` goes false.
         sorted.set_incremental(false);
@@ -225,7 +249,13 @@ impl FolderView {
             banner,
             scroller,
             grid,
-            dir_list,
+            dir_list: RefCell::new(dir_list),
+            dir_list_handlers: RefCell::new(Vec::new()),
+            filtered,
+            me: RefCell::new(Weak::new()),
+            watch: RefCell::new(None),
+            stall_names: RefCell::new(Vec::new()),
+            stall_gen: Cell::new(0),
             sorted,
             selection,
             status,
@@ -266,6 +296,7 @@ impl FolderView {
             size_hover_gen: Cell::new(0),
         });
 
+        *this.me.borrow_mut() = Rc::downgrade(&this);
         this.wire_factory(&factory);
         this.wire_signals();
         this.attach_background_drop_target();
@@ -582,37 +613,44 @@ impl FolderView {
                 }
             });
         }
+        let list = self.dir_list.borrow().clone();
+        self.connect_dir_list(&list);
+    }
+
+    /// Wire one `DirectoryList`'s signals to this view, remembering the
+    /// handler ids so a replaced list can be disconnected.
+    fn connect_dir_list(self: &Rc<Self>, list: &gtk::DirectoryList) {
+        let mut handlers = Vec::new();
         {
             let weak = Rc::downgrade(self);
-            self.dir_list
-                .connect_items_changed(move |list, _, _, added| {
-                    if let Some(view) = weak.upgrade() {
-                        if added > 0 && !view.first_logged.replace(true) {
-                            crate::log!(
-                                "folder",
-                                "first items in model: +{added} ({} so far) in {} ms",
-                                list.n_items(),
-                                view.started.get().elapsed().as_millis()
-                            );
-                        }
-                        view.schedule_settle();
+            handlers.push(list.connect_items_changed(move |list, _, _, added| {
+                if let Some(view) = weak.upgrade() {
+                    if added > 0 && !view.first_logged.replace(true) {
+                        crate::log!(
+                            "folder",
+                            "first items in model: +{added} ({} so far) in {} ms",
+                            list.n_items(),
+                            view.started.get().elapsed().as_millis()
+                        );
                     }
-                });
+                    view.schedule_settle();
+                }
+            }));
         }
         {
             let weak = Rc::downgrade(self);
-            self.dir_list.connect_loading_notify(move |list| {
+            handlers.push(list.connect_loading_notify(move |list| {
                 if list.is_loading() {
                     return;
                 }
                 if let Some(view) = weak.upgrade() {
                     view.finished();
                 }
-            });
+            }));
         }
         {
             let weak = Rc::downgrade(self);
-            self.dir_list.connect_error_notify(move |list| {
+            handlers.push(list.connect_error_notify(move |list| {
                 let Some(view) = weak.upgrade() else {
                     return;
                 };
@@ -620,8 +658,146 @@ impl FolderView {
                     Some(error) => view.show_error(&error.to_string()),
                     None => view.error.set_visible(false),
                 }
-            });
+            }));
         }
+        *self.dir_list_handlers.borrow_mut() = handlers;
+    }
+
+    /// Swap in a fresh `DirectoryList` with the same attributes. GTK clears a
+    /// list's queued monitor events only in `dispose`
+    /// (gtk-4.22.4:gtk/gtkdirectorylist.c:255-272), so `set_file` on the same
+    /// list cannot undo a stalled queue. The caller sets the folder again.
+    fn fresh_dir_list(&self) {
+        let Some(me) = self.me.borrow().upgrade() else {
+            return;
+        };
+        let old = self.dir_list.borrow().clone();
+        for id in self.dir_list_handlers.borrow_mut().drain(..) {
+            old.disconnect(id);
+        }
+        old.set_file(None::<&gio::File>);
+        let attributes = old.attributes();
+        let list = gtk::DirectoryList::new(attributes.as_deref(), None::<&gio::File>);
+        me.connect_dir_list(&list);
+        *self.dir_list.borrow_mut() = list.clone();
+        self.filtered.set_model(Some(&list));
+    }
+
+    /// Watch the shown folder ourselves, to notice when GtkDirectoryList stops
+    /// applying changes. GTK 4.22 queues each monitor event and handles them
+    /// in order; a "created" event whose file is gone before GTK's query
+    /// returns (a browser's `.part` file) is never handled, and every later
+    /// event waits behind it forever
+    /// (gtk-4.22.4:gtk/gtkdirectorylist.c `handle_event`: `if (!info) return
+    /// FALSE`). A rename or move then left the old row in the grid (Kyle,
+    /// Nov 8, in `~/Downloads`). Administrator views are skipped: they are
+    /// re-read after every administrator job, and root-only paths can't be
+    /// checked from here.
+    fn watch_folder(&self, folder: &Path, scope: fm_core::admin::Scope) {
+        self.stop_watching();
+        if scope == fm_core::admin::Scope::Admin {
+            return;
+        }
+        let Ok(monitor) = gio::File::for_path(folder)
+            .monitor_directory(gio::FileMonitorFlags::WATCH_MOVES, gio::Cancellable::NONE)
+        else {
+            return;
+        };
+        let weak = self.me.borrow().clone();
+        monitor.connect_changed(move |_, file, other, event| {
+            if let Some(view) = weak.upgrade() {
+                view.note_change(file, other, event);
+            }
+        });
+        *self.watch.borrow_mut() = Some(monitor);
+    }
+
+    fn stop_watching(&self) {
+        self.stall_gen.set(self.stall_gen.get() + 1);
+        self.stall_names.borrow_mut().clear();
+        if let Some(monitor) = self.watch.borrow_mut().take() {
+            monitor.cancel();
+        }
+    }
+
+    fn note_change(
+        &self,
+        file: &gio::File,
+        other: Option<&gio::File>,
+        event: gio::FileMonitorEvent,
+    ) {
+        use gio::FileMonitorEvent as Event;
+        let files: Vec<&gio::File> = match event {
+            Event::Created | Event::MovedIn | Event::Deleted | Event::MovedOut => vec![file],
+            Event::Renamed => std::iter::once(file).chain(other).collect(),
+            _ => return,
+        };
+        {
+            let mut names = self.stall_names.borrow_mut();
+            for file in files {
+                if let Some(name) = file.basename() {
+                    names.push(name.into_os_string());
+                }
+            }
+        }
+        self.schedule_stall_check(STALL_FIRST, false);
+    }
+
+    /// Compare GTK's listing with the disk for the names that changed. A first
+    /// disagreement may just be GTK's query still running, so check once more;
+    /// a second one means the list has stalled, and it is replaced.
+    fn schedule_stall_check(&self, delay: Duration, second: bool) {
+        let generation = self.stall_gen.get() + 1;
+        self.stall_gen.set(generation);
+        let weak = self.me.borrow().clone();
+        glib::timeout_add_local_once(delay, move || {
+            let Some(view) = weak.upgrade() else {
+                return;
+            };
+            if view.stall_gen.get() != generation {
+                return;
+            }
+            let Some(folder) = view.current.borrow().clone() else {
+                return;
+            };
+            let list = view.dir_list.borrow().clone();
+            if list.is_loading() {
+                view.schedule_stall_check(STALL_FIRST, second);
+                return;
+            }
+            let listed: std::collections::HashSet<OsString> = (0..list.n_items())
+                .filter_map(|position| list.item(position).and_downcast::<gio::FileInfo>())
+                .map(|info| info.name().into_os_string())
+                .collect();
+            let names = view.stall_names.borrow().clone();
+            let checks: Vec<(bool, bool)> = names
+                .iter()
+                .map(|name| {
+                    (
+                        listed.contains(name),
+                        std::fs::symlink_metadata(folder.join(name)).is_ok(),
+                    )
+                })
+                .collect();
+            if !listing_disagrees(&checks) {
+                view.stall_names.borrow_mut().clear();
+                return;
+            }
+            if !second {
+                view.schedule_stall_check(STALL_SECOND, true);
+                return;
+            }
+            crate::log!(
+                "folder",
+                "GTK's listing of {} stopped following changes ({} name(s) disagree with the disk); re-reading",
+                folder.display(),
+                checks
+                    .iter()
+                    .filter(|(listed, on_disk)| listed != on_disk)
+                    .count()
+            );
+            view.reload();
+        });
     }
 
     /// Show one folder. `restore` is true for a tab switch, a restore or a
@@ -668,8 +844,9 @@ impl FolderView {
         self.invalidate_scroll();
 
         let attributes = sort::attributes(rule);
-        if self.dir_list.attributes().as_deref() != Some(attributes.as_str()) {
-            self.dir_list.set_attributes(Some(attributes.as_str()));
+        let list = self.dir_list.borrow().clone();
+        if list.attributes().as_deref() != Some(attributes.as_str()) {
+            list.set_attributes(Some(attributes.as_str()));
         }
         if let Some(sorter) = self.sorted.sorter().and_downcast::<gtk::CustomSorter>() {
             sorter.changed(gtk::SorterChange::Different);
@@ -689,8 +866,8 @@ impl FolderView {
             rule.order.as_str(),
             rule.folders_first
         );
-        self.dir_list
-            .set_file(Some(&fm_core::admin::gfile(&folder, scope)));
+        list.set_file(Some(&fm_core::admin::gfile(&folder, scope)));
+        self.watch_folder(&folder, scope);
     }
 
     /// Drop this view's folder monitor, thumbnail demand and folder-size walk
@@ -709,7 +886,9 @@ impl FolderView {
         self.cancel_size_all();
         self.cancel_all_thumbnails();
         self.thumbnails.borrow().release_root(root);
-        self.dir_list.set_file(None::<&gio::File>);
+        let list = self.dir_list.borrow().clone();
+        list.set_file(None::<&gio::File>);
+        self.stop_watching();
         *self.current.borrow_mut() = None;
         self.loaded.set(false);
         *self.cell_bindings.borrow_mut() = HashMap::new();
@@ -748,9 +927,9 @@ impl FolderView {
         // gtk_directory_list_set_file returns early for an equal GFile
         // (gtk-4.22.4:gtk/gtkdirectorylist.c, g_file_equal), so setting the
         // same folder again re-read nothing while set_folder reset this view's
-        // own counts and selection: stale rows and a stuck highlight. Clear the
-        // file first so GTK really enumerates the folder again.
-        self.dir_list.set_file(None::<&gio::File>);
+        // own counts and selection: stale rows and a stuck highlight. A fresh
+        // list also drops a stalled event queue, which `set_file` cannot.
+        self.fresh_dir_list();
         let rule = self.sort_rule.get();
         let anchor = self.first_visible_name();
         let wanted = self.wanted.borrow().clone();
@@ -779,7 +958,8 @@ impl FolderView {
             self.started.set(Instant::now());
             self.first_logged.set(false);
             self.invalidate_scroll();
-            self.dir_list.set_attributes(Some(new_attributes.as_str()));
+            let list = self.dir_list.borrow().clone();
+            list.set_attributes(Some(new_attributes.as_str()));
             crate::log!(
                 "folder",
                 "re-listing for sort {} {} (the attribute list changed)",
@@ -1843,7 +2023,8 @@ impl FolderView {
     }
 
     fn finished(&self) {
-        if let Some(error) = self.dir_list.error() {
+        let list = self.dir_list.borrow().clone();
+        if let Some(error) = list.error() {
             self.show_error(&error.to_string());
             return;
         }
@@ -1851,7 +2032,7 @@ impl FolderView {
         crate::log!(
             "folder",
             "listing complete: {} items ({} visible) in {} ms",
-            self.dir_list.n_items(),
+            list.n_items(),
             self.selection.n_items(),
             self.started.get().elapsed().as_millis()
         );
@@ -2645,6 +2826,18 @@ fn compare_objects(a: &glib::Object, b: &glib::Object, rule: SortRule) -> gtk::O
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_listing_disagrees_only_when_a_changed_name_differs_from_the_disk() {
+        // Renamed away but still listed: the stalled-queue case.
+        assert!(listing_disagrees(&[(true, false), (false, true)]));
+        assert!(listing_disagrees(&[(true, false)]));
+        assert!(listing_disagrees(&[(false, true)]));
+        // A short-lived file that is gone and unlisted, and a listed file that
+        // exists: both agree.
+        assert!(!listing_disagrees(&[(false, false), (true, true)]));
+        assert!(!listing_disagrees(&[]));
+    }
 
     #[test]
     fn modified_enter_reaches_the_window_shortcuts() {
