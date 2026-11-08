@@ -79,6 +79,8 @@ fn css_impl(
     let slide_ms = motion::ms(150);
     let pulse_ms = motion::ms(600);
     let fade_ms = motion::ms(120);
+    let focus_pulse_ms = motion::ms(900);
+    let mid2 = mid * 2;
     let window_bg = fill(BG);
     let pill_bg = fill(RECESSED);
     let pill_active = fill(RAISED);
@@ -133,7 +135,6 @@ window.gimbal-look, window.gimbal-look.background {{ background-color: {window_b
 .gl-pill.admin.active, .gl-pill.admin.selected, .gl-pill.admin.active.selected {{ background-color: @error_bg_color; color: @error_fg_color; }}
 .gl-pill.admin label, .gl-pill.admin image {{ color: @error_fg_color; }}
 .gl-pill.admin .gl-pill-close {{ color: @error_fg_color; border-color: @error_fg_color; }}
-.gl-accordion-row.admin .gl-menu-item {{ color: @error_color; }}
 .gl-pill label {{ font-size: {tc}px; }}
 .gl-pill.tab {{ margin-bottom: {gs}px; }}
 .gl-pill.tile {{ min-width: 0; }}
@@ -227,6 +228,23 @@ to {{ background-color: alpha(@accent_bg_color, 0.0); }}
 .gl-menu-item:disabled {{ color: alpha({FG}, 0.45); }}
 .gl-menu-item:focus-visible {{ box-shadow: 0 0 0 {thin}px {FOCUS_RING}; }}
 .gl-menu-note {{ padding: {gs}px {gm}px; color: alpha({FG}, 0.75); font-size: {tsmall}px; }}
+.gl-accordion-scroll, .gl-accordion-scroll viewport {{ background-color: transparent; }}
+.gl-accordion-scroll .gl-menu {{ padding: 0 {gs}px 0 0; }}
+.gl-accordion-row {{ min-height: {pinrow}px; border-radius: {ri}px; }}
+.gl-accordion-row .gl-menu-item, .gl-accordion-row .gl-menu-item:hover {{ min-height: {pinrow}px; padding: 0 {gm}px; background-color: transparent; }}
+.gl-accordion-row:hover {{ background-color: {HOVER}; }}
+.gl-accordion-row.active {{ background-color: {pill_active}; }}
+.gl-accordion-row.active .gl-menu-item, .gl-accordion-row.active .gl-menu-item:hover {{ color: {RAISED_FG}; }}
+.gl-accordion-row.selected {{ background-color: {pill_selected}; }}
+.gl-accordion-row.active.selected {{ background-color: {pill_selected_active}; }}
+@keyframes gl-focus-pulse {{
+from {{ box-shadow: 0 0 0 {mid}px {FOCUS_RING}; }}
+50% {{ box-shadow: 0 0 0 {mid2}px alpha({FOCUS_RING}, 0.55); }}
+to {{ box-shadow: 0 0 0 {mid}px {FOCUS_RING}; }}
+}}
+.gl-accordion-row .gl-pill-close:focus-visible {{ box-shadow: 0 0 0 {mid}px {FOCUS_RING}; animation: gl-focus-pulse {focus_pulse_ms}ms ease-in-out infinite; }}
+.gl-accordion-row.admin .gl-menu-item, .gl-accordion-row.admin .gl-menu-item:hover {{ color: @error_color; }}
+.gl-accordion-row.active .gl-pill-close {{ color: {RAISED_FG}; border-color: {RAISED_FG}; }}
 .gl-app-icon {{ -gtk-icon-size: {irow}px; margin-right: {gs}px; }}
 .gl-openwith-root {{ padding: {gm}px; min-width: {search_w}px; }}
 .gl-openwith-list {{ background-color: transparent; }}

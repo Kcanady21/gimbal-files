@@ -67,6 +67,66 @@ impl HeaderView {
     }
 }
 
+/// What a left click on an accordion row does. Ctrl and Shift keep the menu
+/// open so several rows can be selected in one visit; a plain click focuses
+/// the row and closes it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AccordionClick {
+    Focus,
+    Toggle,
+    Range,
+}
+
+impl AccordionClick {
+    pub fn keeps_menu_open(self) -> bool {
+        !matches!(self, Self::Focus)
+    }
+}
+
+pub fn accordion_click(modifiers: gdk::ModifierType) -> AccordionClick {
+    if modifiers.contains(gdk::ModifierType::CONTROL_MASK) {
+        AccordionClick::Toggle
+    } else if modifiers.contains(gdk::ModifierType::SHIFT_MASK) {
+        AccordionClick::Range
+    } else {
+        AccordionClick::Focus
+    }
+}
+
+/// The header keeps one accordion while it stays collapsed. Only a change
+/// between collapsed and expanded replaces it.
+pub fn accordion_is_reused(collapsed_before: bool, collapsed_after: bool) -> bool {
+    collapsed_before && collapsed_after
+}
+
+/// A right click on an unselected row first makes it the only selection, as
+/// file managers do. A selected row keeps the selection it is part of.
+pub fn row_right_click_selects_only(view: &HeaderView, index: usize) -> bool {
+    view.pills.get(index).is_some_and(|pill| !pill.selected)
+}
+
+/// The accordion list may grow to twelve token-sized rows or to the space the
+/// popover has below the header, whichever is smaller.
+pub fn accordion_scroll_cap(scale: f64, window_height: i32, header_bottom: i32) -> i32 {
+    let token_cap = scaled(PIN_ROW_H, scale) * 12;
+    let below = (window_height - header_bottom).max(0);
+    token_cap.min(below)
+}
+
+struct AccordionRow {
+    row: gtk::Widget,
+    choose: gtk::Button,
+}
+
+struct Accordion {
+    pill: gtk::CenterBox,
+    popover: gtk::Popover,
+    menu: gtk::Box,
+    label: gtk::Label,
+    scroller: gtk::ScrolledWindow,
+    rows: RefCell<Vec<AccordionRow>>,
+}
+
 /// A single tab's pill shows its folder's name; a split group shows its title
 /// and tab count ("Group N · K tabs", or the chosen name).
 pub fn pill_label(group: &Group) -> String {
@@ -169,6 +229,10 @@ pub struct Header {
     handle: gtk::WindowHandle,
     strip: gtk::Fixed,
     pills: RefCell<Vec<gtk::Widget>>,
+    /// The collapsed strip's one pill and its popover. Kept across a refresh
+    /// that leaves the header collapsed, so an open list can be refilled in
+    /// place instead of destroyed under the pointer.
+    accordion: RefCell<Option<Rc<Accordion>>>,
     last_labels: RefCell<Vec<String>>,
     last_groups: RefCell<Vec<fm_core::workspace::GroupId>>,
     drag: Cell<Option<DragState>>,
@@ -306,6 +370,7 @@ impl Header {
             handle,
             strip,
             pills: RefCell::new(Vec::new()),
+            accordion: RefCell::new(None),
             last_labels: RefCell::new(Vec::new()),
             last_groups: RefCell::new(Vec::new()),
             drag: Cell::new(None),
@@ -494,6 +559,7 @@ impl Header {
             view.can_forward = false;
             view.can_up = false;
         }
+        let collapsed_before = self.overflow.get();
         let collapsed = self.update_layout(&view);
 
         let groups: Vec<_> = window.pills.clone();
@@ -512,6 +578,32 @@ impl Header {
         *self.last_groups.borrow_mut() = groups;
         *self.last_labels.borrow_mut() = view.pills.iter().map(|p| p.label.clone()).collect();
 
+        let reused = self.accordion.borrow().clone();
+        if accordion_is_reused(collapsed_before, collapsed)
+            && let Some(accordion) = reused
+        {
+            // The strip still holds this pill. Refill its rows instead of
+            // building another accordion, so an open popover (and the row the
+            // click came from) survives the selection change.
+            self.fill_accordion(&accordion, &view);
+            self.update_text(&view, trash);
+            self.animate_group.set(None);
+            crate::log!(
+                "header",
+                "window {} refilled the accordion {:?} (active {}, overflow {})",
+                self.window_id,
+                self.last_labels.borrow(),
+                view.active_index(),
+                collapsed
+            );
+            return;
+        }
+
+        // Leaving the collapsed strip drops the old accordion before its pill
+        // leaves the tree, so the pill's destroy can unparent its popover once.
+        if !collapsed {
+            self.accordion.borrow_mut().take();
+        }
         while let Some(child) = self.strip.first_child() {
             self.strip.remove(&child);
         }
@@ -788,7 +880,7 @@ impl Header {
                 return;
             };
             let current = crate::header::view(&window);
-            header_right.open_pill_menu(&ui, index, &anchor, &current);
+            header_right.open_pill_menu(&ui, index, &anchor, &current, None);
         });
         pill.add_controller(right);
 
@@ -874,58 +966,326 @@ impl Header {
         let popover = gtk::Popover::new();
         popover.set_parent(&pill);
         let menu = vbox(&["gl-menu"]);
-        self.fill_accordion(&popover, &menu, &label, view);
-        popover.set_child(Some(&menu));
+        let scroller = gtk::ScrolledWindow::new();
+        scroller.add_css_class("gl-accordion-scroll");
+        scroller.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
+        scroller.set_propagate_natural_height(true);
+        scroller.set_propagate_natural_width(true);
+        // A classic scrollbar that takes its own width: the default overlay
+        // scrollbar was drawn over each row's close button (Kyle, Nov 8). With
+        // the natural width propagated, the popover widens to fit it.
+        scroller.set_overlay_scrolling(false);
+        scroller.set_child(Some(&menu));
+        popover.set_child(Some(&scroller));
+
+        let wrapper = pill_revealer(&pill);
+        let accordion = Rc::new(Accordion {
+            pill: pill.clone(),
+            popover: popover.clone(),
+            menu,
+            label,
+            scroller,
+            rows: RefCell::new(Vec::new()),
+        });
+        *self.accordion.borrow_mut() = Some(accordion.clone());
+        self.fill_accordion(&accordion, view);
+
         // The pill owns this popover for its whole life; only the pill's
         // destroy unparents it. Showing a popover with no parent realizes it
         // outside any window, which crashed GTK (Nov 8), so both openers check.
+        // The closures hold weak references: a strong one would make the
+        // pill/popover/widget cycle keep itself alive after an expand.
+        let weak_header = Rc::downgrade(self);
+        let weak_accordion = Rc::downgrade(&accordion);
         let motion = gtk::EventControllerMotion::new();
-        let weak = popover.downgrade();
+        let weak_header_motion = weak_header.clone();
+        let weak_accordion_motion = weak_accordion.clone();
         motion.connect_enter(move |_, _, _| {
-            if let Some(popover) = weak.upgrade()
-                && popover.parent().is_some()
+            if let (Some(header), Some(accordion)) = (
+                weak_header_motion.upgrade(),
+                weak_accordion_motion.upgrade(),
+            ) && accordion.popover.parent().is_some()
             {
-                crate::popup::show(&popover);
+                header.open_accordion(&accordion);
             }
         });
         pill.add_controller(motion);
         let click = gtk::GestureClick::new();
         click.set_button(1);
-        let weak = popover.downgrade();
+        let weak_header_click = weak_header.clone();
+        let weak_accordion_click = weak_accordion.clone();
         click.connect_released(move |_, _, _, _| {
-            if let Some(popover) = weak.upgrade()
-                && popover.parent().is_some()
+            if let (Some(header), Some(accordion)) =
+                (weak_header_click.upgrade(), weak_accordion_click.upgrade())
+                && accordion.popover.parent().is_some()
             {
-                crate::popup::show(&popover);
+                header.open_accordion(&accordion);
             }
         });
         pill.add_controller(click);
-        let weak = popover.downgrade();
+
+        let key = gtk::EventControllerKey::new();
+        key.set_propagation_phase(gtk::PropagationPhase::Capture);
+        let weak_header_key = weak_header;
+        let weak_accordion_key = weak_accordion;
+        key.connect_key_pressed(move |_, keyval, _, _| {
+            if let (Some(header), Some(accordion)) =
+                (weak_header_key.upgrade(), weak_accordion_key.upgrade())
+            {
+                header.accordion_key(&accordion, keyval)
+            } else {
+                glib::Propagation::Proceed
+            }
+        });
+        accordion.scroller.add_controller(key);
+
+        let weak_map = Rc::downgrade(&accordion);
+        popover.connect_map(move |_| {
+            let weak = weak_map.clone();
+            glib::idle_add_local_once(move || {
+                if let Some(accordion) = weak.upgrade()
+                    && accordion.popover.is_visible()
+                {
+                    scroll_active_into_view(&accordion);
+                }
+            });
+        });
+
+        let weak_popover = popover.downgrade();
         pill.connect_destroy(move |_| {
-            if let Some(popover) = weak.upgrade() {
+            if let Some(popover) = weak_popover.upgrade() {
                 popover.popdown();
                 popover.unparent();
             }
         });
-        pill_revealer(&pill).upcast()
+        wrapper.upcast()
     }
 
-    fn fill_accordion(
+    /// Show the accordion with the largest content height this window can use.
+    /// The cap is computed at open time, so a resized window does not need a
+    /// rebuild to get a fitting list.
+    fn open_accordion(self: &Rc<Self>, accordion: &Rc<Accordion>) {
+        self.apply_accordion_cap(accordion);
+        crate::popup::show(&accordion.popover);
+    }
+
+    fn apply_accordion_cap(self: &Rc<Self>, accordion: &Accordion) {
+        let scale = self.scale.get();
+        let (window_height, header_bottom) = match self.window_ui() {
+            Some(ui) => {
+                let window = ui.window();
+                let height = if window.height() > 0 {
+                    window.height()
+                } else {
+                    scaled(f64::from(DEFAULT_H), scale)
+                };
+                let bottom = accordion
+                    .pill
+                    .compute_bounds(window)
+                    .map(|bounds| (bounds.y() + bounds.height()).round() as i32)
+                    .unwrap_or_else(|| scaled(HEADER_H, scale));
+                (height, bottom)
+            }
+            None => (scaled(f64::from(DEFAULT_H), scale), scaled(HEADER_H, scale)),
+        };
+        let cap = accordion_scroll_cap(scale, window_height, header_bottom);
+        accordion.scroller.set_max_content_height(cap.max(1));
+        // With an Automatic policy GTK measured the popover before deciding
+        // on a scrollbar, then took the scrollbar's width out of the rows and
+        // clipped their close buttons (Kyle, Nov 8). Decide here instead: the
+        // rows keep their natural width, and a needed scrollbar is counted in
+        // the popover's width up front.
+        let (_, rows_width, _, _) = accordion.menu.measure(gtk::Orientation::Horizontal, -1);
+        let (_, rows_height, _, _) = accordion
+            .menu
+            .measure(gtk::Orientation::Vertical, rows_width);
+        let vertical = if rows_height > cap {
+            gtk::PolicyType::Always
+        } else {
+            gtk::PolicyType::Never
+        };
+        accordion
+            .scroller
+            .set_policy(gtk::PolicyType::Never, vertical);
+        accordion.scroller.set_min_content_width(rows_width);
+    }
+
+    fn activate_accordion_row(
         self: &Rc<Self>,
+        index: usize,
+        modifiers: gdk::ModifierType,
         popover: &gtk::Popover,
-        menu: &gtk::Box,
-        label: &gtk::Label,
-        view: &HeaderView,
     ) {
-        while let Some(child) = menu.first_child() {
-            menu.remove(&child);
+        let Some(ui) = self.window_ui() else {
+            return;
+        };
+        if accordion_click(modifiers).keeps_menu_open() {
+            // Ctrl and Shift take the same path as a header pill's modified
+            // click; the accordion stays open while the selection changes.
+            ui.pill_click(index, modifiers);
+        } else {
+            popover.popdown();
+            // The modifier wrapper's plain branch is the same model call as
+            // focus_pill(); use it so the row keeps the pre-existing path.
+            ui.focus_pill(index);
         }
-        label.set_label(&format!("{} tabs", view.tab_count));
+    }
+
+    fn accordion_key(
+        self: &Rc<Self>,
+        accordion: &Rc<Accordion>,
+        keyval: gdk::Key,
+    ) -> glib::Propagation {
+        let rows = accordion.rows.borrow();
+        if rows.is_empty() {
+            return glib::Propagation::Proceed;
+        }
+        let focused = rows.iter().position(|row| row.choose.has_focus());
+        let active = rows.iter().position(|row| row.row.has_css_class("active"));
+        match keyval {
+            gdk::Key::Up | gdk::Key::Down => {
+                let current = focused.or(active).unwrap_or(0);
+                let target = if keyval == gdk::Key::Up {
+                    current.saturating_sub(1)
+                } else {
+                    (current + 1).min(rows.len() - 1)
+                };
+                let button = rows[target].choose.clone();
+                drop(rows);
+                button.grab_focus();
+                scroll_row_into_view(accordion, target);
+                glib::Propagation::Stop
+            }
+            // Enter on a row button is a plain click; on a row's ✕ leave the
+            // button's own activation alone. Space toggles exactly like Ctrl.
+            gdk::Key::Return | gdk::Key::KP_Enter => {
+                let Some(index) = focused else {
+                    return glib::Propagation::Proceed;
+                };
+                drop(rows);
+                self.activate_accordion_row(index, gdk::ModifierType::empty(), &accordion.popover);
+                glib::Propagation::Stop
+            }
+            gdk::Key::space => {
+                let Some(index) = focused else {
+                    return glib::Propagation::Proceed;
+                };
+                drop(rows);
+                self.activate_accordion_row(
+                    index,
+                    gdk::ModifierType::CONTROL_MASK,
+                    &accordion.popover,
+                );
+                glib::Propagation::Stop
+            }
+            gdk::Key::Escape => {
+                drop(rows);
+                accordion.popover.popdown();
+                glib::Propagation::Stop
+            }
+            _ => glib::Propagation::Proceed,
+        }
+    }
+
+    fn accordion_row_right_click(
+        self: &Rc<Self>,
+        accordion: &Rc<Accordion>,
+        index: usize,
+        anchor: &gtk::Widget,
+    ) {
+        let Some(ui) = self.window_ui() else {
+            return;
+        };
+        let Some(window) = ui.workspace_window() else {
+            return;
+        };
+        let current = view(&window);
+        if current.pills.get(index).is_none() {
+            return;
+        }
+        if row_right_click_selects_only(&current, index) {
+            // pill_click() rebuilds the header, which recreates the rows. Open
+            // the menu from the new row after that refill, never from the one
+            // whose gesture is running.
+            ui.pill_click(index, gdk::ModifierType::empty());
+            let weak_header = Rc::downgrade(self);
+            let weak_accordion = Rc::downgrade(accordion);
+            glib::idle_add_local_once(move || {
+                let (Some(header), Some(accordion)) =
+                    (weak_header.upgrade(), weak_accordion.upgrade())
+                else {
+                    return;
+                };
+                let current_accordion = header.accordion.borrow().clone();
+                if !current_accordion.is_some_and(|current| Rc::ptr_eq(&current, &accordion))
+                    || accordion.popover.parent().is_none()
+                {
+                    return;
+                }
+                let Some(ui) = header.window_ui() else {
+                    return;
+                };
+                let Some(window) = ui.workspace_window() else {
+                    return;
+                };
+                let current = view(&window);
+                let anchor = accordion
+                    .rows
+                    .borrow()
+                    .get(index)
+                    .map(|row| row.row.clone());
+                let Some(anchor) = anchor else {
+                    return;
+                };
+                header.open_pill_menu(
+                    &ui,
+                    index,
+                    &anchor,
+                    &current,
+                    Some(accordion.popover.clone()),
+                );
+            });
+        } else {
+            self.open_pill_menu(
+                &ui,
+                index,
+                anchor,
+                &current,
+                Some(accordion.popover.clone()),
+            );
+        }
+    }
+
+    fn fill_accordion(self: &Rc<Self>, accordion: &Rc<Accordion>, view: &HeaderView) {
+        let focused = accordion
+            .rows
+            .borrow()
+            .iter()
+            .position(|row| row.choose.has_focus());
+        let scroll = accordion.scroller.vadjustment().value();
+        let open = accordion.popover.is_visible();
+        while let Some(child) = accordion.menu.first_child() {
+            accordion.menu.remove(&child);
+        }
+        accordion
+            .label
+            .set_label(&format!("{} tabs", view.tab_count));
+
+        let weak_header = Rc::downgrade(self);
+        let weak_accordion = Rc::downgrade(accordion);
+        let mut rows = Vec::new();
         for pill in &view.pills {
             let row = hbox(&["gl-accordion-row"]);
+            if pill.active {
+                row.add_css_class("active");
+            }
+            if pill.selected {
+                row.add_css_class("selected");
+            }
             if pill.admin {
                 row.add_css_class("admin");
             }
+            let index = pill.index;
             let choose = gtk::Button::new();
             choose.add_css_class("gl-menu-item");
             choose.set_hexpand(true);
@@ -947,34 +1307,91 @@ impl Header {
             } else {
                 choose.set_child(Some(&label));
             }
-            let header_choose = self.clone();
-            let popover_choose = popover.clone();
-            let index = pill.index;
-            // Close the menu but keep it on its pill. take_down() unparented
-            // it, and when the click changed nothing (the tab was already
-            // focused) the header kept this pill, so the next hover showed a
-            // parentless popover and GTK crashed.
-            choose.connect_clicked(move |_| {
-                popover_choose.popdown();
-                if let Some(ui) = header_choose.window_ui() {
-                    ui.focus_pill(index);
+
+            // A row's own click gesture reads the real modifiers. Claiming the
+            // press keeps the button from also emitting a modifier-blind
+            // `clicked`; the keyboard path calls the same action directly.
+            let click = gtk::GestureClick::new();
+            click.set_button(1);
+            click.set_propagation_phase(gtk::PropagationPhase::Capture);
+            click.connect_pressed(|gesture, _, _, _| {
+                let _ = gesture.set_state(gtk::EventSequenceState::Claimed);
+            });
+            let weak_header_click = weak_header.clone();
+            let weak_accordion_click = weak_accordion.clone();
+            click.connect_released(move |gesture, _, _, _| {
+                let modifiers = gesture
+                    .last_event(None)
+                    .map(|event| event.modifier_state())
+                    .unwrap_or_else(gdk::ModifierType::empty);
+                if let (Some(header), Some(accordion)) =
+                    (weak_header_click.upgrade(), weak_accordion_click.upgrade())
+                {
+                    header.activate_accordion_row(index, modifiers, &accordion.popover);
                 }
             });
+            choose.add_controller(click);
+
+            let right = gtk::GestureClick::new();
+            right.set_button(3);
+            let weak_header_right = weak_header.clone();
+            let weak_accordion_right = weak_accordion.clone();
+            right.connect_pressed(move |gesture, _, _, _| {
+                let Some(anchor) = gesture.widget() else {
+                    return;
+                };
+                if let (Some(header), Some(accordion)) =
+                    (weak_header_right.upgrade(), weak_accordion_right.upgrade())
+                {
+                    header.accordion_row_right_click(&accordion, index, &anchor);
+                }
+            });
+            row.add_controller(right);
+
+            row.update_state(&[gtk::accessible::State::Selected(Some(pill.selected))]);
+            choose.update_state(&[gtk::accessible::State::Selected(Some(pill.selected))]);
             row.append(&choose);
             let close = gtk::Button::new();
             close.add_css_class("gl-pill-close");
             close.set_valign(gtk::Align::Center);
             close.set_child(Some(&gtk::Image::from_icon_name("window-close-symbolic")));
-            let header_close = self.clone();
-            let popover_close = popover.clone();
+            let weak_header_close = weak_header.clone();
+            let weak_accordion_close = weak_accordion.clone();
             close.connect_clicked(move |_| {
-                popover_close.popdown();
-                if let Some(ui) = header_close.window_ui() {
+                if let Some(accordion) = weak_accordion_close.upgrade() {
+                    accordion.popover.popdown();
+                }
+                if let Some(header) = weak_header_close.upgrade()
+                    && let Some(ui) = header.window_ui()
+                {
                     ui.close_pill(index);
                 }
             });
             row.append(&close);
-            menu.append(&row);
+            rows.push(AccordionRow {
+                row: row.clone().upcast(),
+                choose,
+            });
+            accordion.menu.append(&row);
+        }
+        *accordion.rows.borrow_mut() = rows;
+
+        if open {
+            if let Some(index) = focused
+                && let Some(row) = accordion.rows.borrow().get(index)
+            {
+                row.choose.grab_focus();
+            }
+            // The rows were rebuilt, so restore the old top after the new
+            // content has been measured. This keeps the list still while the
+            // user Ctrl-clicks several rows.
+            let adjustment = accordion.scroller.vadjustment();
+            adjustment.set_value(scroll);
+            glib::idle_add_local_once(move || {
+                if adjustment.upper() > adjustment.page_size() {
+                    adjustment.set_value(scroll.min(adjustment.upper() - adjustment.page_size()));
+                }
+            });
         }
     }
 
@@ -984,6 +1401,7 @@ impl Header {
         index: usize,
         anchor: &gtk::Widget,
         view: &HeaderView,
+        accordion: Option<gtk::Popover>,
     ) {
         let Some(pill) = view.pills.get(index).cloned() else {
             return;
@@ -993,25 +1411,34 @@ impl Header {
         let menu = vbox(&["gl-menu"]);
 
         let ui_split = ui.clone();
-        menu_item(
+        menu_item_extra(
             &popover,
             &menu,
             "Split View",
             view.selected_pills() >= 2,
+            accordion.clone(),
             move || {
                 ui_split.dispatch(Caller::Ui, Invocation::new("group.split", Vec::new()));
             },
         );
         let ui_close = ui.clone();
-        menu_item(&popover, &menu, "Close", true, move || {
-            ui_close.focus_and_dispatch(index, Invocation::new("tab.close", Vec::new()));
-        });
+        menu_item_extra(
+            &popover,
+            &menu,
+            "Close",
+            true,
+            accordion.clone(),
+            move || {
+                ui_close.focus_and_dispatch(index, Invocation::new("tab.close", Vec::new()));
+            },
+        );
         let ui_selected = ui.clone();
-        menu_item(
+        menu_item_extra(
             &popover,
             &menu,
             "Close Selected Tabs",
             view.any_selected(),
+            accordion.clone(),
             move || {
                 ui_selected.dispatch(
                     Caller::Ui,
@@ -1020,24 +1447,47 @@ impl Header {
             },
         );
         let ui_window = ui.clone();
-        menu_item(&popover, &menu, "Open in New Window", true, move || {
-            ui_window
-                .focus_and_dispatch(index, Invocation::new("tab.open-in-new-window", Vec::new()));
-        });
+        menu_item_extra(
+            &popover,
+            &menu,
+            "Open in New Window",
+            true,
+            accordion.clone(),
+            move || {
+                ui_window.focus_and_dispatch(
+                    index,
+                    Invocation::new("tab.open-in-new-window", Vec::new()),
+                );
+            },
+        );
 
         if pill.is_group {
             let header_rename = self.clone();
             let ui_rename = ui.clone();
             let anchor_rename = anchor.clone();
             let title = pill.title.clone();
+            let accordion_rename = accordion.clone();
             menu_item(&popover, &menu, "Rename Group…", true, move || {
-                header_rename.open_rename_popover(&ui_rename, index, &anchor_rename, &title);
+                header_rename.open_rename_popover(
+                    &ui_rename,
+                    index,
+                    &anchor_rename,
+                    &title,
+                    accordion_rename.clone(),
+                );
             });
             let ui_group_close = ui.clone();
             let count = pill.tabs;
-            menu_item(&popover, &menu, "Close Group", true, move || {
-                ui_group_close.confirm_and_close_group(index, count);
-            });
+            menu_item_extra(
+                &popover,
+                &menu,
+                "Close Group",
+                true,
+                accordion.clone(),
+                move || {
+                    ui_group_close.confirm_and_close_group(index, count);
+                },
+            );
         }
 
         if view.pills.len() > 1 {
@@ -1045,8 +1495,15 @@ impl Header {
             let ui_add = ui.clone();
             let anchor_add = anchor.clone();
             let current = view.clone();
+            let accordion_add = accordion.clone();
             menu_item(&popover, &menu, "Add to Group", true, move || {
-                header_add.open_add_group_menu(&ui_add, index, &anchor_add, &current);
+                header_add.open_add_group_menu(
+                    &ui_add,
+                    index,
+                    &anchor_add,
+                    &current,
+                    accordion_add.clone(),
+                );
             });
         }
 
@@ -1061,6 +1518,7 @@ impl Header {
         source: usize,
         anchor: &gtk::Widget,
         view: &HeaderView,
+        accordion: Option<gtk::Popover>,
     ) {
         let popover = gtk::Popover::new();
         popover.set_parent(anchor);
@@ -1072,15 +1530,22 @@ impl Header {
             let ui_target = ui.clone();
             let target = pill.index;
             let label = pill.label.clone();
-            menu_item(&popover, &menu, &label, true, move || {
-                ui_target.focus_and_dispatch(
-                    source,
-                    Invocation::new(
-                        "group.add-tab",
-                        vec![("group".to_string(), target.to_string())],
-                    ),
-                );
-            });
+            menu_item_extra(
+                &popover,
+                &menu,
+                &label,
+                true,
+                accordion.clone(),
+                move || {
+                    ui_target.focus_and_dispatch(
+                        source,
+                        Invocation::new(
+                            "group.add-tab",
+                            vec![("group".to_string(), target.to_string())],
+                        ),
+                    );
+                },
+            );
         }
         if menu.first_child().is_none() {
             menu.append(
@@ -1101,6 +1566,7 @@ impl Header {
         index: usize,
         anchor: &gtk::Widget,
         title: &str,
+        accordion: Option<gtk::Popover>,
     ) {
         let popover = gtk::Popover::new();
         popover.set_parent(anchor);
@@ -1119,9 +1585,13 @@ impl Header {
         let ui_rename = ui.clone();
         let popover_rename = popover.clone();
         let entry_rename = entry.clone();
+        let accordion_rename = accordion.clone();
         rename.connect_clicked(move |_| {
             let name = entry_rename.text().to_string();
             take_down(&popover_rename);
+            if let Some(accordion) = &accordion_rename {
+                accordion.popdown();
+            }
             ui_rename.focus_and_dispatch(
                 index,
                 Invocation::new("group.rename", vec![("name".to_string(), name)]),
@@ -1145,12 +1615,16 @@ impl Header {
         let weak_entry = entry.downgrade();
         let ui_enter = ui.clone();
         let popover_enter = popover.clone();
+        let accordion_enter = accordion;
         entry.connect_activate(move |_| {
             let Some(entry) = weak_entry.upgrade() else {
                 return;
             };
             let name = entry.text().to_string();
             take_down(&popover_enter);
+            if let Some(accordion) = &accordion_enter {
+                accordion.popdown();
+            }
             ui_enter.focus_and_dispatch(
                 index,
                 Invocation::new("group.rename", vec![("name".to_string(), name)]),
@@ -2099,6 +2573,20 @@ fn menu_item(
     enabled: bool,
     action: impl Fn() + 'static,
 ) {
+    menu_item_extra(popover, menu, text, enabled, None, action);
+}
+
+/// A menu item that can also close the accordion under an inner menu. The
+/// inner menu is unparented first, so the action never runs against a widget
+/// whose anchor has already gone away.
+fn menu_item_extra(
+    popover: &gtk::Popover,
+    menu: &gtk::Box,
+    text: &str,
+    enabled: bool,
+    accordion: Option<gtk::Popover>,
+    action: impl Fn() + 'static,
+) {
     let item = gtk::Button::new();
     item.add_css_class("gl-menu-item");
     item.set_sensitive(enabled);
@@ -2112,9 +2600,53 @@ fn menu_item(
     let popover = popover.clone();
     item.connect_clicked(move |_| {
         take_down(&popover);
+        if let Some(accordion) = &accordion {
+            accordion.popdown();
+        }
         action();
     });
     menu.append(&item);
+}
+
+/// Focus the active row and put it inside the scroll viewport. Called from
+/// the popover's map handler after the list has been allocated.
+fn scroll_active_into_view(accordion: &Rc<Accordion>) {
+    let rows = accordion.rows.borrow();
+    let Some(index) = rows
+        .iter()
+        .position(|row| row.row.has_css_class("active"))
+        .or_else(|| (!rows.is_empty()).then_some(0))
+    else {
+        return;
+    };
+    let button = rows[index].choose.clone();
+    drop(rows);
+    button.grab_focus();
+    scroll_row_into_view(accordion, index);
+}
+
+fn scroll_row_into_view(accordion: &Accordion, index: usize) {
+    let row = accordion
+        .rows
+        .borrow()
+        .get(index)
+        .map(|row| row.row.clone());
+    let Some(row) = row else {
+        return;
+    };
+    let Some(bounds) = row.compute_bounds(&accordion.menu) else {
+        return;
+    };
+    let adjustment = accordion.scroller.vadjustment();
+    let top = f64::from(bounds.y());
+    let bottom = top + f64::from(bounds.height());
+    let value = adjustment.value();
+    let page = adjustment.page_size();
+    if top < value {
+        adjustment.set_value(top);
+    } else if bottom > value + page {
+        adjustment.set_value(bottom - page);
+    }
 }
 
 fn take_down(popover: &gtk::Popover) {
@@ -2388,5 +2920,71 @@ mod tests {
             sort_order_label(SortBy::Modified, SortOrder::Ascending),
             "Oldest first"
         );
+    }
+
+    #[test]
+    fn an_accordion_is_reused_only_while_the_header_stays_collapsed() {
+        assert!(accordion_is_reused(true, true));
+        assert!(!accordion_is_reused(false, true));
+        assert!(!accordion_is_reused(true, false));
+        assert!(!accordion_is_reused(false, false));
+    }
+
+    #[test]
+    fn ctrl_and_shift_clicks_keep_the_accordion_open_and_a_plain_click_closes_it() {
+        assert_eq!(
+            accordion_click(gdk::ModifierType::empty()),
+            AccordionClick::Focus
+        );
+        assert_eq!(
+            accordion_click(gdk::ModifierType::CONTROL_MASK),
+            AccordionClick::Toggle
+        );
+        assert_eq!(
+            accordion_click(gdk::ModifierType::SHIFT_MASK),
+            AccordionClick::Range
+        );
+        assert!(!accordion_click(gdk::ModifierType::empty()).keeps_menu_open());
+        assert!(accordion_click(gdk::ModifierType::CONTROL_MASK).keeps_menu_open());
+        assert!(accordion_click(gdk::ModifierType::SHIFT_MASK).keeps_menu_open());
+        // Ctrl wins when both are held, exactly as Process::pill_click does.
+        assert_eq!(
+            accordion_click(gdk::ModifierType::CONTROL_MASK | gdk::ModifierType::SHIFT_MASK),
+            AccordionClick::Toggle
+        );
+    }
+
+    #[test]
+    fn right_clicking_an_unselected_row_selects_only_it() {
+        let mut workspace = window_with(&["/tmp/a", "/tmp/b", "/tmp/c"]);
+        workspace.pill_ctrl_click(0).unwrap();
+        workspace.pill_ctrl_click(1).unwrap();
+        let view = view(&first(&workspace));
+        assert!(view.pills[0].selected);
+        assert!(view.pills[1].selected);
+        assert!(!view.pills[2].selected);
+
+        assert!(!row_right_click_selects_only(&view, 0));
+        assert!(!row_right_click_selects_only(&view, 1));
+        assert!(row_right_click_selects_only(&view, 2));
+        assert!(!row_right_click_selects_only(&view, 9));
+    }
+
+    #[test]
+    fn the_accordion_cap_is_twelve_rows_or_the_space_below_the_header() {
+        let twelve_rows = scaled(PIN_ROW_H, 1.0) * 12;
+        assert_eq!(twelve_rows, 528);
+        // A tall window is limited by the twelve-row token cap.
+        assert_eq!(accordion_scroll_cap(1.0, 1440, 96), twelve_rows);
+        // A short window is limited by the space below the header.
+        assert_eq!(accordion_scroll_cap(1.0, 500, 96), 404);
+        // The smaller of the two wins when they meet in the middle.
+        assert_eq!(accordion_scroll_cap(1.0, 600, 200), 400);
+        // The token cap scales with the look.
+        assert_eq!(
+            accordion_scroll_cap(2.0, 2000, 192),
+            scaled(PIN_ROW_H, 2.0) * 12
+        );
+        assert_eq!(accordion_scroll_cap(1.0, 90, 96), 0);
     }
 }
