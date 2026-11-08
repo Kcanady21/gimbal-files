@@ -40,7 +40,10 @@ homepage="$(workspace_repository)"
 echo "==> building the $version .deb"
 deb="$(deb_build "$version")"
 [[ -f "$deb" ]] || fail "build-deb.sh did not produce $deb"
+dbgsym="$(deb_dbgsym_path "$version")"
+[[ -f "$dbgsym" ]] || fail "build-deb.sh did not produce $dbgsym"
 cp -- "$deb" "$scratch/first.deb"
+cp -- "$dbgsym" "$scratch/first-dbgsym.deb"
 
 echo "==> checking the control fields"
 field() {
@@ -95,17 +98,38 @@ echo "==> checking the control area has no maintainer scripts"
 ctrl="$(dpkg-deb --ctrl-tarfile "$deb" | tar -tf - | sort)"
 [[ "$ctrl" == $'./\n./control' ]] || fail "unexpected control files: $ctrl"
 
-echo "==> comparing the installed binaries with stripped target/release"
-mkdir -p "$scratch/extract"
+echo "==> checking the debuglink, build ID and dbgsym package"
+mkdir -p "$scratch/extract" "$scratch/debug"
 dpkg-deb --extract "$deb" "$scratch/extract"
+dpkg-deb --extract "$dbgsym" "$scratch/debug"
 for binary in gimbal-files gimbal-files-cli; do
-    cp -- "$repo_root/target/release/$binary" "$scratch/$binary.stripped"
-    strip --strip-unneeded "$scratch/$binary.stripped"
-    cmp -s "$scratch/$binary.stripped" "$scratch/extract/usr/bin/$binary" \
-        || fail "installed $binary differs from target/release after stripping"
+    installed="$scratch/extract/usr/bin/$binary"
+    if [[ "$binary" == "gimbal-files-cli" ]]; then
+        "$installed" --version >/dev/null \
+            || fail "the extracted CLI does not run"
+    fi
+    readelf -S "$installed" | grep -q '\.gnu_debuglink' \
+        || fail "$binary has no .gnu_debuglink"
+    readelf -p .gnu_debuglink "$installed" | grep -q "$binary.debug" \
+        || fail "$binary's debuglink does not name $binary.debug"
+    if readelf -S "$installed" | grep -q '\.debug_info'; then
+        fail "$binary still carries .debug_info"
+    fi
+    build_id="$(readelf -n "$installed" | sed -n 's/.*Build ID: //p' | head -n 1)"
+    [[ -n "$build_id" ]] || fail "$binary has no build ID"
+    debug_file="$scratch/debug/usr/lib/debug/.build-id/${build_id:0:2}/${build_id:2}.debug"
+    [[ -f "$debug_file" ]] \
+        || fail "the dbgsym package has no $binary symbols for build ID $build_id"
+    cmp -s <(readelf -n "$debug_file" 2>/dev/null | sed -n 's/.*Build ID: //p' | head -n 1) \
+        <(printf '%s\n' "$build_id") \
+        || fail "the dbgsym file's build ID does not match $binary"
 done
-"$scratch/extract/usr/bin/gimbal-files-cli" --version >/dev/null \
-    || fail "the extracted CLI does not run"
+[[ "$(dpkg-deb --field "$dbgsym" Package)" == "gimbal-files-dbgsym" ]] \
+    || fail "the dbgsym package name is wrong"
+[[ "$(dpkg-deb --field "$dbgsym" Version)" == "$version" ]] \
+    || fail "the dbgsym version is wrong"
+[[ "$(dpkg-deb --field "$dbgsym" Depends)" == "gimbal-files (= $version)" ]] \
+    || fail "the dbgsym Depends is wrong"
 
 echo "==> checking the FileManager1 activation file"
 service="$scratch/extract/usr/share/dbus-1/services/io.github.kcanady21.GimbalFiles.FileManager1.service"
@@ -129,19 +153,26 @@ grep -q '^ gtk4 0.11.5 - MIT$' <<<"$copyright" \
 
 echo "==> checking reproducibility"
 deb_again="$(deb_build "$version")"
+dbgsym_again="$(deb_dbgsym_path "$version")"
 cmp -s "$scratch/first.deb" "$deb_again" || fail "two builds of $version differ"
+cmp -s "$scratch/first-dbgsym.deb" "$dbgsym_again" \
+    || fail "two dbgsym builds of $version differ"
 first_sum="$(sha256sum "$scratch/first.deb" | awk '{print $1}')"
 echo "    two builds are byte-identical: $first_sum"
 
 echo "==> building a second version for the repository"
 deb_new="$(deb_build "${version}.1")"
 [[ -f "$deb_new" ]] || fail "the second build did not produce a .deb"
+dbgsym_new="$(deb_dbgsym_path "${version}.1")"
+[[ -f "$dbgsym_new" ]] || fail "the second build did not produce a dbgsym .deb"
 
 repo="$scratch/pages/apt"
 pool="$repo/pool/main/g/gimbal-files"
 mkdir -p "$pool"
 cp -- "$scratch/first.deb" "$pool/gimbal-files_${version}_amd64.deb"
 cp -- "$deb_new" "$pool/gimbal-files_${version}.1_amd64.deb"
+cp -- "$scratch/first-dbgsym.deb" "$pool/gimbal-files-dbgsym_${version}_amd64.deb"
+cp -- "$dbgsym_new" "$pool/gimbal-files-dbgsym_${version}.1_amd64.deb"
 
 echo "==> making a scratch archive key and signing the repo"
 export GNUPGHOME="$scratch/gnupg"

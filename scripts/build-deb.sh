@@ -17,7 +17,8 @@ deb_usage() {
     cat <<'EOF'
 Usage: build-deb.sh <version>
 
-Build dist/gimbal-files_<version>_amd64.deb from target/release. This script
+Build dist/gimbal-files_<version>_amd64.deb and its optional
+dist/gimbal-files-dbgsym_<version>_amd64.deb from target/release. This script
 never runs cargo; run `cargo build --workspace --release` first. It reads the
 workspace repository for Homepage, DEBFULLNAME/DEBEMAIL (falling back to git
 config) for Maintainer, and SOURCE_DATE_EPOCH (falling back to the release
@@ -77,7 +78,7 @@ deb_build() {
         [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.+~][A-Za-z0-9.+~:-]+)?$ ]] \
             || deb_error "version must look like 0.1.0 (got: $version)"
 
-        for tool in dpkg-deb dpkg-shlibdeps dpkg-gencontrol gzip strip; do
+        for tool in dpkg-deb dpkg-shlibdeps dpkg-gencontrol gzip strip objcopy readelf; do
             command -v "$tool" >/dev/null 2>&1 || deb_error "$tool is not installed"
         done
         for binary in gimbal-files gimbal-files-cli; do
@@ -116,12 +117,19 @@ deb_build() {
             "$pkg/usr/share/icons/hicolor/scalable/apps" \
             "$pkg/usr/share/doc/gimbal-files" \
             "$pkg/DEBIAN" \
-            "$meta/debian"
+            "$meta/debian" \
+            "$stage/debug"
 
         install -m 0755 "$repo_root/target/release/gimbal-files" "$pkg/usr/bin/gimbal-files"
         install -m 0755 "$repo_root/target/release/gimbal-files-cli" "$pkg/usr/bin/gimbal-files-cli"
-        strip --strip-unneeded "$pkg/usr/bin/gimbal-files"
-        strip --strip-unneeded "$pkg/usr/bin/gimbal-files-cli"
+        # Keep the file/line tables in a separate debug package. The installed
+        # binary carries a build ID and a debuglink; Debian's dbgsym layout
+        # finds the symbols through the build ID.
+        for binary in gimbal-files gimbal-files-cli; do
+            objcopy --only-keep-debug "$pkg/usr/bin/$binary" "$stage/debug/$binary.debug"
+            strip --strip-unneeded "$pkg/usr/bin/$binary"
+            objcopy --add-gnu-debuglink="$stage/debug/$binary.debug" "$pkg/usr/bin/$binary"
+        done
         chmod 0755 "$pkg/usr/bin/gimbal-files" "$pkg/usr/bin/gimbal-files-cli"
 
         # Exec=gimbal-files %U works unchanged because /usr/bin is on PATH.
@@ -177,9 +185,50 @@ deb_build() {
         mkdir -p "$repo_root/dist"
         rm -f -- "$deb"
         dpkg-deb --root-owner-group --threads-max=1 --build "$pkg" "$deb" >&2
+
+        # The optional dbgsym package: Debian's /usr/lib/debug/.build-id
+        # layout, keyed by the build ID gdb and apport already know.
+        local dbgstage="$stage/dbgsym"
+        mkdir -p "$dbgstage/usr/lib/debug/.build-id" "$dbgstage/DEBIAN"
+        for binary in gimbal-files gimbal-files-cli; do
+            local build_id
+            build_id="$(readelf -n "$pkg/usr/bin/$binary" \
+                | sed -n 's/.*Build ID: //p' | head -n 1)"
+            [[ -n "$build_id" ]] \
+                || deb_error "$binary has no build ID for the dbgsym package"
+            local debug_file="$dbgstage/usr/lib/debug/.build-id/${build_id:0:2}/${build_id:2}.debug"
+            mkdir -p "$(dirname -- "$debug_file")"
+            install -m 0644 "$stage/debug/$binary.debug" "$debug_file"
+        done
+        local installed_size
+        installed_size="$(du -sk "$dbgstage" | cut -f1)"
+        cat >"$dbgstage/DEBIAN/control" <<EOF
+Package: gimbal-files-dbgsym
+Version: $version
+Architecture: amd64
+Maintainer: $maintainer
+Installed-Size: $installed_size
+Depends: gimbal-files (= $version)
+Section: debug
+Priority: optional
+Auto-Built-Package: debug-symbols
+Description: debug symbols for gimbal-files
+ Debug symbols for Gimbal Files. Install this package to let gdb and apport
+ show function names and line numbers in crash reports.
+EOF
+        find "$dbgstage" -exec touch -h -d "@$epoch" -- {} +
+        local dbgsym="$repo_root/dist/gimbal-files-dbgsym_${version}_amd64.deb"
+        rm -f -- "$dbgsym"
+        dpkg-deb --root-owner-group --threads-max=1 --build "$dbgstage" "$dbgsym" >&2
         printf '%s\n' "$deb"
     )
 }
+
+# The dbgsym path for a version; `deb_build` writes it next to the main deb.
+deb_dbgsym_path() {
+    printf '%s\n' "$repo_root/dist/gimbal-files-dbgsym_${1}_amd64.deb"
+}
+
 
 # Build Packages, Packages.gz and Release in one apt root. Release deliberately
 # has no Valid-Until: this repository is rebuilt only when Kyle releases, and a
@@ -251,19 +300,29 @@ apt_sign() {
 
 # Remove all but the newest <keep> package versions from the apt pool.
 apt_prune_pool() {
+    apt_prune_matching "$1" "$2" "gimbal-files_" "_amd64.deb"
+}
+
+apt_prune_dbgsym_pool() {
+    apt_prune_matching "$1" "$2" "gimbal-files-dbgsym_" "_amd64.deb"
+}
+
+apt_prune_matching() {
     local pool="$1"
     local keep="$2"
-    [[ "$keep" =~ ^[0-9]+$ ]] || deb_error "apt_prune_pool needs a non-negative count"
+    local prefix="$3"
+    local suffix="$4"
+    [[ "$keep" =~ ^[0-9]+$ ]] || deb_error "apt_prune_matching needs a non-negative count"
     local files=() versions=() v o i placed
     while IFS= read -r v; do
         files+=("$v")
-    done < <(find "$pool" -maxdepth 1 -type f -name 'gimbal-files_*_amd64.deb' -printf '%f\n')
+    done < <(find "$pool" -maxdepth 1 -type f -name "${prefix}*${suffix}" -printf '%f\n')
     (( ${#files[@]} > keep )) || return 0
 
     local ordered=()
     for v in "${files[@]}"; do
-        v="${v#gimbal-files_}"
-        v="${v%_amd64.deb}"
+        v="${v#"$prefix"}"
+        v="${v%"$suffix"}"
         versions+=("$v")
     done
     for v in "${versions[@]}"; do
@@ -280,7 +339,7 @@ apt_prune_pool() {
         ordered=("${next[@]}")
     done
     for ((i = keep; i < ${#ordered[@]}; i++)); do
-        rm -f -- "$pool/gimbal-files_${ordered[i]}_amd64.deb"
+        rm -f -- "$pool/${prefix}${ordered[i]}${suffix}"
     done
 }
 

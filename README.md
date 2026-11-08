@@ -236,6 +236,11 @@ touches your configuration or session.
 - Update check (last check time and the last version announced):
   `$XDG_STATE_HOME/gimbal-files/update.toml`, or
   `~/.local/state/gimbal-files/update.toml`.
+- Log (up to three 5 MiB files) and crash records:
+  `$XDG_STATE_HOME/gimbal-files/logs/` and `crashes/`, or
+  `~/.local/state/gimbal-files/logs/` and `crashes/`. A `running` file there
+  marks a session in progress, so an unclean exit can be noticed at the next
+  start. See "Reporting a bug".
 - Install marker (tarball and source installs):
   `$XDG_DATA_HOME/gimbal-files/install.toml`, or
   `~/.local/share/gimbal-files/install.toml`; under `--prefix DIR` it is
@@ -254,6 +259,39 @@ Only a release notice signed with Gimbal's minisign key is believed, so a
 spoofed or replayed notice cannot make Gimbal report a false update. A
 development build run from `target/` never checks for updates; Settings says
 so.
+
+## Reporting a bug
+
+Gimbal keeps its own log at `$XDG_STATE_HOME/gimbal-files/logs/gimbal.log`
+(`~/.local/state/gimbal-files/logs/gimbal.log`). It is always on, stays on
+your machine and is never uploaded. The log contains file paths; it never
+contains file contents. When the log reaches 5 MiB it rotates to
+`gimbal.log.1` and `gimbal.log.2`, keeping three files.
+
+If Gimbal closes unexpectedly, the next start saves the end of that run under
+`$XDG_STATE_HOME/gimbal-files/crashes/` and shows a one-time line in the first
+window: **Settings → Report a bug**. Panics, GTK/GLib warnings and native
+crashes (SIGSEGV, SIGABRT, SIGBUS) all leave a record.
+
+After a bug or crash, run:
+
+```bash
+gimbal-files-cli bug-report
+```
+
+It writes one text file, `~/gimbal-files-bug-report-<YYYY-MM-DD-HHMMSS>.txt`, prints
+its path and sends nothing anywhere. Read it before attaching it. It replaces
+your home folder with `~`; pass `--no-paths` to replace every path, including
+those inside your home folder, with `<path>`, and `--lines N` to keep more
+than the last 500 log lines.
+It names any apport crash file and its date, but never copies its contents.
+
+Attach the file to a new issue at
+<https://github.com/Kcanady21/gimbal-files/issues/new/choose>.
+
+For a more detailed log while you reproduce a problem, start Gimbal with
+`GIMBAL_LOG=1 gimbal-files`. That also prints the log to the terminal. The
+Settings row has **Open log folder** and **Copy report command** buttons.
 
 ## Contributing
 

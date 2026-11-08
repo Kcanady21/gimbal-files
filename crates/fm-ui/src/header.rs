@@ -621,7 +621,7 @@ impl Header {
         }
         self.update_text(&view, trash);
         self.animate_group.set(None);
-        crate::log!(
+        crate::log_verbose!(
             "header",
             "window {} pills {:?} (active {}, overflow {})",
             self.window_id,
@@ -2295,6 +2295,55 @@ fn open_settings_menu(ui: &Rc<WindowUi>, anchor: &gtk::Button) {
         .build();
     integration_status_label.add_css_class("dim-label");
     menu.append(&integration_status_label);
+
+    // Report a bug: both actions are local. The report command writes a file
+    // the user reads and attaches; nothing is sent anywhere.
+    let report_row = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    report_row.add_css_class("gl-menu-item");
+    let report_label = gtk::Label::builder()
+        .label(fm_core::logfile::text::REPORT_A_BUG)
+        .halign(gtk::Align::Start)
+        .build();
+    let report_buttons = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    let open_log = gtk::Button::with_label(fm_core::logfile::text::OPEN_LOG_FOLDER);
+    open_log.update_property(&[gtk::accessible::Property::Label(
+        fm_core::logfile::text::OPEN_LOG_FOLDER,
+    )]);
+    let copy_report = gtk::Button::with_label(fm_core::logfile::text::COPY_REPORT_COMMAND);
+    copy_report.update_property(&[gtk::accessible::Property::Label(
+        fm_core::logfile::text::COPY_REPORT_COMMAND,
+    )]);
+    report_buttons.append(&open_log);
+    report_buttons.append(&copy_report);
+    report_row.append(&report_label);
+    report_row.append(&report_buttons);
+    menu.append(&report_row);
+
+    let ui_open_log = ui.clone();
+    open_log.connect_clicked(move |_| {
+        let Some(directory) = fm_core::logfile::default_log_dir() else {
+            return;
+        };
+        let _ = std::fs::create_dir_all(&directory);
+        let uri = gtk::gio::File::for_path(&directory).uri();
+        gtk::UriLauncher::new(&uri).launch(
+            Some(ui_open_log.window()),
+            None::<&gtk::gio::Cancellable>,
+            |result| {
+                if let Err(error) = result {
+                    crate::log!("logfile", "could not open the log folder: {error}");
+                }
+            },
+        );
+    });
+
+    let ui_copy_report = ui.clone();
+    copy_report.connect_clicked(move |_| {
+        ui_copy_report
+            .window()
+            .clipboard()
+            .set_text(fm_core::logfile::REPORT_COMMAND);
+    });
 
     let integration_syncing = Rc::new(Cell::new(false));
     *ui.header().filemanager1_widgets.borrow_mut() = Some(FileManager1Widgets {

@@ -879,6 +879,9 @@ impl Process {
         let ui = WindowUi::new(self, application, id);
         self.windows.borrow_mut().insert(id, ui.clone());
         ui.present();
+        if let Some(notice) = crate::log::take_crash_notice() {
+            ui.show_summary(&notice, None);
+        }
         crate::log!("window", "opened model window {id}");
     }
 
@@ -2275,6 +2278,7 @@ impl Process {
         // still exist; setting a flag after `application.quit` is too late.
         crate::folder::size::shutdown();
         crate::pdf::shutdown();
+        crate::log::shutdown();
         if let Some(application) = &self.application {
             application.quit();
         }

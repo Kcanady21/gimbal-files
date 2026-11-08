@@ -1495,7 +1495,7 @@ impl Inner {
                 )
             })
             .collect();
-        crate::log!(
+        crate::log_verbose!(
             "split",
             "layout columns {:?} heights {:?} share {} at scale {scale:.2}; rects {rects:?}; pills {pills:?}; actual {actual:?}; pill wraps {pill_actual:?}",
             layout.columns,

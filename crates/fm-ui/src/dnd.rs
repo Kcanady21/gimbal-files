@@ -1113,7 +1113,7 @@ fn log_hover(
         return;
     }
     last.set(Some(key));
-    crate::log!(
+    crate::log_verbose!(
         "dnd",
         "hover {what} target #{target_id}: source {}, selected {}, target prefers {}, filesystem {}, modifiers {}",
         capability.text(current),

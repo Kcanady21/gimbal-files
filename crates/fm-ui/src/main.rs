@@ -50,6 +50,8 @@ thread_local! {
 
 fn main() -> gtk::glib::ExitCode {
     log::start();
+    log::install_panic_hook();
+    log::install_glib_writer();
     let service = filemanager1::is_service_launch(&std::env::args_os().collect::<Vec<_>>());
     let app = adw::Application::builder()
         .application_id(fm_core::APP_ID)
@@ -58,6 +60,7 @@ fn main() -> gtk::glib::ExitCode {
     app.connect_startup(move |application| startup(application, service));
     app.connect_activate(activate);
     app.connect_open(open);
+    app.connect_shutdown(|_| log::shutdown());
 
     if service {
         // GApplication makes "cannot own the app id" fatal in service mode.
@@ -82,9 +85,26 @@ fn main() -> gtk::glib::ExitCode {
 /// `service` comes from the raw arguments because a primary service registers
 /// before `run` parses the flag.
 fn startup(application: &adw::Application, service: bool) {
+    log::install_quit_signals(quit_on_signal);
     // `startup` only runs on the primary instance. A service launch is the
     // bus's activation file starting us; an ordinary launch reaches activate.
+    log::init_primary();
     filemanager1::start(application, service);
+}
+
+/// SIGTERM, SIGINT or SIGHUP: leave like a normal quit (session saved,
+/// workers stopped, crash marker removed), without asking about unsaved
+/// preview edits, since the session is ending.
+fn quit_on_signal() {
+    crate::log!("quit", "signal received; quitting cleanly");
+    if let Some(process) = process() {
+        process.quit_now();
+    } else {
+        log::shutdown();
+        if let Some(application) = gio::Application::default() {
+            application.quit();
+        }
+    }
 }
 
 /// The process, once startup has built it. The FileManager1 object uses this

@@ -33,3 +33,8 @@ fm-cli = { path = "crates/fm-cli" }
 
 [workspace.lints.rust]
 unsafe_code = "deny"
+
+[profile.release]
+# File and line tables for apport crash reports. build-deb.sh splits them into
+# gimbal-files-dbgsym; release binaries stay small for users.
+debug = "line-tables-only"

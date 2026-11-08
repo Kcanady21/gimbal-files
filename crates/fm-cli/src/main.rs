@@ -8,13 +8,15 @@
 
 #![forbid(unsafe_code)]
 
-use std::path::PathBuf;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use fm_agent::client::{self, ClientError, ReplyEnvelope};
 use fm_agent::protocol::{Operation, Request};
 use fm_core::command::{Caller, Invocation, Registry};
+use fm_core::logfile::{self, ApportCrash, CrashRecord, ReportData};
 
 const USAGE: &str = "\
 Usage: gimbal-files-cli [--help | --version]
@@ -24,14 +26,20 @@ Usage: gimbal-files-cli [--help | --version]
        gimbal-files-cli run [--window ID] [--tab ID] [--wait] [--timeout SECS]
                             <command> [key=value ...]
        gimbal-files-cli job <job-id> [--wait] [--timeout SECS]
+       gimbal-files-cli bug-report [--output FILE] [--lines N] [--no-paths]
 
 `commands` lists every registry command. `check` validates one as the Cli
 caller without a running app. `state`, `run` and `job` use the local socket;
-every connection runs as the Agent caller.
+every connection runs as the Agent caller. `bug-report` reads files only and
+needs no running app or socket.
 
 The socket is only there when Gimbal is running and Settings -> Allow local
 automation is On. There is no CLI enable option and the client never starts
 the app. Replies are printed as TOML.
+
+`bug-report` writes one text file (500 log lines by default), prints its path
+and sends nothing. Read it before attaching it. `--lines N` keeps more log
+lines; `--no-paths` replaces every absolute path except your home folder.
 
 Exit codes:
   0  success
@@ -81,6 +89,11 @@ enum Action {
         wait: bool,
         timeout: Duration,
     },
+    BugReport {
+        output: Option<PathBuf>,
+        lines: usize,
+        no_paths: bool,
+    },
     UsageError,
 }
 
@@ -99,6 +112,7 @@ fn action_for(args: &[String]) -> Action {
         [command, rest @ ..] if command == "state" => parse_state(rest),
         [command, rest @ ..] if command == "run" => parse_run(rest),
         [command, rest @ ..] if command == "job" => parse_job(rest),
+        [command, rest @ ..] if command == "bug-report" => parse_bug_report(rest),
         _ => Action::UsageError,
     }
 }
@@ -224,6 +238,45 @@ fn parse_job(args: &[String]) -> Action {
     Action::Job { id, wait, timeout }
 }
 
+fn parse_bug_report(args: &[String]) -> Action {
+    let mut output = None;
+    let mut lines = logfile::DEFAULT_REPORT_LINES;
+    let mut no_paths = false;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--output" => {
+                let Some(value) = args.get(index + 1) else {
+                    return Action::UsageError;
+                };
+                output = Some(PathBuf::from(value));
+                index += 2;
+            }
+            "--lines" => {
+                let Some(value) = args
+                    .get(index + 1)
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .filter(|value| *value > 0 && *value <= logfile::REPORT_LIMIT)
+                else {
+                    return Action::UsageError;
+                };
+                lines = value;
+                index += 2;
+            }
+            "--no-paths" => {
+                no_paths = true;
+                index += 1;
+            }
+            _ => return Action::UsageError,
+        }
+    }
+    Action::BugReport {
+        output,
+        lines,
+        no_paths,
+    }
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
@@ -261,6 +314,11 @@ fn main() -> ExitCode {
             tokens,
         } => run_command(window, tab, wait, timeout, &tokens),
         Action::Job { id, wait, timeout } => job_command(&id, wait, timeout),
+        Action::BugReport {
+            output,
+            lines,
+            no_paths,
+        } => bug_report(output, lines, no_paths),
         Action::UsageError => {
             eprint!("{USAGE}");
             ExitCode::from(EXIT_USAGE)
@@ -286,6 +344,159 @@ fn print_commands() {
             spec.name, spec.effect, rendered, spec.summary
         );
     }
+}
+
+fn bug_report(output: Option<PathBuf>, lines: usize, no_paths: bool) -> ExitCode {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let data = report_data(lines.clamp(1, logfile::REPORT_LIMIT));
+    let report = logfile::build_report(&data, home.as_deref(), no_paths);
+    let path = match output.or_else(|| logfile::report_path(home.as_deref(), SystemTime::now())) {
+        Some(path) => path,
+        None => {
+            eprintln!("HOME is not set; pass --output FILE");
+            return ExitCode::from(EXIT_USAGE);
+        }
+    };
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        let _ = fs::create_dir_all(parent);
+    }
+    if let Err(error) = fs::write(&path, report) {
+        eprintln!("could not write {}: {error}", path.display());
+        return ExitCode::from(EXIT_TRANSPORT);
+    }
+    println!("{}", path.display());
+    println!("{}", logfile::text::READ_BEFORE_ATTACHING);
+    println!("Attach it to a new issue at {}", logfile::ISSUE_URL);
+    ExitCode::from(EXIT_OK)
+}
+
+fn report_data(lines: usize) -> ReportData {
+    let log_path = logfile::default_log_path();
+    let log = log_path
+        .as_deref()
+        .and_then(|path| fs::read_to_string(path).ok())
+        .map(|text| logfile::last_lines(&text, lines));
+    let config_path = fm_core::config::default_config_path();
+    let config = config_path
+        .as_deref()
+        .and_then(|path| fs::read_to_string(path).ok())
+        .map(|text| logfile::redact_pins(&text));
+
+    ReportData {
+        gimbal_version: env!("CARGO_PKG_VERSION").to_string(),
+        install_kind: fm_core::update::current_install_kind(),
+        package_version: installed_package_version(),
+        cli_version: env!("CARGO_PKG_VERSION").to_string(),
+        os: os_release(),
+        kernel: kernel_release(),
+        desktop: std::env::var("XDG_CURRENT_DESKTOP").ok(),
+        display: display_kind(),
+        crash: crash_record(),
+        log,
+        log_path,
+        config,
+        config_path,
+        apport: apport_crash(),
+    }
+}
+
+fn installed_package_version() -> Option<String> {
+    let output = std::process::Command::new("dpkg-query")
+        .args(["-W", "-f=${Version}", "gimbal-files"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let version = String::from_utf8(output.stdout).ok()?.trim().to_string();
+    (!version.is_empty()).then_some(version)
+}
+
+fn os_release() -> Option<String> {
+    let text = fs::read_to_string("/etc/os-release").ok()?;
+    text.lines().find_map(|line| {
+        let value = line.strip_prefix("PRETTY_NAME=")?;
+        Some(value.trim().trim_matches('"').to_string())
+    })
+}
+
+fn kernel_release() -> Option<String> {
+    if let Ok(output) = std::process::Command::new("uname").arg("-r").output()
+        && output.status.success()
+    {
+        let kernel = String::from_utf8(output.stdout).ok()?.trim().to_string();
+        if !kernel.is_empty() {
+            return Some(kernel);
+        }
+    }
+    let text = fs::read_to_string("/proc/sys/kernel/osrelease").ok()?;
+    let text = text.trim().to_string();
+    (!text.is_empty()).then_some(text)
+}
+
+fn display_kind() -> String {
+    if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+        "Wayland".to_string()
+    } else if std::env::var_os("DISPLAY").is_some() {
+        "X11".to_string()
+    } else {
+        "unknown".to_string()
+    }
+}
+
+fn crash_record() -> Option<CrashRecord> {
+    let directory = logfile::default_crash_dir()?;
+    let mut newest: Option<(SystemTime, PathBuf)> = None;
+    for entry in fs::read_dir(directory).ok()? {
+        let Ok(entry) = entry else {
+            continue;
+        };
+        let path = entry.path();
+        if path.extension().is_none_or(|extension| extension != "log") || !path.is_file() {
+            continue;
+        }
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        let Ok(modified) = metadata.modified() else {
+            continue;
+        };
+        if newest.as_ref().is_none_or(|(time, _)| modified > *time) {
+            newest = Some((modified, path));
+        }
+    }
+    let (_, path) = newest?;
+    let timestamp = path.file_stem()?.to_string_lossy().to_string();
+    let text = fs::read_to_string(path).ok()?;
+    Some(CrashRecord { timestamp, text })
+}
+
+fn apport_crash() -> Option<ApportCrash> {
+    let mut newest: Option<(SystemTime, String)> = None;
+    for entry in fs::read_dir(Path::new("/var/crash")).ok()? {
+        let Ok(entry) = entry else {
+            continue;
+        };
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !name.starts_with("_usr_bin_gimbal-files.") || !name.ends_with(".crash") {
+            continue;
+        }
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        let Ok(modified) = metadata.modified() else {
+            continue;
+        };
+        if newest.as_ref().is_none_or(|(time, _)| modified > *time) {
+            newest = Some((modified, name));
+        }
+    }
+    let (modified, name) = newest?;
+    let stamp = logfile::wall_clock(modified);
+    let date = stamp.get(..16).unwrap_or(&stamp).replace('T', " ");
+    Some(ApportCrash { name, date })
 }
 
 fn check_command(tokens: &[String]) -> ExitCode {
@@ -604,6 +815,41 @@ mod tests {
         assert_eq!(action_for(&args(&["run", "--wait"])), Action::UsageError);
         assert_eq!(
             action_for(&args(&["run", "--nope", "tab.new"])),
+            Action::UsageError
+        );
+    }
+
+    #[test]
+    fn bug_report_takes_output_lines_and_no_paths() {
+        assert_eq!(
+            action_for(&args(&[
+                "bug-report",
+                "--output",
+                "/tmp/report.txt",
+                "--lines",
+                "50",
+                "--no-paths",
+            ])),
+            Action::BugReport {
+                output: Some(std::path::PathBuf::from("/tmp/report.txt")),
+                lines: 50,
+                no_paths: true,
+            }
+        );
+        assert_eq!(
+            action_for(&args(&["bug-report"])),
+            Action::BugReport {
+                output: None,
+                lines: super::logfile::DEFAULT_REPORT_LINES,
+                no_paths: false,
+            }
+        );
+        assert_eq!(
+            action_for(&args(&["bug-report", "--lines", "0"])),
+            Action::UsageError
+        );
+        assert_eq!(
+            action_for(&args(&["bug-report", "extra"])),
             Action::UsageError
         );
     }

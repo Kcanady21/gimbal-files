@@ -1,0 +1,66 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+name: Bug report
+description: Something went wrong in Gimbal Files
+title: "[Bug]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a bug. Please attach the file from
+        `gimbal-files-cli bug-report`; the [Reporting a bug](https://github.com/Kcanady21/gimbal-files#reporting-a-bug)
+        section explains it. Read the file before attaching it.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: Describe the problem plainly.
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: The shortest sequence that shows the problem.
+      placeholder: |
+        1. Open ...
+        2. Click ...
+        3. See ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect?
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: report-file
+    attributes:
+      label: Bug report file
+      description: The report is a local text file. Nothing is sent automatically.
+      options:
+        - label: I ran `gimbal-files-cli bug-report`, read the file, and attached it
+        - label: I can't attach the report file (explain below)
+    validations:
+      required: true
+
+  - type: textarea
+    id: report-note
+    attributes:
+      label: If you can't attach the report, say why
+      description: For example, you could not install the CLI or the file is missing.
+    validations:
+      required: false
+
+  - type: input
+    id: version
+    attributes:
+      label: Gimbal version
+      description: The version shown in Settings, or the output of `gimbal-files --version`.
+      placeholder: "0.1.2"
+    validations:
+      required: true

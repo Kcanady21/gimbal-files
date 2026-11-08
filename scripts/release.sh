@@ -84,6 +84,7 @@ stage="$dist/$stage_name"
 tarball="$dist/$stage_name.tar.gz"
 latest="$dist/latest.toml"
 deb="$dist/gimbal-files_${version}_amd64.deb"
+dbgsym="$dist/gimbal-files-dbgsym_${version}_amd64.deb"
 pages_root="$dist/pages"
 apt_dir="$pages_root/apt"
 
@@ -223,6 +224,12 @@ update_apt_repo() {
     local pool="$pages/apt/pool/main/g/gimbal-files"
     mkdir -p "$pool"
     install -m 0644 "$deb" "$pool/$(basename -- "$deb")"
+    local debug_package
+    debug_package="$dbgsym"
+    if [[ -f "$debug_package" ]]; then
+        install -m 0644 "$debug_package" "$pool/$(basename -- "$debug_package")"
+        apt_prune_dbgsym_pool "$pool" 3
+    fi
     apt_prune_pool "$pool" 3
     apt_build_indexes "$pages/apt"
     if $sign; then
@@ -246,7 +253,7 @@ cargo metadata --format-version 1 --offline --locked \
 
 echo "==> staging $stage_name"
 rm -rf -- "$stage"
-rm -f -- "$tarball" "$tarball.minisig" "$latest" "$latest.minisig" "$deb"
+rm -f -- "$tarball" "$tarball.minisig" "$latest" "$latest.minisig" "$deb" "$dbgsym"
 mkdir -p -- "$stage/bin" "$stage/share/applications" "$stage/share/dbus-1/services" "$stage/share/icons/hicolor/scalable/apps"
 install -m 0755 target/release/gimbal-files "$stage/bin/gimbal-files"
 install -m 0755 target/release/gimbal-files-cli "$stage/bin/gimbal-files-cli"
@@ -275,6 +282,7 @@ done < <(tar -tzf "$tarball")
 echo "==> scripts/build-deb.sh $version"
 deb="$(deb_build "$version")"
 [[ -f "$deb" ]] || error "build-deb.sh did not produce $deb"
+[[ -f "$dbgsym" ]] || error "build-deb.sh did not produce $dbgsym"
 
 if $dry_run; then
     scratch_pages="$(mktemp -d "${TMPDIR:-/tmp}/gimbal-pages-dry-run.XXXXXX")"
@@ -305,6 +313,7 @@ cat <<EOF
 Ready to publish $tag:
   $tarball
   $deb
+  $dbgsym
   $latest
   $tarball.minisig
   $latest.minisig
@@ -343,7 +352,7 @@ step "gh release create $tag" gh release create "$tag" \
     --target "$local_main" \
     --title "$tag" \
     --notes-file "$notes_file" \
-    "$tarball" "$deb" "$latest" "$tarball.minisig" "$latest.minisig"
+    "$tarball" "$deb" "$dbgsym" "$latest" "$tarball.minisig" "$latest.minisig"
 
 # The apt index is pushed only after the GitHub release exists, so a failed
 # release never leaves apt pointing at a version that cannot be downloaded.

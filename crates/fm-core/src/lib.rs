@@ -15,6 +15,7 @@ pub mod filemanager1;
 pub mod fileops;
 pub mod folder_size;
 pub(crate) mod fsutil;
+pub mod logfile;
 pub mod openwith;
 pub mod preview;
 pub mod search;

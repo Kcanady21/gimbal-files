@@ -276,7 +276,7 @@ impl Blur {
             .find(|(_, interface, _)| interface == "ext_background_effect_manager_v1")
             .map(|(name, _, version)| (*name, *version))
             .ok_or("ext_background_effect_manager_v1 is not advertised")?;
-        crate::log!(
+        crate::log_verbose!(
             "blur",
             "global ext_background_effect_manager_v1 v{version} (name {name})"
         );
@@ -288,7 +288,7 @@ impl Blur {
             .capabilities
             .ok_or("ext_background_effect_manager_v1 sent no capabilities")?;
         let blur = capabilities.contains(Capability::Blur);
-        crate::log!("blur", "capabilities {capabilities:?} (blur {blur})");
+        crate::log_verbose!("blur", "capabilities {capabilities:?} (blur {blur})");
         if !blur {
             return Err("the compositor does not offer blur".into());
         }
@@ -309,7 +309,7 @@ impl Blur {
 impl Inner {
     fn fallback(&self, reason: &str) {
         if !self.logged.replace(true) {
-            crate::log!("blur", "{reason}; keeping the window transparent");
+            crate::log_verbose!("blur", "{reason}; keeping the window transparent");
         }
     }
 
@@ -355,14 +355,14 @@ impl Inner {
             if let Some(inner) = weak.upgrade()
                 && inner.layout.replace(Some((width, height))) != Some((width, height))
             {
-                crate::log!("blur", "surface layout changed to {width}×{height}");
+                crate::log_verbose!("blur", "surface layout changed to {width}×{height}");
                 inner.update();
             }
         });
         let weak = Rc::downgrade(self);
         surface.connect_notify_local(Some("scale-factor"), move |surface, _| {
             if let Some(inner) = weak.upgrade() {
-                crate::log!("blur", "surface scale-factor {}", surface.scale_factor());
+                crate::log_verbose!("blur", "surface scale-factor {}", surface.scale_factor());
                 inner.update();
             }
         });
@@ -386,7 +386,7 @@ impl Inner {
             effect.set_blur_region(None);
             protocol.connection.flush().ok();
             surface.queue_render();
-            crate::log!("blur", "opacity {opacity:.2}: blur region removed");
+            crate::log_verbose!("blur", "opacity {opacity:.2}: blur region removed");
             *self.protocol.borrow_mut() = Some(protocol);
             return;
         }
@@ -415,7 +415,7 @@ impl Inner {
         region.destroy();
         protocol.connection.flush().ok();
         surface.queue_render();
-        crate::log!(
+        crate::log_verbose!(
             "blur",
             "opacity {opacity:.2}: visible {w}×{h} at ({x}, {y}), radius {radius}, {} rects: {placed:?}",
             placed.len()

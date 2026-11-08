@@ -1326,7 +1326,7 @@ impl PreviewPanel {
     /// As keeps its new path preview while the old browser selection is merely
     /// reapplied; a different selection is a real navigation.
     pub fn apply_model_selection(self: &Rc<Self>, selection: Selection) {
-        crate::log!("preview", "model selection {:?}", selection);
+        crate::log_verbose!("preview", "model selection {:?}", selection);
         let was_dirty = self.session.borrow().is_dirty();
         let ticket = self.session.borrow_mut().apply_model_selection(selection);
         if let Some(ticket) = ticket {
@@ -1357,7 +1357,7 @@ impl PreviewPanel {
     /// An explicit pointer/keyboard selection. It releases a Save As preview
     /// override even when the chosen name was already the browser's selection.
     pub fn set_selection_user(self: &Rc<Self>, selection: Selection) {
-        crate::log!("preview", "user selection {:?}", selection);
+        crate::log_verbose!("preview", "user selection {:?}", selection);
         let was_dirty = self.session.borrow().is_dirty();
         let ticket = self.session.borrow_mut().select_user(selection);
         if let Some(ticket) = ticket {
@@ -1394,7 +1394,7 @@ impl PreviewPanel {
     }
 
     fn begin_load_display(self: &Rc<Self>, ticket: &LoadTicket) {
-        crate::log!(
+        crate::log_verbose!(
             "preview",
             "load generation {} for {}",
             ticket.generation,
@@ -3180,7 +3180,7 @@ impl PreviewPanel {
         let weak = Rc::downgrade(self);
         file_monitor.connect_changed(move |_, _, _, event| {
             if let Some(panel) = weak.upgrade() {
-                crate::log!(
+                crate::log_verbose!(
                     "preview",
                     "monitor event {event:?} on {}",
                     watched.display()
@@ -3194,7 +3194,7 @@ impl PreviewPanel {
             if file.path().is_some_and(|changed| changed == watched)
                 && let Some(panel) = weak.upgrade()
             {
-                crate::log!(
+                crate::log_verbose!(
                     "preview",
                     "parent monitor event {event:?} on {}",
                     watched.display()

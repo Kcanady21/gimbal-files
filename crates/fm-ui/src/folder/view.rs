@@ -835,7 +835,7 @@ impl FolderView {
         if let Some(name) = stored
             && let Some(position) = self.position_of_name(&name)
         {
-            crate::log!(
+            crate::log_verbose!(
                 "folder",
                 "restoring scroll anchor {:?} at item {position}",
                 name.to_string_lossy()
@@ -1103,7 +1103,7 @@ impl FolderView {
             binding.display_name.clone(),
             binding.modified.clone(),
         );
-        crate::log!(
+        crate::log_verbose!(
             "folder-size",
             "request {} (device {}, inode {})",
             binding.root.path.display(),
@@ -1113,7 +1113,7 @@ impl FolderView {
         match self.size_service.request(binding.root.clone()) {
             size::RequestOutcome::Cached(hit) => {
                 let age = now.saturating_sub(hit.completed_at_ms);
-                crate::log!(
+                crate::log_verbose!(
                     "folder-size",
                     "cache hit {}: {} contents, {} files, {} folders, age {} ms",
                     binding.root.path.display(),
@@ -1128,7 +1128,7 @@ impl FolderView {
             size::RequestOutcome::Started(started) => {
                 let stale = started.stale.is_some();
                 model.start(started.stale.clone(), now);
-                crate::log!(
+                crate::log_verbose!(
                     "folder-size",
                     "start {} (stale shown: {stale})",
                     binding.root.path.display()
@@ -1137,7 +1137,7 @@ impl FolderView {
                 self.ensure_size_poll();
             }
             size::RequestOutcome::Busy => {
-                crate::log!(
+                crate::log_verbose!(
                     "folder-size",
                     "queue full for {}; the current demand will retry",
                     binding.root.path.display()
@@ -1147,7 +1147,7 @@ impl FolderView {
                 self.schedule_size_retry(cell);
             }
             size::RequestOutcome::Stopped => {
-                crate::log!(
+                crate::log_verbose!(
                     "folder-size",
                     "service stopped for {}; showing unavailable",
                     binding.root.path.display()
@@ -1190,7 +1190,7 @@ impl FolderView {
         };
         if let Some(started) = &active.started {
             self.size_service.cancel(started);
-            crate::log!(
+            crate::log_verbose!(
                 "folder-size",
                 "cancel {} (token {})",
                 active.model.identity.root.path.display(),
@@ -1267,7 +1267,7 @@ impl FolderView {
                         let age = now.saturating_sub(event.completed_at_ms);
                         let label = result_label(&event.result);
                         active.model.finish(event.result, age, event.cached);
-                        crate::log!(
+                        crate::log_verbose!(
                             "folder-size",
                             "result {label} for {} (age {age} ms, cached {})",
                             active.model.identity.root.path.display(),
@@ -1277,7 +1277,7 @@ impl FolderView {
                         changed = true;
                     }
                     _ => {
-                        crate::log!(
+                        crate::log_verbose!(
                             "folder-size",
                             "rejected a late result for a cell that no longer binds this folder"
                         );
@@ -1293,7 +1293,7 @@ impl FolderView {
                 if active.progress_throttle.should_show(now) {
                     active.last_progress_version = version;
                     active.model.set_progress(progress);
-                    crate::log!(
+                    crate::log_verbose!(
                         "folder-size",
                         "progress for {}: {} files, {} folders",
                         active.model.identity.root.path.display(),
@@ -1499,7 +1499,7 @@ impl FolderView {
                     dnd::current_modifiers_text()
                 );
                 drag.connect_selected_action_notify(|drag| {
-                    crate::log!(
+                    crate::log_verbose!(
                         "dnd",
                         "drag selected-action changed: {} (actions {})",
                         dnd::action_text(dnd::unique_action(drag.selected_action())),
@@ -1702,7 +1702,7 @@ impl FolderView {
         if self.grid.max_columns() != cap {
             self.grid.set_max_columns(cap);
         }
-        crate::log!(
+        crate::log_verbose!(
             "folder",
             "viewport {width} px at scale {:.2} -> cap {cap}",
             self.scale.get()
@@ -1800,7 +1800,7 @@ impl FolderView {
                 .copied()
                 .or_else(|| self.position_of_name(name))
             {
-                crate::log!(
+                crate::log_verbose!(
                     "folder",
                     "restoring scroll anchor {:?} at item {position}",
                     name.to_string_lossy()
@@ -2272,7 +2272,7 @@ impl FolderView {
             height: target.height,
             kind,
         };
-        crate::log!(
+        crate::log_verbose!(
             "thumb",
             "request {:?} {}x{} for {}",
             kind,
@@ -2382,7 +2382,7 @@ impl FolderView {
                 continue;
             };
             if let Some(failure) = &event.failure {
-                crate::log!("thumb", "no thumbnail for {:?}: {failure}", binding.name);
+                crate::log_verbose!("thumb", "no thumbnail for {:?}: {failure}", binding.name);
             }
             if let Some(image_data) = event.image {
                 let key = event.key.clone();
