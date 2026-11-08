@@ -98,7 +98,7 @@ public key, then run its installer. The check needs `minisign`
 (`sudo apt install minisign` on Ubuntu):
 
 ```sh
-VERSION=0.1.2
+VERSION=0.1.3
 BASE="https://github.com/Kcanady21/gimbal-files/releases/download/v${VERSION}"
 
 curl -LO "${BASE}/gimbal-files-${VERSION}-x86_64-linux.tar.gz"
