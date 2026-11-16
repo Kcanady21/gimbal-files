@@ -50,6 +50,7 @@ const KNOWN_TOP_LEVEL: &[&str] = &[
     "sections",
     "pins",
     "sort",
+    "view",
     "hotkeys",
     "agent",
     "updates",
@@ -518,6 +519,8 @@ pub struct Config {
     pub updates: Updates,
     /// Desktop integration switches. Off unless the user turns them on.
     pub integration: Integration,
+    /// Folder-listing switches. Off unless the user turns them on.
+    pub view: View,
     /// Runtime context: home for `~` expansion. Not written to the file.
     pub home: PathBuf,
 }
@@ -551,6 +554,17 @@ pub struct Integration {
     pub show_in_folder: bool,
 }
 
+/// The folder-listing switches. Off unless the user turns them on. Like
+/// `[integration]` and `[updates]`, this section is layered from the system
+/// defaults file, so a distro like GimbalOS could ship a starting value; the
+/// user's own file always wins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct View {
+    /// Show names that begin with `.`, dimmed. One app-wide setting owned by
+    /// `view.set-hidden` / `view.toggle-hidden`.
+    pub show_hidden: bool,
+}
+
 impl Default for Config {
     fn default() -> Self {
         let home = home_dir();
@@ -572,6 +586,7 @@ impl Config {
             agent: Agent::default(),
             updates: Updates::default(),
             integration: Integration::default(),
+            view: View::default(),
             home,
         }
     }
@@ -628,6 +643,7 @@ pub fn default_hotkeys() -> BTreeMap<String, Hotkey> {
         ("<Control>v", "file.paste"),
         ("<Control>equal", "view.zoom-in"),
         ("<Control>minus", "view.zoom-out"),
+        ("<Control>h", "view.toggle-hidden"),
         ("<Alt>Left", "nav.back"),
         ("<Alt>Right", "nav.forward"),
         ("<Alt>Up", "nav.up"),
@@ -688,6 +704,8 @@ pub enum Change {
     SetUpdatesEnabled(bool),
     /// Answer `org.freedesktop.FileManager1` while Gimbal runs.
     SetShowInFolder(bool),
+    /// Show or hide names that begin with `.` in every folder view.
+    SetShowHidden(bool),
 }
 
 /// What went wrong while loading the config.
@@ -837,11 +855,11 @@ impl ConfigFile {
     /// A key in the user's file wins; a key only in the defaults file applies.
     /// A key in neither keeps its built-in default.
     ///
-    /// Only `[integration]`, `[updates]` and `[agent]` are layered. The other
-    /// sections are ignored in the defaults file with a problem line, because
-    /// their shapes are not simple key/value pairs. `[agent] enabled` is never
-    /// taken from the defaults file: the local automation socket stays the
-    /// user's own choice.
+    /// Only `[integration]`, `[updates]`, `[agent]` and `[view]` are layered.
+    /// The other sections are ignored in the defaults file with a problem
+    /// line, because their shapes are not simple key/value pairs.
+    /// `[agent] enabled` is never taken from the defaults file: the local
+    /// automation socket stays the user's own choice.
     pub fn load_with_defaults(
         path: &Path,
         defaults: Option<&Path>,
@@ -1119,6 +1137,13 @@ pub fn change_for(
             Some(CommandValue::Bool(enabled)) => Some(Change::SetShowInFolder(*enabled)),
             _ => None,
         },
+        "view.set-hidden" => match command.get("enabled") {
+            Some(CommandValue::Bool(enabled)) => Some(Change::SetShowHidden(*enabled)),
+            _ => None,
+        },
+        // The no-argument flip: the saved value decides the next one, so a
+        // hotkey, the menu entry, the switch and the socket all agree.
+        "view.toggle-hidden" => Some(Change::SetShowHidden(!config.view.show_hidden)),
         _ => None,
     }
 }
@@ -1284,13 +1309,14 @@ impl Loader<'_> {
         self.read_sections(root, config);
         self.read_pins(root, config);
         self.read_sort(root, config);
+        self.read_view(root, config, Layer::User);
         self.read_hotkeys(root, config);
         self.read_agent(root, config, Layer::User);
         self.read_updates(root, config, Layer::User);
         self.read_integration(root, config, Layer::User);
     }
 
-    /// The defaults file version of [`Self::read_document`]. Only the three
+    /// The defaults file version of [`Self::read_document`]. Only the four
     /// simple sections apply; everything else is reported and left alone.
     fn read_defaults_document(&mut self, document: &Document<&str>, config: &mut Config) {
         let root = document.as_table();
@@ -1299,13 +1325,14 @@ impl Loader<'_> {
             match key {
                 "integration" => self.read_integration(root, config, Layer::Defaults),
                 "updates" => self.read_updates(root, config, Layer::Defaults),
+                "view" => self.read_view(root, config, Layer::Defaults),
                 "agent" => self.read_agent(root, config, Layer::Defaults),
                 _ if KNOWN_TOP_LEVEL.contains(&key) => {
                     self.report_item(
                         ConfigProblemKind::NotLayered,
                         key,
                         item,
-                        "only [integration], [updates] and [agent] are layered from the defaults file; this section is ignored",
+                        "only [integration], [updates], [agent] and [view] are layered from the defaults file; this section is ignored",
                     );
                 }
                 _ => self.unknown_entry(root, "", key, item),
@@ -1805,6 +1832,47 @@ impl Loader<'_> {
         config.integration.show_in_folder = valid && show_in_folder;
     }
 
+    /// `[view] show_hidden = true|false`. The default is Off. As with
+    /// `[agent]`, `[updates]` and `[integration]`, the whole section must be
+    /// valid before its bool applies: a wrong shape, an unknown key or a wrong
+    /// type leaves the default Off. A missing key keeps the value from the
+    /// defaults file (or the built-in default). Unlike `[agent]`, this section
+    /// is layered from the defaults file, so a distro like GimbalOS could
+    /// ship a starting value; the user's own file wins.
+    fn read_view(&mut self, root: &Table, config: &mut Config, _layer: Layer) {
+        let Some(item) = root.get("view") else {
+            return;
+        };
+        let Some(table) = table_like(item) else {
+            self.wrong_type("view", item, "a table");
+            config.view = View::default();
+            return;
+        };
+
+        let mut valid = true;
+        for (key, value) in table.iter() {
+            if key != "show_hidden" {
+                self.unknown_entry(table, "view", key, value);
+                valid = false;
+            }
+        }
+
+        let Some(item) = table.get("show_hidden") else {
+            if !valid {
+                config.view = View::default();
+            }
+            return;
+        };
+        let show_hidden = match self.read_bool(item, "view.show_hidden") {
+            Some(value) => value,
+            None => {
+                valid = false;
+                false
+            }
+        };
+        config.view.show_hidden = valid && show_hidden;
+    }
+
     fn read_inline_hotkey(&mut self, inline: &InlineTable, key: &str) -> Option<Hotkey> {
         let Some(command_value) = inline.get("command") else {
             self.report(
@@ -2188,6 +2256,7 @@ fn apply_to_config(config: &mut Config, change: &Change) {
         Change::SetAgentEnabled(enabled) => config.agent.enabled = *enabled,
         Change::SetUpdatesEnabled(enabled) => config.updates.check = *enabled,
         Change::SetShowInFolder(enabled) => config.integration.show_in_folder = *enabled,
+        Change::SetShowHidden(show) => config.view.show_hidden = *show,
     }
 }
 
@@ -2385,6 +2454,9 @@ fn apply_to_document(document: &mut DocumentMut, change: &Change, config: &Confi
                 "show_in_folder",
                 Value::from(*enabled),
             );
+        }
+        Change::SetShowHidden(show) => {
+            set_root_value(document, "view", "show_hidden", Value::from(*show));
         }
     }
 }
@@ -2649,7 +2721,8 @@ mod tests {
         assert_eq!(config.sort.order, SortOrder::Ascending);
         assert!(config.sort.folders_first);
         assert!(config.sort.folders.is_empty());
-        assert_eq!(config.hotkeys.len(), 19);
+        assert!(!config.view.show_hidden);
+        assert_eq!(config.hotkeys.len(), 20);
         assert_eq!(config.home, PathBuf::from("/home/kyle"));
 
         let expected = [
@@ -2663,6 +2736,7 @@ mod tests {
             ("<Control>z", "file.undo"),
             ("<Control>equal", "view.zoom-in"),
             ("<Control>minus", "view.zoom-out"),
+            ("<Control>h", "view.toggle-hidden"),
             ("<Alt>Left", "nav.back"),
             ("<Alt>Right", "nav.forward"),
             ("<Alt>Up", "nav.up"),
@@ -3421,6 +3495,8 @@ order = "ascending"
                 &["view.set-sort", "by=name", "order=ascending"],
             ),
             ("view.clear-folder-sort", &["view.clear-folder-sort"]),
+            ("view.set-hidden", &["view.set-hidden", "enabled=true"]),
+            ("view.toggle-hidden", &["view.toggle-hidden"]),
             ("pins.add", &["pins.add", "path=/tmp"]),
             ("pins.remove", &["pins.remove", "path=/tmp"]),
             ("pins.move", &["pins.move", "from=0", "to=1"]),
@@ -3965,6 +4041,171 @@ answer = 42
             change_for(&disabled, &config, home),
             Some(Change::SetShowInFolder(false))
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // P2aj: the hidden-files switch
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn hidden_files_default_off_and_read_both_ways() {
+        let temp = TempDir::new("view-default");
+        let home = temp.path();
+        let path = temp.write("config.toml", "[look]\nscale = 1.0\n");
+        let (file, problems) = ConfigFile::load_with(&path, home, &SpecialFolders::default());
+        assert!(problems.is_empty(), "{problems:?}");
+        assert!(!file.config().view.show_hidden);
+
+        let missing = temp.path().join("absent.toml");
+        let (file, problems) = ConfigFile::load_with(&missing, home, &SpecialFolders::default());
+        assert!(problems.is_empty());
+        assert!(!file.config().view.show_hidden);
+
+        let on = temp.write("on.toml", "[view]\nshow_hidden = true\n");
+        let (file, problems) = ConfigFile::load_with(&on, home, &SpecialFolders::default());
+        assert!(problems.is_empty(), "{problems:?}");
+        assert!(file.config().view.show_hidden);
+
+        let off = temp.write("off.toml", "[view]\nshow_hidden = false\n");
+        let (file, problems) = ConfigFile::load_with(&off, home, &SpecialFolders::default());
+        assert!(problems.is_empty());
+        assert!(!file.config().view.show_hidden);
+    }
+
+    #[test]
+    fn an_invalid_view_section_leaves_the_default_off_in_every_key_order() {
+        let temp = TempDir::new("view-invalid");
+        let home = temp.path();
+        let cases = [
+            ("unknown-first", "[view]\nextra = 1\nshow_hidden = true\n"),
+            ("unknown-last", "[view]\nshow_hidden = true\nextra = 1\n"),
+            ("wrong-shape", "view = true\n"),
+            ("array-shape", "view = [true]\n"),
+            ("wrong-type", "[view]\nshow_hidden = \"yes\"\n"),
+            (
+                "nested",
+                "[view]\nshow_hidden = true\nnested = { value = 1 }\n",
+            ),
+        ];
+        for (name, text) in cases {
+            let path = temp.write(&format!("{name}.toml"), text);
+            let (file, problems) = ConfigFile::load_with(&path, home, &SpecialFolders::default());
+            assert!(
+                !file.config().view.show_hidden,
+                "{name} changed the default despite a problem: {problems:?}"
+            );
+            assert!(!problems.is_empty(), "{name} was not diagnosed");
+        }
+
+        let parse = temp.write("parse.toml", "[view\nshow_hidden = true\n");
+        let (file, problems) = ConfigFile::load_with(&parse, home, &SpecialFolders::default());
+        assert!(!file.config().view.show_hidden);
+        assert_eq!(problems[0].kind, ConfigProblemKind::Parse);
+    }
+
+    #[test]
+    fn show_hidden_saves_one_key_and_preserves_comments_and_other_settings() {
+        let temp = TempDir::new("view-save");
+        let home = temp.path();
+        let path = temp.write(
+            "config.toml",
+            "# keep this comment\n[look]\nscale = 0.9\n\n[updates]\ncheck = false\n",
+        );
+        let (mut file, problems) = ConfigFile::load_with(&path, home, &SpecialFolders::default());
+        assert!(problems.is_empty(), "{problems:?}");
+        file.apply(Change::SetShowHidden(true)).expect("saves");
+
+        let text = fs::read_to_string(&path).expect("read");
+        assert!(text.contains("# keep this comment"), "{text}");
+        assert!(text.contains("scale = 0.9"), "{text}");
+        assert!(text.contains("[updates]\ncheck = false"), "{text}");
+        assert!(text.contains("[view]"), "{text}");
+        assert!(text.contains("show_hidden = true"), "{text}");
+
+        let (mut file, problems) = ConfigFile::load_with(&path, home, &SpecialFolders::default());
+        assert!(problems.is_empty());
+        assert!(file.config().view.show_hidden);
+
+        file.apply(Change::SetShowHidden(false)).expect("saves");
+        let text = fs::read_to_string(&path).expect("read");
+        assert!(text.contains("show_hidden = false"), "{text}");
+    }
+
+    #[test]
+    fn show_hidden_change_comes_from_the_bool_and_toggle_flips_the_saved_value() {
+        let home = Path::new("/tmp/home");
+        let config = default_config(home);
+        let on = check("view.set-hidden", &["view.set-hidden", "enabled=true"]);
+        assert_eq!(
+            change_for(&on, &config, home),
+            Some(Change::SetShowHidden(true))
+        );
+        let off = check("view.set-hidden", &["view.set-hidden", "enabled=false"]);
+        assert_eq!(
+            change_for(&off, &config, home),
+            Some(Change::SetShowHidden(false))
+        );
+
+        let toggle = check("view.toggle-hidden", &["view.toggle-hidden"]);
+        assert_eq!(
+            change_for(&toggle, &config, home),
+            Some(Change::SetShowHidden(true)),
+            "hidden files are off, so the toggle turns them on"
+        );
+        let mut shown = config.clone();
+        shown.view.show_hidden = true;
+        assert_eq!(
+            change_for(&toggle, &shown, home),
+            Some(Change::SetShowHidden(false)),
+            "hidden files are on, so the toggle turns them off"
+        );
+    }
+
+    #[test]
+    fn view_layers_under_the_defaults_file() {
+        let temp = TempDir::new("defaults-view");
+        let home = temp.path();
+        let user_missing = temp.path().join("absent-user.toml");
+        let defaults = temp.write("defaults.toml", "[view]\nshow_hidden = true\n");
+
+        let (file, problems) = load_layered(&user_missing, Some(&defaults), home);
+        assert!(problems.is_empty(), "{problems:?}");
+        assert!(
+            file.config().view.show_hidden,
+            "a GimbalOS default applies where the user set nothing"
+        );
+
+        let user_off = temp.write("off.toml", "[view]\nshow_hidden = false\n");
+        let (file, problems) = load_layered(&user_off, Some(&defaults), home);
+        assert!(problems.is_empty(), "{problems:?}");
+        assert!(
+            !file.config().view.show_hidden,
+            "the user's false must win over the defaults file"
+        );
+
+        let wrong = temp.write("wrong-defaults.toml", "[view]\nshow_hidden = \"yes\"\n");
+        let (file, problems) = load_layered(&user_missing, Some(&wrong), home);
+        assert!(!file.config().view.show_hidden);
+        assert!(
+            problems
+                .iter()
+                .any(|problem| problem.file == wrong && !problem.is_warning()),
+            "{problems:?}"
+        );
+
+        // The save still writes only the user's file, as with the other
+        // layered sections.
+        let user = temp.path().join("user.toml");
+        let (mut file, problems) = load_layered(&user, Some(&defaults), home);
+        assert!(problems.is_empty(), "{problems:?}");
+        file.apply(Change::SetShowHidden(false)).expect("saves");
+        let defaults_text = fs::read_to_string(&defaults).expect("defaults");
+        assert!(
+            defaults_text.contains("show_hidden = true"),
+            "the defaults file changed: {defaults_text}"
+        );
+        let text = fs::read_to_string(&user).expect("user file");
+        assert!(text.contains("show_hidden = false"), "{text}");
     }
 
     // ---------------------------------------------------------------------

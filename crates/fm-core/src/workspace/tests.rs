@@ -1533,6 +1533,97 @@ fn rubber_band_selection_carries_non_utf8_names() {
     assert_eq!(tab.selection.focused, Some(weird));
 }
 
+/// The same rule as the grid's `folder::is_hidden_name`: a leading dot.
+/// `fm-core` never names the UI's helper, so the operation takes a predicate.
+fn starts_with_dot(name: &std::ffi::OsStr) -> bool {
+    name.as_encoded_bytes().first() == Some(&b'.')
+}
+
+#[test]
+fn hiding_names_drops_only_the_hidden_selection_in_every_tab_of_every_window() {
+    let mut workspace = Workspace::with_home(home());
+    workspace.window_new(Some(folder("/tmp/one"))).unwrap();
+    workspace.tab_new(Some(folder("/tmp/two"))).unwrap();
+    let (window_one, tabs_one) = {
+        let window = workspace.focused().unwrap();
+        let ids = window
+            .groups
+            .values()
+            .flat_map(|group| group.tabs.iter().map(|tab| tab.id))
+            .collect::<Vec<_>>();
+        (window.id, ids)
+    };
+    workspace.window_new(Some(folder("/tmp/quiet"))).unwrap();
+    let window_two = workspace.focused().unwrap().id;
+    let quiet_tab = workspace.focused().unwrap().focused_tab;
+
+    workspace.focus_window(window_one).unwrap();
+    workspace.focus_tab(tabs_one[0]).unwrap();
+    workspace.file_click(os("visible.txt")).unwrap();
+    workspace.file_ctrl_click(os(".hidden-file")).unwrap();
+    workspace.file_ctrl_click(os(".git")).unwrap();
+
+    workspace.focus_tab(tabs_one[1]).unwrap();
+    workspace.file_click(os(".dotfile")).unwrap();
+    workspace.file_ctrl_click(os("keep.txt")).unwrap();
+
+    workspace.focus_window(window_two).unwrap();
+    workspace.focus_tab(quiet_tab).unwrap();
+    workspace.file_click(os("plain.txt")).unwrap();
+
+    let (dropped, events) = workspace.selection_drop_hidden(starts_with_dot);
+    assert_eq!(dropped, 3, "three selected names began with a dot");
+    assert_eq!(
+        events,
+        vec![Event::SelectionChanged { window: window_one }],
+        "the window with no hidden name gets no event"
+    );
+
+    workspace.focus_window(window_one).unwrap();
+    let tab = workspace.focused().unwrap().tab(tabs_one[0]).unwrap();
+    assert_eq!(tab.selection.names, BTreeSet::from([os("visible.txt")]));
+    assert_eq!(
+        tab.selection.focused, None,
+        "the focused name was hidden, so it dropped too"
+    );
+    assert_eq!(tab.selection.anchor, Some(os("visible.txt")));
+
+    let tab = workspace.focused().unwrap().tab(tabs_one[1]).unwrap();
+    assert_eq!(tab.selection.names, BTreeSet::from([os("keep.txt")]));
+    assert_eq!(tab.selection.focused, Some(os("keep.txt")));
+    assert_eq!(
+        tab.selection.anchor, None,
+        "the anchor was hidden, so the next Shift does not range from it"
+    );
+
+    let quiet = workspace
+        .windows
+        .iter()
+        .find(|window| window.id == window_two)
+        .unwrap()
+        .tab(quiet_tab)
+        .unwrap();
+    assert_eq!(quiet.selection.names, BTreeSet::from([os("plain.txt")]));
+    assert_eq!(quiet.selection.focused, Some(os("plain.txt")));
+
+    workspace.check_invariants().unwrap();
+}
+
+#[test]
+fn hiding_names_with_a_fully_hidden_selection_leaves_a_clean_tab() {
+    let mut workspace = workspace();
+    workspace.file_click(os(".one")).unwrap();
+    workspace.file_ctrl_click(os(".two")).unwrap();
+
+    let (dropped, events) = workspace.selection_drop_hidden(starts_with_dot);
+    assert_eq!(dropped, 2);
+    let window = workspace.focused().unwrap();
+    assert_eq!(events, vec![Event::SelectionChanged { window: window.id }]);
+    let tab = window.tab(window.focused_tab).unwrap();
+    assert_eq!(tab.selection, FileSelection::default());
+    workspace.check_invariants().unwrap();
+}
+
 #[test]
 fn a_drag_from_a_non_focused_split_tile_focuses_and_selects_that_tile_only() {
     let mut workspace = Workspace::with_home(home());

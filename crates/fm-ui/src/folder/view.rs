@@ -24,8 +24,8 @@ use crate::app::Process;
 use crate::dnd::{self, DragItem};
 use crate::folder::{
     ClickRequest, GridKey, KeyboardFocus, NavMode, RubberRect, SelectionEntry, StatusLine, cell_at,
-    click_request, clip_rect, details_text, drag_passes_threshold, is_hidden_name, keyboard_move,
-    nav_mode, normalize_rect, rubber_hits, size, sort, visible_page_rows,
+    click_request, clip_rect, details_text, drag_passes_threshold, entry_visible, is_hidden_name,
+    keyboard_move, nav_mode, normalize_rect, rubber_hits, size, sort, visible_page_rows,
 };
 use crate::look::icons::{self, MockupIcon};
 use crate::look::tokens::*;
@@ -92,6 +92,10 @@ pub struct FolderView {
 
     current: RefCell<Option<PathBuf>>,
     sort_rule: Rc<Cell<SortRule>>,
+    /// This view's copy of the `[view] show_hidden` setting. The filter reads
+    /// it on every decision; `set_show_hidden` updates it and re-decides in
+    /// place. New views start from the config (`Process::show_hidden`).
+    show_hidden: Rc<Cell<bool>>,
     started: Cell<Instant>,
     first_logged: Cell<bool>,
     loaded: Cell<bool>,
@@ -202,10 +206,14 @@ impl FolderView {
         let attributes = sort::attributes(default_rule);
         let dir_list = gtk::DirectoryList::new(Some(attributes.as_str()), None::<&gio::File>);
 
-        let filter = gtk::CustomFilter::new(|object| {
-            object
-                .downcast_ref::<gio::FileInfo>()
-                .is_none_or(|info| !is_hidden_name(&info.name()))
+        let show_hidden = Rc::new(Cell::new(process.show_hidden()));
+        let filter = gtk::CustomFilter::new({
+            let show_hidden = show_hidden.clone();
+            move |object| {
+                object
+                    .downcast_ref::<gio::FileInfo>()
+                    .is_none_or(|info| entry_visible(&info.name(), show_hidden.get()))
+            }
         });
         let filtered = gtk::FilterListModel::new(Some(dir_list.clone()), Some(filter));
 
@@ -298,6 +306,7 @@ impl FolderView {
             status_gate: status_gate.unwrap_or_else(|| Rc::new(Cell::new(true))),
             current: RefCell::new(None),
             sort_rule,
+            show_hidden,
             started: Cell::new(Instant::now()),
             first_logged: Cell::new(false),
             loaded: Cell::new(false),
@@ -332,6 +341,9 @@ impl FolderView {
         });
 
         *this.me.borrow_mut() = Rc::downgrade(&this);
+        // A hidden-files change reaches every live grid through the process,
+        // so no window, tab or split tile needs walking the widget tree.
+        process.register_folder_view(&this);
         this.wire_factory(&factory);
         this.wire_signals();
         this.attach_background_drop_target();
@@ -514,6 +526,14 @@ impl FolderView {
                 // A recycled cell never keeps another item's temporary
                 // rubber-band highlight.
                 cell.remove_css_class("gl-rubber-hit");
+                // A hidden item shows only while the setting admits it, and
+                // always dimmed, so it cannot be mistaken for an ordinary
+                // file. The `.gl-cell.hidden` rule lives in the look module.
+                if is_hidden_name(&info.name()) {
+                    cell.add_css_class("hidden");
+                } else {
+                    cell.remove_css_class("hidden");
+                }
                 let details = details_for(&info);
                 cell.set_has_tooltip(true);
                 cell.update_property(&[gtk::accessible::Property::Description(&details)]);
@@ -555,6 +575,7 @@ impl FolderView {
                     .borrow_mut()
                     .retain(|(candidate, _)| candidate != &widget);
                 cell.remove_css_class("gl-rubber-hit");
+                cell.remove_css_class("hidden");
                 if let Some(view) = weak.upgrade() {
                     view.cancel_thumbnail_for(&widget);
                     view.unbind_size_cell(&widget);
@@ -1029,6 +1050,45 @@ impl FolderView {
                 rule.order.as_str()
             );
         }
+    }
+
+    /// Apply a `[view] show_hidden` change in place: the filter re-decides
+    /// every name — `LessStrict` when hidden names are admitted, `MoreStrict`
+    /// when they are dropped — with no re-listing and no folder reload, the
+    /// same way a sort-order change re-sorts. The first visible name is kept
+    /// as a scroll anchor, like a sort change keeps its place. The model's
+    /// selection is re-asserted afterwards because GTK shifts item positions
+    /// under a filter change; the app has already dropped hidden names from
+    /// the model (`Process::apply_show_hidden`), so nothing invisible can
+    /// stay selected.
+    pub fn set_show_hidden(self: &Rc<Self>, show: bool) {
+        if self.show_hidden.get() == show {
+            return;
+        }
+        self.show_hidden.set(show);
+        let anchor = self.first_visible_name();
+        if let Some(filter) = self.filtered.filter().and_downcast::<gtk::CustomFilter>() {
+            filter.changed(if show {
+                gtk::FilterChange::LessStrict
+            } else {
+                gtk::FilterChange::MoreStrict
+            });
+        }
+        self.rebuild_index();
+        self.apply_selection();
+        self.count_listed();
+        self.update_status();
+        if let Some(name) = anchor
+            && let Some(position) = self.position_of_name(&name)
+        {
+            self.scroll_to_item(position);
+        }
+        crate::log!(
+            "folder",
+            "show_hidden is now {show}: {} of {} listed names are visible",
+            self.selection.n_items(),
+            self.dir_list.borrow().n_items()
+        );
     }
 
     pub fn set_selection(&self, selection: &FileSelection) {

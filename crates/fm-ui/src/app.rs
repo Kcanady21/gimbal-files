@@ -30,12 +30,12 @@ use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 
 use crate::commands;
 use crate::dnd::{self, DropIntent};
 use crate::fileops::{self, FileOps, ProgressView, clipboard, dialogs, menu as menus, progress};
-use crate::folder::ClickRequest;
+use crate::folder::{ClickRequest, FolderView, is_hidden_name};
 use crate::frame::WindowUi;
 use crate::look::Look;
 use crate::open::{OpenDecision, decision};
@@ -51,6 +51,10 @@ pub struct Process {
     pub look: Option<Rc<Look>>,
     workspace: RefCell<Workspace>,
     windows: RefCell<BTreeMap<WindowId, Rc<WindowUi>>>,
+    /// Every live folder grid. The hidden-files switch re-decides each
+    /// view's filter in place; the weaks make a closed window or split tile
+    /// harmless, and every pass prunes them.
+    folder_views: RefCell<Vec<Weak<FolderView>>>,
     session_path: Option<PathBuf>,
     saver: Saver,
     save_source: RefCell<Option<glib::SourceId>>,
@@ -318,6 +322,7 @@ impl Process {
             look: Some(look),
             workspace: RefCell::new(workspace),
             windows: RefCell::new(BTreeMap::new()),
+            folder_views: RefCell::new(Vec::new()),
             session_path: session::default_session_path(),
             saver: Saver::new(),
             save_source: RefCell::new(None),
@@ -364,6 +369,7 @@ impl Process {
             }
         });
         process.restore_session();
+        process.drop_restored_hidden_selection();
         crate::agent::start_if_enabled(&process);
         update::start(&process);
         let weak = Rc::downgrade(&process);
@@ -434,6 +440,7 @@ impl Process {
             look: None,
             workspace: RefCell::new(Workspace::with_home(home)),
             windows: RefCell::new(BTreeMap::new()),
+            folder_views: RefCell::new(Vec::new()),
             session_path,
             saver: Saver::new(),
             save_source: RefCell::new(None),
@@ -586,6 +593,90 @@ impl Process {
         let status = crate::filemanager1::status();
         for ui in self.windows.borrow().values() {
             ui.header().refresh_filemanager1_status(&status);
+        }
+    }
+
+    /// The `[view] show_hidden` setting, straight from the one config.
+    pub fn show_hidden(&self) -> bool {
+        self.config.borrow().config().view.show_hidden
+    }
+
+    /// A restored session may name a hidden item in a selection: it was saved
+    /// while hidden files were shown, and the setting changed before this
+    /// start (the config edited by hand, or a defaults file). With hidden
+    /// files off, drop those names now, so Delete, Cut or Move can never act
+    /// on an item the user cannot see.
+    fn drop_restored_hidden_selection(self: &Rc<Self>) {
+        if self.show_hidden() {
+            return;
+        }
+        let (dropped, events) = {
+            let mut workspace = self.workspace.borrow_mut();
+            workspace.selection_drop_hidden(|name| is_hidden_name(Path::new(name)))
+        };
+        if dropped == 0 {
+            return;
+        }
+        crate::log!(
+            "hidden",
+            "the restored session selected {dropped} hidden item(s); deselected them"
+        );
+        self.apply_events(&events);
+        for event in &events {
+            if let Event::SelectionChanged { window } = event {
+                self.sync_preview_user(*window);
+            }
+        }
+        self.schedule_save();
+    }
+
+    /// Note one live folder grid, so a hidden-files change reaches every
+    /// window, tab and split tile without walking the widget tree.
+    pub(crate) fn register_folder_view(&self, view: &Rc<FolderView>) {
+        let mut views = self.folder_views.borrow_mut();
+        views.retain(|weak| weak.upgrade().is_some());
+        views.push(Rc::downgrade(view));
+    }
+
+    /// The live grids, with the dead ones pruned.
+    fn live_folder_views(&self) -> Vec<Rc<FolderView>> {
+        let mut slots = self.folder_views.borrow_mut();
+        let live: Vec<Rc<FolderView>> = slots.iter().filter_map(Weak::upgrade).collect();
+        slots.retain(|weak| weak.upgrade().is_some());
+        live
+    }
+
+    /// Apply a `show_hidden` change from any caller. When hidden names leave,
+    /// the model drops them from every tab's selection first, so no view ever
+    /// keeps an invisible item selected against Delete, Cut or Move; the log
+    /// carries the count. Then every live grid re-decides its filter in place,
+    /// and the open Settings switches sync last.
+    fn apply_show_hidden(self: &Rc<Self>, show: bool) {
+        if !show {
+            let (dropped, events) = {
+                let mut workspace = self.workspace.borrow_mut();
+                workspace.selection_drop_hidden(|name| is_hidden_name(Path::new(name)))
+            };
+            crate::log!(
+                "hidden",
+                "hiding hidden files deselected {dropped} invisible item(s)"
+            );
+            if !events.is_empty() {
+                self.apply_events(&events);
+                for event in &events {
+                    if let Event::SelectionChanged { window } = event {
+                        self.sync_preview_user(*window);
+                    }
+                }
+                self.schedule_save();
+            }
+        }
+        for view in self.live_folder_views() {
+            view.set_show_hidden(show);
+        }
+        let windows: Vec<Rc<WindowUi>> = self.windows.borrow().values().cloned().collect();
+        for ui in windows {
+            ui.header().refresh_show_hidden_switch(show);
         }
     }
 
@@ -3032,6 +3123,9 @@ impl Process {
             Change::SetShowInFolder(enabled) => {
                 crate::filemanager1::apply(*enabled);
             }
+            Change::SetShowHidden(show) => {
+                self.apply_show_hidden(*show);
+            }
             other => crate::log!("command", "change applied: {other:?}"),
         }
     }
@@ -4350,6 +4444,7 @@ impl Process {
             has_files,
             needs_admin,
             self.focused_admin(window),
+            self.show_hidden(),
         );
         if let Some(ui) = self.window(window) {
             // The anchor is the whole grid scroller: point at the click, or
@@ -5244,6 +5339,7 @@ mod tests {
             )),
             workspace: RefCell::new(Workspace::with_home(scratch.root.join("home"))),
             windows: RefCell::new(BTreeMap::new()),
+            folder_views: RefCell::new(Vec::new()),
             session_path: None,
             saver: Saver::new(),
             save_source: RefCell::new(None),
@@ -7579,6 +7675,139 @@ order = "descending"
             window.groups[&group].tab(sibling).unwrap().selection.names,
             BTreeSet::from([OsString::from("keep")]),
             "the sibling tile keeps its own selection"
+        );
+    }
+
+    /// Hiding names through the real command removes every hidden name from
+    /// every tab's model selection, so Delete, Cut or Move can never act on a
+    /// file the user cannot see. Showing them again changes no selection.
+    #[test]
+    fn toggling_hidden_files_drops_hidden_names_from_every_selection() {
+        let scratch = search_scratch("hidden-bridge");
+        let process = Process::headless(
+            scratch.root.join("config.toml"),
+            scratch.root.join("home"),
+            Rc::new(NoClipboard),
+        );
+        let window = process.seed_window(scratch.root.join("home"));
+        let (home_tab, other_tab) = {
+            let mut workspace = process.workspace.borrow_mut();
+            workspace.tab_new(Some(scratch.root.join("other"))).unwrap();
+            let window = workspace.focused().unwrap();
+            let tabs: Vec<TabId> = window
+                .groups
+                .values()
+                .flat_map(|group| group.tabs.iter().map(|tab| tab.id))
+                .collect();
+            (tabs[0], tabs[1])
+        };
+        for tab in [home_tab, other_tab] {
+            let mut workspace = process.workspace.borrow_mut();
+            workspace.focus_tab(tab).unwrap();
+            workspace.file_click(OsString::from("visible.txt")).unwrap();
+            workspace
+                .file_ctrl_click(OsString::from(".hidden-file"))
+                .unwrap();
+        }
+
+        process.dispatch_for_window(
+            window,
+            Caller::Ui,
+            Invocation::new("view.toggle-hidden", Vec::new()),
+        );
+        assert!(process.show_hidden(), "the flip shows hidden names");
+        let snapshot = process.window_snapshot(window).expect("window");
+        for tab in [home_tab, other_tab] {
+            assert_eq!(
+                snapshot.tab(tab).unwrap().selection.names,
+                BTreeSet::from([
+                    OsString::from("visible.txt"),
+                    OsString::from(".hidden-file")
+                ]),
+                "showing hidden names changes no selection"
+            );
+        }
+
+        process.dispatch_for_window(
+            window,
+            Caller::Ui,
+            Invocation::new("view.toggle-hidden", Vec::new()),
+        );
+        assert!(!process.show_hidden(), "the second flip hides them again");
+        let snapshot = process.window_snapshot(window).expect("window");
+        for tab in [home_tab, other_tab] {
+            let selection = &snapshot.tab(tab).unwrap().selection;
+            assert_eq!(
+                selection.names,
+                BTreeSet::from([OsString::from("visible.txt")]),
+                "the hidden name left the selection when it stopped being visible"
+            );
+            assert_eq!(
+                selection.focused, None,
+                "the Ctrl-click focus was the hidden name, and nothing replaces it"
+            );
+            assert_eq!(
+                selection.anchor,
+                Some(OsString::from("visible.txt")),
+                "the visible anchor is untouched"
+            );
+        }
+        let text = std::fs::read_to_string(scratch.root.join("config.toml")).expect("config");
+        assert!(text.contains("[view]\nshow_hidden = false"), "{text}");
+    }
+
+    /// A restored selection naming a hidden item (saved while hidden files were
+    /// shown, then the setting changed between runs) is cleaned at startup
+    /// when hidden files are off, and left alone when they are on.
+    #[test]
+    fn a_restored_selection_loses_hidden_names_when_hidden_files_are_off() {
+        let scratch = search_scratch("hidden-restore");
+        let process = Process::headless(
+            scratch.root.join("config.toml"),
+            scratch.root.join("home"),
+            Rc::new(NoClipboard),
+        );
+        let window = process.seed_window(scratch.root.join("home"));
+        let select_both = || {
+            let mut workspace = process.workspace.borrow_mut();
+            workspace.file_click(OsString::from("visible.txt")).unwrap();
+            workspace
+                .file_ctrl_click(OsString::from(".hidden-file"))
+                .unwrap();
+        };
+        let names = || {
+            let snapshot = process.window_snapshot(window).expect("window");
+            snapshot
+                .tab(snapshot.focused_tab)
+                .expect("tab")
+                .selection
+                .names
+                .clone()
+        };
+
+        assert!(!process.show_hidden(), "hidden files are off by default");
+        select_both();
+        process.drop_restored_hidden_selection();
+        assert_eq!(names(), BTreeSet::from([OsString::from("visible.txt")]));
+
+        process.dispatch_for_window(
+            window,
+            Caller::Ui,
+            Invocation::new(
+                "view.set-hidden",
+                vec![("enabled".to_string(), "true".to_string())],
+            ),
+        );
+        assert!(process.show_hidden());
+        select_both();
+        process.drop_restored_hidden_selection();
+        assert_eq!(
+            names(),
+            BTreeSet::from([
+                OsString::from("visible.txt"),
+                OsString::from(".hidden-file")
+            ]),
+            "with hidden files shown, a hidden name is visible and stays selected"
         );
     }
 

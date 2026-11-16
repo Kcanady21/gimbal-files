@@ -513,6 +513,13 @@ pub fn is_hidden_name(name: &Path) -> bool {
         .is_some_and(|name| name.as_encoded_bytes().first() == Some(&b'.'))
 }
 
+/// The filter's decision as a pure function: whether the grid lists this name.
+/// A hidden name shows only while the `[view] show_hidden` setting is on, and
+/// shows dimmed; every other name always shows.
+pub fn entry_visible(name: &Path, show_hidden: bool) -> bool {
+    show_hidden || !is_hidden_name(name)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -796,6 +803,16 @@ mod tests {
         assert!(is_hidden_name(Path::new("notes/.hidden")));
         assert!(!is_hidden_name(Path::new("notes")));
         assert!(!is_hidden_name(PathBuf::from("file.txt").as_path()));
+    }
+
+    #[test]
+    fn the_filter_admits_hidden_names_only_while_the_setting_is_on() {
+        assert!(entry_visible(Path::new("visible.txt"), false));
+        assert!(entry_visible(Path::new("visible.txt"), true));
+        assert!(!entry_visible(Path::new(".hidden-file"), false));
+        assert!(entry_visible(Path::new(".hidden-file"), true));
+        assert!(!entry_visible(Path::new(".hidden-folder"), false));
+        assert!(entry_visible(Path::new(".hidden-folder"), true));
     }
 
     #[test]

@@ -271,10 +271,12 @@ pub fn background_menu(
         clipboard_has_files,
         false,
         false,
+        false,
     )
 }
 
-/// The same menu with the folder's ownership and the tab's scope.
+/// The same menu with the folder's ownership, the tab's scope and whether
+/// hidden files are currently shown.
 pub fn background_menu_in_scope(
     folder: &Path,
     undo_summary: Option<&str>,
@@ -282,6 +284,7 @@ pub fn background_menu_in_scope(
     clipboard_has_files: bool,
     folder_needs_admin: bool,
     in_admin: bool,
+    show_hidden: bool,
 ) -> Vec<MenuItem> {
     let folder_text = folder.to_string_lossy().into_owned();
     let mut menu = Vec::new();
@@ -369,6 +372,20 @@ pub fn background_menu_in_scope(
         "Properties",
         "file.properties",
         MenuAction::Command(vec![("paths".to_string(), folder_text)]),
+    ));
+
+    // P2aj: the same app-wide switch as Ctrl+H and the Settings row. The
+    // entry states the current setting in its label (`MenuItem` carries no
+    // check state, and the brief's alternative was a label over a check
+    // widget), and dispatches the no-argument flip.
+    menu.push(item(
+        if show_hidden {
+            "Hide Hidden Files"
+        } else {
+            "Show Hidden Files"
+        },
+        "view.toggle-hidden",
+        MenuAction::Command(Vec::new()),
     ));
 
     menu.push(separator());
@@ -712,6 +729,7 @@ mod tests {
                 "Refresh",
                 "Disk Usage",
                 "Properties",
+                "Show Hidden Files",
                 "|",
                 "Settings…",
             ]
@@ -762,8 +780,15 @@ mod tests {
     #[test]
     fn new_tab_and_new_window_carry_this_folder_even_inside_an_admin_tab() {
         for in_admin in [false, true] {
-            let menu =
-                background_menu_in_scope(Path::new("/tmp/docs"), None, true, true, false, in_admin);
+            let menu = background_menu_in_scope(
+                Path::new("/tmp/docs"),
+                None,
+                true,
+                true,
+                false,
+                in_admin,
+                false,
+            );
             for (command, label) in [("tab.new", "New Tab"), ("window.new", "New Window")] {
                 let entry = menu
                     .iter()
@@ -812,6 +837,35 @@ mod tests {
             .unwrap();
         assert!(!usage.enabled);
         assert_eq!(usage.tooltip, Some(BAOBAB_MISSING));
+    }
+
+    #[test]
+    fn the_hidden_files_entry_states_the_setting_and_flips_it() {
+        let off = background_menu(Path::new("/tmp"), None, true, false);
+        let entry = off
+            .iter()
+            .find(|item| item.command == "view.toggle-hidden")
+            .expect("the entry is in every background menu");
+        assert_eq!(entry.label, "Show Hidden Files");
+        assert_eq!(entry.action, MenuAction::Command(Vec::new()));
+        assert!(entry.enabled);
+
+        let on = background_menu_in_scope(Path::new("/tmp"), None, true, false, false, false, true);
+        let entry = on
+            .iter()
+            .find(|item| item.command == "view.toggle-hidden")
+            .expect("the entry stays while hidden files are shown");
+        assert_eq!(entry.label, "Hide Hidden Files");
+
+        // The entry sits in the Pin / Refresh / Disk Usage / Properties
+        // section, last in it, and never inside the Settings… separator tail.
+        let shape = shape(&off);
+        let properties = shape
+            .iter()
+            .position(|label| label == "Properties")
+            .unwrap();
+        assert_eq!(shape[properties + 1], "Show Hidden Files");
+        assert_eq!(shape[properties + 2], "|");
     }
 
     #[test]

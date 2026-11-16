@@ -2120,6 +2120,54 @@ impl Workspace {
         Ok(vec![Event::SelectionChanged { window: window_id }])
     }
 
+    /// Drop every selected name `is_hidden` marks from every tab of every
+    /// window. When the app stops showing hidden files, no selection may keep
+    /// a name the user can no longer see: Delete, Cut or Move must never act
+    /// on an invisible file. The focused and anchor names drop with the set,
+    /// and a tab that held no hidden name is left exactly as it was.
+    /// Returns the number of dropped names and one `SelectionChanged` event
+    /// per window whose selection changed.
+    pub fn selection_drop_hidden(
+        &mut self,
+        is_hidden: impl Fn(&std::ffi::OsStr) -> bool,
+    ) -> (usize, Vec<Event>) {
+        let mut dropped = 0;
+        let mut events = Vec::new();
+        for window in &mut self.windows {
+            let mut window_changed = false;
+            for group in window.groups.values_mut() {
+                for tab in &mut group.tabs {
+                    let selection = &mut tab.selection;
+                    let before = selection.names.len();
+                    selection.names.retain(|name| !is_hidden(name));
+                    if selection.names.len() == before {
+                        continue;
+                    }
+                    dropped += before - selection.names.len();
+                    window_changed = true;
+                    if selection
+                        .focused
+                        .as_ref()
+                        .is_some_and(|name| is_hidden(name.as_os_str()))
+                    {
+                        selection.focused = None;
+                    }
+                    if selection
+                        .anchor
+                        .as_ref()
+                        .is_some_and(|name| is_hidden(name.as_os_str()))
+                    {
+                        selection.anchor = None;
+                    }
+                }
+            }
+            if window_changed {
+                events.push(Event::SelectionChanged { window: window.id });
+            }
+        }
+        (dropped, events)
+    }
+
     /// Record the first visible item's name.
     pub fn record_scroll_anchor(
         &mut self,

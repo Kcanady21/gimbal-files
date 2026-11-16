@@ -652,6 +652,30 @@ pub const COMMANDS: &[CommandSpec] = &[
         undo: false,
         arguments: &[],
     },
+    // P2aj: one app-wide switch for hidden names. Both entries carry the same
+    // caller rule as the other `view.*` Settings commands: an agent that can
+    // re-sort a grid or hide a sidebar can also show or hide names, because
+    // the change lists different names and touches no file.
+    CommandSpec {
+        name: "view.set-hidden",
+        summary: "Show or hide files whose names begin with a dot.",
+        effect: Effect::Settings,
+        undo: false,
+        arguments: &[ArgSpec {
+            name: "enabled",
+            kind: ArgKind::Bool,
+            presence: Presence::Required,
+            default: None,
+        }],
+    },
+    // The no-argument flip the Ctrl+H hotkey and the empty-space menu use.
+    CommandSpec {
+        name: "view.toggle-hidden",
+        summary: "Turn hidden files on when they are off, and off when they are on.",
+        effect: Effect::Settings,
+        undo: false,
+        arguments: &[],
+    },
     // Kyle approved one Settings key for local automation on Nov 3. It is a
     // UI-only switch: the registry refuses Agent, Cli and Hotkey before any
     // handler or config write. The switch itself is the only caller.
@@ -900,5 +924,23 @@ mod tests {
         assert_eq!(settings.effect, Effect::System);
         assert!(!settings.undo);
         assert!(settings.arguments.is_empty());
+    }
+
+    #[test]
+    fn hidden_file_commands_are_settings_commands_with_the_reviewed_arguments() {
+        let set = drive_command("view.set-hidden");
+        assert_eq!(set.effect, Effect::Settings);
+        assert!(!set.undo);
+        assert_eq!(set.arguments.len(), 1);
+        assert_eq!(set.arguments[0].name, "enabled");
+        assert!(matches!(set.arguments[0].kind, ArgKind::Bool));
+        assert!(matches!(set.arguments[0].presence, Presence::Required));
+        assert!(!set.summary.is_empty());
+
+        let toggle = drive_command("view.toggle-hidden");
+        assert_eq!(toggle.effect, Effect::Settings);
+        assert!(!toggle.undo);
+        assert!(toggle.arguments.is_empty());
+        assert!(!toggle.summary.is_empty());
     }
 }

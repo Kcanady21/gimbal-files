@@ -11,6 +11,12 @@ use crate::look::icons::{FLOAT_PALETTE, FOLDER_PALETTE, SAVE_AS_PALETTE};
 use crate::look::motion;
 use crate::look::tokens::*;
 
+/// The look token for a shown hidden item's opacity. Dim enough that a name
+/// starting with a dot can never be mistaken for an ordinary file, and light
+/// enough to stay readable in the light and the dark theme. Only the grid's
+/// `.gl-cell.hidden` rule uses it (P2aj).
+const HIDDEN_OPACITY: f64 = 0.55;
+
 /// One rule per line, so the stylesheet can be read and diffed live.
 pub fn css(scale: f64, font: Option<&str>, opacity: f64) -> String {
     css_impl(scale, font, None, opacity, false)
@@ -67,6 +73,7 @@ fn css_impl(
     );
     let section_gap = p(SECTION_GAP);
     let section_tail = (p(GAP_M) - section_gap).max(0);
+    let dim = HIDDEN_OPACITY;
     let pill_h = (p(CONTROL_H) - 2 * mid).max(1);
     let pill_w = (p(PILL_W) - 2 * gm - 2 * mid).max(1);
     let sect_h = (p(SECTION_H) - 2 * thin).max(1);
@@ -181,6 +188,7 @@ window.gimbal-look, window.gimbal-look.background {{ background-color: {window_b
 gridview > child {{ padding: 0; }}
 .gl-cell {{ min-width: {cellw}px; min-height: {cellh}px; }}
 .gl-cell.gl-rubber-hit {{ background-color: alpha(@accent_bg_color, 0.30); border-radius: {r}px; }}
+.gl-cell.hidden {{ opacity: {dim:.2}; }}
 .gl-rubber-band {{ background-color: alpha(@accent_bg_color, 0.18); border: {thin}px solid @accent_color; border-radius: {ri}px; }}
 .gl-cell image {{ -gtk-icon-size: {igrid}px; color: {FG}; -gtk-icon-palette: {folder_palette}; }}
 .gl-cell label {{ font-size: {trow}px; }}
@@ -473,6 +481,21 @@ mod tests {
             .expect("the scaled rectangle rule");
         assert!(band.contains("border: 1px solid @accent_color"), "{band}");
         assert!(band.contains("border-radius: 2px"), "{band}");
+    }
+
+    #[test]
+    fn a_shown_hidden_cell_is_dimmed_from_the_token_in_both_stylesheets() {
+        for sheet in [css(1.0, None, PLAIN), css_with_mono(1.0, None, None, PLAIN)] {
+            let rule = sheet
+                .lines()
+                .find(|line| line.contains(".gl-cell.hidden"))
+                .expect("the dimmed hidden-cell rule");
+            assert_eq!(
+                rule,
+                format!(".gl-cell.hidden {{ opacity: {HIDDEN_OPACITY:.2}; }}")
+            );
+            assert!(!rule.contains('#') && !rule.contains("rgb("), "{rule}");
+        }
     }
 
     #[test]

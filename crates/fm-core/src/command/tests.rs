@@ -83,6 +83,8 @@ fn the_v1_catalogue_has_every_reviewed_command_in_order() {
         "view.toggle-section",
         "view.set-sort",
         "view.clear-folder-sort",
+        "view.set-hidden",
+        "view.toggle-hidden",
         "agent.set-enabled",
         "updates.set-enabled",
         "updates.check",
@@ -974,6 +976,25 @@ fn clear_folder_sort_is_a_plain_settings_command_for_every_caller() {
         assert_eq!(clear.effect(), sort.effect());
         assert!(clear.arguments().is_empty());
     }
+}
+
+#[test]
+fn hidden_file_commands_follow_the_view_caller_rules() {
+    // The same rule as `view.set-sort`: every caller may show or hide names,
+    // because the change lists different names and touches no file.
+    for caller in [Caller::Ui, Caller::Hotkey, Caller::Cli, Caller::Agent] {
+        let set = check(caller, &["view.set-hidden", "enabled=true"]).expect("a bool is valid");
+        assert_eq!(set.effect(), Effect::Settings);
+        assert!(matches!(set.get("enabled"), Some(Value::Bool(true))));
+        let toggle = check(caller, &["view.toggle-hidden"]).expect("the no-argument flip is valid");
+        assert_eq!(toggle.effect(), Effect::Settings);
+        assert!(toggle.arguments().is_empty());
+    }
+
+    let error = check(Caller::Ui, &["view.set-hidden"]).expect_err("enabled is required");
+    assert!(matches!(error.kind(), CommandErrorKind::MissingArgument));
+    let error = check(Caller::Ui, &["view.set-hidden", "enabled=maybe"]).expect_err("not a bool");
+    assert!(matches!(error.kind(), CommandErrorKind::BadValue { .. }));
 }
 
 #[test]

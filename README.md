@@ -225,6 +225,9 @@ touches your configuration or session.
 
 - Configuration: `$XDG_CONFIG_HOME/gimbal-files/config.toml`, or
   `~/.config/gimbal-files/config.toml`.
+- Hidden files: the **Show hidden files** switch (Ctrl+H) is one setting for
+  every window, tab and split tile, saved as `[view] show_hidden` in your own
+  file; a system defaults file can supply it too.
 - System defaults (optional, read-only):
   `$XDG_CONFIG_DIRS/gimbal-files/config.toml`, or
   `/etc/xdg/gimbal-files/config.toml` when `XDG_CONFIG_DIRS` is unset. A key

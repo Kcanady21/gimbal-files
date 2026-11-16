@@ -224,6 +224,11 @@ struct FileManager1Widgets {
     syncing: Rc<Cell<bool>>,
 }
 
+struct HiddenWidgets {
+    switch: gtk::Switch,
+    syncing: Rc<Cell<bool>>,
+}
+
 pub struct Header {
     window_id: WindowId,
     handle: gtk::WindowHandle,
@@ -269,6 +274,8 @@ pub struct Header {
     update_widgets: RefCell<Option<UpdateWidgets>>,
     /// The open Settings menu's Integration switch and status.
     filemanager1_widgets: RefCell<Option<FileManager1Widgets>>,
+    /// The Settings menu's Show hidden files switch, while the menu is open.
+    hidden_widgets: RefCell<Option<HiddenWidgets>>,
     /// The open Settings menu's Sort rows. The header owns them while the menu
     /// is open; the rows' click handlers hold only weak references.
     sort_rows: RefCell<Option<Rc<SortRows>>>,
@@ -400,6 +407,7 @@ impl Header {
             agent_widgets: RefCell::new(None),
             update_widgets: RefCell::new(None),
             filemanager1_widgets: RefCell::new(None),
+            hidden_widgets: RefCell::new(None),
             sort_rows: RefCell::new(None),
             ui: RefCell::new(Weak::new()),
         });
@@ -478,6 +486,23 @@ impl Header {
         switch.set_active(status.enabled);
         syncing.set(false);
         label.set_text(&status.text());
+    }
+
+    /// Sync the open Settings menu's Show hidden files switch after a change
+    /// from anywhere else: the Ctrl+H hotkey, the empty-space menu, another
+    /// window, the CLI or the agent.
+    pub fn refresh_show_hidden_switch(&self, show: bool) {
+        let widgets = self
+            .hidden_widgets
+            .borrow()
+            .as_ref()
+            .map(|widgets| (widgets.switch.clone(), widgets.syncing.clone()));
+        let Some((switch, syncing)) = widgets else {
+            return;
+        };
+        syncing.set(true);
+        switch.set_active(show);
+        syncing.set(false);
     }
 
     /// Sync the open Settings menu's Sort rows with the config, after any sort
@@ -2070,6 +2095,83 @@ fn open_settings_menu(ui: &Rc<WindowUi>, anchor: &gtk::Button) {
             }
         });
     }
+
+    // P2aj: one app-wide Show hidden files switch. It reads the same setting
+    // as Ctrl+H and the empty-space menu entry, dispatches through the same
+    // command, and syncs when another window or caller flips it.
+    let view_heading = gtk::Label::builder()
+        .label("View")
+        .halign(gtk::Align::Start)
+        .build();
+    view_heading.add_css_class("gl-menu-item");
+    menu.append(&view_heading);
+
+    let hidden_row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+    hidden_row.add_css_class("gl-menu-item");
+    let hidden_label = gtk::Label::builder()
+        .label("Show hidden files")
+        .halign(gtk::Align::Start)
+        .hexpand(true)
+        .build();
+    let hidden_switch = gtk::Switch::new();
+    hidden_switch.update_property(&[gtk::accessible::Property::Label("Show hidden files")]);
+    hidden_switch.update_property(&[gtk::accessible::Property::Description(
+        "Shows names that begin with a dot, dimmed. Ctrl+H toggles it.",
+    )]);
+    let hidden_syncing = Rc::new(Cell::new(false));
+    hidden_syncing.set(true);
+    hidden_switch.set_active(
+        ui.process_upgrade()
+            .is_some_and(|process| process.show_hidden()),
+    );
+    hidden_syncing.set(false);
+    hidden_row.append(&hidden_label);
+    hidden_row.append(&hidden_switch);
+    menu.append(&hidden_row);
+
+    let hidden_explanation = gtk::Label::builder()
+        .label(
+            "Shows files and folders whose names begin with a dot, dimmed so they can't be \
+             mistaken for ordinary items. Ctrl+H toggles it. Off is the default.",
+        )
+        .wrap(true)
+        .xalign(0.0)
+        .halign(gtk::Align::Start)
+        .build();
+    hidden_explanation.add_css_class("dim-label");
+    menu.append(&hidden_explanation);
+
+    *ui.header().hidden_widgets.borrow_mut() = Some(HiddenWidgets {
+        switch: hidden_switch.clone(),
+        syncing: hidden_syncing.clone(),
+    });
+
+    let ui_hidden = ui.clone();
+    let hidden_switch_widget = hidden_switch.clone();
+    let hidden_switch_syncing = hidden_syncing.clone();
+    hidden_switch.connect_active_notify(move |_| {
+        if hidden_switch_syncing.get() {
+            return;
+        }
+        let requested = hidden_switch_widget.is_active();
+        ui_hidden.dispatch(
+            Caller::Ui,
+            Invocation::new(
+                "view.set-hidden",
+                vec![("enabled".to_string(), requested.to_string())],
+            ),
+        );
+        // The dispatch already synced every open switch through
+        // `apply_show_hidden`; this puts the row back if the save failed.
+        if let Some(process) = ui_hidden.process_upgrade() {
+            let actual = process.show_hidden();
+            if actual != requested {
+                hidden_switch_syncing.set(true);
+                hidden_switch_widget.set_active(actual);
+                hidden_switch_syncing.set(false);
+            }
+        }
+    });
 
     let row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
     row.add_css_class("gl-menu-item");
