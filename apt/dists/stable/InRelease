@@ -8,14 +8,14 @@ Codename: stable
 Architectures: amd64
 Components: main
 Description: Gimbal Files apt repository
-Date: Sun, 08 Nov 2026 22:31:35 +0000
+Date: Mon, 16 Nov 2026 18:17:25 +0000
 SHA256:
- 21a044040863606622073be4aa49b79ec6e99ba2d90d24403cdea3ae29299e49 4381 main/binary-amd64/Packages
- ac0ef27d98b515d7be9b103605910c9d9eefa0e2343d3e631f67ef1c57d7c8dc 1235 main/binary-amd64/Packages.gz
+ f69341f6d5f856166b398b47d734bb28a1d7694780bcffd428b3f45812d535a4 5043 main/binary-amd64/Packages
+ 2c291a9e41b55822af1c2a69f3b0a654ae62a44f72c55e59a8f54b5ed3a93b28 1353 main/binary-amd64/Packages.gz
 -----BEGIN PGP SIGNATURE-----
 
-iHUEARYIAB0WIQSzkWuZ7NhHza0ZNwuazpkux0QEbQUCavD4uQAKCRCazpkux0QE
-bSYkAP9Yqd3Bhf9OZJFmDsZH5MmPg2ObXxWYcCisotUAJiIkJAEA+q+zX8mQDgtQ
-p5Xx7kNjs0/FxJj0w6HQ8+z3hyRFwQI=
-=hnD3
+iHUEARYIAB0WIQSzkWuZ7NhHza0ZNwuazpkux0QEbQUCavtJCwAKCRCazpkux0QE
+bTDyAQDMn3EktO7pTzJ9KsxxhGBA1BuXie2xpHTWHGnjPdpgowEAmk9DlszbEhz2
+4Bpvgms25Y9jszLxo/c/5SK8fG5QaAA=
+=JX5u
 -----END PGP SIGNATURE-----
