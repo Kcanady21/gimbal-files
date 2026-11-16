@@ -948,6 +948,23 @@ fn choice_must_be_one_of_the_fixed_list() {
 }
 
 #[test]
+fn the_internal_drives_section_toggles_like_the_others() {
+    let command = check(Caller::Ui, &["view.toggle-section", "section=internal"])
+        .expect("internal is allowed");
+    assert_eq!(command.get("section"), Some(&Value::Choice("internal")));
+
+    let error = check(Caller::Ui, &["view.toggle-section", "section=pinboard"])
+        .expect_err("pinboard is not a section");
+    assert!(matches!(error.kind(), CommandErrorKind::BadValue { .. }));
+    assert!(
+        error
+            .to_string()
+            .contains("recent, devices, internal, remote"),
+        "the refusal names every choice: {error}"
+    );
+}
+
+#[test]
 fn the_sort_scope_defaults_to_folder() {
     let command =
         check(Caller::Ui, &["view.set-sort", "by=name", "order=ascending"]).expect("valid sort");

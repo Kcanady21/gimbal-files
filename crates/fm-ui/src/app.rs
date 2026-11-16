@@ -7079,6 +7079,156 @@ mod tests {
     }
 
     #[test]
+    fn real_sidebar_internal_drives_section_opens_hides_and_orders() {
+        let executable = std::env::current_exe().expect("the test executable");
+        let output = std::process::Command::new(executable)
+            .args([
+                "--exact",
+                "app::tests::real_sidebar_internal_drives_section_opens_hides_and_orders_inner",
+                "--ignored",
+                "--nocapture",
+            ])
+            .output()
+            .expect("the owned internal-drives widget regression process");
+        assert!(
+            output.status.success(),
+            "the internal drives widget regression failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    #[ignore = "runs in its own process through the subprocess widget regression"]
+    fn real_sidebar_internal_drives_section_opens_hides_and_orders_inner() {
+        let _guard = gtk_test_lock();
+        gtk::init().expect("the internal drives regression needs a GTK display");
+        adw::init().expect("libadwaita init");
+
+        let scratch = search_scratch("gtk-internal");
+        let wd_blue = scratch.root.join("mnt/wd-blue");
+        let nvme_storage = scratch.root.join("mnt/nvme-storage");
+        std::fs::create_dir_all(&wd_blue).expect("wd-blue fixture");
+        std::fs::create_dir_all(&nvme_storage).expect("nvme-storage fixture");
+        std::fs::create_dir_all(scratch.root.join("home")).expect("home fixture");
+
+        let application = adw::Application::builder()
+            .application_id("org.gimbal.Files.InternalDrivesTest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        application
+            .register(None::<&gio::Cancellable>)
+            .expect("register the owned non-unique test application");
+        let runtime = Rc::new(crate::search::SearchRuntime::with_service(Arc::new(
+            crate::search::SearchService::new(),
+        )));
+        let process = gtk_search_process(&scratch, &application, runtime);
+
+        // An injected table in the shape of Kyle's machine, with no injected
+        // mountinfo yet: no machine's disks leak into this test, and the
+        // section starts hidden.
+        let backend = Rc::new(crate::volumes::tests::FakeBackend::default());
+        let volumes = crate::volumes::Volumes::new(backend.clone());
+        process.install_volumes_for_tests(volumes.clone());
+        let window = seed_gtk_window(&process, scratch.root.join("home"));
+        let ui = process.window(window).expect("real window");
+        ui.window().present();
+        let sidebar = ui.sidebar_for_tests();
+
+        assert!(
+            !sidebar.internal_section_visible_for_tests(),
+            "no rows means no section at all"
+        );
+        assert_eq!(
+            sidebar.section_order_for_tests(),
+            vec![
+                ("Recent Directories".to_string(), true),
+                ("Devices".to_string(), true),
+                ("Internal Drives".to_string(), false),
+                ("Remote".to_string(), true),
+            ],
+            "the hidden section still sits right after Devices and before Remote"
+        );
+
+        backend.set_internal_mountinfo(&format!(
+            concat!(
+                "1 0 0:37 /@ / rw,noatime - btrfs /dev/nvme1n1p2 rw,ssd\n",
+                "2 1 0:37 /@home /home rw,noatime - btrfs /dev/nvme1n1p2 rw,ssd\n",
+                "3 1 0:53 / {wd} rw,noatime - btrfs /dev/sda1 rw,ssd\n",
+                "4 1 0:51 / {nvme} rw,noatime - btrfs /dev/nvme0n1p1 rw,ssd\n",
+                "5 1 0:52 / {root}/tmp rw - tmpfs tmpfs rw\n",
+            ),
+            wd = wd_blue.display(),
+            nvme = nvme_storage.display(),
+            root = scratch.root.display(),
+        ));
+        backend.add_drive_label("/dev/sda1", "WD-Blue-SSD");
+        volumes.refresh_for_tests();
+
+        assert!(sidebar.internal_section_visible_for_tests());
+        assert!(
+            sidebar
+                .section_order_for_tests()
+                .iter()
+                .all(|(_, visible)| *visible)
+        );
+
+        let rows = sidebar.internal_rows_for_tests();
+        assert_eq!(
+            rows.iter()
+                .map(|(name, _, _)| name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["nvme-storage", "WD-Blue-SSD"],
+            "folder name without a label, label with one, sorted by path"
+        );
+        assert_eq!(
+            rows[1].1,
+            format!("{} — /dev/sda1", wd_blue.display()),
+            "the tooltip is the mount path and the device"
+        );
+        assert!(
+            rows.iter().all(|(_, _, bar)| *bar),
+            "usage bars come through the shared queue"
+        );
+
+        // The mounted menu, minus the two removal actions an fstab mount
+        // cannot offer without root.
+        let labels = |buttons: &[gtk::Button]| -> Vec<String> {
+            buttons
+                .iter()
+                .filter_map(|button| {
+                    button
+                        .child()
+                        .and_then(|child| child.downcast::<gtk::Label>().ok())
+                        .map(|label| label.text().to_string())
+                })
+                .collect()
+        };
+        let buttons = sidebar
+            .build_internal_menu_for_tests(0)
+            .expect("the first internal row has a menu");
+        assert_eq!(
+            labels(&buttons),
+            vec!["Open".to_string(), "Open in new tab".to_string()],
+            "no Unmount and no Eject"
+        );
+
+        // Clicking Open navigates the window into the drive.
+        buttons.first().expect("Open").emit_clicked();
+        assert!(
+            process.recent_dirs().contains(&nvme_storage),
+            "the Open item ran nav.go for the mount path"
+        );
+
+        // The mount leaves the table: the list empties and the whole section
+        // hides again, exactly like a machine that never had such mounts.
+        backend.set_internal_mountinfo("1 0 0:37 /@ / rw,noatime - btrfs /dev/nvme1n1p2 rw,ssd\n");
+        volumes.refresh_for_tests();
+        assert!(sidebar.internal_rows_for_tests().is_empty());
+        assert!(!sidebar.internal_section_visible_for_tests());
+    }
+
+    #[test]
     fn visible_rows_rank_exact_then_prefix_then_substring_then_fuzzy() {
         let scratch = search_scratch("ranked");
         let root = scratch.root.join("tree");

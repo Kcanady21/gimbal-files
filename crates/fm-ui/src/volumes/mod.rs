@@ -12,7 +12,7 @@ mod gio_backend;
 pub(crate) mod tests;
 
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::Duration;
@@ -22,9 +22,9 @@ use gtk::glib;
 use gtk::prelude::*;
 
 use fm_core::volumes::{
-    DeviceEntry, DriveAction, Inventory, MountFailureKind, MountRefusal, MountStatus, MountTarget,
-    RawSnapshot, ReconcileReport, RemovalFailureKind, RemovalRefusal, RemovalStatus, RemovalTarget,
-    VolumeId,
+    DeviceEntry, DriveAction, InternalDrive, Inventory, MountFailureKind, MountRefusal,
+    MountStatus, MountTarget, RawSnapshot, ReconcileReport, RemovalFailureKind, RemovalRefusal,
+    RemovalStatus, RemovalTarget, VolumeId, internal_drives,
 };
 use fm_core::workspace::WindowId;
 
@@ -92,12 +92,52 @@ pub trait Backend {
         done: MountDone,
     ) -> Result<Option<gio::MountOperation>, glib::Error>;
     fn usage(&self, root: &Path, cancellable: &gio::Cancellable, done: UsageDone);
+    /// `/proc/self/mountinfo` text for the Internal Drives section.
+    /// Production reads the real file; a test backend hands in text instead,
+    /// so no test depends on the machine's own disks. `None` means the
+    /// section treats the machine as having no fstab mounts at all.
+    fn mountinfo(&self) -> Option<String> {
+        std::fs::read_to_string("/proc/self/mountinfo").ok()
+    }
+    /// The `/dev/disk/by-label` names mapped to the canonical `/dev/…` node
+    /// each symlink resolves to. Reading symlinks is the backend's job; the
+    /// naming decision stays in the pure fm-core filter.
+    fn drive_labels(&self) -> BTreeMap<String, String> {
+        drive_labels_from(Path::new("/dev/disk/by-label"))
+    }
     /// Which volume service is present. No desktop is assumed to have the
     /// same one.
     fn note(&self) -> String;
     fn monitor(&self) -> Option<gio::VolumeMonitor> {
         None
     }
+}
+
+/// Reads one by-label directory: each entry's name is a filesystem label and
+/// the symlink target canonicalizes to the `/dev/…` node it labels. A link
+/// that resolves nowhere is no label. When two labels name one device, the
+/// alphabetically first label wins, so the map does not depend on the
+/// directory's iteration order.
+fn drive_labels_from(directory: &Path) -> BTreeMap<String, String> {
+    let mut found: Vec<(String, String)> = Vec::new();
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return BTreeMap::new();
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.trim().is_empty() {
+            continue;
+        }
+        if let Ok(device) = std::fs::canonicalize(entry.path()) {
+            found.push((name, device.to_string_lossy().into_owned()));
+        }
+    }
+    found.sort();
+    let mut labels = BTreeMap::new();
+    for (name, device) in found {
+        labels.entry(device).or_insert(name);
+    }
+    labels
 }
 
 /// A backend for headless tests and for a process that never starts the volume
@@ -155,6 +195,14 @@ impl Backend for HeadlessBackend {
             gio::IOErrorEnum::NotSupported,
             "no volume backend is available",
         )));
+    }
+
+    fn mountinfo(&self) -> Option<String> {
+        None
+    }
+
+    fn drive_labels(&self) -> BTreeMap<String, String> {
+        BTreeMap::new()
     }
 
     fn note(&self) -> String {
@@ -228,19 +276,28 @@ impl UsageValue {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct UsageKey {
     root: PathBuf,
-    /// `Some(id, incarnation)` ties a volume's bar to the exact enumerated
-    /// object; `None` is the main/root row.
-    owner: Option<(VolumeId, u64)>,
+    owner: UsageOwner,
     /// The exact live mount object. A same-root remount has a new serial and
     /// therefore a new key, never the previous mount's cached capacity.
     mount_object: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum UsageOwner {
+    /// The main/root row.
+    Main,
+    /// Ties a volume's bar to the exact enumerated object.
+    Entry(VolumeId, u64),
+    /// An Internal Drives row. Its identity is its mount path: an fstab
+    /// mount has no backend object serial.
+    Internal,
 }
 
 impl UsageKey {
     fn main(mount_object: Option<u64>) -> Self {
         Self {
             root: PathBuf::from("/"),
-            owner: None,
+            owner: UsageOwner::Main,
             mount_object,
         }
     }
@@ -249,9 +306,17 @@ impl UsageKey {
         let root = entry.state().root()?.to_path_buf();
         Some(Self {
             root,
-            owner: Some((entry.id().clone(), entry.incarnation())),
+            owner: UsageOwner::Entry(entry.id().clone(), entry.incarnation()),
             mount_object: entry.mount_object(),
         })
+    }
+
+    fn internal(mount_path: &Path) -> Self {
+        Self {
+            root: mount_path.to_path_buf(),
+            owner: UsageOwner::Internal,
+            mount_object: None,
+        }
     }
 }
 
@@ -380,6 +445,10 @@ pub struct Volumes {
     monitor: RefCell<Option<gio::VolumeMonitor>>,
     refresh_source: RefCell<Option<glib::SourceId>>,
     usage_refresh: RefCell<HashSet<UsageKey>>,
+    /// The fstab-mounted disks the Devices section does not show, parsed
+    /// from the backend's `mountinfo` text.
+    internal: RefCell<Vec<InternalDrive>>,
+    internal_poll: RefCell<Option<glib::SourceId>>,
 }
 
 impl Volumes {
@@ -403,6 +472,8 @@ impl Volumes {
             monitor: RefCell::new(None),
             refresh_source: RefCell::new(None),
             usage_refresh: RefCell::new(HashSet::new()),
+            internal: RefCell::new(Vec::new()),
+            internal_poll: RefCell::new(None),
         })
     }
 
@@ -413,6 +484,7 @@ impl Volumes {
         let volumes = Self::new(backend);
         volumes.start_monitor();
         volumes.refresh();
+        volumes.start_internal_poll();
         log!("volumes", "{}", volumes.backend_note());
         volumes
     }
@@ -515,6 +587,75 @@ impl Volumes {
         self.usage_value(&key)
     }
 
+    /// The fstab-mounted disks the Devices section does not show. A cloned
+    /// list, like `entries`.
+    pub fn internal_drives(&self) -> Vec<InternalDrive> {
+        self.internal.borrow().clone()
+    }
+
+    /// An Internal Drives row's usage, from the same deduplicated queue as
+    /// the Devices rows, keyed by mount path.
+    pub fn internal_usage(&self, mount_path: &Path) -> UsageValue {
+        self.usage_value(&UsageKey::internal(mount_path))
+    }
+
+    /// Re-read the backend's `mountinfo` text and rebuild the internal list.
+    /// `true` when the parsed list changed. The read is a few kilobytes, and
+    /// rows are only rebuilt on a real change, the same signature approach
+    /// as the sidebar's `sync_devices`.
+    fn poll_internal(&self) -> bool {
+        let drives = match self.backend.mountinfo() {
+            Some(text) => {
+                let devices_roots: Vec<PathBuf> = self
+                    .inventory
+                    .borrow()
+                    .entries()
+                    .iter()
+                    .filter_map(|entry| entry.state().root().map(Path::to_path_buf))
+                    .collect();
+                internal_drives(&text, &devices_roots, &self.backend.drive_labels())
+            }
+            None => Vec::new(),
+        };
+        let changed = drives != *self.internal.borrow();
+        if changed {
+            let paths: Vec<String> = drives
+                .iter()
+                .map(|drive| drive.mount_path.display().to_string())
+                .collect();
+            log!(
+                "volumes",
+                "internal-drives: {} shown ({})",
+                drives.len(),
+                paths.join(", ")
+            );
+            *self.internal.borrow_mut() = drives;
+        }
+        changed
+    }
+
+    /// The slow timer between monitor events. A `mountinfo` poll catches a
+    /// mount the desktop's volume service never announced — a root remount,
+    /// a disk that appeared after boot — with no new dependency.
+    fn start_internal_poll(self: &Rc<Self>) {
+        let weak = Rc::downgrade(self);
+        let source = glib::timeout_add_local(
+            Duration::from_secs(fm_core::volumes::MOUNTINFO_POLL_SECS),
+            move || {
+                let Some(volumes) = weak.upgrade() else {
+                    return glib::ControlFlow::Break;
+                };
+                if volumes.poll_internal() {
+                    // Queue the new rows' usage and let that path notify the
+                    // sidebars; an unchanged list never wakes them.
+                    volumes.reconcile_usage(false);
+                }
+                glib::ControlFlow::Continue
+            },
+        );
+        *self.internal_poll.borrow_mut() = Some(source);
+    }
+
     pub fn main_usage(&self) -> UsageValue {
         let key = self.main_usage_key();
         self.usage_value(&key)
@@ -614,7 +755,12 @@ impl Volumes {
         if *self.main_label.borrow() != main {
             *self.main_label.borrow_mut() = main;
         }
-        self.inventory.borrow_mut().reconcile(&snapshot)
+        let mut report = self.inventory.borrow_mut().reconcile(&snapshot);
+        // Re-read the internal mounts against the fresh inventory: a mount
+        // Devices has started to show retires its Internal Drives row, and
+        // the volume service's own change is what triggers this poll.
+        report.changed |= self.poll_internal();
+        report
     }
 
     fn after_inventory(self: &Rc<Self>, report: &ReconcileReport) {
@@ -1244,6 +1390,9 @@ impl Volumes {
         if let Some(source) = self.refresh_source.borrow_mut().take() {
             source.remove();
         }
+        if let Some(source) = self.internal_poll.borrow_mut().take() {
+            source.remove();
+        }
         let requests: Vec<Rc<MountRequest>> = self.requests.borrow().values().cloned().collect();
         for request in requests {
             request.cancellable.cancel();
@@ -1274,6 +1423,7 @@ impl Volumes {
         usage.in_flight.clear();
         usage.active = 0;
         self.usage_refresh.borrow_mut().clear();
+        self.internal.borrow_mut().clear();
     }
 
     // -----------------------------------------------------------------
@@ -1285,12 +1435,16 @@ impl Volumes {
             let inventory = self.inventory.borrow();
             (inventory.entries().to_vec(), inventory.root_mount_object())
         };
+        let internal = self.internal.borrow().clone();
         let mut live = HashSet::new();
         live.insert(UsageKey::main(root_mount_object));
         for entry in &entries {
             if let Some(key) = UsageKey::entry(entry) {
                 live.insert(key);
             }
+        }
+        for drive in &internal {
+            live.insert(UsageKey::internal(&drive.mount_path));
         }
 
         // Cancel queries for roots that no longer match a live entry/root.
@@ -1488,12 +1642,21 @@ impl Volumes {
     fn usage_key_live(&self, key: &UsageKey) -> bool {
         let inventory = self.inventory.borrow();
         match &key.owner {
-            None => key.root == Path::new("/") && key.mount_object == inventory.root_mount_object(),
-            Some((id, incarnation)) => inventory.entry(id).is_some_and(|entry| {
+            UsageOwner::Main => {
+                key.root == Path::new("/") && key.mount_object == inventory.root_mount_object()
+            }
+            UsageOwner::Entry(id, incarnation) => inventory.entry(id).is_some_and(|entry| {
                 entry.incarnation() == *incarnation
                     && entry.state().root() == Some(key.root.as_path())
                     && entry.mount_object() == key.mount_object
             }),
+            UsageOwner::Internal => {
+                drop(inventory);
+                self.internal
+                    .borrow()
+                    .iter()
+                    .any(|drive| drive.mount_path == key.root)
+            }
         }
     }
 

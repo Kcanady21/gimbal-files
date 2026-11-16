@@ -3,6 +3,7 @@
 //! opened, mounted, unmounted or ejected.
 
 use std::cell::{Cell, RefCell};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
@@ -38,6 +39,11 @@ struct FakeInner {
     pending_usage: Vec<(PathBuf, gio::Cancellable, UsageDone)>,
     block_usage: bool,
     usage_result: Option<Result<(u64, u64), String>>,
+    /// `/proc/self/mountinfo` text the service should parse. `None` (the
+    /// default) means no fstab mounts at all: no unit test reads this
+    /// machine's real table.
+    internal_mountinfo: Option<String>,
+    internal_labels: BTreeMap<String, String>,
 }
 
 pub(crate) struct FakeBackend {
@@ -201,6 +207,20 @@ impl FakeBackend {
 
     pub(crate) fn block_usage(&self, blocked: bool) {
         self.inner.borrow_mut().block_usage = blocked;
+    }
+
+    /// The `mountinfo` text the next refresh parses. Injected exactly like
+    /// the volume/mount lists, so no test depends on this machine's disks.
+    pub(crate) fn set_internal_mountinfo(&self, text: &str) {
+        self.inner.borrow_mut().internal_mountinfo = Some(text.to_string());
+    }
+
+    /// One `/dev/disk/by-label` entry the service may use as a row name.
+    pub(crate) fn add_drive_label(&self, device: &str, label: &str) {
+        self.inner
+            .borrow_mut()
+            .internal_labels
+            .insert(device.to_string(), label.to_string());
     }
 
     pub(crate) fn mount_calls(&self) -> usize {
@@ -385,6 +405,14 @@ impl Backend for FakeBackend {
             .map_err(|message| glib::Error::new(gio::IOErrorEnum::Failed, &message));
         drop(inner);
         done(result);
+    }
+
+    fn mountinfo(&self) -> Option<String> {
+        self.inner.borrow().internal_mountinfo.clone()
+    }
+
+    fn drive_labels(&self) -> BTreeMap<String, String> {
+        self.inner.borrow().internal_labels.clone()
     }
 
     fn note(&self) -> String {
@@ -1941,4 +1969,102 @@ fn registry_mount_accepts_pending_and_duplicate_across_windows_calls_once() {
     assert_eq!(backend.mount_calls(), 1);
 
     let _ = std::fs::remove_dir_all(root);
+}
+
+// -------------------------------------------------------------------------
+// Internal drives: injected mountinfo, the shared queue, and the poll
+// -------------------------------------------------------------------------
+
+/// A table in the shape of Kyle's machine: root disk with a `/home`
+/// subvolume, the two fstab data disks, and the tmpfs the kernel always has.
+const INTERNAL_TABLE: &str = concat!(
+    "1 0 0:37 /@ / rw,noatime shared:1 - btrfs /dev/nvme1n1p2 rw,ssd\n",
+    "2 1 0:37 /@home /home rw,noatime shared:2 - btrfs /dev/nvme1n1p2 rw,ssd\n",
+    "3 1 0:51 / /mnt/nvme-storage rw,noatime shared:3 - btrfs /dev/nvme0n1p1 rw,ssd\n",
+    "4 1 0:53 / /mnt/wd-blue rw,noatime shared:4 - btrfs /dev/sda1 rw,ssd\n",
+);
+
+#[test]
+fn injected_mountinfo_yields_internal_rows_shared_across_windows() {
+    let backend = Rc::new(FakeBackend::default());
+    backend.set_internal_mountinfo(INTERNAL_TABLE);
+    backend.add_drive_label("/dev/sda1", "WD-Blue-SSD");
+    let volumes = Volumes::new(backend.clone());
+    backend.block_usage(true);
+    volumes.refresh_for_tests();
+
+    let drives = volumes.internal_drives();
+    let paths: Vec<String> = drives
+        .iter()
+        .map(|drive| drive.mount_path.display().to_string())
+        .collect();
+    assert_eq!(paths, vec!["/mnt/nvme-storage", "/mnt/wd-blue"]);
+    assert_eq!(drives[1].name(), "WD-Blue-SSD");
+    assert_eq!(drives[0].name(), "nvme-storage");
+
+    // One deduplicated usage query per mount, like the Devices rows.
+    assert_eq!(backend.usage_calls_for(Path::new("/mnt/wd-blue")), 1);
+    volumes.refresh_for_tests();
+    volumes.refresh_for_tests();
+    assert_eq!(
+        backend.usage_calls_for(Path::new("/mnt/wd-blue")),
+        1,
+        "repeated refreshes share the one queue entry"
+    );
+    assert_eq!(
+        volumes.internal_usage(Path::new("/mnt/wd-blue")),
+        UsageValue::Pending
+    );
+    backend.complete_usage(Path::new("/mnt/wd-blue"), Ok((2_000_000, 500_000)));
+    assert_eq!(
+        volumes.internal_usage(Path::new("/mnt/wd-blue")).ready(),
+        Some((2_000_000, 500_000))
+    );
+}
+
+#[test]
+fn a_devices_root_retires_the_internal_row_and_a_poll_rereads_the_text() {
+    let backend = Rc::new(FakeBackend::default());
+    backend.set_internal_mountinfo(INTERNAL_TABLE);
+    let volumes = Volumes::new(backend.clone());
+    volumes.refresh_for_tests();
+    assert_eq!(volumes.internal_drives().len(), 2);
+
+    // The desktop now shows the wd-blue disk in Devices at the same path:
+    // the mount stays in Devices and never appears in both sections.
+    let object = backend.add_volume("/dev/sda1", "WD Blue");
+    backend.set_mounted(object, "/mnt/wd-blue");
+    volumes.refresh_for_tests();
+    let paths: Vec<String> = volumes
+        .internal_drives()
+        .iter()
+        .map(|drive| drive.mount_path.display().to_string())
+        .collect();
+    assert_eq!(paths, vec!["/mnt/nvme-storage"]);
+
+    // The slow poll re-reads the backend's text: a disk that left the table
+    // loses its row, and with it its usage record.
+    backend.set_internal_mountinfo("");
+    assert!(volumes.poll_internal());
+    assert!(volumes.internal_drives().is_empty());
+    volumes.reconcile_usage(false);
+    assert_eq!(
+        volumes.internal_usage(Path::new("/mnt/nvme-storage")),
+        UsageValue::Unknown
+    );
+    assert!(
+        !volumes.poll_internal(),
+        "an unchanged table is not a change"
+    );
+}
+
+#[test]
+fn a_service_without_a_mountinfo_source_never_shows_internal_rows() {
+    // The HeadlessBackend and a fresh FakeBackend: no injected text, and the
+    // real /proc is never opened. No machine's disks leak into a test.
+    let backend = Rc::new(FakeBackend::default());
+    let volumes = Volumes::new(backend.clone());
+    volumes.refresh_for_tests();
+    assert!(volumes.internal_drives().is_empty());
+    assert_eq!(backend.usage_calls(), 1, "only the main row queries usage");
 }

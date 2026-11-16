@@ -225,6 +225,11 @@ touches your configuration or session.
 
 - Configuration: `$XDG_CONFIG_HOME/gimbal-files/config.toml`, or
   `~/.config/gimbal-files/config.toml`.
+- Internal drives: data disks that `/etc/fstab` mounts at boot (such as
+  `/mnt` mounts) get a collapsible **Internal Drives** sidebar section,
+  because the desktop's volume service hides them; their expand/collapse
+  state saves as `[sections] internal`, and the section stays hidden when
+  the machine has no such mount.
 - Hidden files: the **Show hidden files** switch (Ctrl+H) is one setting for
   every window, tab and split tile, saved as `[view] show_hidden` in your own
   file; a system defaults file can supply it too.

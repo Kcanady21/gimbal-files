@@ -6,7 +6,7 @@
 use super::{ArgKind, ArgSpec, CommandSpec, ContextSource, Effect, Presence};
 
 const SIDES: &[&str] = &["left", "right"];
-const SECTIONS: &[&str] = &["recent", "devices", "remote"];
+const SECTIONS: &[&str] = &["recent", "devices", "internal", "remote"];
 const SORT_BY: &[&str] = &["name", "modified", "size", "type"];
 const SORT_ORDER: &[&str] = &["ascending", "descending"];
 const SORT_SCOPE: &[&str] = &["folder", "global"];

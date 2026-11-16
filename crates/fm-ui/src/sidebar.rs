@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! The left sidebar: pinned folders with the spike's `PinnedRowLayout`, recent
-//! directories, mounted devices with drive bars, Remote and the main drive.
+//! directories, mounted devices with drive bars, the fstab-mounted Internal
+//! Drives, Remote and the main drive.
 //!
 //! Recent directories are one shared session list, rendered by every window.
 
@@ -16,7 +17,7 @@ use gtk::subclass::prelude::*;
 use fm_core::command::{Caller, Invocation};
 use fm_core::config::{self, Section, SectionState};
 use fm_core::volumes::{
-    DeviceEntry, DeviceState, DriveAction, MountStatus, RemovalStatus, VolumeId,
+    DeviceEntry, DeviceState, DriveAction, InternalDrive, MountStatus, RemovalStatus, VolumeId,
 };
 use fm_core::workspace::WindowId;
 
@@ -137,9 +138,15 @@ pub struct Sidebar {
     selection: Rc<RefCell<SidebarSelection>>,
     recent_content: gtk::Box,
     devices_content: gtk::Box,
+    internal_content: gtk::Box,
+    /// The whole `Internal Drives` section view. It is hidden while the
+    /// parsed list is empty, so a machine without such mounts sees no change.
+    internal_view: gtk::Box,
     revealers: RefCell<Vec<(Section, gtk::Revealer)>>,
     devices: RefCell<Vec<(VolumeId, Rc<DriveRow>)>>,
     device_signature: RefCell<Vec<String>>,
+    internal_rows: RefCell<Vec<(PathBuf, Rc<DriveRow>)>>,
+    internal_signature: RefCell<Vec<String>>,
     main: Rc<DriveRow>,
     recent: RefCell<Vec<PathBuf>>,
     process: Weak<Process>,
@@ -173,21 +180,29 @@ impl Sidebar {
         recent_content.add_css_class("gl-section-content");
         let devices_content = gtk::Box::new(gtk::Orientation::Vertical, 0);
         devices_content.add_css_class("gl-section-content");
+        let internal_content = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        internal_content.add_css_class("gl-section-content");
         let remote_content = gtk::Box::new(gtk::Orientation::Vertical, 0);
         remote_content.add_css_class("gl-section-content");
         remote_content.append(&dir_row("No remotes"));
 
         let mut revealers = Vec::new();
+        let mut internal_view: Option<gtk::Box> = None;
         for (name, section, content) in [
             ("Recent Directories", Section::Recent, &recent_content),
             ("Devices", Section::Devices, &devices_content),
+            ("Internal Drives", Section::Internal, &internal_content),
             ("Remote", Section::Remote, &remote_content),
         ] {
             let expanded = sections.get(section) == SectionState::Expanded;
             let (view, revealer) = section_view(name, section, content, expanded, process, window);
+            if section == Section::Internal {
+                internal_view = Some(view.clone());
+            }
             revealers.push((section, revealer));
             body.append(&view);
         }
+        let internal_view = internal_view.expect("the loop built the Internal Drives section");
 
         scroll.set_child(Some(&body));
         root.append(&scroll);
@@ -216,9 +231,13 @@ impl Sidebar {
             selection,
             recent_content,
             devices_content,
+            internal_content,
+            internal_view,
             revealers: RefCell::new(revealers),
             devices: RefCell::new(Vec::new()),
             device_signature: RefCell::new(Vec::new()),
+            internal_rows: RefCell::new(Vec::new()),
+            internal_signature: RefCell::new(Vec::new()),
             main,
             recent: RefCell::new(recent),
             process: Rc::downgrade(process),
@@ -366,6 +385,9 @@ impl Sidebar {
         self.pinned.set_scale(scale);
         self.main.set_scale(scale);
         for (_, row) in self.devices.borrow().iter() {
+            row.set_scale(scale);
+        }
+        for (_, row) in self.internal_rows.borrow().iter() {
             row.set_scale(scale);
         }
     }
@@ -551,6 +573,7 @@ impl Sidebar {
     fn refresh_from_volumes(&self) {
         self.refresh_main();
         self.sync_devices();
+        self.sync_internal();
     }
 
     fn sync_devices(&self) {
@@ -722,6 +745,84 @@ impl Sidebar {
         self.apply_usage(&self.main, &volumes.main_usage());
     }
 
+    /// The Internal Drives section follows the list the volume service
+    /// rebuilds from `/proc/self/mountinfo` on every monitor change and on
+    /// its slow timer. Rows are rebuilt only when that list changes — the
+    /// same signature approach as `sync_devices` — and the whole section is
+    /// hidden while the list is empty.
+    fn sync_internal(&self) {
+        let Some(process) = self.process.upgrade() else {
+            return;
+        };
+        let volumes = process.volumes();
+        let drives = volumes.internal_drives();
+        let signature: Vec<String> = drives
+            .iter()
+            .map(|drive| {
+                format!(
+                    "{}:{}:{}",
+                    drive.device,
+                    drive.mount_path.display(),
+                    drive.name()
+                )
+            })
+            .collect();
+
+        if signature != *self.internal_signature.borrow() {
+            clear_children(&self.internal_content);
+            let mut rows = Vec::with_capacity(drives.len());
+            for drive in &drives {
+                let row = self.build_internal_row(&process, drive);
+                self.internal_content.append(&row.root);
+                rows.push((drive.mount_path.clone(), row));
+            }
+            *self.internal_rows.borrow_mut() = rows;
+            *self.internal_signature.borrow_mut() = signature;
+        }
+        self.internal_view.set_visible(!drives.is_empty());
+
+        // Capacity arrives after the row; update the bars in place, as with
+        // Devices, so focus and an open menu survive an unrelated result.
+        let rows = self.internal_rows.borrow().clone();
+        for (mount_path, row) in rows {
+            row.set_name(&drive_name(&drives, &mount_path));
+            self.apply_usage(&row, &volumes.internal_usage(&mount_path));
+        }
+    }
+
+    /// One Internal Drives row, built like a mounted Devices row: name, bar,
+    /// click to open, drop target and the mounted menu — without Unmount or
+    /// Eject, because an fstab mount needs root to unmount and Gimbal never
+    /// offers that.
+    fn build_internal_row(&self, process: &Rc<Process>, drive: &InternalDrive) -> Rc<DriveRow> {
+        let row = DriveRow::new(&drive.name(), false, self.scale.get());
+        row.root.set_tooltip_text(Some(&drive.tooltip()));
+        attach_click(
+            &row.root,
+            &self.process,
+            self.window,
+            drive.mount_path.clone(),
+            Process::nav_go_path,
+        );
+        let target = drive.mount_path.clone();
+        dnd::attach_folder_target(
+            &row.root,
+            self.process.clone(),
+            self.window,
+            Rc::new(move || Some(target.clone())),
+            None,
+            None,
+        );
+        attach_internal_menu(
+            &row,
+            Rc::downgrade(process),
+            self.window,
+            drive.name(),
+            drive.mount_path.clone(),
+        );
+        row
+    }
+
     #[cfg(test)]
     pub(crate) fn device_ids_for_tests(&self) -> Vec<String> {
         self.devices
@@ -754,6 +855,68 @@ impl Sidebar {
             self.main.name.text().to_string(),
             self.main.status.text().to_string(),
             self.main.bar.get_visible(),
+        )
+    }
+
+    /// (name, tooltip, usage-bar-visible) for every Internal Drives row.
+    #[cfg(test)]
+    pub(crate) fn internal_rows_for_tests(&self) -> Vec<(String, String, bool)> {
+        self.internal_rows
+            .borrow()
+            .iter()
+            .map(|(_, row)| {
+                (
+                    row.name.text().to_string(),
+                    row.root
+                        .tooltip_text()
+                        .map(|text| text.to_string())
+                        .unwrap_or_default(),
+                    row.bar.get_visible(),
+                )
+            })
+            .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn internal_section_visible_for_tests(&self) -> bool {
+        self.internal_view.get_visible()
+    }
+
+    /// (pill title, section visible) in sidebar order, for the layout check.
+    /// A pre-order walk, because the scrolled window wraps the body in a
+    /// viewport the caller should not have to know about.
+    #[cfg(test)]
+    pub(crate) fn section_order_for_tests(&self) -> Vec<(String, bool)> {
+        fn walk(widget: &gtk::Widget, found: &mut Vec<(String, bool)>) {
+            if widget.has_css_class("gl-section") {
+                let title = widget
+                    .first_child()
+                    .and_then(|pill| pill.downcast::<gtk::Button>().ok())
+                    .and_then(|pill| pill.child())
+                    .and_then(|label| label.downcast::<gtk::Label>().ok())
+                    .map(|label| label.text().to_string())
+                    .unwrap_or_default();
+                found.push((title, widget.get_visible()));
+                return;
+            }
+            let mut child = widget.first_child();
+            while let Some(section) = child {
+                walk(&section, found);
+                child = section.next_sibling();
+            }
+        }
+        let mut found = Vec::new();
+        walk(self.root.upcast_ref(), &mut found);
+        found
+    }
+
+    #[cfg(test)]
+    pub(crate) fn build_internal_menu_for_tests(&self, index: usize) -> Option<Vec<gtk::Button>> {
+        let process = self.process.upgrade()?;
+        let drive = process.volumes().internal_drives().into_iter().nth(index)?;
+        Some(
+            build_internal_drive_menu(&self.process, self.window, &drive.name(), &drive.mount_path)
+                .1,
         )
     }
 
@@ -1052,49 +1215,7 @@ fn build_mounted_device_menu(
     }
 
     // Keep the existing row actions in place ahead of the new drive actions.
-    let open = menu_action("Open", &format!("Open {name}"));
-    {
-        let popover_for_button = popover.clone();
-        let weak = Rc::downgrade(&process);
-        let folder = root.to_path_buf();
-        open.connect_clicked(move |_| {
-            popover_for_button.popdown();
-            if let Some(process) = weak.upgrade() {
-                process.dispatch_for_window(
-                    window,
-                    Caller::Ui,
-                    Invocation::new(
-                        "nav.go",
-                        vec![("path".to_string(), folder.display().to_string())],
-                    ),
-                );
-            }
-        });
-    }
-    menu.append(&open);
-    buttons.push(open);
-
-    let new_tab = menu_action("Open in new tab", &format!("Open {name} in a new tab"));
-    {
-        let popover_for_button = popover.clone();
-        let weak = Rc::downgrade(&process);
-        let folder = root.to_path_buf();
-        new_tab.connect_clicked(move |_| {
-            popover_for_button.popdown();
-            if let Some(process) = weak.upgrade() {
-                process.dispatch_for_window(
-                    window,
-                    Caller::Ui,
-                    Invocation::new(
-                        "tab.new",
-                        vec![("path".to_string(), folder.display().to_string())],
-                    ),
-                );
-            }
-        });
-    }
-    menu.append(&new_tab);
-    buttons.push(new_tab);
+    append_open_actions(&menu, &popover, &process, window, name, root, &mut buttons);
 
     let Some(entry) = volumes.entry(id.as_str()) else {
         menu.append(&menu_note("That volume is no longer present."));
@@ -1133,6 +1254,109 @@ fn build_mounted_device_menu(
             "This desktop does not offer to unmount or eject this drive.",
         ));
     }
+    popover.set_child(Some(&menu));
+    (popover, buttons)
+}
+
+/// The two actions every mounted row offers, shared so a Devices row and an
+/// Internal Drives row cannot drift apart.
+fn append_open_actions(
+    menu: &gtk::Box,
+    popover: &gtk::Popover,
+    process: &Rc<Process>,
+    window: WindowId,
+    name: &str,
+    root: &Path,
+    buttons: &mut Vec<gtk::Button>,
+) {
+    let open = menu_action("Open", &format!("Open {name}"));
+    {
+        let popover_for_button = popover.clone();
+        let weak = Rc::downgrade(process);
+        let folder = root.to_path_buf();
+        open.connect_clicked(move |_| {
+            popover_for_button.popdown();
+            if let Some(process) = weak.upgrade() {
+                process.dispatch_for_window(
+                    window,
+                    Caller::Ui,
+                    Invocation::new(
+                        "nav.go",
+                        vec![("path".to_string(), folder.display().to_string())],
+                    ),
+                );
+            }
+        });
+    }
+    menu.append(&open);
+    buttons.push(open);
+
+    let new_tab = menu_action("Open in new tab", &format!("Open {name} in a new tab"));
+    {
+        let popover_for_button = popover.clone();
+        let weak = Rc::downgrade(process);
+        let folder = root.to_path_buf();
+        new_tab.connect_clicked(move |_| {
+            popover_for_button.popdown();
+            if let Some(process) = weak.upgrade() {
+                process.dispatch_for_window(
+                    window,
+                    Caller::Ui,
+                    Invocation::new(
+                        "tab.new",
+                        vec![("path".to_string(), folder.display().to_string())],
+                    ),
+                );
+            }
+        });
+    }
+    menu.append(&new_tab);
+    buttons.push(new_tab);
+}
+
+/// An Internal Drives row's right-click gesture.
+fn attach_internal_menu(
+    row: &Rc<DriveRow>,
+    process: Weak<Process>,
+    window: WindowId,
+    name: String,
+    root: PathBuf,
+) {
+    let gesture = gtk::GestureClick::new();
+    gesture.set_button(3);
+    let weak_row = Rc::downgrade(row);
+    gesture.connect_pressed(move |_, _, x, y| {
+        let Some(row) = weak_row.upgrade() else {
+            return;
+        };
+        let (popover, _) = build_internal_drive_menu(&process, window, &name, &root);
+        popover.set_parent(&row.root);
+        popover.set_pointing_to(Some(&gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+        popover.connect_closed(|popover| popover.unparent());
+        crate::popup::show(&popover);
+    });
+    row.root.add_controller(gesture);
+}
+
+/// The context menu for one fstab-mounted drive: the two open actions and
+/// nothing else. Unmount and Eject are deliberately absent — an fstab mount
+/// needs root to unmount, and Gimbal does not offer it.
+fn build_internal_drive_menu(
+    process: &Weak<Process>,
+    window: WindowId,
+    name: &str,
+    root: &Path,
+) -> (gtk::Popover, Vec<gtk::Button>) {
+    let popover = gtk::Popover::new();
+    popover.add_css_class("gl-menu");
+    let menu = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    let mut buttons = Vec::new();
+    let Some(process) = process.upgrade() else {
+        menu.append(&menu_note("Gimbal is closing."));
+        popover.set_child(Some(&menu));
+        return (popover, buttons);
+    };
+    append_open_actions(&menu, &popover, &process, window, name, root, &mut buttons);
     popover.set_child(Some(&menu));
     (popover, buttons)
 }
@@ -1402,6 +1626,16 @@ fn recent_label(path: &Path, home: &Path) -> String {
     } else {
         path_label(path)
     }
+}
+
+/// The name for one mount path in the current Internal Drives list, for the
+/// in-place update pass. It is present unless a rebuild raced the borrow.
+fn drive_name(drives: &[InternalDrive], mount_path: &Path) -> String {
+    drives
+        .iter()
+        .find(|drive| drive.mount_path == mount_path)
+        .map(InternalDrive::name)
+        .unwrap_or_else(|| path_label(mount_path))
 }
 
 fn path_label(path: &Path) -> String {

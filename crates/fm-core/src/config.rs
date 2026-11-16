@@ -301,6 +301,7 @@ impl Side {
 pub enum Section {
     Recent,
     Devices,
+    Internal,
     Remote,
 }
 
@@ -309,6 +310,7 @@ impl Section {
         match value {
             "recent" => Some(Self::Recent),
             "devices" => Some(Self::Devices),
+            "internal" => Some(Self::Internal),
             "remote" => Some(Self::Remote),
             _ => None,
         }
@@ -318,6 +320,7 @@ impl Section {
         match self {
             Self::Recent => "recent",
             Self::Devices => "devices",
+            Self::Internal => "internal",
             Self::Remote => "remote",
         }
     }
@@ -354,11 +357,12 @@ impl SectionState {
     }
 }
 
-/// The three sections of the sidebar.
+/// The four sections of the sidebar.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Sections {
     pub recent: SectionState,
     pub devices: SectionState,
+    pub internal: SectionState,
     pub remote: SectionState,
 }
 
@@ -367,6 +371,7 @@ impl Default for Sections {
         Self {
             recent: SectionState::Expanded,
             devices: SectionState::Expanded,
+            internal: SectionState::Expanded,
             remote: SectionState::Expanded,
         }
     }
@@ -377,6 +382,7 @@ impl Sections {
         match section {
             Section::Recent => self.recent,
             Section::Devices => self.devices,
+            Section::Internal => self.internal,
             Section::Remote => self.remote,
         }
     }
@@ -385,6 +391,7 @@ impl Sections {
         match section {
             Section::Recent => self.recent = state,
             Section::Devices => self.devices = state,
+            Section::Internal => self.internal = state,
             Section::Remote => self.remote = state,
         }
     }
@@ -1191,7 +1198,7 @@ fn path_argument(value: &CommandValue) -> Option<PathBuf> {
 // -------------------------------------------------------------------------
 
 /// Which file a loader is reading. The defaults file may only contribute the
-/// three simple sections, and may never enable the automation socket.
+/// four simple sections, and may never enable the automation socket.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Layer {
     User,
@@ -1469,12 +1476,17 @@ impl Loader<'_> {
         };
 
         for (key, value) in table.iter() {
-            if !matches!(key, "recent" | "devices" | "remote") {
+            if !matches!(key, "recent" | "devices" | "internal" | "remote") {
                 self.unknown_entry(table, "sections", key, value);
             }
         }
 
-        for section in [Section::Recent, Section::Devices, Section::Remote] {
+        for section in [
+            Section::Recent,
+            Section::Devices,
+            Section::Internal,
+            Section::Remote,
+        ] {
             let key = section.as_str();
             if let Some(item) = table.get(key)
                 && let Some(state) = self.read_section_state(item, &join_key("sections", key))
@@ -2713,6 +2725,7 @@ mod tests {
             Sections {
                 recent: SectionState::Expanded,
                 devices: SectionState::Expanded,
+                internal: SectionState::Expanded,
                 remote: SectionState::Expanded
             }
         );
@@ -3124,6 +3137,7 @@ right = { collapsed = false, width = 648 }   # right
 [sections]
 recent = "expanded"
 devices = "expanded"    # devices
+internal = "expanded"
 remote = "expanded"
 "#;
         let path = temp.write("config.toml", original);
@@ -3146,6 +3160,66 @@ remote = "expanded"
         .unwrap();
         let expected = expected.replace("devices = \"expanded\"", "devices = \"collapsed\"");
         assert_eq!(fs::read_to_string(&path).unwrap(), expected);
+
+        file.apply(Change::SetSection {
+            section: Section::Internal,
+            state: SectionState::Collapsed,
+        })
+        .unwrap();
+        let expected = expected.replace("internal = \"expanded\"", "internal = \"collapsed\"");
+        assert_eq!(fs::read_to_string(&path).unwrap(), expected);
+    }
+
+    #[test]
+    fn the_internal_section_parses_writes_and_rejects_unknown_keys() {
+        let temp = TempDir::new("sections-internal");
+        let home = temp.path();
+
+        // Parse: the key loads, and it is the only one of the four collapsed.
+        let path = temp.write(
+            "config.toml",
+            "[sections]\nrecent = \"expanded\"\ninternal = \"collapsed\"\n",
+        );
+        let (mut file, problems) = ConfigFile::load_with(&path, home, &SpecialFolders::default());
+        assert!(problems.is_empty(), "{problems:#?}");
+        assert_eq!(file.config().sections.internal, SectionState::Collapsed);
+        assert_eq!(file.config().sections.devices, SectionState::Expanded);
+
+        // Write: toggling internal keeps the file's own keys and formatting.
+        file.apply(Change::SetSection {
+            section: Section::Internal,
+            state: SectionState::Expanded,
+        })
+        .unwrap();
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "[sections]\nrecent = \"expanded\"\ninternal = \"expanded\"\n"
+        );
+
+        // A toggle when no file has a [sections] table creates it, like the
+        // other sections do.
+        let plain = temp.write("plain.toml", "[look]\nscale = 1.0\n");
+        let (mut file, problems) = ConfigFile::load_with(&plain, home, &SpecialFolders::default());
+        assert!(problems.is_empty(), "{problems:#?}");
+        file.apply(Change::SetSection {
+            section: Section::Internal,
+            state: SectionState::Collapsed,
+        })
+        .unwrap();
+        let written = fs::read_to_string(&plain).unwrap();
+        assert!(written.contains("[sections]"), "{written}");
+        assert!(written.contains("internal = \"collapsed\""), "{written}");
+
+        // Unknown key: reported, kept in the file, changes nothing.
+        let odd = temp.write(
+            "odd.toml",
+            "[sections]\ninternal = \"collapsed\"\npinboard = \"expanded\"\n",
+        );
+        let (_file, problems) = ConfigFile::load_with(&odd, home, &SpecialFolders::default());
+        assert_eq!(problems.len(), 1, "{problems:#?}");
+        assert_eq!(problems[0].kind, ConfigProblemKind::UnknownKey);
+        assert_eq!(problems[0].key, "sections.pinboard");
+        assert_eq!(problems[0].line, 3);
     }
 
     #[test]
@@ -3552,6 +3626,18 @@ order = "ascending"
                 section: Section::Devices,
                 state: SectionState::Collapsed
             })
+        );
+        let internal_toggle = check(
+            "view.toggle-section",
+            &["view.toggle-section", "section=internal"],
+        );
+        assert_eq!(
+            change_for(&internal_toggle, &config, current_folder),
+            Some(Change::SetSection {
+                section: Section::Internal,
+                state: SectionState::Collapsed
+            }),
+            "the Internal Drives choice toggles from its default like the others"
         );
     }
 

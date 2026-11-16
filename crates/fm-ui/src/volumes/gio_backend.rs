@@ -6,6 +6,13 @@
 //! elsewhere). Nothing here talks to D-Bus directly, runs `/dev` lookups or
 //! shells out. Only a live volume object with a `unix-device` identifier and
 //! `can_mount` becomes a mount candidate.
+//!
+//! That is also why the Devices list cannot be the whole story: the monitor
+//! hides an fstab mount outside `/media`, `/run/media/$USER` or the home
+//! folder as system-internal (GLib's `g_unix_mount_is_system_internal` and
+//! `g_unix_mount_guess_should_display` rule). Those disks are real user
+//! storage, so the Internal Drives section reads the kernel's table instead —
+//! the backend's `mountinfo` and `drive_labels` above.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
