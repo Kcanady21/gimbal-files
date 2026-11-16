@@ -219,3 +219,33 @@ right-click menu yourself, nothing in this change touches the pin list.
 
 No new dependencies, no new `unsafe`, no new GTK calls beyond what Devices
 already uses.
+
+## Claude's review (Nov 16, 2026)
+
+The return matches the brief. The parser and filter are pure and cover every
+skip rule, octal escapes and labels; the Devices and Internal Drives menus
+share `append_open_actions`, so the open actions cannot drift apart; usage
+goes through the shared queue with its own `UsageOwner::Internal`; the
+popover lifecycle matches the Devices menu. The only file outside the Output
+list is `crates/fm-ui/src/app.rs`, for the subprocess widget test, which is
+where the other real-widget tests live. **[read]**
+
+One small limit, not fixed: a label is matched by the mount source, so a disk
+mounted through `/dev/mapper/…` (LUKS, LVM) resolves its label to `/dev/dm-N`
+and falls back to the folder name. Harmless; worth a line if Kyle ever
+encrypts a data disk. **[inferred]**
+
+The agent committed the change itself (89fbddf, on a new local branch
+`p2al-internal-drives`, under Kyle's name). Nothing was pushed.
+
+### Gates
+
+`scripts/check.sh`: exit 0; 1027 passed, 26 ignored. **[observed]**
+
+### Live checks (Kyle, Nov 16, scratch XDG dirs, `/tmp/gimbal-p2al-check`)
+
+All passed: Internal Drives sits after Devices with WD-Blue-SSD and
+Nvme-Storage-1, usage bars match `df` (73 % and 13 %); clicking opens the
+drive and the menu offers only Open and Open in new tab; the section
+collapses, expands and is remembered; no system mount appears; light and dark
+are fine. **[observed]**
