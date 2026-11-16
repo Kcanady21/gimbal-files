@@ -346,16 +346,18 @@ impl Header {
         row.append(&trash);
 
         let controls = platform::controls_here();
-        let float = crate::look::icons::button(crate::look::icons::MockupIcon::Float);
-        float.add_css_class("winbtn");
-        float.add_css_class("float");
-        float.set_valign(gtk::Align::Center);
-        row.append(&float);
+        // The usual minimize-maximize-close run. Appending in this order also
+        // sets the Tab chain, which walks the buttons left to right.
         let minimize = controls.minimize.then(|| {
             let button = icon_button("window-minimize-symbolic", "winbtn");
             row.append(&button);
             button
         });
+        let float = crate::look::icons::button(crate::look::icons::MockupIcon::Float);
+        float.add_css_class("winbtn");
+        float.add_css_class("float");
+        float.set_valign(gtk::Align::Center);
+        row.append(&float);
         let close = crate::look::icons::button(crate::look::icons::MockupIcon::Close);
         close.add_css_class("winbtn");
         close.add_css_class("close");
@@ -669,7 +671,7 @@ impl Header {
             0
         };
         let desktop = if platform::controls_here().minimize {
-            ((ICON_WINDOW + 2.0 * GAP_S + GAP_L) * scale).round() as i32
+            crate::look::css::window_button_width(scale)
         } else {
             0
         };

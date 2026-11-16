@@ -62,14 +62,14 @@ fn css_impl(
         p(TEXT_SMALL),
         p(TEXT_TINY),
     );
-    let (irow, ipin, igrid, itc, inav, isearch, iwin) = (
+    let (irow, ipin, igrid, itc, inav, isearch, ismall) = (
         p(ICON_ROW),
         p(ICON_PIN),
         p(ICON_GRID),
         p(ICON_TAB_CLOSE),
         p(ICON_NAV),
         p(ICON_SEARCH),
-        p(ICON_WINDOW),
+        p(ICON_HEADER_SMALL),
     );
     let section_gap = p(SECTION_GAP);
     let section_tail = (p(GAP_M) - section_gap).max(0);
@@ -80,7 +80,9 @@ fn css_impl(
     let close_inner = (itc - 2 * thin).max(1);
     let search_w = (p(SEARCH_W) - 2 * gm - 2 * mid).max(1);
     let search_entry_w = (search_w - isearch - gm - p(SEARCH_HINT_W)).max(1);
-    let trash_inner = (p(TRASH) - 2 * thin).max(1);
+    // No outline (Kyle, Nov 16): the box keeps its full TRASH size so the
+    // row's layout and `header_fits` are unchanged.
+    let trash_box = p(TRASH);
     let pitch = p(PILL_W) + p(GAP_L);
     let hover_ms = motion::ms(120);
     let slide_ms = motion::ms(150);
@@ -114,15 +116,15 @@ window.gimbal-look, window.gimbal-look.background {{ background-color: {window_b
 .gl-icon-button:focus-visible {{ box-shadow: 0 0 0 {thin}px {FOCUS_RING}; }}
 .gl-icon-button.nav {{ padding: 0 {gs}px; min-width: {inav}px; min-height: {ch}px; border-radius: {ri}px; -gtk-icon-size: {inav}px; margin-right: {gl}px; }}
 .gl-icon-button.searchbtn {{ padding: 0 {gs}px; min-width: {isearch}px; min-height: {ch}px; border-radius: {ri}px; -gtk-icon-size: {isearch}px; }}
-.gl-icon-button.winbtn {{ padding: 0 {gs}px; min-width: {iwin}px; min-height: {iwin}px; border-radius: {ri}px; -gtk-icon-size: {iwin}px; margin-left: {gl}px; }}
+.gl-icon-button.winbtn {{ padding: 0 {gs}px; min-width: {ismall}px; min-height: {ismall}px; border-radius: {ri}px; -gtk-icon-size: {ismall}px; margin-left: {gl}px; }}
 .gl-icon-button.float {{ -gtk-icon-palette: {float_palette}; }}
-.gl-icon-button.float image {{ -gtk-icon-size: {iwin}px; }}
-.gl-icon-button.close image {{ -gtk-icon-size: {iwin}px; }}
+.gl-icon-button.float image {{ -gtk-icon-size: {ismall}px; }}
+.gl-icon-button.close image {{ -gtk-icon-size: {ismall}px; }}
 .gl-search {{ margin-right: {gl}px; }}
 .gl-strip {{ margin-right: {gxl}px; }}
 .gl-field {{ min-height: {pill_h}px; padding: 0 {gm}px; border: {mid}px solid {OUTLINE}; border-radius: {r}px; color: {FG}; }}
 .gl-field:focus-within {{ box-shadow: 0 0 0 {thin}px {FOCUS_RING}; }}
-.gl-field .gl-icon-button {{ padding: 0; min-width: {inav}px; min-height: {inav}px; border-radius: {ri}px; -gtk-icon-size: {inav}px; }}
+.gl-field .gl-icon-button {{ padding: 0; min-width: {ismall}px; min-height: {ismall}px; border-radius: {ri}px; -gtk-icon-size: {ismall}px; }}
 .gl-field label {{ font-size: {tc}px; }}
 .gl-field entry {{ all: unset; padding: 0; background-color: transparent; color: {FG}; caret-color: {FG}; font-size: {tc}px; }}
 .gl-field entry > text > selection {{ background-color: {SELECTION}; color: {BG}; }}
@@ -229,7 +231,7 @@ to {{ background-color: alpha(@accent_bg_color, 0.0); }}
 .gl-preview-admin-banner label, .gl-preview-admin-banner image {{ color: @error_fg_color; }}
 .gl-action-row .gl-icon-button {{ margin-left: {gm}px; }}
 .gl-action-row image {{ color: {FG}; -gtk-icon-palette: {save_as_palette}; }}
-.gl-trash {{ all: unset; min-width: {trash_inner}px; min-height: {trash_inner}px; -gtk-icon-size: {iwin}px; border: {thin}px solid {OUTLINE}; border-radius: {r}px; color: {FG}; margin-left: {gl}px; }}
+.gl-trash {{ all: unset; min-width: {trash_box}px; min-height: {trash_box}px; -gtk-icon-size: {ismall}px; border-radius: {r}px; color: {FG}; margin-left: {gl}px; }}
 .gl-trash:hover {{ background-color: {HOVER}; }}
 .gl-trash:focus-visible {{ box-shadow: 0 0 0 {thin}px {FOCUS_RING}; }}
 .gl-menu {{ padding: {gs}px; }}
@@ -371,12 +373,21 @@ pub struct Fit {
     pub path_width: i32,
 }
 
+/// The outer width of one header window-control button (Float / Maximize,
+/// Minimize, Close): the small glyph, the horizontal padding and the left
+/// margin `.gl-icon-button.winbtn` gives it. `header_fits` counts two of them
+/// and `Header::update_layout` adds a third when the desktop shows Minimize,
+/// so both estimates are built from this one function.
+pub fn window_button_width(scale: f64) -> i32 {
+    scaled(ICON_HEADER_SMALL, scale) + 2 * scaled(GAP_S, scale) + scaled(GAP_L, scale)
+}
+
 pub fn header_fits(available: i32, pills: usize, scale: f64) -> Fit {
     let p = |token: f64| scaled(token, scale);
     let insets = 2 * p(HEADER_INSET);
     let nav = 4 * (p(ICON_NAV) + 2 * p(GAP_S) + p(GAP_L));
     let search = p(ICON_SEARCH) + 2 * p(GAP_S) + p(GAP_L);
-    let right = p(TRASH) + p(GAP_L) + 2 * (p(ICON_WINDOW) + 2 * p(GAP_S)) + 2 * p(GAP_L);
+    let right = p(TRASH) + p(GAP_L) + 2 * window_button_width(scale);
     let strip = if pills == 0 {
         0
     } else {
@@ -682,9 +693,9 @@ mod tests {
         assert!(
             full.contains(".gl-icon-button.float { -gtk-icon-palette: error @window_bg_color; }")
         );
-        assert!(full.contains(".gl-icon-button.float image { -gtk-icon-size: 32px; }"));
+        assert!(full.contains(".gl-icon-button.float image { -gtk-icon-size: 24px; }"));
         let half = css(0.5, None, PLAIN);
-        assert!(half.contains(".gl-icon-button.float image { -gtk-icon-size: 16px; }"));
+        assert!(half.contains(".gl-icon-button.float image { -gtk-icon-size: 12px; }"));
     }
 
     #[test]
@@ -698,10 +709,52 @@ mod tests {
         assert!(!svg.contains('#'));
         assert!(!svg.contains("rgb("));
         let full = css(1.0, None, PLAIN);
-        assert!(full.contains(".gl-icon-button.close image { -gtk-icon-size: 32px; }"));
+        assert!(full.contains(".gl-icon-button.close image { -gtk-icon-size: 24px; }"));
         assert!(!full.contains(".gl-icon-button.close { -gtk-icon-palette"));
         let half = css(0.5, None, PLAIN);
-        assert!(half.contains(".gl-icon-button.close image { -gtk-icon-size: 16px; }"));
+        assert!(half.contains(".gl-icon-button.close image { -gtk-icon-size: 12px; }"));
+    }
+
+    #[test]
+    fn the_small_header_glyphs_and_the_right_edge_agree() {
+        let full = css(1.0, None, PLAIN);
+        let half = css(0.5, None, PLAIN);
+        for rule in [
+            ".gl-icon-button.winbtn { padding: 0 8px; min-width: 24px; min-height: 24px;",
+            ".gl-field .gl-icon-button { padding: 0; min-width: 24px; min-height: 24px;",
+            ".gl-trash { all: unset; min-width: 48px; min-height: 48px; -gtk-icon-size: 24px; border-radius:",
+        ] {
+            assert!(full.contains(rule), "missing {rule:?}");
+        }
+        for rule in [
+            ".gl-icon-button.winbtn { padding: 0 4px; min-width: 12px; min-height: 12px;",
+            ".gl-field .gl-icon-button { padding: 0; min-width: 12px; min-height: 12px;",
+            ".gl-trash { all: unset; min-width: 24px; min-height: 24px; -gtk-icon-size: 12px; border-radius:",
+        ] {
+            assert!(half.contains(rule), "missing at half scale {rule:?}");
+        }
+        // The nav arrows and the search glyph are untouched at 32 px.
+        assert!(full.contains(".gl-search-glyph { -gtk-icon-size: 32px;"));
+
+        // One drawn window button: a 24 px glyph, 8 px padding either side and
+        // a 24 px left margin. The Trash box keeps its 48 px outer size, so the
+        // right edge is 48 + 24 + 2 * 64 = 200 px at scale 1, where it was
+        // 216 px with 32 px glyphs. With Minimize, 264 px instead of 288 px.
+        assert_eq!(window_button_width(1.0), 64);
+        assert_eq!(window_button_width(0.5), 32);
+        let right = scaled(TRASH, 1.0) + scaled(GAP_L, 1.0) + 2 * window_button_width(1.0);
+        assert_eq!(right, 200);
+        assert_eq!(right + window_button_width(1.0), 264);
+        // `header_fits` charges exactly this much for the chrome it always
+        // draws, so the fit maths and the stylesheet cannot drift apart.
+        let fixed = 2 * scaled(HEADER_INSET, 1.0)
+            + 4 * (scaled(ICON_NAV, 1.0) + 2 * scaled(GAP_S, 1.0) + scaled(GAP_L, 1.0))
+            + scaled(ICON_SEARCH, 1.0)
+            + 2 * scaled(GAP_S, 1.0)
+            + scaled(GAP_L, 1.0)
+            + right
+            + scaled(GAP_XL, 1.0);
+        assert_eq!(header_fits(2000, 0, 1.0).path_width, 2000 - fixed);
     }
 
     #[test]
@@ -732,7 +785,7 @@ mod tests {
             wide.fits && wide.path_width > 960,
             "the path must stretch past 960: {wide:?}"
         );
-        for available in 1540..=2560 {
+        for available in 1524..=2560 {
             let fit = header_fits(available, 2, 1.0);
             assert!(fit.fits && fit.path_width >= 320, "at {available}: {fit:?}");
         }
@@ -740,17 +793,17 @@ mod tests {
             header_fits(1600, 2, 1.0),
             Fit {
                 fits: true,
-                path_width: 380
+                path_width: 396
             }
         );
         assert_eq!(
-            header_fits(1540, 2, 1.0),
+            header_fits(1524, 2, 1.0),
             Fit {
                 fits: true,
                 path_width: 320
             }
         );
-        let collapsed = header_fits(1539, 2, 1.0);
+        let collapsed = header_fits(1523, 2, 1.0);
         assert!(
             !collapsed.fits && collapsed.path_width == 320,
             "{collapsed:?}"
@@ -759,17 +812,17 @@ mod tests {
             header_fits(800, 2, 0.5),
             Fit {
                 fits: true,
-                path_width: 190
+                path_width: 198
             }
         );
         assert_eq!(
-            header_fits(770, 2, 0.5),
+            header_fits(762, 2, 0.5),
             Fit {
                 fits: true,
                 path_width: 160
             }
         );
-        assert!(!header_fits(769, 2, 0.5).fits);
+        assert!(!header_fits(761, 2, 0.5).fits);
         assert!(header_fits(1600, 2, 0.5).path_width > 480);
     }
 

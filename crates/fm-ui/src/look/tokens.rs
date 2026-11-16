@@ -73,7 +73,9 @@ pub const ICON_GRID: f64 = 80.0;
 pub const ICON_TAB_CLOSE: f64 = 28.0;
 pub const ICON_NAV: f64 = 32.0;
 pub const ICON_SEARCH: f64 = 32.0;
-pub const ICON_WINDOW: f64 = 32.0;
+/// The header's small chrome glyphs: Refresh, Trash, Minimize, Float /
+/// Maximize and Close. One step below the 32 px nav and search glyphs.
+pub const ICON_HEADER_SMALL: f64 = 24.0;
 
 // Colour roles. Every colour is a theme colour or a GTK colour function of
 // one; no literal colour appears anywhere in the generated stylesheet.
@@ -174,13 +176,23 @@ mod tests {
             RADIUS_ICON,
             ICON_NAV,
             ICON_SEARCH,
-            ICON_WINDOW,
+            ICON_HEADER_SMALL,
             SEARCH_W,
             SEARCH_HINT_W,
             PATH_MIN,
             TRASH,
         ] {
             assert!(value > 0.0);
+        }
+        // The small header glyphs are one step below the nav and search ones,
+        // and the Trash box still wraps them.
+        assert_eq!(ICON_HEADER_SMALL, 24.0);
+        for (small, larger) in [
+            (ICON_HEADER_SMALL, ICON_NAV),
+            (ICON_HEADER_SMALL, ICON_SEARCH),
+            (ICON_HEADER_SMALL, TRASH),
+        ] {
+            assert!(small < larger, "{small} should sit below {larger}");
         }
         assert_eq!((DEFAULT_W, DEFAULT_H), (2560, 1440));
     }
