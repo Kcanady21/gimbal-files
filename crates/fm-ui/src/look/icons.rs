@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! The mockup's six SVGs as shared `gtk::Svg` paintables.
+//! The look's seven SVGs as shared `gtk::Svg` paintables.
 //!
-//! Loading a `-symbolic.svg` by name through the icon theme sends it down
-//! GTK's older symbolic path, which ignores the `gpa:` slots and paints
-//! everything in the text colour. `GtkSvg` implements `GtkSymbolicPaintable`,
-//! so an image built with `Image::from_paintable` passes its CSS `color` and
-//! `-gtk-icon-palette` to the SVG's slots instead
+//! Six come from the mockup; the new-tab plus (P2aq) is drawn here until the
+//! mockup has one. Loading a `-symbolic.svg` by name through the icon theme
+//! sends it down GTK's older symbolic path, which ignores the `gpa:` slots and
+//! paints everything in the text colour. `GtkSvg` implements
+//! `GtkSymbolicPaintable`, so an image built with `Image::from_paintable`
+//! passes its CSS `color` and `-gtk-icon-palette` to the SVG's slots instead
 //! (gtk-4.22.4:gtk/gtkrendericon.c:97-134).
 //!
 //! P2h and P2m use the palettes and buttons; P2g only embeds them.
@@ -37,6 +38,7 @@ pub enum MockupIcon {
     Discard,
     Float,
     Close,
+    NewTab,
 }
 
 impl MockupIcon {
@@ -48,6 +50,7 @@ impl MockupIcon {
             Self::Discard => include_bytes!("../../icons/gimbal-discard-symbolic.svg"),
             Self::Float => include_bytes!("../../icons/float.svg"),
             Self::Close => include_bytes!("../../icons/close.svg"),
+            Self::NewTab => include_bytes!("../../icons/gimbal-new-tab-symbolic.svg"),
         }
     }
 }
@@ -88,7 +91,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn all_six_mockup_icons_are_embedded() {
+    fn all_seven_icons_are_embedded() {
         for icon in [
             MockupIcon::Folder,
             MockupIcon::Save,
@@ -96,12 +99,26 @@ mod tests {
             MockupIcon::Discard,
             MockupIcon::Float,
             MockupIcon::Close,
+            MockupIcon::NewTab,
         ] {
             let bytes = icon.bytes();
             assert!(!bytes.is_empty(), "{icon:?} is empty");
             let text = std::str::from_utf8(bytes).expect("SVG is UTF-8");
             assert!(text.contains("<svg"), "{icon:?} is not an SVG");
         }
+    }
+
+    #[test]
+    fn the_new_tab_icon_is_a_foreground_plus_in_a_circle() {
+        let svg = std::str::from_utf8(MockupIcon::NewTab.bytes()).expect("SVG is UTF-8");
+        assert!(svg.contains("viewBox=\"0 0 28.08 28.08\""));
+        assert_eq!(svg.matches("gpa:stroke=\"foreground\"").count(), 3);
+        assert_eq!(svg.matches("stroke-width=\"3\"").count(), 3);
+        assert_eq!(svg.matches("stroke-linecap=\"round\"").count(), 2);
+        assert!(svg.contains("<circle"), "the ring");
+        assert!(!svg.contains("gpa:fill="));
+        assert!(!svg.contains('#'));
+        assert!(!svg.contains("rgb("));
     }
 
     #[test]

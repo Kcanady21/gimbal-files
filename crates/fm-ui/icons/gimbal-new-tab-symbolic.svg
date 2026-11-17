@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="28.08" height="28.08" viewBox="0 0 28.08 28.08" gpa:version="1">
+<!-- Drawn for P2aq's new-tab button, not extracted from Gimbal-Files.vectorcraft: the mockup has
+     no plus-in-a-circle icon. Replace it when the mockup gains one. The ring and the plus share
+     close.svg's foreground slot, square view box and 3 px round stroke. -->
+  <circle id="ring" cx="14.04" cy="14.04" r="11" fill="none" gpa:stroke="foreground" stroke-width="3"/>
+  <path id="plus-vertical" d="M 14.04 9.54 L 14.04 18.54" fill="none" gpa:stroke="foreground" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+  <path id="plus-horizontal" d="M 9.54 14.04 L 18.54 14.04" fill="none" gpa:stroke="foreground" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

@@ -382,18 +382,29 @@ pub fn window_button_width(scale: f64) -> i32 {
     scaled(ICON_HEADER_SMALL, scale) + 2 * scaled(GAP_S, scale) + scaled(GAP_L, scale)
 }
 
+/// The outer width of one header nav button: the glyph, the horizontal padding
+/// and the right margin `.gl-icon-button.nav` gives it. The four nav buttons and
+/// P2aq's new-tab button share the class, so `header_fits` counts this width
+/// five times, which is also the button's width plus the gap to the path field.
+/// Built here so the stylesheet and the estimate cannot drift apart, as
+/// `window_button_width` does for the window buttons.
+pub fn nav_button_width(scale: f64) -> i32 {
+    scaled(ICON_NAV, scale) + 2 * scaled(GAP_S, scale) + scaled(GAP_L, scale)
+}
+
 pub fn header_fits(available: i32, pills: usize, scale: f64) -> Fit {
     let p = |token: f64| scaled(token, scale);
     let insets = 2 * p(HEADER_INSET);
-    let nav = 4 * (p(ICON_NAV) + 2 * p(GAP_S) + p(GAP_L));
+    let nav = 4 * nav_button_width(scale);
     let search = p(ICON_SEARCH) + 2 * p(GAP_S) + p(GAP_L);
     let right = p(TRASH) + p(GAP_L) + 2 * window_button_width(scale);
+    let new_tab = nav_button_width(scale);
     let strip = if pills == 0 {
         0
     } else {
         pills as i32 * p(PILL_W) + (pills as i32 - 1) * p(GAP_L)
     };
-    let free = available - insets - nav - search - right - p(GAP_XL) - strip;
+    let free = available - insets - nav - search - right - p(GAP_XL) - strip - new_tab;
     let fits = free >= p(PATH_MIN);
     Fit {
         fits,
@@ -746,15 +757,51 @@ mod tests {
         assert_eq!(right, 200);
         assert_eq!(right + window_button_width(1.0), 264);
         // `header_fits` charges exactly this much for the chrome it always
-        // draws, so the fit maths and the stylesheet cannot drift apart.
+        // draws, so the fit maths and the stylesheet cannot drift apart. P2aq's
+        // new-tab button shares the nav look, so its width and right margin
+        // (72 px at scale 1) are one more nav unit.
+        assert_eq!(nav_button_width(1.0), 72);
+        assert_eq!(nav_button_width(0.5), 36);
         let fixed = 2 * scaled(HEADER_INSET, 1.0)
-            + 4 * (scaled(ICON_NAV, 1.0) + 2 * scaled(GAP_S, 1.0) + scaled(GAP_L, 1.0))
+            + 4 * nav_button_width(1.0)
             + scaled(ICON_SEARCH, 1.0)
             + 2 * scaled(GAP_S, 1.0)
             + scaled(GAP_L, 1.0)
             + right
-            + scaled(GAP_XL, 1.0);
+            + scaled(GAP_XL, 1.0)
+            + nav_button_width(1.0);
         assert_eq!(header_fits(2000, 0, 1.0).path_width, 2000 - fixed);
+    }
+
+    #[test]
+    fn the_new_tab_button_costs_its_own_nav_width() {
+        // Two pills used to fit at 1524 px; with the button they collapse
+        // there, and 1596 px is the new last width that keeps the path at
+        // PATH_MIN.
+        assert!(!header_fits(1524, 2, 1.0).fits);
+        assert_eq!(
+            header_fits(1596, 2, 1.0),
+            Fit {
+                fits: true,
+                path_width: 320
+            }
+        );
+        assert!(!header_fits(1595, 2, 1.0).fits);
+        // At a fixed width the path loses exactly the button plus its gap.
+        let with = header_fits(2000, 2, 1.0).path_width;
+        let without = 2000
+            - (2 * scaled(HEADER_INSET, 1.0)
+                + 4 * nav_button_width(1.0)
+                + scaled(ICON_SEARCH, 1.0)
+                + 2 * scaled(GAP_S, 1.0)
+                + scaled(GAP_L, 1.0)
+                + scaled(TRASH, 1.0)
+                + scaled(GAP_L, 1.0)
+                + 2 * window_button_width(1.0)
+                + scaled(GAP_XL, 1.0)
+                + 2 * scaled(PILL_W, 1.0)
+                + scaled(GAP_L, 1.0));
+        assert_eq!(without - with, nav_button_width(1.0));
     }
 
     #[test]
@@ -785,7 +832,7 @@ mod tests {
             wide.fits && wide.path_width > 960,
             "the path must stretch past 960: {wide:?}"
         );
-        for available in 1524..=2560 {
+        for available in 1596..=2560 {
             let fit = header_fits(available, 2, 1.0);
             assert!(fit.fits && fit.path_width >= 320, "at {available}: {fit:?}");
         }
@@ -793,17 +840,17 @@ mod tests {
             header_fits(1600, 2, 1.0),
             Fit {
                 fits: true,
-                path_width: 396
+                path_width: 324
             }
         );
         assert_eq!(
-            header_fits(1524, 2, 1.0),
+            header_fits(1596, 2, 1.0),
             Fit {
                 fits: true,
                 path_width: 320
             }
         );
-        let collapsed = header_fits(1523, 2, 1.0);
+        let collapsed = header_fits(1595, 2, 1.0);
         assert!(
             !collapsed.fits && collapsed.path_width == 320,
             "{collapsed:?}"
@@ -812,17 +859,17 @@ mod tests {
             header_fits(800, 2, 0.5),
             Fit {
                 fits: true,
-                path_width: 198
+                path_width: 162
             }
         );
         assert_eq!(
-            header_fits(762, 2, 0.5),
+            header_fits(798, 2, 0.5),
             Fit {
                 fits: true,
                 path_width: 160
             }
         );
-        assert!(!header_fits(761, 2, 0.5).fits);
+        assert!(!header_fits(797, 2, 0.5).fits);
         assert!(header_fits(1600, 2, 0.5).path_width > 480);
     }
 

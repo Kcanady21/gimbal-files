@@ -100,6 +100,12 @@ pub fn accordion_is_reused(collapsed_before: bool, collapsed_after: bool) -> boo
     collapsed_before && collapsed_after
 }
 
+/// The header's new-tab button and Ctrl+T send the same argument-free
+/// command. With no folder the workspace opens the tab at home (P2ap).
+pub fn new_tab_invocation() -> Invocation {
+    Invocation::new("tab.new", Vec::new())
+}
+
 /// A right click on an unselected row first makes it the only selection, as
 /// file managers do. A selected row keeps the selection it is part of.
 pub fn row_right_click_selects_only(view: &HeaderView, index: usize) -> bool {
@@ -243,6 +249,7 @@ pub struct Header {
     window_id: WindowId,
     handle: gtk::WindowHandle,
     strip: gtk::Fixed,
+    new_tab: gtk::Button,
     pills: RefCell<Vec<gtk::Widget>>,
     /// The collapsed strip's one pill and its popover. Kept across a refresh
     /// that leaves the header collapsed, so an open list can be refilled in
@@ -341,6 +348,13 @@ impl Header {
         strip.set_valign(gtk::Align::Center);
         row.append(&strip);
 
+        let new_tab = crate::look::icons::button(crate::look::icons::MockupIcon::NewTab);
+        new_tab.add_css_class("nav");
+        new_tab.set_valign(gtk::Align::Center);
+        new_tab.set_tooltip_text(Some("New Tab"));
+        new_tab.update_property(&[gtk::accessible::Property::Label("New Tab")]);
+        row.append(&new_tab);
+
         let path = hbox(&["gl-field", "gl-path"]);
         path.set_valign(gtk::Align::Center);
         path.set_hexpand(true);
@@ -392,6 +406,7 @@ impl Header {
             window_id,
             handle,
             strip,
+            new_tab,
             pills: RefCell::new(Vec::new()),
             accordion: RefCell::new(None),
             last_labels: RefCell::new(Vec::new()),
@@ -1890,6 +1905,13 @@ impl Header {
             });
         }
 
+        let header_new_tab = self.clone();
+        self.new_tab.connect_clicked(move |_| {
+            if let Some(ui) = header_new_tab.window_ui() {
+                ui.dispatch(Caller::Ui, new_tab_invocation());
+            }
+        });
+
         let header_search = self.clone();
         self.search_icon.connect_clicked(move |_| {
             if let Some(ui) = header_search.window_ui() {
@@ -2903,6 +2925,16 @@ fn expand_home(text: &str, home: &Path) -> PathBuf {
 mod tests {
     use super::*;
     use fm_core::workspace::Workspace;
+
+    #[test]
+    fn the_new_tab_button_names_the_same_command_as_control_t() {
+        let invocation = new_tab_invocation();
+        assert_eq!(invocation.name(), "tab.new");
+        assert!(
+            invocation.arguments().is_empty(),
+            "the registry supplies the folder"
+        );
+    }
 
     #[test]
     fn the_path_bar_keeps_typing_only_over_the_same_folder() {
