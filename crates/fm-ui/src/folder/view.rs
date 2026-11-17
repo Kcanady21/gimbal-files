@@ -22,6 +22,7 @@ use fm_core::workspace::{FileSelection, TabId, WindowId};
 
 use crate::app::Process;
 use crate::dnd::{self, DragItem};
+use crate::file_icon::{self, FileIcon};
 use crate::folder::{
     ClickRequest, GridKey, KeyboardFocus, NavMode, RubberRect, SelectionEntry, StatusLine, cell_at,
     click_request, clip_rect, details_text, drag_passes_threshold, entry_visible, is_hidden_name,
@@ -134,6 +135,8 @@ pub struct FolderView {
 
     scale: Rc<Cell<f64>>,
     cell_positions: Rc<RefCell<Vec<(gtk::Widget, u32)>>>,
+    /// The default-app change listener id, disconnected when this view drops.
+    icon_watch: Cell<Option<u64>>,
     scroll_gen: Cell<u64>,
     settle_pending: Rc<Cell<bool>>,
     cap_pending: Rc<Cell<bool>>,
@@ -351,6 +354,7 @@ impl FolderView {
             scroll_top: Cell::new(true),
             scale: Rc::new(Cell::new(scale)),
             cell_positions: Rc::new(RefCell::new(Vec::new())),
+            icon_watch: Cell::new(None),
             scroll_gen: Cell::new(0),
             settle_pending: Rc::new(Cell::new(false)),
             cap_pending: Rc::new(Cell::new(false)),
@@ -373,6 +377,15 @@ impl FolderView {
         });
 
         *this.me.borrow_mut() = Rc::downgrade(&this);
+        {
+            let weak = Rc::downgrade(&this);
+            let id = file_icon::connect_changed(move || {
+                if let Some(view) = weak.upgrade() {
+                    view.refresh_app_icons();
+                }
+            });
+            this.icon_watch.set(Some(id));
+        }
         // A hidden-files change reaches every live grid through the process,
         // so no window, tab or split tile needs walking the widget tree.
         process.register_folder_view(&this);
@@ -1835,9 +1848,15 @@ impl FolderView {
                     .first()
                     .and_then(|item| item.path.file_name())
                     .map(std::ffi::OsString::from);
-                let icon = first
-                    .and_then(|name| view.info_for_name(&name))
-                    .and_then(|info| info.icon());
+                let drag_info = first.and_then(|name| view.info_for_name(&name));
+                let icon =
+                    drag_info
+                        .as_ref()
+                        .and_then(|info| match file_icon::for_file_info(info) {
+                            FileIcon::Folder => info.icon(),
+                            FileIcon::App(icon) => Some(icon),
+                            FileIcon::Placeholder => None,
+                        });
                 let paths: Vec<PathBuf> = items.iter().map(|item| item.path.clone()).collect();
                 dnd::set_internal_drag(items.clone());
                 let widget = dnd::drag_icon(icon.as_ref(), items.len(), scale.get());
@@ -2687,6 +2706,29 @@ impl FolderView {
         }
     }
 
+    /// Redraw the type icon of every bound cell after the default apps
+    /// changed. A cell showing a thumbnail or the folder SVG holds a paintable
+    /// and keeps it; only cells drawn from an app icon or the placeholder are
+    /// refreshed. No listing reload and no rebind happen.
+    fn refresh_app_icons(&self) {
+        let cells = self.cell_positions.borrow().clone();
+        for (cell, position) in cells {
+            let Some(image) = cell.first_child().and_downcast::<gtk::Image>() else {
+                continue;
+            };
+            if image.paintable().is_some() {
+                continue;
+            }
+            let Some(name) = self.name_at(position) else {
+                continue;
+            };
+            let Some(info) = self.info_for_name(&name) else {
+                continue;
+            };
+            show_type_icon(&image, &info);
+        }
+    }
+
     fn key_pressed(
         self: &Rc<Self>,
         key: gdk::Key,
@@ -3027,6 +3069,9 @@ impl FolderView {
 
 impl Drop for FolderView {
     fn drop(&mut self) {
+        if let Some(id) = self.icon_watch.take() {
+            file_icon::disconnect_changed(id);
+        }
         if let Some(active) = self.size_active.get_mut().take()
             && let Some(started) = &active.started
         {
@@ -3127,12 +3172,10 @@ fn make_cell(scale: f64) -> gtk::Box {
 
 fn show_type_icon(image: &gtk::Image, info: &gio::FileInfo) {
     image.set_paintable(None::<&gdk::Paintable>);
-    if info.file_type() == gio::FileType::Directory {
-        image.set_paintable(Some(&icons::svg(MockupIcon::Folder)));
-    } else if let Some(icon) = info.icon() {
-        image.set_from_gicon(&icon);
-    } else {
-        image.set_icon_name(Some("text-x-generic"));
+    match file_icon::for_file_info(info) {
+        FileIcon::Folder => image.set_paintable(Some(&icons::svg(MockupIcon::Folder))),
+        FileIcon::App(icon) => image.set_from_gicon(&icon),
+        FileIcon::Placeholder => image.set_icon_name(Some("text-x-generic")),
     }
 }
 

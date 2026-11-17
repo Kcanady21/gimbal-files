@@ -22,6 +22,7 @@ use gtk::gio;
 use gtk::glib;
 use gtk::pango;
 
+use crate::file_icon::{self, FileIcon};
 use crate::fileops::ProgressView;
 use crate::frame::WindowUi;
 use crate::look::icons::{self, MockupIcon};
@@ -970,12 +971,16 @@ impl TrashBrowser {
                 let Some(image) = row.first_child().and_downcast::<gtk::Image>() else {
                     return;
                 };
-                if let Some(icon_name) = trash_item.icon_name() {
-                    image.set_icon_name(Some(icon_name));
-                } else if trash_item.is_dir() {
+                if trash_item.is_dir() {
                     image.set_paintable(Some(&icons::svg(MockupIcon::Folder)));
                 } else {
-                    image.set_icon_name(Some("text-x-generic"));
+                    image.set_paintable(None::<&gtk::gdk::Paintable>);
+                    // A Trash item has only a name, so guess the type from the
+                    // name alone. No read and no content sniffing happen.
+                    match file_icon::for_name(trash_item.display_name()) {
+                        FileIcon::App(icon) => image.set_from_gicon(&icon),
+                        _ => image.set_icon_name(Some("text-x-generic")),
+                    }
                 }
                 let Some(labels) = image.next_sibling().and_downcast::<gtk::Box>() else {
                     return;

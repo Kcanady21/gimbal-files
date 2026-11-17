@@ -22,11 +22,12 @@ use fm_core::folder_size::{
 use fm_core::properties::{self, SummaryItem};
 use gtk::{gdk, gio, glib};
 
+use crate::file_icon::{self, FileIcon};
 use crate::frame::WindowUi;
 use crate::look::icons::{self, MockupIcon};
 use crate::look::tokens::{GAP_M, GAP_S, SEARCH_W, scaled};
 
-const INFO_ATTRIBUTES: &str = "standard::name,standard::display-name,standard::type,standard::size,standard::content-type,standard::icon,standard::is-symlink,standard::symlink-target,owner::user,owner::group,unix::uid,unix::gid,unix::mode,time::created,time::access,time::modified";
+const INFO_ATTRIBUTES: &str = "standard::name,standard::display-name,standard::type,standard::size,standard::content-type,standard::is-symlink,standard::symlink-target,owner::user,owner::group,unix::uid,unix::gid,unix::mode,time::created,time::access,time::modified";
 
 const SIZE_ATTRIBUTES: &str = "filesystem::free,filesystem::size";
 
@@ -49,7 +50,6 @@ struct Facts {
     created: Option<i64>,
     modified: Option<i64>,
     accessed: Option<i64>,
-    icon: Option<gio::Icon>,
 }
 
 impl Facts {
@@ -116,7 +116,6 @@ impl Facts {
             created: time_attribute(info, "time::created"),
             modified: time_attribute(info, "time::modified"),
             accessed: time_attribute(info, "time::access"),
-            icon: info.and_then(gio::FileInfo::icon),
         }
     }
 }
@@ -175,9 +174,9 @@ pub fn show(ui: &Rc<WindowUi>, paths: &[PathBuf], scope: Scope) {
         let icon = if fact.is_dir {
             icons::image(MockupIcon::Folder)
         } else {
-            match &fact.icon {
-                Some(icon) => gtk::Image::from_gicon(icon),
-                None => gtk::Image::from_icon_name("text-x-generic-symbolic"),
+            match file_icon::for_content_type(Some(&fact.content_type)) {
+                FileIcon::App(icon) => gtk::Image::from_gicon(&icon),
+                _ => gtk::Image::from_icon_name("text-x-generic-symbolic"),
             }
         };
         icon.add_css_class("gl-properties-icon");

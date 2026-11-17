@@ -12,6 +12,7 @@ mod commands;
 mod content;
 mod dnd;
 mod events;
+mod file_icon;
 mod filemanager1;
 mod fileops;
 mod folder;
