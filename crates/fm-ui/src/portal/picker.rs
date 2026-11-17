@@ -47,6 +47,7 @@ use fm_core::workspace::{TabId, Window, WindowId};
 use super::filter::{SearchFilter, ViewRules};
 use super::service::{self, Call, DialogHost, Pick, Request};
 use crate::app::Process;
+use crate::fileops::keys::entry_focused;
 use crate::folder::{ClickRequest, FolderView, GridFilter, StatusLine};
 use crate::look::blur::Blur;
 use crate::look::motion;
@@ -794,9 +795,10 @@ impl Picker {
             }
             // A text entry keeps its editing keys (Ctrl+A/C/X/V/Z, cursor
             // movement, Delete), the main window's rule
-            // (`fileops::keys::entry_owns_key`). The dialog's shortcuts —
-            // Ctrl+F, Ctrl+H, Ctrl+L, F5 — still work while you type, so
-            // Ctrl+H on the results page re-asks the query.
+            // (`fileops::keys::entry_owns_key`), and `entry_focused` is the
+            // same shared check. The dialog's shortcuts — Ctrl+F, Ctrl+H,
+            // Ctrl+L, F5 — still work while you type, so Ctrl+H on the results
+            // page re-asks the query.
             let typing = entry_focused(&picker.path_entry) || entry_focused(&picker.search_entry);
             if typing && crate::fileops::keys::entry_owns_key(key, modifiers) {
                 return glib::Propagation::Proceed;
@@ -1479,14 +1481,6 @@ fn build_choices(call: &Call, footer: &gtk::Box, scale: f64) -> Vec<ChoiceContro
         });
     }
     controls
-}
-
-/// Whether the caret is in this entry. A `GtkEntry` hands its focus to the
-/// `GtkText` inside it (`gtk/gtkentry.c:426-431`), so `has_focus()` on the
-/// entry itself is always false; the entry and every other ancestor of the
-/// focus widget carry `FOCUS_WITHIN` instead (`gtk/gtkwindow.c:5280-5310`).
-fn entry_focused(entry: &gtk::Entry) -> bool {
-    entry.state_flags().contains(gtk::StateFlags::FOCUS_WITHIN)
 }
 
 fn connect_nav(picker: &Rc<Picker>, button: &gtk::Button, name: &'static str) {

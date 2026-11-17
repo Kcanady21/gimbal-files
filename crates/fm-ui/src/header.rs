@@ -19,6 +19,7 @@ use fm_core::workspace::{Group, Window, WindowId};
 use gtk::{gdk, glib, pango};
 
 use crate::dnd;
+use crate::fileops::keys::entry_focused;
 use crate::frame::WindowUi;
 use crate::look::motion;
 use crate::look::tokens::*;
@@ -129,6 +130,15 @@ struct Accordion {
 
 /// A single tab's pill shows its folder's name; a split group shows its title
 /// and tab count ("Group N · K tabs", or the chosen name).
+/// Whether `update_text` leaves the path bar's text alone. A path that failed
+/// (`invalid`) stays up so you can fix it. While the caret is in the path bar,
+/// a redraw of the same folder keeps what you typed, but a different folder
+/// (you switched or closed a tab by clicking, which doesn't move focus) still
+/// replaces it, so the bar never names a folder the window isn't showing.
+pub fn keep_path_text(focused: bool, invalid: bool, same_folder: bool) -> bool {
+    invalid || (focused && same_folder)
+}
+
 pub fn pill_label(group: &Group) -> String {
     if group.is_split() {
         return group.label();
@@ -244,6 +254,10 @@ pub struct Header {
     available: Cell<i32>,
     path: gtk::Box,
     path_entry: gtk::Entry,
+    /// The folder `update_text` last showed. A redraw of the same folder
+    /// leaves a half-typed path alone; a different folder (another tab, a
+    /// closed tab) replaces it even while the caret is in the path bar.
+    path_folder: RefCell<String>,
     menu_button: gtk::Button,
     back: gtk::Button,
     forward: gtk::Button,
@@ -386,6 +400,7 @@ impl Header {
             available: Cell::new(DEFAULT_W),
             path,
             path_entry,
+            path_folder: RefCell::new(String::new()),
             menu_button,
             back,
             forward,
@@ -532,11 +547,11 @@ impl Header {
     /// The path bar and search field are the window's own text entries. The
     /// rename and new-folder entries report through `WindowUi::editing`.
     pub fn text_focused(&self) -> bool {
-        self.path_entry.has_focus() || self.search_entry.has_focus()
+        entry_focused(&self.path_entry) || entry_focused(&self.search_entry)
     }
 
     pub fn search_entry_focused(&self) -> bool {
-        self.search_entry.has_focus()
+        entry_focused(&self.search_entry)
     }
 
     /// The results page is about to open; its own status replaces the
@@ -712,9 +727,21 @@ impl Header {
         if trash {
             self.path.remove_css_class("invalid");
             self.path_entry.set_text(&shown);
-        } else if !self.path_entry.has_focus() && !self.path.has_css_class("invalid") {
-            self.path_entry.set_text(&shown);
+        } else {
+            // `entry_focused`, not `has_focus`: the caret is in the entry's
+            // inner `GtkText`, so `has_focus()` on the entry is always false
+            // and every redraw would put the current folder back over a
+            // half-typed path.
+            let same_folder = *self.path_folder.borrow() == shown;
+            if !keep_path_text(
+                entry_focused(&self.path_entry),
+                self.path.has_css_class("invalid"),
+                same_folder,
+            ) {
+                self.path_entry.set_text(&shown);
+            }
         }
+        self.path_folder.replace(shown);
         self.path_entry.set_editable(!trash);
         self.path_entry.set_can_focus(!trash);
         self.back
@@ -2876,6 +2903,20 @@ fn expand_home(text: &str, home: &Path) -> PathBuf {
 mod tests {
     use super::*;
     use fm_core::workspace::Workspace;
+
+    #[test]
+    fn the_path_bar_keeps_typing_only_over_the_same_folder() {
+        // Not focused: every redraw shows the folder.
+        assert!(!keep_path_text(false, false, true));
+        assert!(!keep_path_text(false, false, false));
+        // Typing: a redraw of the same folder keeps the half-typed path...
+        assert!(keep_path_text(true, false, true));
+        // ...but another folder (a tab switched by a click) replaces it.
+        assert!(!keep_path_text(true, false, false));
+        // A failed path stays up either way, as before P2ao.
+        assert!(keep_path_text(false, true, false));
+        assert!(keep_path_text(true, true, false));
+    }
 
     fn window_with(folders: &[&str]) -> fm_core::workspace::Workspace {
         let mut workspace = Workspace::with_home(PathBuf::from("/home/kyle"));
