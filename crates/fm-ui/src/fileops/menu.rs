@@ -163,6 +163,13 @@ pub fn item_menu_in_scope(
             "tab.new",
             MenuAction::Command(vec![("path".to_string(), folder.clone())]),
         ));
+        // Kyle (Nov 17): a folder's own menu opens that folder in a new
+        // window; the empty-space menu's New Window opens home instead.
+        menu.push(item(
+            "Open in New Window",
+            "window.new",
+            MenuAction::Command(vec![("path".to_string(), folder.clone())]),
+        ));
         if !in_admin
             && items[0]
                 .owner_uid
@@ -299,18 +306,16 @@ pub fn background_menu_in_scope(
         menu.push(admin);
     }
 
-    // New Tab and New Window always open normal tabs and windows at this
-    // folder, even inside an administrator tab (P2af). The handler enforces
-    // that; the menu only names the ordinary commands.
-    menu.push(item(
-        "New Tab",
-        "tab.new",
-        MenuAction::Command(vec![("path".to_string(), folder_text.clone())]),
-    ));
+    // New Tab and New Window always open normal tabs and windows, never
+    // another administrator tab, even inside one (P2af). The handler enforces
+    // that; the menu only names the ordinary commands. Neither carries a
+    // folder, so both open home (P2ap; Kyle, Nov 17). A folder's own menu has
+    // Open in New Tab and Open in New Window for that folder.
+    menu.push(item("New Tab", "tab.new", MenuAction::Command(Vec::new())));
     menu.push(item(
         "New Window",
         "window.new",
-        MenuAction::Command(vec![("path".to_string(), folder_text.clone())]),
+        MenuAction::Command(Vec::new()),
     ));
 
     menu.push(separator());
@@ -611,6 +616,7 @@ mod tests {
         let labels = labels(&menu);
         assert!(!labels.contains(&"Rename…"));
         assert!(!labels.contains(&"Open in New Tab"));
+        assert!(!labels.contains(&"Open in New Window"));
         assert!(!labels.contains(&"Pin"));
         assert!(labels.contains(&"Move to Trash"));
     }
@@ -620,6 +626,23 @@ mod tests {
         let menu = item_menu(&[folder("docs")], Some(CURRENT_UID));
         let labels = labels(&menu);
         assert!(labels.contains(&"Open in New Tab"));
+        let tab_at = labels.iter().position(|label| *label == "Open in New Tab");
+        let window_at = labels
+            .iter()
+            .position(|label| *label == "Open in New Window");
+        assert_eq!(
+            window_at,
+            tab_at.map(|at| at + 1),
+            "right under Open in New Tab"
+        );
+        let new_window = menu
+            .iter()
+            .find(|item| item.command == "window.new")
+            .unwrap();
+        assert_eq!(
+            new_window.action,
+            MenuAction::Command(vec![("path".to_string(), "/tmp/docs".to_string())])
+        );
         assert!(labels.contains(&"Pin"));
         assert!(labels.contains(&"Disk Usage"));
         assert_eq!(labels.last().copied(), Some("Properties"));
@@ -778,7 +801,8 @@ mod tests {
     }
 
     #[test]
-    fn new_tab_and_new_window_carry_this_folder_even_inside_an_admin_tab() {
+    fn new_window_carries_no_folder_even_inside_an_admin_tab() {
+        // Kyle (Nov 17): the empty-space menu's New Window opens home.
         for in_admin in [false, true] {
             let menu = background_menu_in_scope(
                 Path::new("/tmp/docs"),
@@ -789,20 +813,41 @@ mod tests {
                 in_admin,
                 false,
             );
-            for (command, label) in [("tab.new", "New Tab"), ("window.new", "New Window")] {
-                let entry = menu
-                    .iter()
-                    .find(|item| item.command == command)
-                    .unwrap_or_else(|| panic!("{label} inside an admin tab: {in_admin}"));
-                assert_eq!(
-                    entry.action,
-                    MenuAction::Command(vec![("path".to_string(), "/tmp/docs".to_string())])
-                );
-                assert!(entry.enabled);
-            }
+            let entry = menu
+                .iter()
+                .find(|item| item.command == "window.new")
+                .expect("New Window");
+            assert_eq!(entry.action, MenuAction::Command(Vec::new()));
+            assert!(entry.enabled);
             assert!(
                 !menu.iter().any(|item| item.command == "tab.open-as-admin"),
-                "New Tab and New Window are the ordinary commands"
+                "New Window is an ordinary command"
+            );
+        }
+    }
+
+    #[test]
+    fn new_tab_carries_no_folder_even_inside_an_admin_tab() {
+        // P2ap: the empty-space menu's New Tab opens home, not this folder.
+        for in_admin in [false, true] {
+            let menu = background_menu_in_scope(
+                Path::new("/tmp/docs"),
+                None,
+                true,
+                true,
+                false,
+                in_admin,
+                false,
+            );
+            let entry = menu
+                .iter()
+                .find(|item| item.command == "tab.new")
+                .expect("New Tab");
+            assert_eq!(entry.action, MenuAction::Command(Vec::new()));
+            assert!(entry.enabled);
+            assert!(
+                !menu.iter().any(|item| item.command == "tab.open-as-admin"),
+                "New Tab is an ordinary command"
             );
         }
     }

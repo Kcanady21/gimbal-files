@@ -131,7 +131,7 @@ pub const COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "window.new",
-        summary: "Open a new window, optionally at a folder.",
+        summary: "Open a new window at home, or at a folder when one is given.",
         effect: Effect::View,
         undo: false,
         arguments: &[OPTIONAL_FOLDER],
@@ -145,7 +145,7 @@ pub const COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "tab.new",
-        summary: "Open a new tab, optionally at a folder.",
+        summary: "Open a new tab at home, or at a folder when one is given.",
         effect: Effect::View,
         undo: false,
         arguments: &[OPTIONAL_FOLDER],

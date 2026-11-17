@@ -272,7 +272,7 @@ fn focus_window_moves_the_focus_and_refuses_an_unknown_id() {
 }
 
 #[test]
-fn tab_new_opens_after_the_focused_pill_and_inherits_its_folder() {
+fn tab_new_opens_after_the_focused_pill_at_home() {
     let mut workspace = workspace();
     workspace.tab_new(Some(folder("/tmp/a"))).unwrap();
     workspace.tab_new(Some(folder("/tmp/b"))).unwrap();
@@ -283,8 +283,53 @@ fn tab_new_opens_after_the_focused_pill_and_inherits_its_folder() {
     assert_eq!(window.pills.len(), 4);
     assert!(matches!(events[0], Event::TabAdded { index: 1, .. }));
     let opened = window.pills[1];
-    assert_eq!(window.groups[&opened].tabs[0].folder, folder("/tmp/start"));
-    assert_eq!(window.groups[&opened].tabs[0].id, window.focused_tab);
+    let tab = &window.groups[&opened].tabs[0];
+    assert_eq!(tab.folder, home(), "a folderless tab opens home");
+    assert_ne!(
+        tab.folder,
+        folder("/tmp/start"),
+        "not the pill it came from"
+    );
+    assert_eq!(tab.id, window.focused_tab);
+    workspace.check_invariants().unwrap();
+}
+
+#[test]
+fn tab_new_with_a_folder_opens_that_folder_from_a_tab_elsewhere() {
+    let mut workspace = workspace();
+    workspace.pill_click(0).unwrap();
+    let events = workspace.tab_new(Some(folder("/tmp/elsewhere"))).unwrap();
+    let window = workspace.focused().unwrap();
+    assert!(matches!(events[0], Event::TabAdded { index: 1, .. }));
+    let opened = window.pills[1];
+    let tab = &window.groups[&opened].tabs[0];
+    assert_eq!(tab.folder, folder("/tmp/elsewhere"));
+    assert_eq!(tab.id, window.focused_tab);
+    assert!(!tab.admin);
+    workspace.check_invariants().unwrap();
+}
+
+#[test]
+fn tab_new_without_a_folder_from_an_admin_tab_is_ordinary_at_home() {
+    // P2ap: Ctrl+T in an administrator tab is an ordinary tab at home.
+    let mut workspace = workspace();
+    workspace.tab_new_admin(folder("/etc")).unwrap();
+    let admin = workspace.focused().unwrap().focused_tab;
+    assert!(workspace.focused().unwrap().tab(admin).unwrap().admin);
+
+    workspace.tab_new(None).unwrap();
+    let window = workspace.focused().unwrap();
+    let fresh = window.tab(window.focused_tab).unwrap();
+    assert_eq!(fresh.folder, home());
+    assert!(
+        !fresh.admin,
+        "a folderless tab is never an administrator one"
+    );
+    assert!(
+        window.tab(admin).unwrap().admin,
+        "the administrator tab it came from is untouched"
+    );
+    workspace.check_invariants().unwrap();
 }
 
 #[test]
@@ -2431,8 +2476,9 @@ fn administrator_scope_follows_new_tabs_and_splits_and_leaves_in_place() {
     let admin = workspace.focused().unwrap().focused_tab;
     assert!(workspace.focused().unwrap().tab(admin).unwrap().admin);
 
-    // tab.new copies the focused tab's scope.
-    workspace.tab_new(None).unwrap();
+    // tab.new with a folder copies the focused tab's scope. Without a folder
+    // it is an ordinary tab at home instead (P2ap).
+    workspace.tab_new(Some(folder("/tmp/inherited"))).unwrap();
     let inherited = workspace.focused().unwrap().focused_tab;
     assert!(workspace.focused().unwrap().tab(inherited).unwrap().admin);
     assert_ne!(inherited, admin);

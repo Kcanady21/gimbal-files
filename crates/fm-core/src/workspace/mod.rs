@@ -997,9 +997,10 @@ impl Workspace {
         Ok(events)
     }
 
-    /// Open a tab after the focused pill. With no path it opens the focused
-    /// tab's folder, or home when no window is open. The new tab copies the
-    /// focused tab's administrator scope.
+    /// Open a tab after the focused pill. With no path it opens home, in an
+    /// ordinary tab even when the focused tab is an administrator one (P2ap).
+    /// With a path it opens that folder and copies the focused tab's
+    /// administrator scope.
     pub fn tab_new(&mut self, path: Option<PathBuf>) -> Result<Vec<Event>, WorkspaceError> {
         self.tab_new_scoped(path, None)
     }
@@ -1028,11 +1029,14 @@ impl Workspace {
             let source = window
                 .focused_tab_ref()
                 .ok_or(WorkspaceError::NoFocusedTab)?;
-            let folder = match path {
-                Some(path) => path,
-                None => source.folder.clone(),
+            // With no folder the tab is always an ordinary one at home: there
+            // is no reason to be administrator in your own home folder (P2ap).
+            // With a folder the tab keeps the focused tab's scope.
+            let (folder, admin) = match path {
+                Some(path) => (path, admin.unwrap_or(source.admin)),
+                None => (self.home.clone(), admin.unwrap_or(false)),
             };
-            (folder, position, admin.unwrap_or(source.admin))
+            (folder, position, admin)
         };
 
         let tab = Tab::new(self.ids.tab(), folder).with_admin(admin);
