@@ -56,6 +56,18 @@ pub fn max_columns(view_w: i32, scale: f64) -> i32 {
     (((view_w + gap) / (cell + gap)).max(1) + 1).clamp(1, MAX_COLUMNS as i32)
 }
 
+/// One grid row the file chooser may hide: a `gio::FileInfo` for a listed name.
+pub type GridItem<'a> = &'a gio::FileInfo;
+
+/// The rules a file chooser adds to its own grid on top of the hidden-files
+/// switch: folders-only mode, and the active file-type filter. It answers from
+/// the row's `gio::FileInfo` alone, and it runs inside GTK's model machinery on
+/// every re-decide, so it must be cheap, total and free of side effects — never
+/// a stat, never a dialog, never this view again.
+///
+/// Only a picker's grid ever holds one: see [`FolderView::set_grid_filter`].
+pub type GridFilter = Rc<dyn Fn(GridItem<'_>) -> bool>;
+
 pub struct FolderView {
     /// The visible root: the administrator banner above the grid body.
     root: gtk::Box,
@@ -99,6 +111,11 @@ pub struct FolderView {
     /// it on every decision; `set_show_hidden` updates it and re-decides in
     /// place. New views start from the config (`Process::show_hidden`).
     show_hidden: Rc<Cell<bool>>,
+    /// The file chooser's own rules, on top of the hidden-files switch: its
+    /// folders-only mode and the active file-type filter. Only a picker's grid
+    /// ever holds one (`set_grid_filter`); every grid the main app builds leaves
+    /// it `None`, so nothing about a normal window changes.
+    grid_filter: Rc<RefCell<Option<GridFilter>>>,
     started: Cell<Instant>,
     first_logged: Cell<bool>,
     loaded: Cell<bool>,
@@ -210,12 +227,22 @@ impl FolderView {
         let dir_list = gtk::DirectoryList::new(Some(attributes.as_str()), None::<&gio::File>);
 
         let show_hidden = Rc::new(Cell::new(process.show_hidden()));
+        let grid_filter: Rc<RefCell<Option<GridFilter>>> = Rc::new(RefCell::new(None));
         let filter = gtk::CustomFilter::new({
             let show_hidden = show_hidden.clone();
+            let grid_filter = grid_filter.clone();
             move |object| {
-                object
-                    .downcast_ref::<gio::FileInfo>()
-                    .is_none_or(|info| entry_visible(&info.name(), show_hidden.get()))
+                let Some(info) = object.downcast_ref::<gio::FileInfo>() else {
+                    return true;
+                };
+                if !entry_visible(&info.name(), show_hidden.get()) {
+                    return false;
+                }
+                // The Rc is taken out of the cell before it is called: this runs
+                // inside GTK's model machinery, and a filter that re-entered the
+                // cell while it was borrowed would abort the process.
+                let keep = grid_filter.borrow().clone();
+                keep.is_none_or(|keep| keep(info))
             }
         });
         let filtered = gtk::FilterListModel::new(Some(dir_list.clone()), Some(filter));
@@ -311,6 +338,7 @@ impl FolderView {
             current: RefCell::new(None),
             sort_rule,
             show_hidden,
+            grid_filter,
             started: Cell::new(Instant::now()),
             first_logged: Cell::new(false),
             loaded: Cell::new(false),
@@ -1097,6 +1125,45 @@ impl FolderView {
         crate::log!(
             "folder",
             "show_hidden is now {show}: {} of {} listed names are visible",
+            self.selection.n_items(),
+            self.dir_list.borrow().n_items()
+        );
+    }
+
+    /// Set, replace or clear the file chooser's own rules and re-decide every
+    /// listed name in place — the same way [`Self::set_show_hidden`] applies the
+    /// hidden-files switch, with no re-listing and no folder reload, so the
+    /// dialog keeps its scroll place and its thumbnails. `None` leaves the
+    /// hidden-files switch as the only rule, which is what every grid in the
+    /// main app has.
+    ///
+    /// The caller drops names the new rules hide from the **model**'s selection
+    /// (a dialog has one grid, so it asks [`Self::listed_names`] what survived
+    /// and toggles off the rest). Until it does, a hidden row is simply
+    /// unselectable: GTK cannot select an item its model no longer shows.
+    pub fn set_grid_filter(self: &Rc<Self>, filter: Option<GridFilter>) {
+        let named = filter.is_some();
+        *self.grid_filter.borrow_mut() = filter;
+        let anchor = self.first_visible_name();
+        if let Some(filter) = self.filtered.filter().and_downcast::<gtk::CustomFilter>() {
+            // `Different`, not `MoreStrict`: a predicate this view has never run
+            // can admit a name the hidden-files switch kept and drop one it kept
+            // too, so neither direction is true of the change as a whole.
+            filter.changed(gtk::FilterChange::Different);
+        }
+        self.rebuild_index();
+        self.apply_selection();
+        self.count_listed();
+        self.update_status();
+        if let Some(name) = anchor
+            && let Some(position) = self.position_of_name(&name)
+        {
+            self.scroll_to_item(position);
+        }
+        crate::log!(
+            "folder",
+            "dialog grid filter {}: {} of {} listed names are visible",
+            if named { "set" } else { "cleared" },
             self.selection.n_items(),
             self.dir_list.borrow().n_items()
         );

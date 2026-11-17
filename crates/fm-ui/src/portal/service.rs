@@ -21,6 +21,8 @@ use gtk::gio;
 use gtk::glib;
 use gtk::prelude::*;
 
+use super::filter::Filter;
+
 /// The name Gimbal claims when the picker runs as a portal backend.
 pub const BUS_NAME: &str = "org.freedesktop.impl.portal.desktop.gimbal";
 
@@ -113,9 +115,10 @@ impl Method {
     }
 }
 
-/// The options F1 understands from an OpenFile call. Everything else is
-/// accepted and ignored: a chooser that refused an unfamiliar key would break
-/// applications that only wanted an ordinary dialog.
+/// The options an OpenFile call can carry. Everything else is accepted and
+/// ignored: a chooser that refused an unfamiliar key would break applications
+/// that only wanted an ordinary dialog. A known key whose value is the wrong
+/// type is read as absent and named in `malformed`.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct OpenOptions {
     /// The accept button's label, with mnemonic underlines allowed.
@@ -123,9 +126,81 @@ pub struct OpenOptions {
     /// The suggested starting folder. It is only used if it exists and is a
     /// directory: the frontend's suggestion never becomes a failed dialog.
     pub current_folder: Option<PathBuf>,
-    /// Known option keys F1 does not implement. Each is logged once; unknown
-    /// keys are ignored silently.
+    /// Several files may be picked, as long as every one is a regular file.
+    pub multiple: bool,
+    /// Folders-only mode: the grid shows folders, Open picks a folder.
+    pub directory: bool,
+    /// The application's file-type filters, in the order it sent them.
+    pub filters: Vec<Filter>,
+    /// Where in `filters` the dialog starts: the entry equal to the call's
+    /// `current_filter`, compared as a whole `(sa(us))` value, or the first.
+    pub current_filter: Option<usize>,
+    /// `current_filter` on a call with no `filters`: one fixed filter with no
+    /// dropdown, the rule `nautilus-portal.c:553-560` follows.
+    pub fixed_filter: Option<Filter>,
+    /// The application's extra choices, in the order it sent them.
+    pub choices: Vec<Choice>,
+    /// Known option keys this build does not act on. Each is logged once;
+    /// unknown keys are ignored silently.
     pub ignored: Vec<&'static str>,
+    /// Known option keys whose value could not be read. Also logged once.
+    pub malformed: Vec<&'static str>,
+}
+
+impl OpenOptions {
+    /// Whether the footer shows the filter dropdown. In folders-only mode the
+    /// filters are ignored, so the dropdown goes (a fixed `current_filter`
+    /// still applies, invisibly).
+    pub fn shows_filters(&self) -> bool {
+        !self.directory && !self.filters.is_empty()
+    }
+
+    /// The filter the dialog starts with, or `None` when nothing filters files
+    /// out of it.
+    pub fn start_filter(&self) -> Option<&Filter> {
+        if self.directory {
+            return None;
+        }
+        if !self.filters.is_empty() {
+            return self.filters.get(self.current_filter.unwrap_or(0));
+        }
+        self.fixed_filter.as_ref()
+    }
+}
+
+/// One entry in the `choices` option: an id, a label, its options and a
+/// default. An empty option list means a checkbox, whose value is `"true"` or
+/// `"false"` (`org.freedesktop.impl.portal.FileChooser.xml`, and the same rule
+/// `nautilus-portal.c:402-419` applies).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Choice {
+    pub id: String,
+    pub label: String,
+    /// The `(ss)` option pairs: an id and what the app shows for it.
+    pub options: Vec<(String, String)>,
+    pub default: String,
+}
+
+impl Choice {
+    /// A choice with no options is a checkbox.
+    pub fn is_check(&self) -> bool {
+        self.options.is_empty()
+    }
+
+    /// Where a checkbox starts. Anything but `"true"` is off, as in Nautilus's
+    /// `g_strcmp0 (selected, "true") == 0`.
+    pub fn starts_checked(&self) -> bool {
+        self.default == "true"
+    }
+
+    /// The option a dropdown starts on: the default, or the first option when
+    /// the default is not one of them.
+    pub fn start_option(&self) -> usize {
+        self.options
+            .iter()
+            .position(|(id, _)| *id == self.default)
+            .unwrap_or(0)
+    }
 }
 
 /// One incoming call, after its arguments have been split into the parts the
@@ -139,13 +214,18 @@ pub struct Call {
 }
 
 impl Call {
-    /// The accept button's label: the caller's, or "Open".
+    /// The accept button's label: the caller's, or the mode's own. A folder
+    /// picker says "Select", a file picker "Open".
     pub fn accept_label(&self) -> &str {
         self.options
             .accept_label
             .as_deref()
             .filter(|label| !label.is_empty())
-            .unwrap_or("Open")
+            .unwrap_or(if self.options.directory {
+                "Select"
+            } else {
+                "Open"
+            })
     }
 
     /// The window title: the caller's, or the app's own name.
@@ -157,9 +237,8 @@ impl Call {
     }
 }
 
-/// The known OpenFile option keys. `modal`, `multiple`, `directory`,
-/// `filters`, `current_filter` and `choices` are known but not implemented
-/// yet, so they are named in the log.
+/// The known OpenFile option keys. `modal` is known but stays unimplemented
+/// until F4, so it is named in the log; every other key acts on the dialog.
 const KNOWN_OPEN_KEYS: &[&str] = &[
     "accept_label",
     "modal",
@@ -171,28 +250,123 @@ const KNOWN_OPEN_KEYS: &[&str] = &[
     "current_folder",
 ];
 
-/// Parse an OpenFile options vardict. Only `accept_label` and `current_folder`
-/// change the dialog; the rest are recorded for the log.
+/// The wire type of the `filters` option.
+const FILTERS_TYPE: &str = "a(sa(us))";
+/// The wire type of one filter, and of the `current_filter` option.
+const FILTER_TYPE: &str = "(sa(us))";
+/// The wire type of the `choices` option.
+const CHOICES_TYPE: &str = "a(ssa(ss)s)";
+
+/// Reads one option as `$type`. A value of another type is read as absent and
+/// named for the log, so a caller that sent `multiple: "yes"` still gets a
+/// dialog rather than a failed one.
+macro_rules! typed_option {
+    ($options:expr, $malformed:expr, $key:literal, $type:ty) => {
+        $options
+            .get($key)
+            .and_then(|value| match value.get::<$type>() {
+                Some(parsed) => Some(parsed),
+                None => {
+                    $malformed.push($key);
+                    None
+                }
+            })
+    };
+}
+
+/// Reads one option that must be a whole variant of one exact type, for the two
+/// keys whose received bytes have to survive: a filter is answered back as it
+/// arrived, and comparing types by hand would lose the rules it holds.
+fn variant_option<'a>(
+    options: &'a HashMap<String, glib::Variant>,
+    malformed: &mut Vec<&'static str>,
+    key: &'static str,
+    expected: &str,
+) -> Option<&'a glib::Variant> {
+    let value = options.get(key)?;
+    if value.type_().as_str() == expected {
+        Some(value)
+    } else {
+        malformed.push(key);
+        None
+    }
+}
+
+/// The children of an array-typed option, each as its own variant. The exact
+/// child is what a filter is answered back with, so the array is walked rather
+/// than decoded into Rust types that could not be shown to the application
+/// unchanged.
+fn children(value: &glib::Variant) -> impl Iterator<Item = glib::Variant> {
+    (0..value.n_children()).filter_map(|index| value.try_child_value(index))
+}
+
+/// Parse an OpenFile options vardict. Every key either changes the dialog or is
+/// named in `ignored` / `malformed` for the log; nothing here is an error.
 pub fn parse_open_options(options: &HashMap<String, glib::Variant>) -> OpenOptions {
-    let accept_label = options
-        .get("accept_label")
-        .and_then(|value| value.get::<String>())
-        .filter(|label| !label.is_empty());
-    let current_folder = options
-        .get("current_folder")
-        .and_then(|value| value.get::<Vec<u8>>())
+    let mut malformed: Vec<&'static str> = Vec::new();
+    let accept_label =
+        typed_option!(options, malformed, "accept_label", String).filter(|label| !label.is_empty());
+    let current_folder = typed_option!(options, malformed, "current_folder", Vec<u8>)
         .and_then(|bytes| folder_from_bytes(&bytes));
+    let multiple = typed_option!(options, malformed, "multiple", bool).unwrap_or_default();
+    let directory = typed_option!(options, malformed, "directory", bool).unwrap_or_default();
+
+    let filters = match variant_option(options, &mut malformed, "filters", FILTERS_TYPE) {
+        Some(value) => children(value)
+            .filter_map(|entry| Filter::from_variant(&entry))
+            .collect(),
+        None => Vec::new(),
+    };
+    let requested = variant_option(options, &mut malformed, "current_filter", FILTER_TYPE)
+        .and_then(Filter::from_variant);
+    // The whole `(sa(us))` decides which entry is selected, as Nautilus does
+    // (`nautilus-portal.c:539`). Two filters with the same name but different
+    // rules are different filters.
+    let current_filter = requested
+        .as_ref()
+        .and_then(|want| filters.iter().position(|have| have == want));
+    // A `current_filter` with no `filters` is one fixed filter, with no
+    // dropdown to change it (`nautilus-portal.c:553-560`).
+    let fixed_filter = if filters.is_empty() { requested } else { None };
+
+    let choices = match variant_option(options, &mut malformed, "choices", CHOICES_TYPE) {
+        Some(value) => children(value)
+            .filter_map(|entry| entry.get::<(String, String, Vec<(String, String)>, String)>())
+            .map(|(id, label, options, default)| Choice {
+                id,
+                label,
+                options,
+                default,
+            })
+            .collect(),
+        None => Vec::new(),
+    };
+
     let ignored = KNOWN_OPEN_KEYS
         .iter()
         .copied()
         .filter(|key| {
-            *key != "accept_label" && *key != "current_folder" && options.contains_key(*key)
+            *key != "accept_label"
+                && *key != "current_folder"
+                && *key != "multiple"
+                && *key != "directory"
+                && *key != "filters"
+                && *key != "current_filter"
+                && *key != "choices"
+                && options.contains_key(*key)
         })
         .collect();
     OpenOptions {
         accept_label,
         current_folder,
+        multiple,
+        directory,
+        filters,
+        current_filter,
+        fixed_filter,
+        choices,
         ignored,
+        malformed,
     }
 }
 
@@ -226,19 +400,68 @@ pub fn empty_results() -> HashMap<String, glib::Variant> {
     HashMap::new()
 }
 
-/// The `a{sv}` a successful call returns: one `file://` URI and an empty
-/// `choices` array. Paths are encoded by GIO, so spaces and non-ASCII names
-/// come out percent-encoded exactly as the portal expects.
-pub fn results_for(path: &Path) -> HashMap<String, glib::Variant> {
+/// What a successful OpenFile answers with.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Pick {
+    /// The chosen paths, in the order they are reported in.
+    pub paths: Vec<PathBuf>,
+    /// The chosen filter's exact `(sa(us))` value as it was received, whenever
+    /// the call had filters. `None` leaves the key out, as `nautilus-portal.c`
+    /// does when it has no current filter to report (`:270-273`).
+    pub current_filter: Option<glib::Variant>,
+    /// Every choice the application sent, in the order it sent them, each with
+    /// the value the dialog holds: `"true"`, `"false"`, or the option id.
+    pub choices: Vec<(String, String)>,
+}
+
+impl Pick {
+    /// The one line an accept leaves in the log: the mode, how many URIs, the
+    /// filter's name and the choices as `id=value`. Paths are allowed here;
+    /// the contents of a file never are.
+    pub fn log_line(&self, mode: &str, filter_name: Option<&str>) -> String {
+        let choices = if self.choices.is_empty() {
+            "none".to_string()
+        } else {
+            self.choices
+                .iter()
+                .map(|(id, value)| format!("{id}={value}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        format!(
+            "accept: {mode}, {} uri(s), filter {}, choices {choices}",
+            self.paths.len(),
+            match filter_name {
+                Some(name) => format!("{name:?}"),
+                None => "none".to_string(),
+            }
+        )
+    }
+}
+
+/// The `a{sv}` a successful call returns: one or more `file://` URIs, the
+/// choices, the chosen filter when the call had filters, and `writable`. Paths
+/// are encoded by GIO, so spaces and non-ASCII names come out percent-encoded
+/// exactly as the portal expects.
+///
+/// `writable` is always `true`: Kyle opens files in order to edit them, and a
+/// `false` here would make the document portal hand a sandboxed application a
+/// read-only copy of whatever it picked. Nautilus answers the same way unless
+/// its optional "Open Read-Only" box is ticked (`nautilus-portal.c:186-206`,
+/// `242-276`); Gimbal has no such box.
+pub fn results_for(pick: &Pick) -> HashMap<String, glib::Variant> {
     let mut results = HashMap::new();
-    results.insert(
-        "uris".to_string(),
-        vec![gio::File::for_path(path).uri().to_string()].to_variant(),
-    );
-    results.insert(
-        "choices".to_string(),
-        Vec::<(String, String)>::new().to_variant(),
-    );
+    let uris = pick
+        .paths
+        .iter()
+        .map(|path| gio::File::for_path(path).uri().to_string())
+        .collect::<Vec<_>>();
+    results.insert("uris".to_string(), uris.to_variant());
+    results.insert("choices".to_string(), pick.choices.clone().to_variant());
+    if let Some(filter) = &pick.current_filter {
+        results.insert("current_filter".to_string(), filter.clone());
+    }
+    results.insert("writable".to_string(), true.to_variant());
     results
 }
 
@@ -370,16 +593,18 @@ impl Request {
         true
     }
 
-    /// Answer with success and one path.
+    /// The application that made this call, for tests that check the routing.
     #[cfg(test)]
     pub fn app_id(&self) -> &str {
         &self.app_id
     }
 
-    /// Answer with success and one path.
-    pub fn accept(self: &Rc<Self>, path: &Path) -> bool {
-        crate::log!("portal", "selected {}", path.display());
-        self.complete(RESPONSE_SUCCESS, results_for(path))
+    /// Answer with success and the dialog's pick.
+    pub fn accept(self: &Rc<Self>, pick: Pick) -> bool {
+        for path in &pick.paths {
+            crate::log!("portal", "selected {}", path.display());
+        }
+        self.complete(RESPONSE_SUCCESS, results_for(&pick))
     }
 }
 
@@ -538,6 +763,14 @@ impl Service {
                 "portal",
                 "OpenFile ignores option(s) {}",
                 options.ignored.join(", ")
+            );
+        }
+        if !options.malformed.is_empty() {
+            // A value of the wrong type is read as absent, never refused.
+            crate::log!(
+                "portal",
+                "OpenFile ignores malformed option(s) {}",
+                options.malformed.join(", ")
             );
         }
         let handle = handle.as_str().to_string();

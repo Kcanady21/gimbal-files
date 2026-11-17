@@ -3,6 +3,7 @@
 
 use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashSet, VecDeque};
+use std::ffi::OsStr;
 use std::fs;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
@@ -11,9 +12,9 @@ use std::path::{Path, PathBuf};
 use crate::folder_size::{Clock, DirReader, EntryKind, EntryMeta, NativeSource, ScanSource};
 
 use super::{
-    BATCH_ROWS, MAX_EXAMPLES, PROGRESS_EVERY, PartialReason, RootFailure, SearchChange,
-    SearchMatch, SearchOutcome, SearchProgress, SearchReport, SearchRequest, SearchSource,
-    SkipExample,
+    BATCH_ROWS, MAX_EXAMPLES, PROGRESS_EVERY, PartialReason, RootFailure, SearchCandidate,
+    SearchChange, SearchMatch, SearchOutcome, SearchProgress, SearchReport, SearchRequest,
+    SearchSource, SkipExample,
 };
 
 /// The production native source. The root alias is resolved once here, on the
@@ -214,7 +215,13 @@ pub(super) fn walk(
             let Some(name) = path.file_name().map(std::ffi::OsStr::to_os_string) else {
                 continue;
             };
-            if let Some(score) = request.query.score_name(&name, cancel) {
+            // The query first, so the caller's rule only runs on names that
+            // match (a file chooser's MIME rule asks GIO for a type). A row the
+            // rule drops is never counted as a match and never takes part in
+            // ranking or the result limit.
+            if let Some(score) = request.query.score_name(&name, cancel)
+                && keeps(request, &path, &name, metadata.kind)
+            {
                 report.matches = report.matches.saturating_add(1);
                 let was_truncated = ranked.truncated;
                 // Reserve room for the at most two changes one consideration
@@ -299,6 +306,16 @@ fn missing(source: &dyn SearchSource, path: &Path) -> bool {
     source
         .lstat(path)
         .is_err_and(|error| error.kind() == io::ErrorKind::NotFound)
+}
+
+/// Whether the request's optional result filter keeps this candidate. With no
+/// filter — every caller but the file chooser — it keeps everything, so an
+/// ordinary search costs the one call this function makes.
+fn keeps(request: &SearchRequest, path: &Path, name: &OsStr, kind: EntryKind) -> bool {
+    request
+        .filter
+        .as_ref()
+        .is_none_or(|filter| filter.keeps(&SearchCandidate { path, name, kind }))
 }
 
 fn flush(

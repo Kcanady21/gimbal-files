@@ -45,6 +45,9 @@ pub struct SearchPage {
     positions: RefCell<Vec<(MatchScore, PathBuf)>>,
     updating: Cell<bool>,
     scale: Cell<f64>,
+    /// Whether this surface's results include dotfiles. The walk always reads
+    /// them; this is what the surface keeps, and the scope line says which.
+    hidden_included: Cell<bool>,
 }
 
 impl SearchPage {
@@ -139,6 +142,7 @@ impl SearchPage {
             positions: RefCell::new(Vec::new()),
             updating: Cell::new(false),
             scale: Cell::new(scale),
+            hidden_included: Cell::new(true),
         });
         page.wire_factory(&factory);
         page.wire_selection();
@@ -183,6 +187,14 @@ impl SearchPage {
         self.apply_view(view);
     }
 
+    /// Say whether this surface keeps dotfiles in its results, so the scope
+    /// line tells the truth. The walk reads them either way: the caller has
+    /// already decided what to show. A file chooser sets this from its Ctrl+H
+    /// before it asks for a query (`portal/picker.rs`).
+    pub fn set_hidden_included(&self, included: bool) {
+        self.hidden_included.set(included);
+    }
+
     /// Update counts/status without rebuilding rows.
     pub fn status(&self, view: &SearchView) {
         if view.generation != self.generation.get() {
@@ -196,7 +208,8 @@ impl SearchPage {
     }
 
     fn apply_view(&self, view: &SearchView) {
-        self.scope.set_text(&scope_text(view));
+        self.scope
+            .set_text(&scope_text(view, self.hidden_included.get()));
         let text = status_text(view);
         self.status.set_text(&text);
         self.status

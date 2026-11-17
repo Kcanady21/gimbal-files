@@ -901,3 +901,169 @@ fn fuzzy_scores_use_the_best_span_and_the_stems_actual_origin() {
         .expect("stem transposition");
     assert_eq!((score.edits, score.start), (1, 0));
 }
+
+/// A result filter that keeps only names ending in one exact suffix.
+#[derive(Debug)]
+struct KeepSuffix(&'static str);
+
+impl SearchResultFilter for KeepSuffix {
+    fn keeps(&self, candidate: &SearchCandidate<'_>) -> bool {
+        candidate.name.to_string_lossy().ends_with(self.0)
+    }
+}
+
+/// The folders-only rule a file chooser in `directory` mode sends.
+#[derive(Debug)]
+struct FoldersOnly;
+
+impl SearchResultFilter for FoldersOnly {
+    fn keeps(&self, candidate: &SearchCandidate<'_>) -> bool {
+        candidate.kind == EntryKind::Directory
+    }
+}
+
+/// Counts the candidates it is asked about, and keeps what `inner` keeps.
+#[derive(Debug)]
+struct Counting {
+    inner: FoldersOnly,
+    asked: AtomicU64,
+}
+
+impl SearchResultFilter for Counting {
+    fn keeps(&self, candidate: &SearchCandidate<'_>) -> bool {
+        self.asked.fetch_add(1, Ordering::SeqCst);
+        self.inner.keeps(candidate)
+    }
+}
+
+#[test]
+fn a_result_filter_drops_rows_before_ranking_and_the_count() {
+    let source = FakeSource::default()
+        .dir(
+            "/root",
+            vec![
+                ok("/root/report.txt"),
+                ok("/root/report.pdf"),
+                ok("/root/notes.txt"),
+            ],
+        )
+        .file("/root/report.txt", 1)
+        .file("/root/report.pdf", 1)
+        .file("/root/notes.txt", 1);
+    let mut request = SearchRequest::new(PathBuf::from("/root"), "report");
+    request.filter = Some(Arc::new(KeepSuffix(".pdf")));
+    let (outcome, rows, _) = run(&request, &source, &SystemClock);
+    let report = finished(outcome);
+    assert!(report.is_complete());
+    assert_eq!(
+        rows.iter()
+            .map(|row| row.path.to_string_lossy().into_owned())
+            .collect::<Vec<_>>(),
+        vec!["/root/report.pdf"],
+        "the excluded names never reach the ranked list"
+    );
+    assert_eq!(report.matches, 1, "an excluded match is not a match");
+    assert_eq!(report.visited, 3, "every entry is still visited");
+    assert_eq!(report.retained, 1);
+}
+
+#[test]
+fn the_result_limit_counts_only_the_rows_a_filter_keeps() {
+    // Twenty fuzzy `.txt` rows the filter drops, then three `.pdf` rows it
+    // keeps. Without the filter this scan reports 22 matches and truncates at
+    // two; with it the limit is spent on kept rows alone.
+    let mut children = Vec::new();
+    let mut source = FakeSource::default().dir("/root", vec![]);
+    for index in 0..20 {
+        let name = format!("/root/reprot-{index}.txt");
+        children.push(ok(&name));
+        source = source.file(&name, 1);
+    }
+    for name in [
+        "/root/reprot-a.pdf",
+        "/root/reprot-b.pdf",
+        "/root/reprot-c.pdf",
+    ] {
+        children.push(ok(name));
+        source = source.file(name, 1);
+    }
+    let source = source.dir("/root", children);
+    let mut request = SearchRequest::new(PathBuf::from("/root"), "reprot");
+    request.limits = limits(1_000, 2, 30_000, 128);
+    request.filter = Some(Arc::new(KeepSuffix(".pdf")));
+    let (outcome, rows, _) = run(&request, &source, &SystemClock);
+    let report = finished(outcome);
+    assert_eq!(
+        rows.len(),
+        2,
+        "the limit is spent on kept rows, not excluded ones"
+    );
+    assert!(report.truncated);
+    assert_eq!(report.matches, 3);
+    assert_eq!(report.retained, 2);
+}
+
+#[test]
+fn a_folders_only_filter_keeps_folders_and_still_descends() {
+    let source = FakeSource::default()
+        .dir("/root", vec![ok("/root/Pictures"), ok("/root/photo.png")])
+        .dir("/root/Pictures", vec![ok("/root/Pictures/summer.png")])
+        .file("/root/photo.png", 1)
+        .file("/root/Pictures/summer.png", 1)
+        .meta("/root/Pictures", EntryKind::Directory, 1, 0);
+    let mut request = SearchRequest::new(PathBuf::from("/root"), "pictures");
+    request.filter = Some(Arc::new(FoldersOnly));
+    let (outcome, rows, _) = run(&request, &source, &SystemClock);
+    let report = finished(outcome);
+    assert!(report.is_complete());
+    assert_eq!(
+        rows.iter()
+            .map(|row| row.path.to_string_lossy().into_owned())
+            .collect::<Vec<_>>(),
+        vec!["/root/Pictures"],
+        "a folder matches, a file with the same query does not"
+    );
+
+    // The same query for a name that only exists below a folder the filter
+    // dropped: dropping a row never prunes the walk.
+    let mut request = SearchRequest::new(PathBuf::from("/root"), "summer");
+    request.filter = Some(Arc::new(FoldersOnly));
+    let (outcome, rows, _) = run(&request, &source, &SystemClock);
+    assert!(finished(outcome).is_complete());
+    assert!(
+        rows.is_empty(),
+        "the file below is excluded by the filter too"
+    );
+    let counting = Arc::new(Counting {
+        inner: FoldersOnly,
+        asked: AtomicU64::new(0),
+    });
+    let mut request = SearchRequest::new(PathBuf::from("/root"), "summer");
+    request.filter = Some(counting.clone());
+    let (outcome, _, _) = run(&request, &source, &SystemClock);
+    assert_eq!(finished(outcome).visited, 3, "the walk went down");
+    assert_eq!(
+        counting.asked.load(Ordering::SeqCst),
+        1,
+        "the filter is asked only about names the query matched (summer.png), \
+         so a MIME rule never runs for the rest of the tree"
+    );
+}
+
+#[test]
+fn no_filter_keeps_every_match_as_an_ordinary_search_does() {
+    let source = FakeSource::default()
+        .dir(
+            "/root",
+            vec![ok("/root/report.txt"), ok("/root/report.pdf")],
+        )
+        .file("/root/report.txt", 1)
+        .file("/root/report.pdf", 1);
+    let request = SearchRequest::new(PathBuf::from("/root"), "report");
+    assert!(request.filter.is_none(), "the default is no filter");
+    let (outcome, rows, _) = run(&request, &source, &SystemClock);
+    let report = finished(outcome);
+    assert!(report.is_complete());
+    assert_eq!(rows.len(), 2);
+    assert_eq!(report.matches, 2);
+}

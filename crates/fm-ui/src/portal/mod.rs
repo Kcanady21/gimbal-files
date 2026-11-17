@@ -12,6 +12,7 @@
 //! Only F1 exists: a basic single-file Open dialog. SaveFile and SaveFiles are
 //! answered "not available" until F3.
 
+pub mod filter;
 pub mod picker;
 pub mod service;
 #[cfg(test)]

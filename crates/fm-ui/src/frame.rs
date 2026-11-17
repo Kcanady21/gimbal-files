@@ -23,7 +23,7 @@ use crate::look::blur::Blur;
 use crate::look::motion;
 use crate::look::tokens::*;
 use crate::preview::PreviewPanel;
-use crate::search::SearchView;
+use crate::search::{SearchSurface, SearchView};
 use crate::sidebar::Sidebar;
 use crate::trash::TrashBrowser;
 
@@ -301,55 +301,13 @@ impl WindowUi {
         self.header.focus_path();
     }
 
-    pub fn open_search(&self, query: Option<&str>) {
-        self.header.open_search(query);
-    }
-
     pub fn search_active(&self) -> bool {
         self.content.search_active()
     }
 
-    /// Show a freshly submitted or restarted query. The header entry keeps
-    /// its focus; the results list is not selected just because it appeared.
-    pub fn begin_search(self: &Rc<Self>, view: &SearchView) {
-        self.header.open_search(Some(&view.query));
-        self.header.hide_search_hint();
-        self.content.show_search();
-        self.content.search_page().begin(view);
-    }
-
-    pub fn search_changes(&self, changes: &[fm_core::search::SearchChange]) {
-        self.content.search_page().apply_changes(changes);
-    }
-
-    pub fn search_status(&self, view: &SearchView) {
-        self.content.search_page().status(view);
-    }
-
-    pub fn search_notice(&self, message: &str) {
-        self.content.search_page().show_notice(message);
-    }
-
-    /// The session is gone (tab/folder change, close or window destruction):
-    /// close the entry and restore the ordinary content page.
-    pub fn search_revoked(self: &Rc<Self>) {
-        self.content.search_page().reset();
-        self.content.hide_search();
-        self.header.close_search();
-        self.update_content();
-        if !self.header.dialogs_open() && !self.preview.text_focused() {
-            self.content.focus_visible();
-        }
-    }
-
-    /// The entry was cleared, but stays open for another query. Only the
-    /// transient results page goes away.
-    pub fn search_cleared(self: &Rc<Self>) {
-        self.content.search_page().reset();
-        self.content.hide_search();
-        self.update_content();
-    }
-
+    /// The header's Escape path: the process owns the session, and closing it
+    /// revokes the page. With no process left there is nothing to revoke, so
+    /// the window does it to itself.
     pub fn close_search(self: &Rc<Self>) {
         if let Some(process) = self.process.upgrade() {
             process.close_search(self.id);
@@ -1317,6 +1275,64 @@ impl WindowUi {
         } else {
             self.right_dirty.set(true);
         }
+    }
+}
+
+/// A main window is one of the two things that can show search results; the
+/// other is the file chooser's dialog (`portal/picker.rs`). Each method says how
+/// this window answers what `Process` routes to the surface of a window, and
+/// every one of them forwards to the widget the window already has, so the
+/// header and the content area keep owning their own state.
+impl crate::search::SearchSurface for WindowUi {
+    fn search_active(&self) -> bool {
+        self.content.search_active()
+    }
+
+    fn open_search(&self, query: Option<&str>) {
+        self.header.open_search(query);
+    }
+
+    fn begin_search(&self, view: &SearchView) {
+        self.header.open_search(Some(&view.query));
+        self.header.hide_search_hint();
+        self.content.show_search();
+        self.content.search_page().begin(view);
+    }
+
+    fn search_changes(&self, changes: &[fm_core::search::SearchChange]) {
+        self.content.search_page().apply_changes(changes);
+    }
+
+    fn search_status(&self, view: &SearchView) {
+        self.content.search_page().status(view);
+    }
+
+    fn search_notice(&self, message: &str) {
+        self.content.search_page().show_notice(message);
+    }
+
+    fn search_revoked(&self) {
+        self.content.search_page().reset();
+        self.content.hide_search();
+        self.header.close_search();
+        self.update_content();
+        if !self.header.dialogs_open() && !self.preview.text_focused() {
+            self.content.focus_visible();
+        }
+    }
+
+    fn search_cleared(&self) {
+        self.content.search_page().reset();
+        self.content.hide_search();
+        self.update_content();
+    }
+
+    fn search_message(&self, text: &str) {
+        self.show_summary(text, None);
+    }
+
+    fn preview_result(&self, selection: &Selection) {
+        self.preview().set_selection_user(selection.clone());
     }
 }
 

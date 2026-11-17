@@ -12,7 +12,7 @@ use std::rc::Rc;
 
 use gtk::prelude::*;
 
-pub use view::FolderView;
+pub use view::{FolderView, GridFilter};
 
 /// The non-widget half of the status line. A selection update always caches
 /// the next status, but a held operation summary stays on screen until it is

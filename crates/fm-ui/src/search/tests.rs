@@ -116,7 +116,7 @@ fn status_never_says_no_matches_for_partial_or_unavailable() {
 fn scope_names_the_device_and_mount_rule() {
     let mut search = view("/r", 0, SearchPhase::Searching { queued: false });
     search.mounts_skipped = 2;
-    let scope = scope_text(&search);
+    let scope = scope_text(&search, true);
     assert!(scope.contains("Same filesystem only"));
     assert!(scope.contains("hidden entries included"));
     assert!(scope.contains("2 mount point(s) listed, not entered"));
@@ -187,6 +187,7 @@ fn at_most_eight_window_sessions_are_admitted() {
                 TabId::from_raw(1),
                 PathBuf::from("/r"),
                 "a".to_string(),
+                None,
             )
             .expect("an admitted session");
     }
@@ -196,6 +197,7 @@ fn at_most_eight_window_sessions_are_admitted() {
             TabId::from_raw(1),
             PathBuf::from("/r"),
             "a".to_string(),
+            None,
         )
         .expect_err("the ninth window is busy");
     assert!(error.to_lowercase().contains("busy"));
@@ -216,12 +218,12 @@ fn a_new_query_replaces_the_old_one_and_old_batches_never_apply() {
     let window = WindowId::from_raw(7);
     let tab = TabId::from_raw(9);
     let first = runtime
-        .submit(window, tab, PathBuf::from("/slow"), "old".to_string())
+        .submit(window, tab, PathBuf::from("/slow"), "old".to_string(), None)
         .expect("first query");
     assert!(wait_until(1_000, || gate.entered() == 1));
 
     let second = runtime
-        .submit(window, tab, PathBuf::from("/fast"), "new".to_string())
+        .submit(window, tab, PathBuf::from("/fast"), "new".to_string(), None)
         .expect("replacement query");
     assert_ne!(first.generation, second.generation);
     assert!(wait_until(1_000, || {
@@ -255,7 +257,7 @@ fn clearing_and_closing_remove_the_session_and_ignore_late_results() {
     let tab = TabId::from_raw(4);
 
     runtime
-        .submit(window, tab, PathBuf::from("/slow"), "old".to_string())
+        .submit(window, tab, PathBuf::from("/slow"), "old".to_string(), None)
         .expect("query");
     assert!(wait_until(1_000, || gate.entered() == 1));
     runtime.close(window);
@@ -269,7 +271,7 @@ fn clearing_and_closing_remove_the_session_and_ignore_late_results() {
 
     gate.reset();
     runtime
-        .submit(window, tab, PathBuf::from("/slow"), "old".to_string())
+        .submit(window, tab, PathBuf::from("/slow"), "old".to_string(), None)
         .expect("query again");
     assert!(wait_until(1_000, || gate.entered() == 1));
     runtime.close(window);
@@ -295,7 +297,11 @@ fn repeated_blocked_scans_keep_two_workers_for_the_process_lifetime() {
         source.clone(),
         Arc::new(SystemClock),
     ));
-    assert_eq!(service.worker_count(), MAX_WORKERS);
+    assert_eq!(
+        service.worker_count(),
+        0,
+        "a pool with no scan has no threads"
+    );
 
     for round in 0..3 {
         gate.reset();
@@ -399,7 +405,7 @@ fn pending_activation_uses_the_native_path_not_the_reordered_index() {
     let tab = model.focused_tab;
 
     let view = runtime
-        .submit(window, tab, root.clone(), "report".to_string())
+        .submit(window, tab, root.clone(), "report".to_string(), None)
         .expect("search");
     assert!(wait_until(2_000, || {
         let _ = runtime.poll(window);
@@ -466,4 +472,74 @@ fn pending_activation_uses_the_native_path_not_the_reordered_index() {
     runtime.close(window);
     gate.release();
     let _ = fs::remove_dir_all(&root);
+}
+
+/// The cost rule a file chooser depends on (`P2an`): a process that has a
+/// `SearchRuntime` and has never searched holds no thread for it. The scan pool
+/// starts its two workers at the first scan; the evidence pool starts its two at
+/// the first metadata check. A root monitor belongs to a session, so it appears
+/// with the first query too.
+#[test]
+fn no_search_thread_exists_until_a_query_or_a_check_needs_one() {
+    let source = TestSource::new()
+        .dir("/r", &["/r/a.txt"])
+        .file("/r/a.txt", 1);
+    let service = Arc::new(SearchService::with_parts(
+        Arc::new(source),
+        Arc::new(SystemClock),
+    ));
+    let evidence = Arc::new(EvidencePool::start());
+    assert_eq!(
+        service.worker_count(),
+        0,
+        "a scan pool with no scan has no worker"
+    );
+    assert_eq!(
+        evidence.worker_count(),
+        0,
+        "an idle evidence pool has no worker"
+    );
+
+    let runtime = SearchRuntime::with_evidence(service.clone(), evidence.clone());
+    let window = WindowId::from_raw(4);
+    runtime
+        .submit(
+            window,
+            TabId::from_raw(1),
+            PathBuf::from("/r"),
+            "a".to_string(),
+            None,
+        )
+        .expect("a query");
+    assert_eq!(
+        service.worker_count(),
+        MAX_WORKERS,
+        "the first query starts the scan workers"
+    );
+    assert_eq!(
+        runtime.monitor_count_for_tests(),
+        1,
+        "and the session's one root monitor"
+    );
+
+    // A monitor event asks the evidence pool for a single metadata check.
+    runtime.root_changed(window);
+    runtime.poll(window);
+    assert_eq!(
+        evidence.worker_count(),
+        MAX_EVIDENCE_WORKERS,
+        "the first check starts the evidence workers"
+    );
+
+    runtime.close(window);
+    assert_eq!(runtime.session_count(), 0);
+    assert_eq!(
+        runtime.monitor_count_for_tests(),
+        0,
+        "the monitor went with the session"
+    );
+    // The pools keep the threads they started: a worker is expensive to create,
+    // and both pools are process-lifetime. What they never do is start early.
+    assert_eq!(service.worker_count(), MAX_WORKERS);
+    assert_eq!(evidence.worker_count(), MAX_EVIDENCE_WORKERS);
 }

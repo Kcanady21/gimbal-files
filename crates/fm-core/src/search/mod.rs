@@ -13,9 +13,11 @@ mod walk;
 #[cfg(test)]
 mod tests;
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
+use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::folder_size::{DirReader, EntryKind, EntryMeta};
 
@@ -57,13 +59,44 @@ impl Default for SearchLimits {
     }
 }
 
+/// One entry the walker is about to rank. The filter sees the same `path`,
+/// `name` and `kind` the retained [`SearchMatch`] will carry, and nothing else:
+/// no open handle, no contents. The walk stays on its own thread, so this is
+/// borrowed for the call only.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SearchCandidate<'a> {
+    pub path: &'a Path,
+    pub name: &'a OsStr,
+    pub kind: EntryKind,
+}
+
+/// A caller's own rule about which matches are worth ranking. The file chooser
+/// passes one so its type filter, its folders-only mode and its hidden-files
+/// switch apply to search results the same way they apply to the folder view
+/// (`P2an`). It runs on the search worker, on each name the query matches and
+/// before that match is counted, so a row it drops never takes part in ranking
+/// or the result limit.
+///
+/// It must be cheap, total and side-effect-free: the walker calls it once per
+/// matching entry, and a panic would stop a scan mid-walk. A filter that needs
+/// a filesystem lookup should use the `kind` the walk already paid for, not
+/// stat or open the file again.
+///
+/// `Debug` is required so a request stays `Debug`: implementors should print
+/// what they keep, not every pattern they hold.
+pub trait SearchResultFilter: Send + Sync + fmt::Debug {
+    fn keeps(&self, candidate: &SearchCandidate<'_>) -> bool;
+}
+
 /// One submitted search. `root` is the user's folder; the walker resolves an
-/// alias once on its worker.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// alias once on its worker. `filter` is `None` for an ordinary search, which
+/// is every caller but the file chooser: the main app's results are unchanged.
+#[derive(Clone, Debug)]
 pub struct SearchRequest {
     pub root: PathBuf,
     pub query: SearchQuery,
     pub limits: SearchLimits,
+    pub filter: Option<Arc<dyn SearchResultFilter>>,
 }
 
 impl SearchRequest {
@@ -72,6 +105,7 @@ impl SearchRequest {
             root,
             query: SearchQuery::new(query),
             limits: SearchLimits::default(),
+            filter: None,
         }
     }
 }

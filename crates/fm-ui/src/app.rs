@@ -2241,6 +2241,20 @@ impl Process {
     // Search routing
     // -----------------------------------------------------------------------
 
+    /// Whatever shows this window's search results: a main window's `WindowUi`
+    /// or the file chooser's `Picker`. It is the only place that knows both
+    /// exist, so the routing below never branches on which one it has.
+    pub(crate) fn search_surface(
+        &self,
+        window: WindowId,
+    ) -> Option<Rc<dyn crate::search::SearchSurface>> {
+        if let Some(ui) = self.window(window) {
+            return Some(ui);
+        }
+        crate::portal::picker::get(window)
+            .map(|picker| picker as Rc<dyn crate::search::SearchSurface>)
+    }
+
     /// The exact tab and folder a new search captures. Split tiles share one
     /// focused tab, so this is only ever the focused tile's folder.
     fn search_target(&self, window: WindowId) -> Option<(TabId, PathBuf)> {
@@ -2304,8 +2318,8 @@ impl Process {
                 reason.label()
             );
             self.close_search(window);
-            if let Some(ui) = self.window(window) {
-                ui.show_summary(&format!("Search unavailable — {}.", reason.label()), None);
+            if let Some(surface) = self.search_surface(window) {
+                surface.search_message(&format!("Search unavailable — {}.", reason.label()));
             }
             return;
         }
@@ -2319,14 +2333,14 @@ impl Process {
         if missing_root {
             // The root disappeared: no late batch may revive the page.
             self.close_search(window);
-            if let Some(ui) = self.window(window) {
-                ui.show_summary("Search unavailable — the folder no longer exists.", None);
+            if let Some(surface) = self.search_surface(window) {
+                surface.search_message("Search unavailable — the folder no longer exists.");
             }
             return;
         }
-        if let Some(ui) = self.window(window) {
+        if let Some(surface) = self.search_surface(window) {
             if !tick.alive {
-                ui.search_revoked();
+                surface.search_revoked();
             } else {
                 // A failed root clears the retained rows; do not repaint a
                 // batch from earlier in the same tick under an unavailable page.
@@ -2335,12 +2349,12 @@ impl Process {
                         matches!(view.phase, crate::search::SearchPhase::Unavailable(_))
                     });
                 if !unavailable && !tick.changes.is_empty() {
-                    ui.search_changes(&tick.changes);
+                    surface.search_changes(&tick.changes);
                 }
                 if tick.changed
                     && let Some(view) = self.search.view(window)
                 {
-                    ui.search_status(&view);
+                    surface.search_status(&view);
                 }
             }
         }
@@ -2353,8 +2367,8 @@ impl Process {
     /// This is a transient view lifecycle operation, not a new command.
     pub fn close_search(self: &Rc<Self>, window: WindowId) {
         let closed = self.search.close(window);
-        if let Some(ui) = self.window(window) {
-            ui.search_revoked();
+        if let Some(surface) = self.search_surface(window) {
+            surface.search_revoked();
         }
         if closed {
             self.stop_search_poll_if_idle();
@@ -2365,8 +2379,8 @@ impl Process {
     /// new query. No new command is involved.
     pub fn cancel_search(self: &Rc<Self>, window: WindowId) {
         let closed = self.search.close(window);
-        if let Some(ui) = self.window(window) {
-            ui.search_cleared();
+        if let Some(surface) = self.search_surface(window) {
+            surface.search_cleared();
         }
         if closed {
             self.stop_search_poll_if_idle();
@@ -2380,32 +2394,66 @@ impl Process {
         };
         match result {
             Ok(view) => {
-                if let Some(ui) = self.window(window) {
-                    ui.begin_search(&view);
+                if let Some(surface) = self.search_surface(window) {
+                    surface.begin_search(&view);
                 }
                 self.ensure_search_poll();
             }
             Err(message) => {
-                if let Some(ui) = self.window(window) {
-                    ui.show_summary(&message, None);
+                if let Some(surface) = self.search_surface(window) {
+                    surface.search_message(&message);
                 }
                 crate::log!("search", "{message}");
             }
         }
     }
 
+    /// The rules a query is filtered by have changed under it — the dialog picked
+    /// another file-type filter, or pressed Ctrl+H — so the query on screen is
+    /// submitted again with the rules it should now have. `SearchRuntime::restart`
+    /// repeats the filter the session was submitted with, which is exactly what
+    /// just changed; this asks the surface again. A window with no query showing
+    /// does nothing, and the poll is armed for the new generation either way.
+    pub(crate) fn requery_search(self: &Rc<Self>, window: WindowId) {
+        let Some(surface) = self.search_surface(window) else {
+            return;
+        };
+        if self.search.view(window).is_none() {
+            return;
+        }
+        let filter = surface.search_filter();
+        match self.search.resubmit(window, filter) {
+            Some(Ok(view)) => {
+                crate::log!(
+                    "search",
+                    "generation {} re-asked with the surface's own rules",
+                    view.generation
+                );
+                surface.begin_search(&view);
+                self.ensure_search_poll();
+            }
+            Some(Err(message)) => {
+                crate::log!("search", "{message}");
+                surface.search_message(&message);
+            }
+            None => self.close_search(window),
+        }
+    }
+
     /// A selected result asks the existing preview for its exact path. It does
     /// not touch the model's hidden folder selection and never enables editing.
+    /// A surface with no preview panel — the file chooser — just updates its
+    /// notice line.
     pub(crate) fn search_preview(self: &Rc<Self>, window: WindowId, generation: u64, index: usize) {
         let Some(selection) = self.search_selection(window, generation, index) else {
             return;
         };
         self.search.clear_notice(window);
-        if let Some(ui) = self.window(window) {
+        if let Some(surface) = self.search_surface(window) {
             if let Some(view) = self.search.view(window) {
-                ui.search_status(&view);
+                surface.search_status(&view);
             }
-            ui.preview().set_selection_user(selection);
+            surface.preview_result(&selection);
         }
     }
 
@@ -2446,15 +2494,15 @@ impl Process {
             crate::search::ActivationStart::Busy(message) => {
                 crate::log!("search", "{message}");
                 self.search.notice(window, &message);
-                if let Some(ui) = self.window(window)
+                if let Some(surface) = self.search_surface(window)
                     && let Some(view) = self.search.view(window)
                 {
-                    ui.search_status(&view);
+                    surface.search_status(&view);
                 }
             }
             crate::search::ActivationStart::Revoked => {
-                if let Some(ui) = self.window(window) {
-                    ui.search_revoked();
+                if let Some(surface) = self.search_surface(window) {
+                    surface.search_revoked();
                 }
                 self.stop_search_poll_if_idle();
             }
@@ -2480,8 +2528,8 @@ impl Process {
             .activation_valid(window, ready.generation, &ready.path, &snapshot)
         {
             self.close_search(window);
-            if let Some(ui) = self.window(window) {
-                ui.search_revoked();
+            if let Some(surface) = self.search_surface(window) {
+                surface.search_revoked();
             }
             return;
         }
@@ -2490,15 +2538,33 @@ impl Process {
             Err(message) => {
                 let text = format!("Search result unavailable: {message}");
                 self.search.notice(window, &text);
-                if let Some(ui) = self.window(window)
+                if let Some(surface) = self.search_surface(window)
                     && let Some(view) = self.search.view(window)
                 {
-                    ui.search_status(&view);
+                    surface.search_status(&view);
                 }
                 return;
             }
         };
         let crate::search::NativeNavTarget { folder, select } = target;
+        // The one place the two surfaces' activation differs: `select` is the
+        // worker's own answer that this result is a regular file, and a file
+        // chooser answers its call with it instead of going to look at it. A
+        // folder result, and every result in a main window, navigates.
+        if select.is_some()
+            && let Some(surface) = self.search_surface(window)
+            && let Some(answer) = surface.consume_file_result(&path)
+        {
+            // Answered: the dialog is closing, and `destroy_window` ends its
+            // search. Refused: the results stay up and say why.
+            if let Err(message) = answer {
+                self.search.notice(window, message);
+                if let Some(view) = self.search.view(window) {
+                    surface.search_status(&view);
+                }
+            }
+            return;
+        }
         let same_folder = snapshot
             .tab(snapshot.focused_tab)
             .is_some_and(|tab| tab.folder == folder);
@@ -2540,19 +2606,19 @@ impl Process {
             Outcome::Failed(message) => {
                 let text = format!("{message}: {}", path.display());
                 self.search.notice(window, &text);
-                if let Some(ui) = self.window(window)
+                if let Some(surface) = self.search_surface(window)
                     && let Some(view) = self.search.view(window)
                 {
-                    ui.search_status(&view);
+                    surface.search_status(&view);
                 }
             }
             Outcome::Error(error) => {
                 let text = format!("Could not open {}: {error}", path.display());
                 self.search.notice(window, &text);
-                if let Some(ui) = self.window(window)
+                if let Some(surface) = self.search_surface(window)
                     && let Some(view) = self.search.view(window)
                 {
-                    ui.search_status(&view);
+                    surface.search_status(&view);
                 }
             }
             _ => {}
@@ -2858,12 +2924,10 @@ impl Process {
     }
 
     fn refresh(self: &Rc<Self>, id: WindowId, fade: bool) {
-        // A picker has no WindowUi, no search page and no header of its own:
-        // it follows the model through its small nav row and grid.
-        if crate::portal::picker::is_live(id) {
-            crate::portal::picker::refresh(self, id);
-            return;
-        }
+        // Both surfaces follow the model from here. A search session belongs to
+        // its window's tab and folder, so it is validated before either view is
+        // drawn: navigating away from a searched folder leaves no page behind,
+        // in a dialog as much as in a window.
         let valid = match self.window_snapshot(id) {
             Some(window) => self.search.validate(id, &window),
             None => {
@@ -2871,17 +2935,23 @@ impl Process {
                 false
             }
         };
-        if let Some(ui) = self.window(id) {
-            if !valid {
-                ui.search_revoked();
+        if !valid {
+            if let Some(surface) = self.search_surface(id) {
+                surface.search_revoked();
             }
+            self.stop_search_poll_if_idle();
+        }
+        // A picker has no WindowUi and no header of its own: it follows the
+        // model through its small nav row and grid.
+        if crate::portal::picker::is_live(id) {
+            crate::portal::picker::refresh(self, id);
+            return;
+        }
+        if let Some(ui) = self.window(id) {
             if !self.suppress_header.get() {
                 ui.refresh_header(fade);
             }
             ui.update_content();
-        }
-        if !valid {
-            self.stop_search_poll_if_idle();
         }
     }
 
@@ -3021,8 +3091,8 @@ impl Process {
 
         let closed = self.search.cancel_under(root);
         for search_window in &closed {
-            if let Some(ui) = self.window(*search_window) {
-                ui.search_revoked();
+            if let Some(surface) = self.search_surface(*search_window) {
+                surface.search_revoked();
             }
         }
         crate::log!(
@@ -3337,12 +3407,14 @@ impl Process {
 
         // The read-only results page owns these actions. Nothing here may fall
         // through to the hidden folder selection or a preview buffer.
-        let search_active = self.window(window).is_some_and(|ui| ui.search_active())
+        let search_active = self
+            .search_surface(window)
+            .is_some_and(|surface| surface.search_active())
             || self.search.view(window).is_some();
         if search_active && let Some(message) = crate::search::refusal_for(command.name()) {
             self.search.notice(window, message);
-            if let Some(ui) = self.window(window) {
-                ui.search_notice(message);
+            if let Some(surface) = self.search_surface(window) {
+                surface.search_notice(message);
             }
             return Outcome::Failed(message.to_string());
         }
@@ -3936,7 +4008,9 @@ impl Process {
                 self.finish(result);
             }
             "nav.refresh" => {
-                let search_visible = self.window(window).is_some_and(|ui| ui.search_active());
+                let search_visible = self
+                    .search_surface(window)
+                    .is_some_and(|surface| surface.search_active());
                 if search_visible || self.search.view(window).is_some() {
                     self.restart_search(window);
                     crate::log!("search", "nav.refresh restarted the visible query");
@@ -3956,19 +4030,22 @@ impl Process {
                 }
             }
             "search.open" => {
-                let ui = self.window(window);
+                let surface = self.search_surface(window);
                 if let Some(query) = text {
-                    if let Some(ui) = &ui {
-                        ui.open_search(Some(&query));
+                    if let Some(surface) = &surface {
+                        surface.open_search(Some(&query));
                     }
                     let Some((tab, root)) = self.search_target(window) else {
                         let message = "There is no folder to search.".to_string();
-                        if let Some(ui) = &ui {
-                            ui.show_summary(&message, None);
+                        if let Some(surface) = &surface {
+                            surface.search_message(&message);
                         }
                         return Outcome::Failed(message);
                     };
-                    match self.search.submit(window, tab, root, query) {
+                    // The surface says which of its matches are worth ranking:
+                    // no surface, and no main window, filter nothing.
+                    let filter = surface.as_ref().and_then(|surface| surface.search_filter());
+                    match self.search.submit(window, tab, root, query, filter) {
                         Ok(view) => {
                             crate::log!(
                                 "search",
@@ -3979,21 +4056,21 @@ impl Process {
                                 view.root.display(),
                                 view.query.chars().count()
                             );
-                            if let Some(ui) = &ui {
-                                ui.begin_search(&view);
+                            if let Some(surface) = &surface {
+                                surface.begin_search(&view);
                             }
                             self.ensure_search_poll();
                         }
                         Err(message) => {
-                            if let Some(ui) = &ui {
-                                ui.show_summary(&message, None);
+                            if let Some(surface) = &surface {
+                                surface.search_message(&message);
                             }
                             crate::log!("search", "{message}");
                             return Outcome::Failed(message);
                         }
                     }
-                } else if let Some(ui) = &ui {
-                    ui.open_search(None);
+                } else if let Some(surface) = &surface {
+                    surface.open_search(None);
                 }
             }
             "selection.all" => {
@@ -4899,10 +4976,13 @@ fn log_outcome(invocation: &Invocation, outcome: &Outcome) {
     }
 }
 
-/// The commands a picker window answers (P2am F1): navigation, selection,
-/// the two sort commands and the hidden-files switch, and the dialog's own two
-/// answers. The catalogue's picker names are included from the one list, so
-/// the window and the caller rules cannot drift apart.
+/// The commands a picker window answers (P2am F1, extended by P2an F2):
+/// navigation, selection, the two sort commands and the hidden-files switch,
+/// the dialog's own two answers, and `search.open`. The catalogue's picker
+/// names are included from the one list, so the window and the caller rules
+/// cannot drift apart. `search.open` is `Effect::View`: it reads the model's
+/// folder, hands a query to the read-only worker and shows the results page,
+/// and writes no config, no session and no file.
 pub(crate) fn picker_accepts(name: &str) -> bool {
     fm_core::command::PICKER_COMMANDS.contains(&name)
         || matches!(
@@ -4913,6 +4993,7 @@ pub(crate) fn picker_accepts(name: &str) -> bool {
                 | "nav.up"
                 | "nav.refresh"
                 | "nav.focus-path"
+                | "search.open"
                 | "selection.all"
                 | "selection.none"
                 | "view.set-sort"

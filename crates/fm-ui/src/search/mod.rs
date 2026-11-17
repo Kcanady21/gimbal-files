@@ -20,15 +20,16 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{Receiver, SyncSender, TrySendError};
+use std::sync::mpsc::{Receiver, Sender, SyncSender, TrySendError};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use fm_core::folder_size::{Clock, SystemClock};
+use fm_core::preview::Selection;
 use fm_core::search::{
     NativeSearchSource, PartialReason, RootFailure, SearchChange, SearchLimits, SearchMatch,
-    SearchOutcome, SearchProgress, SearchRequest, SearchSource, SkipExample,
+    SearchOutcome, SearchProgress, SearchRequest, SearchResultFilter, SearchSource, SkipExample,
 };
 use fm_core::workspace::{TabId, Window, WindowId};
 use gtk::prelude::*;
@@ -265,6 +266,10 @@ struct EvidenceJob {
     kind: EvidenceJobKind,
 }
 
+/// One queued evidence job with the id it answers under and the flag that
+/// cancels it. Named because it appears on both ends of the queue.
+type EvidencePacket = (u64, Arc<AtomicBool>, EvidenceJob);
+
 #[derive(Debug)]
 enum EvidenceOutcome {
     Activation {
@@ -287,9 +292,22 @@ struct EvidenceResult {
 /// The process-lifetime, bounded worker pool for result activation and root
 /// checks. These are short, read-only filesystem lookups, never scans; the
 /// walker's own fixed pool remains separate.
+///
+/// Its threads start with the first job, not with the pool: a dialog that never
+/// searches never pays for an evidence worker.
 pub(crate) struct EvidencePool {
-    sender: Option<SyncSender<(u64, Arc<AtomicBool>, EvidenceJob)>>,
+    sender: Option<SyncSender<EvidencePacket>>,
+    /// The jobs end, shared by the workers. Kept here as well as read by them
+    /// so a later `ensure_workers` can hand a new thread the same queue.
+    jobs: Arc<Mutex<Receiver<EvidencePacket>>>,
     results: Mutex<Receiver<EvidenceResult>>,
+    /// The workers' end of the result channel, kept so a spawn after
+    /// construction can clone it.
+    results_out: Mutex<Option<Sender<EvidenceResult>>>,
+    activation: ActivationRunner,
+    root: RootRunner,
+    workers: Mutex<Vec<JoinHandle<()>>>,
+    started: AtomicBool,
     next_id: AtomicU64,
 }
 
@@ -302,17 +320,36 @@ impl EvidencePool {
     }
 
     pub(crate) fn with_runners(activation: ActivationRunner, root: RootRunner) -> Self {
-        let (sender, jobs) = std::sync::mpsc::sync_channel::<(u64, Arc<AtomicBool>, EvidenceJob)>(
-            MAX_EVIDENCE_QUEUE,
-        );
+        let (sender, jobs) = std::sync::mpsc::sync_channel::<EvidencePacket>(MAX_EVIDENCE_QUEUE);
         let (result_tx, results) = std::sync::mpsc::channel();
-        let jobs = Arc::new(Mutex::new(jobs));
+        Self {
+            sender: Some(sender),
+            jobs: Arc::new(Mutex::new(jobs)),
+            results: Mutex::new(results),
+            results_out: Mutex::new(Some(result_tx)),
+            activation,
+            root,
+            workers: Mutex::new(Vec::new()),
+            started: AtomicBool::new(false),
+            next_id: AtomicU64::new(1),
+        }
+    }
+
+    /// Start the evidence workers, once, on the first job.
+    fn ensure_workers(&self) {
+        if self.started.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let Some(result_tx) = self.results_out.lock().unwrap().as_ref().cloned() else {
+            return;
+        };
+        let mut workers = self.workers.lock().unwrap();
         for index in 0..MAX_EVIDENCE_WORKERS {
-            let jobs = Arc::clone(&jobs);
+            let jobs = Arc::clone(&self.jobs);
             let result_tx = result_tx.clone();
-            let activation = Arc::clone(&activation);
-            let root_runner = Arc::clone(&root);
-            thread::Builder::new()
+            let activation = Arc::clone(&self.activation);
+            let root_runner = Arc::clone(&self.root);
+            let spawned = thread::Builder::new()
                 .name(format!("search-evidence-{index}"))
                 .spawn(move || {
                     loop {
@@ -356,13 +393,17 @@ impl EvidencePool {
                             return;
                         }
                     }
-                })
-                .expect("the search evidence thread starts");
-        }
-        Self {
-            sender: Some(sender),
-            results: Mutex::new(results),
-            next_id: AtomicU64::new(1),
+                });
+            match spawned {
+                Ok(handle) => workers.push(handle),
+                Err(error) => {
+                    // Without a worker a check never returns, so the session
+                    // says it is busy rather than waiting forever.
+                    crate::log!("search", "the evidence worker did not start: {error}");
+                    self.started.store(false, Ordering::SeqCst);
+                    break;
+                }
+            }
         }
     }
 
@@ -375,6 +416,7 @@ impl EvidencePool {
         let Some(sender) = &self.sender else {
             return Err("the activation worker pool is unavailable".to_string());
         };
+        self.ensure_workers();
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         match sender.try_send((id, cancel, EvidenceJob { window, kind: job })) {
             Ok(()) => Ok(id),
@@ -390,6 +432,11 @@ impl EvidencePool {
     fn try_result(&self) -> Option<EvidenceResult> {
         self.results.lock().ok()?.try_recv().ok()
     }
+
+    #[cfg(test)]
+    fn worker_count(&self) -> usize {
+        self.workers.lock().unwrap().len()
+    }
 }
 
 impl Drop for EvidencePool {
@@ -397,6 +444,7 @@ impl Drop for EvidencePool {
         // Closing the sender lets idle workers leave `recv`. Never join: a
         // blocked native lookup must not hold up GTK or app shutdown.
         drop(self.sender.take());
+        drop(self.results_out.lock().unwrap().take());
     }
 }
 
@@ -430,6 +478,10 @@ struct ServiceQueue {
     active: HashMap<u64, Arc<AtomicBool>>,
     running: usize,
     stopped: bool,
+    /// Whether the workers exist yet. A pool that has never been given a scan
+    /// has no threads: a process that never searches — every picker dialog until
+    /// someone presses Ctrl+F — pays nothing for the idea of one.
+    started: bool,
 }
 
 struct ServiceInner {
@@ -461,17 +513,27 @@ impl SearchService {
             source,
             clock,
         });
-        let workers: Vec<JoinHandle<()>> = (0..MAX_WORKERS)
+        Self { inner }
+    }
+
+    /// Start the two scan workers, once. Called from `start` with the queue
+    /// lock held: a worker's first act is to take that same lock, so it waits
+    /// for this call to finish rather than racing it. Lock order is
+    /// queue-then-workers everywhere, and nothing takes them the other way.
+    fn spawn_workers(&self) {
+        let mut workers = self.inner.workers.lock().unwrap();
+        if !workers.is_empty() {
+            return;
+        }
+        *workers = (0..MAX_WORKERS)
             .map(|index| {
-                let inner = inner.clone();
+                let inner = self.inner.clone();
                 thread::Builder::new()
                     .name(format!("search-{index}"))
                     .spawn(move || worker_loop(inner))
                     .expect("search worker")
             })
             .collect();
-        *inner.workers.lock().unwrap() = workers;
-        Self { inner }
     }
 
     fn start(
@@ -498,6 +560,10 @@ impl SearchService {
         }
         if queue.pending.len() >= MAX_PENDING_JOBS {
             return StartOutcome::Busy;
+        }
+        if !queue.started {
+            queue.started = true;
+            self.spawn_workers();
         }
         queue.pending.push_back(job);
         self.inner.ready.notify_one();
@@ -671,6 +737,7 @@ struct PendingScan {
     query: String,
     root: PathBuf,
     limits: SearchLimits,
+    filter: Option<Arc<dyn SearchResultFilter>>,
 }
 
 struct PendingActivation {
@@ -707,6 +774,8 @@ struct WindowSession {
     tab: TabId,
     root: PathBuf,
     query: String,
+    /// The rule this query was submitted with, so a restart repeats it.
+    filter: Option<Arc<dyn SearchResultFilter>>,
     rows: Vec<SearchMatch>,
     total_matches: u64,
     truncated: bool,
@@ -850,6 +919,57 @@ impl WindowSession {
     }
 }
 
+/// What a search session needs from whatever shows its results.
+///
+/// Two things host a results page: a main window, whose `WindowUi` implements
+/// this over its header entry and `Content` page (the impl is in `frame.rs`),
+/// and the file chooser's dialog, whose `Picker` implements it over its own nav
+/// row and stack (`portal/picker.rs`). `Process::search_surface` picks one by
+/// window id, so the routing in `app.rs` says neither `WindowUi` nor `Picker`.
+///
+/// Every method is a request about the *view*. The session, its worker and its
+/// ranking stay in [`SearchRuntime`]: a surface never decides what is searched,
+/// only what is shown.
+pub trait SearchSurface {
+    /// The results page is the visible page.
+    fn search_active(&self) -> bool;
+    /// Reveal the search entry, with `query` already typed if there is one.
+    fn open_search(&self, query: Option<&str>);
+    /// Show a freshly submitted or restarted query.
+    fn begin_search(&self, view: &SearchView);
+    /// Apply one worker batch of ranked inserts and removals.
+    fn search_changes(&self, changes: &[SearchChange]);
+    /// Refresh the counts, the phase and the notice.
+    fn search_status(&self, view: &SearchView);
+    /// Explain, on the page itself, why a command was refused.
+    fn search_notice(&self, message: &str);
+    /// The session is gone: close the entry and restore ordinary content.
+    fn search_revoked(&self);
+    /// The entry was cleared but stays open; only the results page goes away.
+    fn search_cleared(&self);
+    /// Say something on the surface's own status line.
+    fn search_message(&self, text: &str);
+
+    /// A result was selected, and the surface may show it. A dialog has no
+    /// preview panel, so the default ignores it.
+    fn preview_result(&self, _selection: &Selection) {}
+
+    /// The rule that decides which of a new query's matches are ranked. `None`
+    /// is an ordinary search: the main app's results are unchanged by it.
+    fn search_filter(&self) -> Option<Arc<dyn SearchResultFilter>> {
+        None
+    }
+
+    /// Enter or double-click on a result that is a regular file. A dialog
+    /// consumes it, so nothing navigates: `Some(Ok(()))` when it answered its
+    /// call with the file, `Some(Err(why))` when its rules refuse it and the
+    /// results stay up with `why` as their notice. The main window's `None` is
+    /// the ordinary "go there and select it".
+    fn consume_file_result(&self, _path: &Path) -> Option<Result<(), &'static str>> {
+        None
+    }
+}
+
 pub struct SearchRuntime {
     service: Arc<SearchService>,
     evidence: Arc<EvidencePool>,
@@ -902,14 +1022,22 @@ impl SearchRuntime {
         *self.wake.borrow_mut() = Some(Rc::new(wake));
     }
 
-    /// Submit a query for the exact window/tab/root captured by the caller.
-    /// A second submission replaces the current session in the same window.
+    /// Submit a query for the exact window/tab/root captured by the caller, and
+    /// the rule that says which of its matches are worth ranking. A second
+    /// submission replaces the current session in the same window.
+    ///
+    /// `filter` is `None` for an ordinary search, which is what every window in
+    /// the main app asks for. The file chooser passes one so its file-type
+    /// filter, its folders-only mode and its Ctrl+H apply to results exactly as
+    /// they apply to the folder view, and an excluded row never uses up the
+    /// result limit (`P2an`).
     pub fn submit(
         &self,
         window: WindowId,
         tab: TabId,
         root: PathBuf,
         query: String,
+        filter: Option<Arc<dyn SearchResultFilter>>,
     ) -> Result<SearchView, String> {
         if query.is_empty() {
             return Err("Search needs a nonempty query.".to_string());
@@ -927,6 +1055,7 @@ impl SearchRuntime {
             session.tab = tab;
             session.root = root.clone();
             session.query = query.clone();
+            session.filter = filter.clone();
             session.rows.clear();
             session.total_matches = 0;
             session.truncated = false;
@@ -941,6 +1070,7 @@ impl SearchRuntime {
                 query,
                 root: root.clone(),
                 limits,
+                filter,
             });
             start_pending(session, &self.service);
             self.install_root_monitor(session);
@@ -957,6 +1087,7 @@ impl SearchRuntime {
             tab,
             root: root.clone(),
             query: query.clone(),
+            filter: filter.clone(),
             rows: Vec::new(),
             total_matches: 0,
             truncated: false,
@@ -972,6 +1103,7 @@ impl SearchRuntime {
                 query,
                 root,
                 limits,
+                filter,
             }),
             activation: None,
             activation_ready: None,
@@ -1055,14 +1187,38 @@ impl SearchRuntime {
     }
 
     /// Restart the session's current query explicitly, used by Folder Refresh
-    /// while results are visible.
+    /// while results are visible. The same result filter applies: the view's
+    /// rules have not changed, only the folder's contents may have.
     pub fn restart(&self, window: WindowId) -> Option<Result<SearchView, String>> {
+        let (tab, root, query, filter) = {
+            let state = self.state.borrow();
+            let session = state.sessions.get(&window)?;
+            (
+                session.tab,
+                session.root.clone(),
+                session.query.clone(),
+                session.filter.clone(),
+            )
+        };
+        Some(self.submit(window, tab, root, query, filter))
+    }
+
+    /// The rule a query is filtered by has changed under it, so the same query
+    /// is submitted again and asked of the worker anew. `restart` repeats the
+    /// filter the session was submitted with; this one takes `filter` instead,
+    /// for the surface whose own rules just moved (a file chooser that picked
+    /// another filter, or pressed Ctrl+H, while its results page was up).
+    pub fn resubmit(
+        &self,
+        window: WindowId,
+        filter: Option<Arc<dyn SearchResultFilter>>,
+    ) -> Option<Result<SearchView, String>> {
         let (tab, root, query) = {
             let state = self.state.borrow();
             let session = state.sessions.get(&window)?;
             (session.tab, session.root.clone(), session.query.clone())
         };
-        Some(self.submit(window, tab, root, query))
+        Some(self.submit(window, tab, root, query, filter))
     }
 
     pub fn close(&self, window: WindowId) -> bool {
@@ -1506,6 +1662,7 @@ fn start_pending(session: &mut WindowSession, service: &SearchService) {
     let progress = Arc::new(ProgressCell::new());
     let mut request = SearchRequest::new(pending.root.clone(), pending.query.clone());
     request.limits = pending.limits;
+    request.filter = pending.filter.clone();
     match service.start(request, cancel.clone(), events.clone(), progress.clone()) {
         StartOutcome::Started(token) => {
             crate::log!(
@@ -1672,10 +1829,20 @@ fn match_count(count: u64) -> String {
 }
 
 /// The scope note beside the root. It never claims more than the walk does.
-pub fn scope_text(view: &SearchView) -> String {
-    let mut text =
-        "Same filesystem only · hidden entries included · child symlink folders not followed · depth ≤ 128"
-            .to_string();
+///
+/// `hidden_included` is the surface's honest word about dotfiles: the walk reads
+/// them either way, and a surface that drops them again — a file chooser with
+/// Ctrl+H off — says so instead of claiming otherwise. The main app includes
+/// them, which is what its `SearchPage` reports (`search/view.rs`).
+pub fn scope_text(view: &SearchView, hidden_included: bool) -> String {
+    let mut text = format!(
+        "Same filesystem only · {} · child symlink folders not followed · depth ≤ 128",
+        if hidden_included {
+            "hidden entries included"
+        } else {
+            "hidden entries skipped"
+        }
+    );
     if view.mounts_skipped > 0 {
         text.push_str(&format!(
             " · {} mount point(s) listed, not entered",

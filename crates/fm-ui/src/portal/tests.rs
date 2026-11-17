@@ -227,6 +227,15 @@ fn nul_path(path: &std::path::Path) -> Vec<u8> {
     bytes
 }
 
+/// The answer of a dialog with no filters and no choices: one path.
+fn pick_one(path: &std::path::Path) -> service::Pick {
+    service::Pick {
+        paths: vec![path.to_path_buf()],
+        current_filter: None,
+        choices: Vec::new(),
+    }
+}
+
 const HANDLE: &str = "/org/freedesktop/portal/desktop/request/1_42/t1";
 
 fn open_file(bus: &Bus, app_id: &str, title: &str, extra: HashMap<String, glib::Variant>) -> Reply {
@@ -306,21 +315,345 @@ fn a_missing_or_empty_start_folder_falls_back_to_home() {
 }
 
 #[test]
-fn parse_open_options_keeps_the_label_and_names_the_ignored_keys() {
+fn parse_open_options_keeps_the_label_and_names_only_the_key_it_still_ignores() {
     let parsed = service::parse_open_options(&options(&[
         ("accept_label", "_Open".to_variant()),
         ("modal", true.to_variant()),
         ("multiple", true.to_variant()),
+        ("directory", true.to_variant()),
         (
             "filters",
-            Vec::<(String, Vec<(String, String)>)>::new().to_variant(),
+            vec![(
+                "Images",
+                vec![
+                    (0u32, "*.png".to_string()),
+                    (1u32, "image/jpeg".to_string()),
+                ],
+            )]
+            .to_variant(),
+        ),
+        (
+            "choices",
+            vec![(
+                "enc",
+                "Encoding",
+                vec![("utf8".to_string(), "UTF-8".to_string())],
+                "utf8".to_string(),
+            )]
+            .to_variant(),
         ),
         ("something_new", 1i32.to_variant()),
     ]));
     assert_eq!(parsed.accept_label.as_deref(), Some("_Open"));
     assert_eq!(parsed.current_folder, None);
-    // Known-but-unimplemented keys are named; an unknown key is silent.
-    assert_eq!(parsed.ignored, vec!["modal", "multiple", "filters"]);
+    assert!(parsed.multiple, "a `b` option is read");
+    assert!(parsed.directory);
+    assert_eq!(parsed.filters.len(), 1);
+    assert_eq!(parsed.filters[0].name, "Images");
+    assert_eq!(parsed.choices.len(), 1);
+    // Only `modal` is left unimplemented until F4; an unknown key is silent.
+    assert_eq!(parsed.ignored, vec!["modal"]);
+    assert!(parsed.malformed.is_empty());
+}
+
+#[test]
+fn the_options_default_to_one_file_a_folder_and_no_filter_or_choice() {
+    let parsed = service::parse_open_options(&HashMap::new());
+    assert!(!parsed.multiple);
+    assert!(!parsed.directory);
+    assert!(parsed.filters.is_empty());
+    assert!(parsed.choices.is_empty());
+    assert_eq!(parsed.current_filter, None);
+    assert_eq!(parsed.start_filter(), None);
+    assert!(!parsed.shows_filters());
+    assert!(parsed.ignored.is_empty() && parsed.malformed.is_empty());
+}
+
+#[test]
+fn a_value_of_the_wrong_type_is_read_as_absent_and_named_for_the_log() {
+    let parsed = service::parse_open_options(&options(&[
+        ("accept_label", 7u32.to_variant()),
+        ("current_folder", "/tmp".to_variant()),
+        ("multiple", "yes".to_variant()),
+        ("directory", 1u32.to_variant()),
+        ("filters", "*.png".to_variant()),
+        ("current_filter", "Images".to_variant()),
+        ("choices", 0u32.to_variant()),
+    ]));
+    // The dialog still opens: nothing here is an error.
+    assert_eq!(parsed.accept_label, None);
+    assert_eq!(parsed.current_folder, None);
+    assert!(!parsed.multiple);
+    assert!(!parsed.directory);
+    assert!(parsed.filters.is_empty());
+    assert!(parsed.fixed_filter.is_none());
+    assert!(parsed.choices.is_empty());
+    assert_eq!(
+        parsed.malformed,
+        vec![
+            "accept_label",
+            "current_folder",
+            "multiple",
+            "directory",
+            "filters",
+            "current_filter",
+            "choices"
+        ]
+    );
+}
+
+fn filter_variant(name: &str, rules: &[(u32, &str)]) -> glib::Variant {
+    let rules: Vec<(u32, String)> = rules
+        .iter()
+        .map(|(kind, pattern)| (*kind, pattern.to_string()))
+        .collect();
+    (name.to_string(), rules).to_variant()
+}
+
+/// One filter as the application's `a(sa(us))` holds it.
+fn filter_tuple(name: &str, rules: &[(u32, &str)]) -> (String, Vec<(u32, String)>) {
+    (
+        name.to_string(),
+        rules
+            .iter()
+            .map(|(kind, pattern)| (*kind, pattern.to_string()))
+            .collect(),
+    )
+}
+
+/// The `filters` option, typed as the portal sends it. A `Vec<Variant>` would
+/// say `av` instead, and the service reads that as a malformed value, so the
+/// array is built from the tuples themselves.
+fn filter_array(filters: &[(String, Vec<(u32, String)>)]) -> glib::Variant {
+    filters.to_vec().to_variant()
+}
+
+/// One entry of an `a(sa(us))`, as a variant: the bytes the service keeps and
+/// answers back.
+fn entry_of(filters: &glib::Variant, index: usize) -> glib::Variant {
+    filters
+        .try_child_value(index)
+        .unwrap_or_else(|| panic!("no entry {index}"))
+}
+
+/// One `choices` entry: an id, a label, its options and a default.
+type ChoiceTuple = (String, String, Vec<(String, String)>, String);
+
+/// The `choices` option, typed as `a(ssa(ss)s)`.
+fn choice_array(choices: &[ChoiceTuple]) -> glib::Variant {
+    choices.to_vec().to_variant()
+}
+
+#[test]
+fn filters_are_kept_in_the_order_sent_with_their_rules_and_their_bytes() {
+    let filters = filter_array(&[
+        filter_tuple("Images", &[(0, "*.png"), (1, "image/jpeg"), (7, "bogus")]),
+        filter_tuple("Text", &[(1, "text/plain")]),
+    ]);
+    let parsed = service::parse_open_options(&options(&[("filters", filters.clone())]));
+    assert_eq!(parsed.filters.len(), 2);
+    assert_eq!(parsed.filters[0].name, "Images");
+    assert_eq!(parsed.filters[1].name, "Text", "the app's order is kept");
+    assert!(parsed.shows_filters());
+    // An unknown rule kind is dropped as `gtk_file_filter_new_from_gvariant`
+    // drops it; the two it knows survive in the order sent.
+    assert_eq!(parsed.filters[0].rules.len(), 2);
+    assert_eq!(parsed.filters[0].rules[0].pattern, "*.png");
+    assert_eq!(parsed.filters[0].rules[1].pattern, "image/jpeg");
+    // The answer must be the bytes that arrived, not a re-encoding of them.
+    assert_eq!(parsed.filters[0].raw(), &entry_of(&filters, 0));
+    // With no `current_filter` the dialog starts on the first entry.
+    assert_eq!(parsed.current_filter, None);
+    assert_eq!(
+        parsed.start_filter().map(|filter| filter.name.as_str()),
+        Some("Images")
+    );
+}
+
+#[test]
+fn current_filter_selects_the_entry_whose_whole_value_matches() {
+    let filters = filter_array(&[
+        filter_tuple("Images", &[(0, "*.png")]),
+        filter_tuple("Text", &[(1, "text/plain")]),
+    ]);
+    let text = entry_of(&filters, 1);
+    let same_name_other_rules = filter_variant("Text", &[(0, "*.md")]);
+    let parsed = service::parse_open_options(&options(&[
+        ("filters", filters.clone()),
+        ("current_filter", text.clone()),
+    ]));
+    assert_eq!(parsed.current_filter, Some(1), "the second entry");
+    assert_eq!(
+        parsed.start_filter().map(|filter| filter.raw().clone()),
+        Some(text.clone())
+    );
+    assert_eq!(parsed.fixed_filter, None, "a list wins over a fixed filter");
+
+    // Two filters with one name and different rules are different filters, so
+    // matching on the whole `(sa(us))` value is what picks the entry.
+    let parsed = service::parse_open_options(&options(&[
+        ("filters", filters),
+        ("current_filter", same_name_other_rules.clone()),
+    ]));
+    assert_eq!(
+        parsed.current_filter, None,
+        "a filter that is not in the list selects nothing"
+    );
+    assert_eq!(
+        parsed.start_filter().map(|filter| filter.name.as_str()),
+        Some("Images"),
+        "and the dialog starts on the first"
+    );
+}
+
+#[test]
+fn a_current_filter_with_no_filters_is_one_fixed_filter_and_no_dropdown() {
+    let only = filter_variant("PDF", &[(0, "*.pdf")]);
+    let parsed = service::parse_open_options(&options(&[("current_filter", only.clone())]));
+    assert!(parsed.filters.is_empty());
+    assert!(!parsed.shows_filters(), "there is nothing to choose from");
+    let fixed = parsed.start_filter().expect("the fixed filter applies");
+    assert_eq!(fixed.name, "PDF");
+    assert_eq!(fixed.raw(), &only);
+}
+
+#[test]
+fn folders_only_mode_hides_the_filter_dropdown_and_the_default_label_says_select() {
+    let images = filter_array(&[filter_tuple("Images", &[(0, "*.png")])]);
+    let call = |directory: bool| Call {
+        method: Method::OpenFile,
+        app_id: "org.example.App".to_string(),
+        title: None,
+        options: service::parse_open_options(&options(&[
+            ("filters", images.clone()),
+            ("directory", directory.to_variant()),
+        ])),
+    };
+    let files = call(false);
+    assert!(files.options.shows_filters());
+    assert_eq!(files.accept_label(), "Open");
+    let folders = call(true);
+    assert!(
+        !folders.options.shows_filters(),
+        "a folder picker ignores filters, so it shows no dropdown"
+    );
+    assert_eq!(
+        folders.options.start_filter(),
+        None,
+        "and filters do not apply to its rows"
+    );
+    assert_eq!(
+        folders.accept_label(),
+        "Select",
+        "until the app says otherwise"
+    );
+
+    let named = Call {
+        options: service::parse_open_options(&options(&[
+            ("directory", true.to_variant()),
+            ("accept_label", "Choose".to_variant()),
+        ])),
+        ..folders
+    };
+    assert_eq!(named.accept_label(), "Choose", "the app's label still wins");
+}
+
+#[test]
+fn choices_keep_their_order_and_an_empty_option_list_is_a_checkbox() {
+    let enc = (
+        "enc".to_string(),
+        "Encoding".to_string(),
+        vec![
+            ("utf8".to_string(), "UTF-8".to_string()),
+            ("latin1".to_string(), "Latin-1".to_string()),
+        ],
+        "latin1".to_string(),
+    );
+    let ro = (
+        "ro".to_string(),
+        "Read only".to_string(),
+        Vec::<(String, String)>::new(),
+        "false".to_string(),
+    );
+    let parsed = service::parse_open_options(&options(&[("choices", choice_array(&[ro, enc]))]));
+    assert_eq!(parsed.choices.len(), 2);
+    assert_eq!(parsed.choices[0].id, "ro", "the order the app sent");
+    assert_eq!(parsed.choices[1].id, "enc");
+    assert!(parsed.choices[0].is_check(), "no options is a checkbox");
+    assert!(!parsed.choices[0].starts_checked());
+    assert_eq!(parsed.choices[1].options.len(), 2);
+    assert_eq!(
+        parsed.choices[1].start_option(),
+        1,
+        "the default names the option to start on"
+    );
+}
+
+#[test]
+fn a_choice_default_that_is_not_one_of_the_options_starts_on_the_first() {
+    let parsed = service::parse_open_options(&options(&[(
+        "choices",
+        choice_array(&[(
+            "mode".to_string(),
+            "Mode".to_string(),
+            vec![
+                ("a".to_string(), "A".to_string()),
+                ("b".to_string(), "B".to_string()),
+            ],
+            "zzz".to_string(),
+        )]),
+    )]));
+    assert_eq!(parsed.choices[0].start_option(), 0);
+    // A checkbox reads "true" and nothing else as on, as Nautilus's
+    // `g_strcmp0 (selected, "true") == 0` does.
+    let parsed = service::parse_open_options(&options(&[(
+        "choices",
+        choice_array(&[(
+            "box".to_string(),
+            "Box".to_string(),
+            Vec::<(String, String)>::new(),
+            "true".to_string(),
+        )]),
+    )]));
+    assert!(parsed.choices[0].starts_checked());
+}
+
+#[test]
+fn a_malformed_choices_array_is_skipped_whole_never_an_error() {
+    // `(ssa(ss)s)` is checked as a whole: one entry of the wrong shape makes the
+    // array not the advertised type at all, which is the only malformation the
+    // wire can carry. `g_variant_lookup` fails the same way for Nautilus.
+    let parsed = service::parse_open_options(&options(&[(
+        "choices",
+        vec![("enc", "Encoding")].to_variant(),
+    )]));
+    assert!(parsed.choices.is_empty());
+    assert_eq!(parsed.malformed, vec!["choices"]);
+}
+
+#[test]
+fn a_log_line_names_the_mode_the_count_the_filter_and_the_choices() {
+    let pick = service::Pick {
+        paths: vec![PathBuf::from("/tmp/a.png"), PathBuf::from("/tmp/b.png")],
+        current_filter: Some(filter_variant("Images", &[(0, "*.png")])),
+        choices: vec![
+            ("enc".to_string(), "utf8".to_string()),
+            ("ro".to_string(), "false".to_string()),
+        ],
+    };
+    assert_eq!(
+        pick.log_line("files+multiple", Some("Images")),
+        "accept: files+multiple, 2 uri(s), filter \"Images\", choices enc=utf8 ro=false"
+    );
+    let plain = service::Pick {
+        paths: vec![PathBuf::from("/tmp/a.png")],
+        current_filter: None,
+        choices: Vec::new(),
+    };
+    assert_eq!(
+        plain.log_line("folders", None),
+        "accept: folders, 1 uri(s), filter none, choices none"
+    );
 }
 
 #[test]
@@ -344,7 +677,7 @@ fn results_carry_one_encoded_uri_and_an_empty_choices_array() {
     let file = scratch.path().join("héllo wörld.txt");
     std::fs::write(&file, b"x").expect("file");
 
-    let results = service::results_for(&file);
+    let results = service::results_for(&pick_one(&file));
     let uris = results
         .get("uris")
         .expect("uris")
@@ -394,7 +727,8 @@ fn openfile_accepts_one_file_and_answers_success_with_its_uri() {
         // Claude's review: the folder must survive the wire, not just parse.
         assert_eq!(host.folders.borrow().as_slice(), &[Some(folder.clone())]);
 
-        requests[0].accept(&file);
+        requests[0].accept(pick_one(&file));
+
         let (response, results) = reply_parts(&bus.wait(&reply).expect("a reply"));
         assert_eq!(response, RESPONSE_SUCCESS);
         let uris = results
@@ -458,9 +792,11 @@ fn a_second_answer_is_a_no_op_after_accept() {
         let reply = open_file(&bus, "org.example.App", "Open", HashMap::new());
         assert!(bus.settles_without_reply(&reply));
         let request = host.requests.borrow()[0].clone();
-        assert!(request.accept(&file));
+        assert!(request.accept(pick_one(&file)));
+
         // Accept then Cancel (a click and then a destroy) answers once.
-        assert!(!request.accept(&file));
+        assert!(!request.accept(pick_one(&file)));
+
         assert!(!request.complete(RESPONSE_CANCELLED, service::empty_results()));
 
         let (response, _) = reply_parts(&bus.wait(&reply).expect("a reply"));
@@ -549,7 +885,8 @@ fn the_picker_allowlist_refuses_every_file_effect_and_the_settings_writes() {
             Effect::Files => assert!(!accepted, "{} must be refused", spec.name),
             Effect::View | Effect::Settings | Effect::System | Effect::Launch => {}
         }
-        // Everything that could create or rearrange windows is outside F1.
+        // Everything that could create or rearrange windows is outside the
+        // chooser, as is every file effect and every settings write.
         if accepted {
             assert!(
                 spec.name.starts_with("nav.")
@@ -560,6 +897,7 @@ fn the_picker_allowlist_refuses_every_file_effect_and_the_settings_writes() {
                             | "view.clear-folder-sort"
                             | "view.set-hidden"
                             | "view.toggle-hidden"
+                            | "search.open"
                             | "picker.accept"
                             | "picker.cancel"
                     ),
@@ -590,7 +928,6 @@ fn the_picker_allowlist_refuses_every_file_effect_and_the_settings_writes() {
         "window.new",
         "app.settings",
         "agent.set-enabled",
-        "search.open",
         "file.open",
     ] {
         assert!(
@@ -605,6 +942,10 @@ fn the_picker_allowlist_refuses_every_file_effect_and_the_settings_writes() {
         "nav.up",
         "nav.refresh",
         "nav.focus-path",
+        // F2 added this one: `Effect::View`, and its handler reads the model's
+        // folder, hands a query to the read-only worker and shows the results
+        // page. It writes no config, no session and no file.
+        "search.open",
         "selection.all",
         "selection.none",
         "view.set-sort",
@@ -658,4 +999,385 @@ fn current_folder_from_the_wire_text_reaches_the_options() {
         parsed.current_folder,
         Some(PathBuf::from("/tmp/gimbal-p2am-wire"))
     );
+}
+
+// ---------------------------------------------------------------------------
+// The filter's matching rules: `portal/filter.rs` is pure apart from GIO's
+// content-type table, so both halves are checked here without a window.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_glob_matches_the_way_gtk_filefilter_matches() {
+    use super::filter::fnmatch;
+
+    // `*` stands for anything.
+    assert!(fnmatch("*.png", "photo.png"));
+    assert!(fnmatch("*", "anything at all"));
+    assert!(!fnmatch("*.png", "photo.jpg"));
+    // `?` is exactly one character.
+    assert!(fnmatch("image-?.png", "image-1.png"));
+    assert!(!fnmatch("image-?.png", "image-12.png"));
+    // Bracket classes, their negation, and ranges.
+    assert!(fnmatch("*.[abc]", "x.b"));
+    assert!(!fnmatch("*.[abc]", "x.d"));
+    assert!(fnmatch("*.[!abc]", "x.d"));
+    assert!(!fnmatch("*.[!abc]", "x.a"));
+    assert!(fnmatch("*.[^abc]", "x.d"), "^ negates as well as !");
+    assert!(fnmatch("x[a-c]z", "xbz"));
+    assert!(!fnmatch("x[a-c]z", "xdz"));
+    // The bracket pattern an application sends when it wants a
+    // case-insensitive suffix, which is how the two rules differ.
+    assert!(fnmatch("*.[jJ][pP][gG]", "Photo.JPG"));
+    assert!(fnmatch("*.[jJ][pP][gG]", "photo.jpg"));
+    // And a plain glob is case-sensitive on Linux: GTK documents it, and this is
+    // the difference the live check looks for (`*.jpg` and `SHOUT.PNG`).
+    assert!(!fnmatch("*.jpg", "A.JPG"));
+    assert!(!fnmatch("*.png", "SHOUT.PNG"));
+    // A leading dot is not special, so `*` reaches a hidden name. GTK's file
+    // filter passes `no_leading_period = FALSE`.
+    assert!(fnmatch("*.txt", ".hidden.txt"));
+    assert!(fnmatch("*", ".dotfile"));
+    // A space and a non-ASCII name are ordinary characters, matched a character
+    // at a time rather than a byte at a time.
+    assert!(fnmatch("*.png", "my photo.png"));
+    assert!(fnmatch("*ö*", "gröna"));
+    assert!(!fnmatch("*ö*", "grona"));
+    // A backslash escapes: `FNM_NOESCAPE` is set only on Windows.
+    assert!(fnmatch("a\\*b", "a*b"));
+    assert!(!fnmatch("a\\*b", "axb"));
+    // An empty pattern takes an empty name, and an unterminated class loses.
+    assert!(fnmatch("", ""));
+    assert!(!fnmatch("", "x"));
+    assert!(!fnmatch("[]", "]"), "an unterminated class matches nothing");
+}
+
+#[test]
+fn a_mime_rule_matches_through_gio_including_a_wildcard() {
+    let png = super::filter::Filter::from_variant(&filter_variant("PNG", &[(1, "image/png")]))
+        .expect("a filter");
+    let any_image =
+        super::filter::Filter::from_variant(&filter_variant("Any image", &[(1, "image/*")]))
+            .expect("a filter");
+    let text = super::filter::Filter::from_variant(&filter_variant("Text", &[(1, "text/plain")]))
+        .expect("a filter");
+
+    assert!(png.matches("x", Some("image/png")));
+    assert!(!png.matches("x", Some("text/plain")));
+    // A wildcard supertype works through `g_content_type_is_a`. Measured on this
+    // machine (GLib 2.88), not assumed: `image/png` against `image/*` is true,
+    // and so is `text/x-changelog` against `text/*`.
+    assert!(any_image.matches("x", Some("image/png")));
+    assert!(any_image.matches("x", Some("image/jpeg")));
+    assert!(!any_image.matches("x", Some("text/plain")));
+    assert!(!text.matches("x", Some("image/png")));
+
+    // From a name alone — what the search worker has, since no file may be
+    // opened during a scan — the type is guessed from the extension.
+    assert!(png.matches_name("photo.png"));
+    assert!(!png.matches_name("notes.txt"));
+    // GIO's extension table ignores case, so a MIME rule catches what a `*.png`
+    // glob does not. The two rule kinds are not interchangeable.
+    assert!(png.matches_name("SHOUT.PNG"));
+    // A name with no extension is `application/octet-stream`, which is not an
+    // image.
+    assert!(!png.matches_name("noext"));
+    assert!(any_image.needs_content_type());
+    assert!(
+        !super::filter::Filter::from_variant(&filter_variant("Globs", &[(0, "*.png")]))
+            .expect("a filter")
+            .needs_content_type(),
+        "a filter of globs alone never asks GIO"
+    );
+}
+
+#[test]
+fn a_filter_with_no_rules_admits_nothing_as_gtk_s_does() {
+    let empty =
+        super::filter::Filter::from_variant(&filter_variant("Empty", &[])).expect("a filter");
+    assert!(!empty.matches_name("photo.png"));
+    assert!(!empty.matches("photo.png", Some("image/png")));
+    // And a filter never hides a folder: `ViewRules` decides that, so the dialog
+    // stays navigable.
+    let rules = super::filter::ViewRules {
+        folders_only: false,
+        filter: Some(empty),
+        show_hidden: true,
+    };
+    assert!(rules.keeps("Pictures", true, None));
+    assert!(!rules.keeps("photo.png", false, Some("image/png")));
+}
+
+#[test]
+fn the_dialog_rules_apply_hidden_mode_and_filter_in_that_order() {
+    use super::filter::ViewRules;
+
+    let png = super::filter::Filter::from_variant(&filter_variant("PNG", &[(0, "*.png")]))
+        .expect("a filter");
+    let rules = ViewRules {
+        folders_only: false,
+        filter: Some(png),
+        show_hidden: false,
+    };
+    assert!(rules.keeps("photo.png", false, Some("image/png")));
+    assert!(!rules.keeps("notes.txt", false, Some("text/plain")));
+    assert!(rules.keeps("Pictures", true, None), "a folder always shows");
+    assert!(
+        !rules.keeps(".photo.png", false, Some("image/png")),
+        "Ctrl+H off hides a dotfile even when the filter admits it"
+    );
+    assert!(
+        !rules.keeps(".secret", true, None),
+        "and a dotfile folder follows the switch too"
+    );
+
+    // Folders-only mode ignores the filter and keeps folders only.
+    let folders = ViewRules {
+        folders_only: true,
+        filter: None,
+        show_hidden: false,
+    };
+    assert!(folders.keeps("Pictures", true, None));
+    assert!(
+        !folders.keeps(".secret", true, None),
+        "Ctrl+H off hides a dotfile folder too"
+    );
+    assert!(!folders.keeps("photo.png", false, Some("image/png")));
+
+    // With no filter and hidden files on, everything shows: the main app's rules.
+    let open = ViewRules {
+        folders_only: false,
+        filter: None,
+        show_hidden: true,
+    };
+    assert!(open.keeps("notes.txt", false, None));
+    assert!(open.keeps(".hidden", false, None));
+}
+
+/// The dialog's rules in the form the search worker takes, run over a real tree
+/// with `NativeSearchSource`: the filter is tested where it runs, before the
+/// score is computed, not next to a stub.
+#[test]
+fn the_search_filter_keeps_only_what_the_dialog_would_show() {
+    use super::filter::SearchFilter;
+    use fm_core::folder_size::SystemClock;
+    use fm_core::search::{NativeSearchSource, SearchRequest, SearchResultFilter, SearchSource};
+    use std::ffi::OsStr;
+    use std::sync::Arc;
+
+    let scratch = Scratch::new("search-filter");
+    let root = scratch.path().to_path_buf();
+    std::fs::write(root.join("a.png"), b"x").expect("file");
+    std::fs::write(root.join("a.txt"), b"x").expect("file");
+    std::fs::write(root.join(".a.png"), b"x").expect("file");
+    std::fs::create_dir_all(root.join("data")).expect("directory");
+
+    let run = |rules: super::filter::ViewRules, max_results: usize| -> (Vec<String>, u64) {
+        let filter: Option<Arc<dyn SearchResultFilter>> = Some(Arc::new(SearchFilter(rules)));
+        let mut request = SearchRequest::new(root.clone(), "a");
+        request.filter = filter;
+        request.limits.max_results = max_results;
+        let mut rows: Vec<std::path::PathBuf> = Vec::new();
+        let mut matches = 0;
+        let outcome = fm_core::search::search(
+            &request,
+            &NativeSearchSource as &dyn SearchSource,
+            &SystemClock,
+            &|| false,
+            &mut |progress| matches = progress.matches,
+            &mut |changes| {
+                for change in changes {
+                    match change {
+                        fm_core::search::SearchChange::Insert { index, row } => {
+                            rows.insert(index.min(rows.len()), row.path)
+                        }
+                        fm_core::search::SearchChange::Remove { index, .. } => {
+                            if index < rows.len() {
+                                rows.remove(index);
+                            }
+                        }
+                    }
+                }
+                true
+            },
+        );
+        assert!(
+            matches!(outcome, fm_core::search::SearchOutcome::Finished(_)),
+            "a scratch tree is searchable: {outcome:?}"
+        );
+        let names = rows
+            .iter()
+            .map(|path| {
+                path.file_name()
+                    .map(OsStr::to_string_lossy)
+                    .unwrap_or_default()
+                    .into_owned()
+            })
+            .collect();
+        (names, matches)
+    };
+
+    // The plain file dialog: the type filter and Ctrl+H both apply, folders stay.
+    let png = super::filter::Filter::from_variant(&filter_variant("PNG", &[(0, "*.png")]))
+        .expect("a filter");
+    let (names, matches) = run(
+        super::filter::ViewRules {
+            folders_only: false,
+            filter: Some(png.clone()),
+            show_hidden: false,
+        },
+        100,
+    );
+    assert_eq!(
+        names,
+        vec!["a.png", "data"],
+        "a.png and the folder; `a.txt` and the dotfile are gone"
+    );
+    assert_eq!(matches, 2, "an excluded row is not counted as a match");
+
+    // Ctrl+H on lets the dotfile in, as it does in the grid.
+    let (names, _) = run(
+        super::filter::ViewRules {
+            folders_only: false,
+            filter: Some(png),
+            show_hidden: true,
+        },
+        100,
+    );
+    assert!(
+        names.iter().any(|name| name == ".a.png"),
+        "a hidden name the switch admits is searchable: {names:?}"
+    );
+
+    // Folders-only mode: one folder, and nothing else.
+    let (names, matches) = run(
+        super::filter::ViewRules {
+            folders_only: true,
+            filter: None,
+            show_hidden: false,
+        },
+        100,
+    );
+    assert_eq!(names, vec!["data"]);
+    assert_eq!(matches, 1);
+
+    // The limit is spent on kept rows: with two `.png` matches kept and a limit
+    // of one, one row is retained and one is reported truncated — the `.txt`
+    // file never took part.
+    let png = super::filter::Filter::from_variant(&filter_variant("PNG", &[(0, "*.png")]))
+        .expect("a filter");
+    let (names, matches) = run(
+        super::filter::ViewRules {
+            folders_only: false,
+            filter: Some(png),
+            show_hidden: true,
+        },
+        1,
+    );
+    assert_eq!(names.len(), 1, "one row, not one row of every kind");
+    assert_eq!(matches, 3, "two pngs and the folder all match `a`");
+}
+
+#[test]
+fn a_success_result_reports_every_uri_the_choices_and_writable_true() {
+    let scratch = Scratch::new("full-result");
+    let folder = scratch.path().join("photos");
+    std::fs::create_dir_all(&folder).expect("folder");
+    let first = folder.join("one.png");
+    let second = folder.join("two 三.png");
+    std::fs::write(&first, b"x").expect("file");
+    std::fs::write(&second, b"x").expect("file");
+    let filters = filter_array(&[filter_tuple("PNG", &[(0, "*.png"), (1, "image/png")])]);
+    let received = entry_of(&filters, 0);
+
+    let context = glib::MainContext::new();
+    let _ = context.with_thread_default(|| {
+        let host = Rc::new(FakeHost::default());
+        let service = service::Service::new();
+        service.set_host(host.clone());
+        let bus = Bus::service(&service, Scratch::new("full-result-bus"));
+
+        let mut extra = options(&[
+            ("multiple", true.to_variant()),
+            ("filters", filters.clone()),
+            (
+                "choices",
+                choice_array(&[
+                    (
+                        "enc".to_string(),
+                        "Encoding".to_string(),
+                        vec![("utf8".to_string(), "UTF-8".to_string())],
+                        "utf8".to_string(),
+                    ),
+                    (
+                        "ro".to_string(),
+                        "Read only".to_string(),
+                        Vec::<(String, String)>::new(),
+                        "false".to_string(),
+                    ),
+                ]),
+            ),
+        ]);
+        extra.insert("current_folder".to_string(), nul_path(&folder).to_variant());
+        let reply = open_file(&bus, "org.example.App", "Pick images", extra);
+        assert!(bus.settles_without_reply(&reply));
+
+        host.requests.borrow()[0].accept(service::Pick {
+            paths: vec![first.clone(), second.clone()],
+            current_filter: Some(received.clone()),
+            choices: vec![
+                ("enc".to_string(), "utf8".to_string()),
+                ("ro".to_string(), "false".to_string()),
+            ],
+        });
+        let (response, results) = reply_parts(&bus.wait(&reply).expect("a reply"));
+        assert_eq!(response, RESPONSE_SUCCESS);
+
+        let uris = results
+            .get("uris")
+            .expect("uris")
+            .get::<Vec<String>>()
+            .expect("a uri array");
+        assert_eq!(
+            uris.len(),
+            2,
+            "both picks, in the order the grid showed them"
+        );
+        assert_eq!(gio::File::for_uri(&uris[0]).path().expect("a path"), first);
+        assert_eq!(
+            gio::File::for_uri(&uris[1]).path().expect("a path"),
+            second,
+            "a space and a non-ASCII name survive the encoding"
+        );
+
+        let choices = results
+            .get("choices")
+            .expect("choices")
+            .get::<Vec<(String, String)>>()
+            .expect("a(ss) array");
+        assert_eq!(
+            choices,
+            vec![
+                ("enc".to_string(), "utf8".to_string()),
+                ("ro".to_string(), "false".to_string())
+            ],
+            "every choice the app sent, in the order it sent them"
+        );
+
+        assert_eq!(
+            results
+                .get("current_filter")
+                .expect("current_filter")
+                .clone(),
+            received,
+            "the filter as it was received, byte for byte"
+        );
+        assert!(
+            results
+                .get("writable")
+                .expect("writable")
+                .get::<bool>()
+                .expect("a boolean"),
+            "the picker always answers writable: true"
+        );
+    });
 }
