@@ -95,6 +95,8 @@ fn the_v1_catalogue_has_every_reviewed_command_in_order() {
         "drive.mount",
         "drive.unmount",
         "drive.eject",
+        "picker.accept",
+        "picker.cancel",
     ];
     let actual: Vec<&str> = COMMANDS.iter().map(|spec| spec.name).collect();
     assert_eq!(actual, expected);
@@ -544,6 +546,37 @@ fn properties_and_settings_are_ui_only_with_the_reviewed_caller_rules() {
     assert!(check(Caller::Ui, &["app.settings", "path=/tmp"]).is_err());
 
     for name in ["file.properties", "app.settings"] {
+        let mut handler = Recorder::new(Outcome::Done);
+        let outcome =
+            Registry::new().dispatch(Caller::Ui, &parse_invocation(&[name]), &mut handler);
+        assert_eq!(outcome, Outcome::Done, "{name}");
+        assert_eq!(handler.seen.len(), 1, "{name}");
+    }
+}
+
+#[test]
+fn picker_answers_refuse_the_cli_and_agent_before_any_handler() {
+    // The two answers a visible dialog can give are UI/Hotkey-only: a CLI
+    // call or an agent could otherwise answer a dialog the user is reading.
+    assert_eq!(PICKER_COMMANDS, &["picker.accept", "picker.cancel"]);
+    for name in PICKER_COMMANDS {
+        let spec = Registry::new().command(name).expect("a picker command");
+        assert_eq!(spec.effect, Effect::View, "{name} changes no file");
+        assert!(spec.arguments.is_empty(), "{name} takes no arguments");
+
+        assert!(caller_allowed(name, Effect::View, Caller::Ui));
+        assert!(caller_allowed(name, Effect::View, Caller::Hotkey));
+        assert!(!caller_allowed(name, Effect::View, Caller::Cli));
+        assert!(!caller_allowed(name, Effect::View, Caller::Agent));
+
+        for caller in [Caller::Cli, Caller::Agent] {
+            let mut handler = Recorder::new(Outcome::Done);
+            let outcome =
+                Registry::new().dispatch(caller, &parse_invocation(&[name]), &mut handler);
+            assert!(matches!(outcome, Outcome::Error(_)), "{name} via {caller}");
+            assert!(handler.seen.is_empty(), "{name} reached a handler");
+        }
+
         let mut handler = Recorder::new(Outcome::Done);
         let outcome =
             Registry::new().dispatch(Caller::Ui, &parse_invocation(&[name]), &mut handler);

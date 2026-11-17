@@ -29,6 +29,17 @@ static START: OnceLock<Instant> = OnceLock::new();
 /// The one file sink. Tests replace it with a memory sink.
 static SINK: Mutex<Option<Box<dyn Sink>>> = Mutex::new(None);
 
+/// The path rotation must use. `init_primary` leaves it empty so the file is
+/// `gimbal.log`; `init_portal` sets `portal.log`.
+static LOG_PATH: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
+
+fn log_path() -> Option<std::path::PathBuf> {
+    LOG_PATH
+        .get()
+        .cloned()
+        .unwrap_or_else(fm_core::logfile::default_log_path)
+}
+
 /// The open file's descriptor for the fatal-signal handler. `-1` when no
 /// primary log is open.
 static LOG_FD: AtomicI32 = AtomicI32::new(-1);
@@ -124,7 +135,7 @@ fn write_to_file(line: &str) -> bool {
         // never written into a file that is being renamed.
         *guard = None;
         LOG_FD.store(-1, Ordering::Relaxed);
-        if let Some(log) = fm_core::logfile::default_log_path() {
+        if let Some(log) = log_path() {
             let _ = fm_core::logfile::rotate(&log);
             if let Ok(file) = open_log(&log) {
                 let size = file.metadata().map(|meta| meta.len()).unwrap_or(0);
@@ -242,6 +253,28 @@ pub fn init_primary() {
     if std::env::var("GIMBAL_TEST_PANIC").as_deref() == Ok("1") {
         panic!("GIMBAL_TEST_PANIC=1");
     }
+}
+
+/// Open the picker's own log, `portal.log` beside `gimbal.log`. It rotates the
+/// same way and carries the same line format, but it never touches the main
+/// app's running marker or crash records: the picker is not the primary
+/// instance and must not make a later Gimbal start report a crash.
+pub fn init_portal() {
+    start();
+    let Some(state) = fm_core::logfile::default_state_dir() else {
+        return;
+    };
+    let log = fm_core::logfile::log_dir_in(&state).join("portal.log");
+    let _ = LOG_PATH.set(Some(log.clone()));
+    let _ = fm_core::logfile::rotate(&log);
+    let Ok(file) = open_log(&log) else {
+        return;
+    };
+    let size = file.metadata().map(|meta| meta.len()).unwrap_or(0);
+    BYTES.store(size, Ordering::Relaxed);
+    LOG_FD.store(file.as_raw_fd(), Ordering::Relaxed);
+    *sink() = Some(Box::new(FileSink(file)));
+    install_signal_handlers();
 }
 
 fn glib_version() -> String {

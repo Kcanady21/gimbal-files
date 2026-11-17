@@ -25,6 +25,7 @@ mod open;
 mod pdf;
 mod platform;
 mod popup;
+mod portal;
 mod preview;
 mod save;
 mod search;
@@ -49,6 +50,12 @@ thread_local! {
 }
 
 fn main() -> gtk::glib::ExitCode {
+    // The picker is its own application: it is built before the main app so it
+    // can never register the main app's id, restore its session or open its
+    // agent socket. `--portal` is consumed here, not by GApplication.
+    if std::env::args_os().skip(1).any(|arg| arg == "--portal") {
+        return portal::run();
+    }
     log::start();
     log::install_panic_hook();
     log::install_glib_writer();

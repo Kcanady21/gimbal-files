@@ -97,6 +97,11 @@ const TRASH_ITEMS: ArgSpec = ArgSpec {
     default: None,
 };
 
+/// The two commands the file-chooser dialog answers with. They are explicit
+/// clicks or one keyboard shortcut on a visible dialog, so the CLI and the
+/// agent are refused before a handler.
+pub const PICKER_COMMANDS: &[&str] = &["picker.accept", "picker.cancel"];
+
 /// The V1 catalogue, in the order menus and `gimbal-files-cli commands` show
 /// it. Do not add or drop commands here without Kyle's review.
 pub const COMMANDS: &[CommandSpec] = &[
@@ -786,6 +791,22 @@ pub const COMMANDS: &[CommandSpec] = &[
             presence: Presence::Required,
             default: None,
         }],
+    },
+    // The file-chooser dialog's two answers. `picker.accept` reads the one
+    // selected file from the dialog's own state; neither changes a file.
+    CommandSpec {
+        name: "picker.accept",
+        summary: "Accept the dialog's selected file.",
+        effect: Effect::View,
+        undo: false,
+        arguments: &[],
+    },
+    CommandSpec {
+        name: "picker.cancel",
+        summary: "Close the file-chooser dialog without a selection.",
+        effect: Effect::View,
+        undo: false,
+        arguments: &[],
     },
 ];
 

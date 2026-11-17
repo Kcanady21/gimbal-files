@@ -1,0 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+[portal]
+DBusName=org.freedesktop.impl.portal.desktop.gimbal
+Interfaces=org.freedesktop.impl.portal.FileChooser;

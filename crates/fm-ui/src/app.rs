@@ -118,6 +118,11 @@ pub struct Process {
     /// The GVfs administrator mount is asked for once per session. It lives
     /// until logout; Gimbal never unmounts it.
     admin_mounted: Cell<bool>,
+    /// This process is the file-chooser picker (P2am). It has no session
+    /// file, no agent socket, no update runtime and no `WindowUi`; its windows
+    /// are built by `crate::portal::picker` and accept only the picker's
+    /// command allowlist.
+    portal: bool,
     /// Headless bridge tests skip GTK window construction and session saves.
     headless: bool,
     /// Test seam for the Trash page's contextual refusal. Production always
@@ -267,6 +272,53 @@ impl Process {
     /// Build the process state and restore the session. Called on the first
     /// activation or open, once per process.
     pub fn start(application: &adw::Application) -> Rc<Self> {
+        let process = Self::assemble(
+            Some(application.clone()),
+            session::default_session_path(),
+            false,
+        );
+        let fileops = FileOps::new(&process);
+        *process.fileops.borrow_mut() = Some(fileops);
+        process.install_volume_wiring();
+        let weak = Rc::downgrade(&process);
+        process.search.set_wake(move || {
+            if let Some(process) = weak.upgrade() {
+                process.ensure_search_poll();
+            }
+        });
+        process.restore_session();
+        process.drop_restored_hidden_selection();
+        crate::agent::start_if_enabled(&process);
+        update::start(&process);
+        let weak = Rc::downgrade(&process);
+        let poll = glib::timeout_add_local(crate::agent::POLL, move || match weak.upgrade() {
+            Some(process) => crate::agent::poll(&process),
+            None => glib::ControlFlow::Break,
+        });
+        *process.agent_poll.borrow_mut() = Some(poll);
+        process
+    }
+
+    /// The picker process (`--portal`). Same config, look, volume inventory and
+    /// file-op worker as the main app, but no session file (so nothing is ever
+    /// saved), no session restore, no agent poll or socket, no update runtime
+    /// and no FileManager1. Its windows are built by `crate::portal::picker`.
+    pub fn portal(application: &adw::Application) -> Rc<Self> {
+        let process = Self::assemble(Some(application.clone()), None, true);
+        let fileops = FileOps::new(&process);
+        *process.fileops.borrow_mut() = Some(fileops);
+        process.install_volume_wiring();
+        process.seed_recent_from_session();
+        process
+    }
+
+    /// The fields both processes share. `session_path` is `None` for the
+    /// picker; `portal` switches the few behaviours that differ.
+    fn assemble(
+        application: Option<adw::Application>,
+        session_path: Option<PathBuf>,
+        portal: bool,
+    ) -> Rc<Self> {
         let path = config::default_config_path().unwrap_or_else(|| {
             crate::log!(
                 "config",
@@ -316,14 +368,14 @@ impl Process {
                 .map(|time| time.as_nanos())
                 .unwrap_or(0)
         );
-        let process = Rc::new(Self {
-            application: Some(application.clone()),
+        Rc::new(Self {
+            application,
             config: Rc::new(RefCell::new(config_file)),
             look: Some(look),
             workspace: RefCell::new(workspace),
             windows: RefCell::new(BTreeMap::new()),
             folder_views: RefCell::new(Vec::new()),
-            session_path: session::default_session_path(),
+            session_path,
             saver: Saver::new(),
             save_source: RefCell::new(None),
             debounce: Cell::new(Debounce::new(SAVE_DELAY_MS)),
@@ -351,6 +403,7 @@ impl Process {
             volumes: RefCell::new(volumes),
             known_mount_roots: RefCell::new(known_mount_roots),
             admin_mounted: Cell::new(false),
+            portal,
             headless: false,
             #[cfg(test)]
             trash_pages: RefCell::new(BTreeSet::new()),
@@ -358,27 +411,28 @@ impl Process {
             native_nav_evidence_uses: Cell::new(0),
             #[cfg(test)]
             dirty_preview_overrides: RefCell::new(Vec::new()),
-        });
-        let fileops = FileOps::new(&process);
-        *process.fileops.borrow_mut() = Some(fileops);
-        process.install_volume_wiring();
-        let weak = Rc::downgrade(&process);
-        process.search.set_wake(move || {
-            if let Some(process) = weak.upgrade() {
-                process.ensure_search_poll();
-            }
-        });
-        process.restore_session();
-        process.drop_restored_hidden_selection();
-        crate::agent::start_if_enabled(&process);
-        update::start(&process);
-        let weak = Rc::downgrade(&process);
-        let poll = glib::timeout_add_local(crate::agent::POLL, move || match weak.upgrade() {
-            Some(process) => crate::agent::poll(&process),
-            None => glib::ControlFlow::Break,
-        });
-        *process.agent_poll.borrow_mut() = Some(poll);
-        process
+        })
+    }
+
+    /// The picker reads the main session file once, only for the Recent
+    /// Directories section. Its windows are not restored and nothing is ever
+    /// written back.
+    fn seed_recent_from_session(self: &Rc<Self>) {
+        let Some(path) = session::default_session_path() else {
+            return;
+        };
+        let home = self.home();
+        let (stored, problems) = session::load(&path, &home, Path::is_dir);
+        for problem in problems {
+            crate::log!("session", "picker: {problem}");
+        }
+        self.workspace.borrow_mut().recent_dirs = stored.recent_dirs;
+        crate::log!(
+            "session",
+            "picker: {} recent folder(s) from {}",
+            self.workspace.borrow().recent_dirs.len(),
+            path.display()
+        );
     }
 
     /// A headless process for bridge tests: no GTK windows, no session file
@@ -432,6 +486,43 @@ impl Process {
         search: Rc<crate::search::SearchRuntime>,
         session_path: Option<PathBuf>,
     ) -> Rc<Self> {
+        Self::headless_mode(
+            config_path,
+            home,
+            clipboard_reader,
+            search,
+            session_path,
+            false,
+        )
+    }
+
+    /// The picker's routing without GTK: `portal` is the only difference from
+    /// an ordinary headless process.
+    #[cfg(test)]
+    pub(crate) fn headless_portal(
+        config_path: PathBuf,
+        home: PathBuf,
+        session_path: Option<PathBuf>,
+    ) -> Rc<Self> {
+        Self::headless_mode(
+            config_path,
+            home,
+            Rc::new(crate::fileops::clipboard::SystemReader),
+            Rc::new(crate::search::SearchRuntime::production()),
+            session_path,
+            true,
+        )
+    }
+
+    #[cfg(test)]
+    fn headless_mode(
+        config_path: PathBuf,
+        home: PathBuf,
+        clipboard_reader: Rc<dyn crate::fileops::clipboard::Reader>,
+        search: Rc<crate::search::SearchRuntime>,
+        session_path: Option<PathBuf>,
+        portal: bool,
+    ) -> Rc<Self> {
         let (config_file, _problems) = ConfigFile::load(&config_path);
         let known_mount_roots = HashSet::new();
         let process = Rc::new(Self {
@@ -471,6 +562,7 @@ impl Process {
             ))),
             known_mount_roots: RefCell::new(known_mount_roots),
             admin_mounted: Cell::new(false),
+            portal,
             headless: true,
             trash_pages: RefCell::new(BTreeSet::new()),
             native_nav_evidence_uses: Cell::new(0),
@@ -992,6 +1084,14 @@ impl Process {
         let Some(application) = &self.application else {
             return;
         };
+        // A picker window is built by the portal module instead of WindowUi:
+        // it has no header, tabs, preview or Trash page. Its options were
+        // parked before the model window was created.
+        if let Some(options) = crate::portal::picker::take_pending(id) {
+            crate::portal::picker::build(self, application, id, options);
+            crate::log!("window", "opened picker window {id}");
+            return;
+        }
         let ui = WindowUi::new(self, application, id);
         self.windows.borrow_mut().insert(id, ui.clone());
         ui.present();
@@ -1007,6 +1107,10 @@ impl Process {
         self.volumes().cancel_window(id);
         self.search.close(id);
         self.stop_search_poll_if_idle();
+        if crate::portal::picker::forget(id) {
+            crate::log!("window", "closed picker window {id}");
+            return;
+        }
         if let Some(ui) = self.windows.borrow_mut().remove(&id) {
             ui.window().destroy();
             crate::log!("window", "closed model window {id}");
@@ -1027,6 +1131,38 @@ impl Process {
         {
             self.apply_events(&events);
         }
+    }
+
+    /// This process is the file-chooser picker. Both view constructors read it so
+    /// a picker's sidebar and grid are read-only without new parameters.
+    pub fn is_portal(&self) -> bool {
+        self.portal
+    }
+
+    /// Open one picker window at `folder`. The options are parked for
+    /// `build_window`, which builds the portal view instead of a `WindowUi`.
+    pub(crate) fn open_picker_window(
+        self: &Rc<Self>,
+        folder: PathBuf,
+        options: crate::portal::picker::PickerOptions,
+    ) -> Option<WindowId> {
+        let events = self.workspace.borrow_mut().window_new(Some(folder)).ok()?;
+        let id = events.iter().find_map(|event| match event {
+            Event::WindowOpened(id) => Some(*id),
+            _ => None,
+        })?;
+        crate::portal::picker::set_pending(id, options);
+        self.apply_events(&events);
+        Some(id)
+    }
+
+    /// Close one picker's model window. `window.close` acts on the focused
+    /// window, so this focuses first; the resulting `WindowClosed` event
+    /// destroys the picker's own GTK window.
+    pub(crate) fn close_picker_window(self: &Rc<Self>, id: WindowId) {
+        self.focus_model_window(id);
+        let result = self.workspace.borrow_mut().window_close();
+        self.finish(result);
     }
 
     /// Whether the exact window/tab pair still exists and belongs together.
@@ -1398,6 +1534,11 @@ impl Process {
         paths: Vec<PathBuf>,
         intent: DropIntent,
     ) {
+        // A picker never accepts a drop: that would copy or move files.
+        if crate::portal::picker::is_live(window) {
+            self.show_drop_reason(window, "dropping is off in the file chooser");
+            return;
+        }
         if paths.is_empty() {
             return;
         }
@@ -1491,6 +1632,11 @@ impl Process {
     /// Pin dropped folders, one `pins.add` per folder. Files are filtered by
     /// the caller before this point.
     pub fn pin_folders(self: &Rc<Self>, window: WindowId, folders: Vec<PathBuf>) {
+        // Pinning writes config.toml; the picker is read-only there.
+        if crate::portal::picker::is_live(window) {
+            self.show_drop_reason(window, "pinning is off in the file chooser");
+            return;
+        }
         for folder in folders {
             let Some(path) = folder.to_str() else {
                 crate::log!(
@@ -1735,6 +1881,12 @@ impl Process {
     /// symlink to its target. A UTF-8 path goes through the named commands;
     /// a non-UTF-8 one uses the model and launch code directly.
     pub fn open_path(self: &Rc<Self>, window: WindowId, path: PathBuf) {
+        // In a picker, a double-click or Enter accepts a file and enters a
+        // folder; nothing is ever launched.
+        if crate::portal::picker::get(window).is_some() {
+            crate::portal::picker::open_path(self, window, path);
+            return;
+        }
         match decision(path.is_dir(), path.is_file()) {
             OpenDecision::Navigate => {
                 if let Some(path) = path.to_str() {
@@ -2633,6 +2785,13 @@ impl Process {
     }
 
     fn on_last_window_closed(self: &Rc<Self>) {
+        // The picker leaves through GApplication's inactivity timeout, not a
+        // synchronous quit: closing one dialog while another is open must not
+        // end the process, and the 60 s hold is the only thing that may.
+        if self.portal {
+            crate::log!("portal", "the last picker window closed");
+            return;
+        }
         self.quit_now();
     }
 
@@ -2699,6 +2858,12 @@ impl Process {
     }
 
     fn refresh(self: &Rc<Self>, id: WindowId, fade: bool) {
+        // A picker has no WindowUi, no search page and no header of its own:
+        // it follows the model through its small nav row and grid.
+        if crate::portal::picker::is_live(id) {
+            crate::portal::picker::refresh(self, id);
+            return;
+        }
         let valid = match self.window_snapshot(id) {
             Some(window) => self.search.validate(id, &window),
             None => {
@@ -3005,6 +3170,11 @@ impl Process {
     }
 
     fn settings_change(self: &Rc<Self>, window: WindowId, command: &CheckedCommand) -> Outcome {
+        // A picker has no write path to config.toml: sort and the hidden-files
+        // switch apply to its own grid for the life of the dialog only.
+        if crate::portal::picker::get(window).is_some() {
+            return crate::portal::picker::apply_setting(self, window, command);
+        }
         // The one Settings key with a runtime side effect. The registry has
         // already refused every caller but Ui before this handler is reached.
         if command.name() == "agent.set-enabled" {
@@ -3154,6 +3324,16 @@ impl Process {
             command.name(),
             command.effect()
         );
+
+        // The picker's own window answers only what a file chooser needs.
+        // Everything else, in particular every file effect, is refused before
+        // a handler can touch the model or the disk.
+        if crate::portal::picker::is_live(window)
+            && let Some(refusal) = picker_refusal(command.name())
+        {
+            crate::log!("portal", "refused {refusal}");
+            return Outcome::Failed(refusal);
+        }
 
         // The read-only results page owns these actions. Nothing here may fall
         // through to the hidden folder selection or a preview buffer.
@@ -3669,6 +3849,18 @@ impl Process {
                 };
                 self.finish(result);
             }
+            "picker.accept" => {
+                let Some(picker) = crate::portal::picker::get(window) else {
+                    return Outcome::Failed("there is no picker window to accept".to_string());
+                };
+                return picker.accept();
+            }
+            "picker.cancel" => {
+                let Some(picker) = crate::portal::picker::get(window) else {
+                    return Outcome::Failed("there is no picker window to cancel".to_string());
+                };
+                return picker.cancel();
+            }
             "nav.go" => {
                 // Search activation and the agent's worker-resolved path
                 // arrive as one-shot typed evidence. Search additionally binds
@@ -3748,6 +3940,9 @@ impl Process {
                 if search_visible || self.search.view(window).is_some() {
                     self.restart_search(window);
                     crate::log!("search", "nav.refresh restarted the visible query");
+                } else if let Some(picker) = crate::portal::picker::get(window) {
+                    picker.reload();
+                    crate::log!("folder", "nav.refresh reloaded the picker listing");
                 } else if let Some(ui) = self.window(window) {
                     ui.reload_folder();
                     crate::log!("folder", "nav.refresh reloaded the listing");
@@ -3756,6 +3951,8 @@ impl Process {
             "nav.focus-path" => {
                 if let Some(ui) = self.window(window) {
                     ui.focus_path();
+                } else if let Some(picker) = crate::portal::picker::get(window) {
+                    picker.focus_path();
                 }
             }
             "search.open" => {
@@ -3800,10 +3997,12 @@ impl Process {
                 }
             }
             "selection.all" => {
-                let names = self
-                    .window(window)
-                    .map(|ui| ui.listed_names())
-                    .unwrap_or_default();
+                let names = match self.window(window) {
+                    Some(ui) => ui.listed_names(),
+                    // A picker's grid is not in `windows`; it is its only
+                    // listing, so it is the names Select All acts on.
+                    None => crate::portal::picker::listed_names(window).unwrap_or_default(),
+                };
                 self.selection_all(window, &names);
             }
             "selection.none" => {
@@ -4620,7 +4819,7 @@ impl Process {
     }
 
     pub fn schedule_save(self: &Rc<Self>) {
-        if self.headless {
+        if self.headless || self.portal {
             return;
         }
         let now = crate::save::now_ms();
@@ -4697,6 +4896,38 @@ fn log_outcome(invocation: &Invocation, outcome: &Outcome) {
             lines.len()
         ),
         Outcome::Done => {}
+    }
+}
+
+/// The commands a picker window answers (P2am F1): navigation, selection,
+/// the two sort commands and the hidden-files switch, and the dialog's own two
+/// answers. The catalogue's picker names are included from the one list, so
+/// the window and the caller rules cannot drift apart.
+pub(crate) fn picker_accepts(name: &str) -> bool {
+    fm_core::command::PICKER_COMMANDS.contains(&name)
+        || matches!(
+            name,
+            "nav.go"
+                | "nav.back"
+                | "nav.forward"
+                | "nav.up"
+                | "nav.refresh"
+                | "nav.focus-path"
+                | "selection.all"
+                | "selection.none"
+                | "view.set-sort"
+                | "view.clear-folder-sort"
+                | "view.set-hidden"
+                | "view.toggle-hidden"
+        )
+}
+
+/// The refusal a picker gives any other command, before any handler runs.
+pub(crate) fn picker_refusal(name: &str) -> Option<String> {
+    if picker_accepts(name) {
+        None
+    } else {
+        Some(format!("{name} is not available in the file chooser"))
     }
 }
 
@@ -4896,6 +5127,40 @@ mod tests {
 
     fn window(number: u64) -> WindowId {
         WindowId::from_raw(number)
+    }
+
+    #[test]
+    fn a_portal_process_has_no_session_and_schedules_no_save() {
+        let base = std::env::temp_dir().join(format!(
+            "gimbal-portal-save-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|time| time.as_nanos())
+                .unwrap_or(0)
+        ));
+        let home = base.join("home");
+        std::fs::create_dir_all(&home).expect("home");
+        let config = base.join("config.toml");
+        let session = base.join("session.toml");
+
+        let process = Process::headless_portal(config.clone(), home.clone(), None);
+        assert!(process.is_portal());
+        assert!(
+            process.session_path.is_none(),
+            "the picker must have no session file"
+        );
+        process.schedule_save();
+        process.save_now(false);
+        assert!(!session.exists());
+
+        // Defence in depth: even handed a path, the portal never schedules a
+        // write, so a future constructor cannot start saving the picker.
+        let guarded = Process::headless_portal(config, home, Some(session.clone()));
+        guarded.schedule_save();
+        assert!(!session.exists());
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     fn prompt(window: WindowId) -> QuitStep {
@@ -5370,6 +5635,7 @@ mod tests {
             ))),
             known_mount_roots: RefCell::new(HashSet::new()),
             admin_mounted: Cell::new(false),
+            portal: false,
             headless: false,
             trash_pages: RefCell::new(BTreeSet::new()),
             native_nav_evidence_uses: Cell::new(0),

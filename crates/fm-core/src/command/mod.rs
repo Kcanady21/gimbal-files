@@ -18,6 +18,7 @@ use std::path::PathBuf;
 
 use crate::fileops::TrashUri;
 pub use catalogue::COMMANDS;
+pub use catalogue::PICKER_COMMANDS;
 pub use check::{CheckedArgument, CheckedCommand, CommandError, CommandErrorKind, Invocation};
 
 /// Something that can call a command.
@@ -328,8 +329,13 @@ pub const UI_ONLY_MENU_COMMANDS: &[&str] = &["file.new-file"];
 /// Whether this caller may run this command at all. The two approved permanent
 /// deletions are explicitly clicked UI operations; the preview commands may
 /// also come from a hotkey. `agent.set-enabled` and the menu-only new-file
-/// command are UI-only.
+/// command are UI-only. The two picker answers are UI/Hotkey-only: a dialog
+/// never answers itself for the CLI or the agent.
 pub fn caller_allowed(name: &str, effect: Effect, caller: Caller) -> bool {
+    if PICKER_COMMANDS.contains(&name) {
+        // Answering a visible dialog is a click or its one shortcut.
+        return matches!(caller, Caller::Ui | Caller::Hotkey);
+    }
     if UI_ONLY_SETTINGS_COMMANDS.contains(&name) || UI_ONLY_MENU_COMMANDS.contains(&name) {
         return caller == Caller::Ui;
     }

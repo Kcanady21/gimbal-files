@@ -89,6 +89,9 @@ pub struct FolderView {
     /// A split tile only writes the one status line while it is the focused
     /// tile; the single folder view has no gate.
     status_gate: Rc<Cell<bool>>,
+    /// The file-chooser picker's grid (P2am): no item or background menus, no
+    /// drag source and no drop targets, so nothing on disk can change from it.
+    read_only: bool,
 
     current: RefCell<Option<PathBuf>>,
     sort_rule: Rc<Cell<SortRule>>,
@@ -304,6 +307,7 @@ impl FolderView {
             window,
             tab,
             status_gate: status_gate.unwrap_or_else(|| Rc::new(Cell::new(true))),
+            read_only: process.is_portal(),
             current: RefCell::new(None),
             sort_rule,
             show_hidden,
@@ -346,7 +350,9 @@ impl FolderView {
         process.register_folder_view(&this);
         this.wire_factory(&factory);
         this.wire_signals();
-        this.attach_background_drop_target();
+        if !this.read_only {
+            this.attach_background_drop_target();
+        }
         this.attach_rubber_band();
         {
             let weak = Rc::downgrade(&this);
@@ -476,6 +482,9 @@ impl FolderView {
                     let Some(view) = weak.upgrade() else {
                         return;
                     };
+                    if view.read_only {
+                        return;
+                    }
                     let Some(item) = right_item.upgrade() else {
                         return;
                     };
@@ -505,8 +514,10 @@ impl FolderView {
                     true
                 });
                 view.attach_size_motion(&cell);
-                view.setup_cell_drag_source(&cell, drag_item.clone());
-                view.setup_cell_drop_target(&cell, drag_item);
+                if !view.read_only {
+                    view.setup_cell_drag_source(&cell, drag_item.clone());
+                    view.setup_cell_drop_target(&cell, drag_item);
+                }
             });
         }
         {
@@ -666,7 +677,7 @@ impl FolderView {
                 let Some(view) = weak.upgrade() else {
                     return;
                 };
-                if view.context_on_item.replace(false) {
+                if view.read_only || view.context_on_item.replace(false) {
                     return;
                 }
                 let Some(folder) = view.current.borrow().clone() else {

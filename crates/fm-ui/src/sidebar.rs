@@ -215,14 +215,16 @@ impl Sidebar {
             PathBuf::from("/"),
             Process::nav_go_path,
         );
-        dnd::attach_folder_target(
-            &main.root,
-            Rc::downgrade(process),
-            window,
-            Rc::new(|| Some(PathBuf::from("/"))),
-            None,
-            None,
-        );
+        if !process.is_portal() {
+            dnd::attach_folder_target(
+                &main.root,
+                Rc::downgrade(process),
+                window,
+                Rc::new(|| Some(PathBuf::from("/"))),
+                None,
+                None,
+            );
+        }
         root.append(&main.root);
 
         let this = Rc::new(Self {
@@ -485,6 +487,13 @@ impl Sidebar {
     }
 
     fn recent_context_menu(&self, x: f64, y: f64) {
+        if self
+            .process
+            .upgrade()
+            .is_none_or(|process| process.is_portal())
+        {
+            return;
+        }
         let Some(slot) = self.recent_slot(y) else {
             return;
         };
@@ -637,15 +646,17 @@ impl Sidebar {
                     root.clone(),
                     Process::nav_go_path,
                 );
-                let target = root.clone();
-                dnd::attach_folder_target(
-                    &row.root,
-                    self.process.clone(),
-                    self.window,
-                    Rc::new(move || Some(target.clone())),
-                    None,
-                    None,
-                );
+                if !process.is_portal() {
+                    let target = root.clone();
+                    dnd::attach_folder_target(
+                        &row.root,
+                        self.process.clone(),
+                        self.window,
+                        Rc::new(move || Some(target.clone())),
+                        None,
+                        None,
+                    );
+                }
                 attach_mounted_menu(
                     &row,
                     Rc::downgrade(process),
@@ -804,15 +815,17 @@ impl Sidebar {
             drive.mount_path.clone(),
             Process::nav_go_path,
         );
-        let target = drive.mount_path.clone();
-        dnd::attach_folder_target(
-            &row.root,
-            self.process.clone(),
-            self.window,
-            Rc::new(move || Some(target.clone())),
-            None,
-            None,
-        );
+        if !process.is_portal() {
+            let target = drive.mount_path.clone();
+            dnd::attach_folder_target(
+                &row.root,
+                self.process.clone(),
+                self.window,
+                Rc::new(move || Some(target.clone())),
+                None,
+                None,
+            );
+        }
         attach_internal_menu(
             &row,
             Rc::downgrade(process),
@@ -974,6 +987,9 @@ fn section_view(
     process: &Rc<Process>,
     window: WindowId,
 ) -> (gtk::Box, gtk::Revealer) {
+    // A picker collapses a section for this dialog only; the setting is never
+    // written back to config.toml.
+    let read_only = process.is_portal();
     let view = gtk::Box::new(gtk::Orientation::Vertical, 0);
     view.add_css_class("gl-section");
     let pill = gtk::Button::new();
@@ -989,7 +1005,12 @@ fn section_view(
     view.append(&pill);
     view.append(&revealer);
     let weak = Rc::downgrade(process);
+    let local = revealer.clone();
     pill.connect_clicked(move |_| {
+        if read_only {
+            local.set_reveal_child(!local.reveals_child());
+            return;
+        }
         if let Some(process) = weak.upgrade() {
             process.dispatch_for_window(
                 window,
@@ -1076,6 +1097,11 @@ fn attach_device_menu(
     id: VolumeId,
     name: String,
 ) {
+    // Mount / unmount / eject stay in the main window; a picker's sidebar
+    // only navigates.
+    if process.upgrade().is_none_or(|process| process.is_portal()) {
+        return;
+    }
     let gesture = gtk::GestureClick::new();
     gesture.set_button(3);
     let weak_row = Rc::downgrade(row);
@@ -1152,6 +1178,11 @@ fn attach_mounted_menu(
     name: String,
     root: PathBuf,
 ) {
+    // Mount / unmount / eject stay in the main window; a picker's sidebar
+    // only navigates.
+    if process.upgrade().is_none_or(|process| process.is_portal()) {
+        return;
+    }
     let gesture = gtk::GestureClick::new();
     gesture.set_button(3);
     let weak_row = Rc::downgrade(row);
@@ -1322,6 +1353,11 @@ fn attach_internal_menu(
     name: String,
     root: PathBuf,
 ) {
+    // Mount / unmount / eject stay in the main window; a picker's sidebar
+    // only navigates.
+    if process.upgrade().is_none_or(|process| process.is_portal()) {
+        return;
+    }
     let gesture = gtk::GestureClick::new();
     gesture.set_button(3);
     let weak_row = Rc::downgrade(row);
@@ -2200,6 +2236,15 @@ impl PinnedList {
     }
 
     fn show_context_menu(&self, x: f64, y: f64) {
+        // No Pin / Unpin (or new tab) in the file chooser: pins are a config
+        // write and a picker has one tab.
+        if self
+            .process
+            .upgrade()
+            .is_none_or(|process| process.is_portal())
+        {
+            return;
+        }
         let n = self.names_len();
         let row_h = self.row_h();
         if n == 0 || y < 0.0 || row_h <= 0 {

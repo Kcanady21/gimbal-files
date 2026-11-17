@@ -56,6 +56,11 @@ pub const PATH_MIN: f64 = 320.0;
 pub const TRASH: f64 = 48.0;
 pub const DEFAULT_W: i32 = 2560;
 pub const DEFAULT_H: i32 = 1440;
+/// The file-chooser dialog's own default size (P2am). It is deliberately
+/// smaller than the main window: a chooser sits over the application that
+/// asked for it.
+pub const PICKER_W: i32 = 1100;
+pub const PICKER_H: i32 = 700;
 
 // Type.
 pub const TEXT_TITLE: f64 = 32.0;
