@@ -19,6 +19,7 @@ use std::path::PathBuf;
 use crate::fileops::TrashUri;
 pub use catalogue::COMMANDS;
 pub use catalogue::PICKER_COMMANDS;
+pub use catalogue::{bindable_commands, is_bindable};
 pub use check::{CheckedArgument, CheckedCommand, CommandError, CommandErrorKind, Invocation};
 
 /// Something that can call a command.
@@ -318,8 +319,15 @@ pub const PREVIEW_EDITING_COMMANDS: &[&str] = &[
 
 /// The one user-only control that is not a file effect: enabling or disabling
 /// the local automation socket. It never comes from a hotkey, the CLI or the
-/// agent, even when the value is unchanged.
-pub const UI_ONLY_SETTINGS_COMMANDS: &[&str] = &["agent.set-enabled"];
+/// agent, even when the value is unchanged. P2as's shortcut editor commands
+/// follow the same rule: only a click in the Settings dialog may rebind a key,
+/// so an agent can never rebind Delete.
+pub const UI_ONLY_SETTINGS_COMMANDS: &[&str] = &[
+    "agent.set-enabled",
+    "hotkey.set",
+    "hotkey.remove",
+    "hotkey.reset",
+];
 
 /// Commands that only an explicitly clicked menu entry may call. `file.new-file`
 /// is here because a hotkey, CLI or agent must never invent a file name and

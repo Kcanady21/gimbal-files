@@ -1033,6 +1033,12 @@ impl Process {
         self.config.borrow().config().hotkeys.clone()
     }
 
+    /// False when config.toml did not parse, so a change must never be
+    /// written. The shortcut dialog says so instead of pretending to save.
+    pub fn config_writable(&self) -> bool {
+        self.config.borrow().is_writable()
+    }
+
     pub fn window(&self, id: WindowId) -> Option<Rc<WindowUi>> {
         self.windows.borrow().get(&id).cloned()
     }
@@ -3366,6 +3372,20 @@ impl Process {
             Change::SetShowHidden(show) => {
                 self.apply_show_hidden(*show);
             }
+            Change::BindHotkey { .. }
+            | Change::RemoveHotkey { .. }
+            | Change::ResetHotkey { .. }
+            | Change::ResetAllHotkeys => {
+                let windows: Vec<Rc<WindowUi>> = self.windows.borrow().values().cloned().collect();
+                for ui in &windows {
+                    ui.reinstall_hotkeys();
+                }
+                crate::log!(
+                    "hotkey",
+                    "reinstalled the shortcuts in {} window(s)",
+                    windows.len()
+                );
+            }
             other => crate::log!("command", "change applied: {other:?}"),
         }
     }
@@ -3462,6 +3482,19 @@ impl Process {
         {
             crate::log!("trash", "refused {message}");
             return Outcome::Failed(format!("refused: {message}"));
+        }
+
+        // P2as: only a click in the Settings shortcut dialog may rebind a
+        // key. The registry already refuses every other caller; this is the
+        // handler's own guard, like `tab.open-as-admin`'s.
+        if command.name().starts_with("hotkey.") {
+            if caller != Caller::Ui {
+                return Outcome::Failed(format!(
+                    "{} is available only from Settings",
+                    command.name()
+                ));
+            }
+            return self.settings_change(window, command);
         }
 
         match command.name() {
@@ -8441,5 +8474,304 @@ order = "descending"
             )
         );
         assert_eq!(dispatch("tab.leave-admin", Vec::new()), Outcome::Done);
+    }
+
+    /// P2as live checks, driven in-process: two real windows, the real
+    /// Keyboard Shortcuts dialog, its own buttons (`emit_clicked`) and the
+    /// same `key_pressed` its capture controller calls. Every step is checked
+    /// against the saved `config.toml` and each window's installed shortcut
+    /// controller. No desktop input is injected.
+    #[test]
+    fn real_shortcut_editor_saves_and_reinstalls_in_every_window() {
+        let executable = std::env::current_exe().expect("test executable");
+        let output = std::process::Command::new(executable)
+            .args([
+                "--exact",
+                "app::tests::real_shortcut_editor_saves_and_reinstalls_in_every_window_inner",
+                "--ignored",
+                "--nocapture",
+            ])
+            .output()
+            .expect("the owned widget regression process");
+        assert!(
+            output.status.success(),
+            "the shortcut editor widget regression failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    #[ignore = "runs in its own process through the subprocess widget regression"]
+    fn real_shortcut_editor_saves_and_reinstalls_in_every_window_inner() {
+        use gtk::gdk::{Key, ModifierType as M};
+
+        let _guard = gtk_test_lock();
+        gtk::init().expect("the widget regression needs a GTK display");
+        adw::init().expect("libadwaita init");
+        let context = glib::MainContext::default();
+        let settle = || {
+            for _ in 0..20 {
+                context.iteration(false);
+            }
+        };
+        let has = |ui: &Rc<WindowUi>, key: Key, mods: M| {
+            ui.hotkey_triggers_for_tests()
+                .iter()
+                .any(|trigger| gtk::accelerator_parse(trigger.as_str()) == Some((key, mods)))
+        };
+
+        let scratch = search_scratch("shortcut-editor");
+        let config = scratch.root.join("config.toml");
+        let hand_written = "# keep this comment: written by hand\n\
+                            [hotkeys]\n\
+                            \"<Control>1\" = { command = \"tab.focus\", index = 0 }\n\
+                            \"<Control><Shift>j\" = \"nav.refresh\"\n";
+        std::fs::write(&config, hand_written).expect("scratch config");
+        let file = || std::fs::read_to_string(&config).expect("read scratch config");
+
+        let application = adw::Application::builder()
+            .application_id("org.gimbal.Files.ShortcutEditorWidgetTest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        application
+            .register(None::<&gio::Cancellable>)
+            .expect("register the owned non-unique test application");
+        let runtime = Rc::new(crate::search::SearchRuntime::with_service(Arc::new(
+            crate::search::SearchService::new(),
+        )));
+        let process = gtk_search_process(&scratch, &application, runtime);
+        let first = seed_gtk_window(&process, scratch.root.join("home"));
+        let second = seed_gtk_window(&process, scratch.root.join("home"));
+        let one = process.window(first).expect("first window");
+        let two = process.window(second).expect("second window");
+        one.window().present();
+        settle();
+        for ui in [&one, &two] {
+            assert!(has(ui, Key::Left, M::ALT_MASK), "the default Alt+Left");
+            assert!(has(ui, Key::j, M::CONTROL_MASK | M::SHIFT_MASK));
+        }
+
+        // 1. The dialog blocks the window's hotkeys while it is open.
+        let driver = crate::hotkeys::testing::open(&one);
+        settle();
+        assert!(
+            process.hotkeys_blocked(first),
+            "hotkeys stay blocked behind the dialog"
+        );
+        assert!(
+            !driver.press(Key::t, M::CONTROL_MASK),
+            "a key with no row capturing is left alone"
+        );
+
+        // 2. Bind Back to Super+Left and Ctrl+Shift+B: saved, and live in both windows.
+        driver.click("Back", "Add");
+        settle();
+        assert!(
+            driver.press(Key::Super_L, M::SUPER_MASK),
+            "a lone modifier keeps waiting"
+        );
+        assert!(driver.press(Key::Left, M::SUPER_MASK));
+        driver.click("Back", "Add");
+        settle();
+        assert!(driver.press(Key::B, M::CONTROL_MASK | M::SHIFT_MASK));
+        settle();
+        let saved = file();
+        assert!(saved.contains("<Super>Left\" = \"nav.back\""), "{saved}");
+        assert!(
+            saved.lines().any(|line| line.contains("b\" = \"nav.back\"")
+                && line.contains("<Control>")
+                && line.contains("<Shift>")),
+            "{saved}"
+        );
+        driver.snapshot("1-bound");
+        for ui in [&one, &two] {
+            assert!(
+                has(ui, Key::Left, M::SUPER_MASK),
+                "Super+Left in every window"
+            );
+            assert!(
+                has(ui, Key::b, M::CONTROL_MASK | M::SHIFT_MASK),
+                "Ctrl+Shift+B in every window"
+            );
+        }
+
+        // 3. Remove Alt+Left from Back: `""` in the file, gone from both windows.
+        driver.remove_chip("Back", "<Alt>Left");
+        settle();
+        assert!(file().contains("\"<Alt>Left\" = \"\""), "{}", file());
+        for ui in [&one, &two] {
+            assert!(
+                !has(ui, Key::Left, M::ALT_MASK),
+                "Alt+Left removed in every window"
+            );
+        }
+
+        // 4. Search finds Refresh with its hand-written key; capturing that key
+        //    on Back names Refresh, and Replace moves the one entry.
+        driver.search("refresh");
+        assert!(driver.has_row("Refresh") && !driver.has_row("Back"));
+        let refresh = driver.row_texts("Refresh");
+        assert!(refresh.iter().any(|text| text == "F5"), "{refresh:?}");
+        assert!(
+            refresh.iter().any(|text| text == "<Control><Shift>j"),
+            "{refresh:?}"
+        );
+        driver.search("");
+        driver.click("Back", "Add");
+        settle();
+        assert!(driver.press(Key::J, M::CONTROL_MASK | M::SHIFT_MASK));
+        driver.snapshot("2-conflict");
+        let back = driver.row_texts("Back");
+        assert!(
+            back.iter().any(|text| text.ends_with("is used by Refresh")),
+            "{back:?}"
+        );
+        driver.click("Back", "Replace");
+        settle();
+        let saved = file();
+        assert!(
+            saved.contains("\"<Control><Shift>j\" = \"nav.back\""),
+            "{saved}"
+        );
+        assert_eq!(
+            saved
+                .lines()
+                .filter(|line| line.to_lowercase().contains("shift>j\""))
+                .count(),
+            1,
+            "one entry per key, in the hand-written spelling:\n{saved}"
+        );
+        assert!(
+            !driver
+                .row_texts("Refresh")
+                .iter()
+                .any(|text| text.contains("j"))
+        );
+
+        // 5. A bare letter is refused and capture keeps waiting; F6 is allowed.
+        //    A key another row uses asks first, and Cancel saves nothing.
+        driver.click("Zoom in", "Add");
+        settle();
+        assert!(driver.press(Key::a, M::empty()));
+        driver.snapshot("3-refused");
+        let zoom = driver.row_texts("Zoom in");
+        assert!(
+            zoom.iter()
+                .any(|text| text.starts_with("Add Ctrl, Alt or Super")),
+            "{zoom:?}"
+        );
+        assert!(driver.press(Key::F6, M::empty()));
+        settle();
+        assert!(
+            file().contains("F6 = \"view.zoom-in\"")
+                || file().contains("\"F6\" = \"view.zoom-in\""),
+            "{}",
+            file()
+        );
+        assert!(has(&two, Key::F6, M::empty()));
+        let before_cancel = file();
+        driver.click("Zoom in", "Add");
+        settle();
+        assert!(driver.press(Key::t, M::CONTROL_MASK));
+        let zoom = driver.row_texts("Zoom in");
+        assert!(
+            zoom.iter().any(|text| text.ends_with("is used by New tab")),
+            "{zoom:?}"
+        );
+        driver.click("Zoom in", "Cancel");
+        settle();
+        assert_eq!(file(), before_cancel, "Cancel writes nothing");
+        driver.click("Zoom in", "Add");
+        settle();
+        assert!(
+            driver.press(Key::Escape, M::empty()),
+            "Escape ends capture inside the dialog"
+        );
+        settle();
+        assert_eq!(file(), before_cancel, "Escape writes nothing");
+
+        // 6. Reset Back, then Reset All.
+        driver.click("Back", "Reset");
+        settle();
+        let saved = file();
+        assert!(!saved.contains("nav.back"), "{saved}");
+        assert!(!saved.contains("\"<Alt>Left\" = \"\""), "{saved}");
+        for ui in [&one, &two] {
+            assert!(
+                has(ui, Key::Left, M::ALT_MASK),
+                "Alt+Left is back in every window"
+            );
+            assert!(!has(ui, Key::b, M::CONTROL_MASK | M::SHIFT_MASK));
+        }
+        driver.reset_all_confirmed();
+        settle();
+        let saved = file();
+        assert!(!saved.contains("F6"), "{saved}");
+        // 7. The hand-written comment and the editor-unlisted entry survive.
+        assert!(
+            saved.contains("# keep this comment: written by hand"),
+            "{saved}"
+        );
+        assert!(
+            saved.contains("\"<Control>1\" = { command = \"tab.focus\", index = 0 }"),
+            "{saved}"
+        );
+        assert!(
+            has(&one, Key::_1, M::CONTROL_MASK),
+            "the hand-written Ctrl+1 still runs"
+        );
+
+        driver.dialog.close();
+        settle();
+        assert!(
+            !process.hotkeys_blocked(first),
+            "closing the dialog unblocks the hotkeys"
+        );
+        drop(driver);
+        for ui in [&one, &two] {
+            ui.window().destroy();
+        }
+        settle();
+        drop(process);
+
+        // 8. A config that does not parse: the dialog says so and nothing moves.
+        let broken_scratch = search_scratch("shortcut-editor-broken");
+        let broken = broken_scratch.root.join("config.toml");
+        let broken_text = format!("{hand_written}\nbroken = \"oops\n");
+        std::fs::write(&broken, &broken_text).expect("broken scratch config");
+        let runtime = Rc::new(crate::search::SearchRuntime::with_service(Arc::new(
+            crate::search::SearchService::new(),
+        )));
+        let process = gtk_search_process(&broken_scratch, &application, runtime);
+        let window = seed_gtk_window(&process, broken_scratch.root.join("home"));
+        let ui = process.window(window).expect("broken-config window");
+        ui.window().present();
+        settle();
+        let before = ui.hotkey_triggers_for_tests();
+        let driver = crate::hotkeys::testing::open(&ui);
+        settle();
+        driver.click("Back", "Add");
+        settle();
+        assert!(driver.press(Key::B, M::CONTROL_MASK | M::SHIFT_MASK));
+        settle();
+        driver.snapshot("4-cant-save");
+        let back = driver.row_texts("Back");
+        assert!(
+            back.iter()
+                .any(|text| text == "Can't save: config.toml has an error"),
+            "{back:?}"
+        );
+        driver.remove_chip("Back", "<Alt>Left");
+        settle();
+        assert_eq!(
+            std::fs::read_to_string(&broken).expect("read broken config"),
+            broken_text,
+            "a file that did not parse is never written"
+        );
+        assert_eq!(ui.hotkey_triggers_for_tests(), before, "no shortcut moved");
+        let _ = driver.global_text();
+        driver.dialog.close();
+        settle();
     }
 }

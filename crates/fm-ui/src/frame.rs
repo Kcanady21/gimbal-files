@@ -37,6 +37,9 @@ pub struct WindowUi {
     content: Rc<Content>,
     sidebar: Rc<Sidebar>,
     preview: Rc<PreviewPanel>,
+    /// The window's one global hotkey controller. P2as removes and re-adds it
+    /// after a shortcut change so it is always the last controller added.
+    hotkeys: RefCell<Option<gtk::ShortcutController>>,
 
     /// Left sidebar | (content | preview): two nested horizontal Paneds.
     outer: gtk::Paned,
@@ -160,6 +163,7 @@ impl WindowUi {
             content,
             sidebar,
             preview,
+            hotkeys: RefCell::new(None),
             outer: outer.clone(),
             inner: inner.clone(),
             left_root,
@@ -244,6 +248,39 @@ impl WindowUi {
 
     pub fn process_upgrade(&self) -> Option<Rc<Process>> {
         self.process.upgrade()
+    }
+
+    /// Swap the stored hotkey controller, handing the old one back so the
+    /// caller can remove it from the window first.
+    pub(crate) fn replace_hotkeys_controller(
+        &self,
+        next: Option<gtk::ShortcutController>,
+    ) -> Option<gtk::ShortcutController> {
+        self.hotkeys.replace(next)
+    }
+
+    /// Rebuild this window's hotkeys from the loaded config. The new
+    /// controller is added last, after the window's Escape controller, the
+    /// order P2ao recorded.
+    /// The triggers of this window's installed hotkey controller, as GTK
+    /// prints them, for the shortcut editor's widget regression.
+    #[cfg(test)]
+    pub(crate) fn hotkey_triggers_for_tests(&self) -> Vec<String> {
+        let Some(controller) = self.hotkeys.borrow().clone() else {
+            return Vec::new();
+        };
+        (0..controller.n_items())
+            .filter_map(|index| controller.item(index).and_downcast::<gtk::Shortcut>())
+            .filter_map(|shortcut| {
+                shortcut
+                    .trigger()
+                    .map(|trigger| trigger.to_str().to_string())
+            })
+            .collect()
+    }
+
+    pub fn reinstall_hotkeys(self: &Rc<Self>) {
+        commands::install_hotkeys(self, self.window.upcast_ref::<gtk::Window>());
     }
 
     pub fn dispatch(&self, caller: Caller, invocation: Invocation) {

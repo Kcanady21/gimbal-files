@@ -42,13 +42,24 @@ impl Handler for UiHandler {
 }
 
 /// Bind every hotkey from the config. An accelerator GTK cannot parse is
-/// logged and skipped; the rest still install.
+/// logged and skipped; the rest still install. Calling it again replaces the
+/// window's controller, so the shortcuts follow a Settings change at once. The
+/// new controller is added after the window's Escape controller, the order
+/// P2ao recorded; removing the old one first keeps it last.
 pub fn install_hotkeys(app: &std::rc::Rc<WindowUi>, window: &gtk::Window) {
-    let Some(process) = app.process_upgrade() else {
-        return;
-    };
+    let controller = build_controller(app);
+    if let Some(old) = app.replace_hotkeys_controller(Some(controller.clone())) {
+        window.remove_controller(&old);
+    }
+    window.add_controller(controller);
+}
+
+fn build_controller(app: &std::rc::Rc<WindowUi>) -> gtk::ShortcutController {
     let controller = gtk::ShortcutController::new();
     controller.set_scope(gtk::ShortcutScope::Global);
+    let Some(process) = app.process_upgrade() else {
+        return controller;
+    };
     let hotkeys = process.hotkeys();
     for (accelerator, invocation) in bindings(&hotkeys) {
         let Some((key, modifiers)) = gtk::accelerator_parse(accelerator.as_str()) else {
@@ -106,7 +117,7 @@ pub fn install_hotkeys(app: &std::rc::Rc<WindowUi>, window: &gtk::Window) {
         controller.add_shortcut(gtk::Shortcut::new(Some(trigger), Some(action)));
         crate::log!("hotkey", "bound {accelerator:?} to {name}");
     }
-    window.add_controller(controller);
+    controller
 }
 
 #[cfg(test)]

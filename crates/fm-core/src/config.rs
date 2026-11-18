@@ -713,6 +713,22 @@ pub enum Change {
     SetShowInFolder(bool),
     /// Show or hide names that begin with `.` in every folder view.
     SetShowHidden(bool),
+    /// Bind `accelerator` to a bindable command, replacing whatever it ran.
+    BindHotkey {
+        accelerator: String,
+        command: String,
+    },
+    /// Unbind `accelerator`.
+    RemoveHotkey {
+        accelerator: String,
+    },
+    /// Give one bindable command its default shortcuts back.
+    ResetHotkey {
+        command: String,
+    },
+    /// Give every bindable command its default shortcuts back. Entries for
+    /// commands the editor does not list stay untouched.
+    ResetAllHotkeys,
 }
 
 /// What went wrong while loading the config.
@@ -977,6 +993,23 @@ impl ConfigFile {
     /// Update the in-memory config and the parsed document, then save. A file
     /// that did not parse is never written.
     pub fn apply(&mut self, change: Change) -> Result<(), ApplyError> {
+        // A hotkey change must leave an unparsable file and its in-memory
+        // config exactly as they were: the dialog reports "Can't save" and the
+        // keys do not move. Other changes keep their older behavior, where the
+        // in-memory value still changes but nothing is written.
+        if matches!(
+            change,
+            Change::BindHotkey { .. }
+                | Change::RemoveHotkey { .. }
+                | Change::ResetHotkey { .. }
+                | Change::ResetAllHotkeys
+        ) && self.document.is_none()
+        {
+            return Err(ApplyError::Unparsable {
+                path: self.path.clone(),
+            });
+        }
+
         // Clearing a folder that has no exception is a true no-op: no in-memory
         // change, no document edit and no write.
         if let Change::ClearFolderSort { folder } = &change {
@@ -1151,6 +1184,36 @@ pub fn change_for(
         // The no-argument flip: the saved value decides the next one, so a
         // hotkey, the menu entry, the switch and the socket all agree.
         "view.toggle-hidden" => Some(Change::SetShowHidden(!config.view.show_hidden)),
+        // P2as: the shortcut editor. fm-core has no GTK, so it checks the
+        // bindable target and a non-empty accelerator; the dialog checks that
+        // `gtk::accelerator_parse` accepts the string before it dispatches.
+        "hotkey.set" => {
+            let accelerator = text_argument(command, "accelerator")?;
+            let target = text_argument(command, "command")?;
+            if accelerator.is_empty() || !crate::command::is_bindable(target) {
+                return None;
+            }
+            Some(Change::BindHotkey {
+                accelerator: accelerator.to_string(),
+                command: target.to_string(),
+            })
+        }
+        "hotkey.remove" => {
+            let accelerator = text_argument(command, "accelerator")?;
+            if accelerator.is_empty() {
+                return None;
+            }
+            Some(Change::RemoveHotkey {
+                accelerator: accelerator.to_string(),
+            })
+        }
+        "hotkey.reset" => match text_argument(command, "command") {
+            Some(target) if crate::command::is_bindable(target) => Some(Change::ResetHotkey {
+                command: target.to_string(),
+            }),
+            Some(_) => None,
+            None => Some(Change::ResetAllHotkeys),
+        },
         _ => None,
     }
 }
@@ -1182,6 +1245,13 @@ fn integer_argument(command: &CheckedCommand, name: &str) -> Option<i64> {
 fn choice_argument<'a>(command: &'a CheckedCommand, name: &str) -> Option<&'a str> {
     match command.get(name) {
         Some(CommandValue::Choice(value)) => Some(value),
+        _ => None,
+    }
+}
+
+fn text_argument<'a>(command: &'a CheckedCommand, name: &str) -> Option<&'a str> {
+    match command.get(name) {
+        Some(CommandValue::Text(value)) => Some(value),
         _ => None,
     }
 }
@@ -2269,6 +2339,58 @@ fn apply_to_config(config: &mut Config, change: &Change) {
         Change::SetUpdatesEnabled(enabled) => config.updates.check = *enabled,
         Change::SetShowInFolder(enabled) => config.integration.show_in_folder = *enabled,
         Change::SetShowHidden(show) => config.view.show_hidden = *show,
+        Change::BindHotkey {
+            accelerator,
+            command,
+        } => {
+            config.hotkeys.insert(
+                accelerator.clone(),
+                Hotkey {
+                    command: command.clone(),
+                    arguments: Vec::new(),
+                },
+            );
+        }
+        Change::RemoveHotkey { accelerator } => {
+            config.hotkeys.remove(accelerator);
+        }
+        Change::ResetHotkey { command } => reset_hotkey(config, command),
+        Change::ResetAllHotkeys => {
+            for command in crate::command::bindable_commands() {
+                reset_hotkey(config, command);
+            }
+        }
+    }
+}
+
+/// Give one command its defaults back in the merged map. A key the command
+/// took from another default falls back to that default; a key it took from
+/// nowhere is removed. Then the command's own default keys are restored, which
+/// is what hands a stolen default key back to its command.
+fn reset_hotkey(config: &mut Config, command: &str) {
+    let defaults = default_hotkeys();
+    let taken: Vec<String> = config
+        .hotkeys
+        .iter()
+        .filter(|(_, hotkey)| hotkey.command == command)
+        .map(|(accelerator, _)| accelerator.clone())
+        .collect();
+
+    for accelerator in taken {
+        match defaults.get(&accelerator) {
+            Some(default) => {
+                config.hotkeys.insert(accelerator, default.clone());
+            }
+            None => {
+                config.hotkeys.remove(&accelerator);
+            }
+        }
+    }
+
+    for (accelerator, default) in &defaults {
+        if default.command == command {
+            config.hotkeys.insert(accelerator.clone(), default.clone());
+        }
     }
 }
 
@@ -2470,6 +2592,104 @@ fn apply_to_document(document: &mut DocumentMut, change: &Change, config: &Confi
         Change::SetShowHidden(show) => {
             set_root_value(document, "view", "show_hidden", Value::from(*show));
         }
+        Change::BindHotkey {
+            accelerator,
+            command,
+        } => {
+            let defaults = default_hotkeys();
+            // A key that already defaults to this command needs no entry.
+            if defaults
+                .get(accelerator)
+                .is_some_and(|default| default.command == *command)
+            {
+                if let Some(table) = hotkeys_document_table(document) {
+                    table.remove(accelerator);
+                }
+            } else {
+                let table = ensure_table(document, "hotkeys");
+                set_table_value(table, accelerator, Value::from(command.clone()));
+            }
+        }
+        Change::RemoveHotkey { accelerator } => {
+            let defaults = default_hotkeys();
+            if defaults.contains_key(accelerator) {
+                let table = ensure_table(document, "hotkeys");
+                set_table_value(table, accelerator, Value::from(""));
+            } else if let Some(table) = hotkeys_document_table(document) {
+                table.remove(accelerator);
+            }
+        }
+        Change::ResetHotkey { command } => {
+            let defaults = default_hotkeys();
+            reset_hotkey_document(document, |entry, accelerator| {
+                entry == Some(command.as_str())
+                    || defaults
+                        .get(accelerator)
+                        .is_some_and(|default| default.command.as_str() == command.as_str())
+            });
+        }
+        Change::ResetAllHotkeys => {
+            let bindable = crate::command::bindable_commands();
+            let defaults = default_hotkeys();
+            reset_hotkey_document(document, |entry, accelerator| {
+                entry.is_some_and(|command| bindable.contains(&command))
+                    || defaults
+                        .get(accelerator)
+                        .is_some_and(|default| bindable.contains(&default.command.as_str()))
+            });
+        }
+    }
+}
+
+/// The `[hotkeys]` table as a mutable `Table`, converting an inline table the
+/// first time the editor writes. `None` when there is no table to edit.
+fn hotkeys_document_table(document: &mut DocumentMut) -> Option<&mut Table> {
+    let root = document.as_table_mut();
+    let convert = matches!(
+        root.get("hotkeys"),
+        Some(Item::Value(value)) if value.is_inline_table()
+    );
+    if convert {
+        let table = match root.remove("hotkeys") {
+            Some(Item::Value(mut value)) => std::mem::take(
+                value
+                    .as_inline_table_mut()
+                    .expect("checked as an inline table"),
+            )
+            .into_table(),
+            _ => return None,
+        };
+        root.insert("hotkeys", Item::Table(table));
+    }
+    root.get_mut("hotkeys").and_then(Item::as_table_mut)
+}
+
+/// The command an entry binds, or `None` for `""` and for a malformed inline
+/// table. Used only to decide which entries an editor operation owns.
+fn hotkey_document_command(item: &Item) -> Option<&str> {
+    let value = item.as_value()?;
+    if let Some(text) = value.as_str() {
+        return (!text.is_empty()).then_some(text);
+    }
+    value
+        .as_inline_table()?
+        .get("command")?
+        .as_str()
+        .filter(|command| !command.is_empty())
+}
+
+/// Remove every `[hotkeys]` entry the predicate owns.
+fn reset_hotkey_document(document: &mut DocumentMut, owned: impl Fn(Option<&str>, &str) -> bool) {
+    let Some(table) = hotkeys_document_table(document) else {
+        return;
+    };
+    let remove: Vec<String> = table
+        .iter()
+        .filter(|(accelerator, item)| owned(hotkey_document_command(item), accelerator))
+        .map(|(accelerator, _)| accelerator.to_string())
+        .collect();
+    for accelerator in remove {
+        table.remove(&accelerator);
     }
 }
 
@@ -3089,6 +3309,263 @@ right = { collapsed = true, width = 700 }
         );
     }
 
+    #[test]
+    fn binding_a_key_back_to_its_default_deletes_the_entry_and_keeps_comments() {
+        let temp = TempDir::new("hotkey-bind-default");
+        let home = temp.path();
+        let path = temp.write(
+            "config.toml",
+            "# my shortcuts\n[hotkeys]\n\"<Alt>Left\" = \"nav.forward\"\n",
+        );
+        let (mut file, problems) = ConfigFile::load_with(&path, home, &SpecialFolders::default());
+        assert!(problems.is_empty(), "{problems:#?}");
+
+        file.apply(Change::BindHotkey {
+            accelerator: "<Alt>Left".to_string(),
+            command: "nav.back".to_string(),
+        })
+        .unwrap();
+
+        let saved = fs::read_to_string(&path).unwrap();
+        assert!(
+            !saved.contains("<Alt>Left"),
+            "a key back on its default needs no entry:\n{saved}"
+        );
+        assert!(
+            saved.contains("# my shortcuts"),
+            "comments survive:\n{saved}"
+        );
+        assert_eq!(file.config().hotkeys["<Alt>Left"].command, "nav.back");
+
+        let (reloaded, problems) = ConfigFile::load_with(&path, home, &SpecialFolders::default());
+        assert!(problems.is_empty(), "{problems:#?}");
+        assert_eq!(reloaded.config().hotkeys["<Alt>Left"].command, "nav.back");
+    }
+
+    #[test]
+    fn a_new_binding_is_written_and_removing_it_deletes_the_entry() {
+        let temp = TempDir::new("hotkey-bind-remove");
+        let home = temp.path();
+        let path = temp.write("config.toml", "# shortcuts\n");
+        let (mut file, _) = ConfigFile::load_with(&path, home, &SpecialFolders::default());
+
+        file.apply(Change::BindHotkey {
+            accelerator: "<Control>j".to_string(),
+            command: "nav.back".to_string(),
+        })
+        .unwrap();
+        let saved = fs::read_to_string(&path).unwrap();
+        assert!(
+            saved.contains("\"<Control>j\" = \"nav.back\""),
+            "a non-default key is written:\n{saved}"
+        );
+        assert_eq!(file.config().hotkeys["<Control>j"].command, "nav.back");
+
+        file.apply(Change::RemoveHotkey {
+            accelerator: "<Control>j".to_string(),
+        })
+        .unwrap();
+        let saved = fs::read_to_string(&path).unwrap();
+        assert!(
+            !saved.contains("<Control>j"),
+            "removing a key that has no default deletes its entry:\n{saved}"
+        );
+        assert!(!file.config().hotkeys.contains_key("<Control>j"));
+    }
+
+    #[test]
+    fn removing_a_default_writes_an_empty_string() {
+        let temp = TempDir::new("hotkey-remove-default");
+        let home = temp.path();
+        let path = temp.write("config.toml", "[hotkeys]\n");
+        let (mut file, _) = ConfigFile::load_with(&path, home, &SpecialFolders::default());
+
+        file.apply(Change::RemoveHotkey {
+            accelerator: "<Alt>Left".to_string(),
+        })
+        .unwrap();
+
+        let saved = fs::read_to_string(&path).unwrap();
+        assert!(
+            saved.contains("\"<Alt>Left\" = \"\""),
+            "a removed default is saved as an empty string:\n{saved}"
+        );
+        assert!(!file.config().hotkeys.contains_key("<Alt>Left"));
+    }
+
+    #[test]
+    fn resetting_a_command_gives_its_stolen_default_key_back() {
+        let temp = TempDir::new("hotkey-reset");
+        let home = temp.path();
+        let path = temp.write(
+            "config.toml",
+            "[hotkeys]\n\"<Alt>Left\" = \"nav.forward\"\n\"F6\" = \"nav.back\"\n",
+        );
+        let (mut file, _) = ConfigFile::load_with(&path, home, &SpecialFolders::default());
+
+        file.apply(Change::ResetHotkey {
+            command: "nav.back".to_string(),
+        })
+        .unwrap();
+
+        let saved = fs::read_to_string(&path).unwrap();
+        assert!(
+            !saved.contains("<Alt>Left") && !saved.contains("F6"),
+            "reset drops the stolen and added keys:\n{saved}"
+        );
+        assert_eq!(file.config().hotkeys["<Alt>Left"].command, "nav.back");
+        assert!(
+            !file
+                .config()
+                .hotkeys
+                .iter()
+                .any(|(accelerator, hotkey)| accelerator == "F6" && hotkey.command == "nav.back")
+        );
+        assert_eq!(file.config().hotkeys["<Alt>Right"].command, "nav.forward");
+    }
+
+    #[test]
+    fn reset_all_keeps_hand_written_entries_the_editor_does_not_list() {
+        let temp = TempDir::new("hotkey-reset-all");
+        let home = temp.path();
+        let path = temp.write(
+            "config.toml",
+            r#"# keep this comment
+[hotkeys]
+"<Control>1" = { command = "tab.focus", index = 0 }
+"F6" = "nav.refresh"
+"<Alt>Left" = ""
+"<Control>t" = "tab.close"
+"#,
+        );
+        let (mut file, _) = ConfigFile::load_with(&path, home, &SpecialFolders::default());
+
+        file.apply(Change::ResetAllHotkeys).unwrap();
+
+        let saved = fs::read_to_string(&path).unwrap();
+        assert!(
+            saved.contains("tab.focus") && saved.contains("index = 0"),
+            "the unlisted indexed binding stays:\n{saved}"
+        );
+        assert!(
+            !saved.contains("F6") && !saved.contains("<Alt>Left") && !saved.contains("<Control>t"),
+            "the editor's own entries are gone:\n{saved}"
+        );
+        assert!(saved.contains("# keep this comment"), "{saved}");
+
+        let hotkeys = &file.config().hotkeys;
+        assert_eq!(hotkeys["<Control>1"].command, "tab.focus");
+        assert_eq!(
+            hotkeys["<Control>1"].arguments,
+            vec![("index".to_string(), "0".to_string())]
+        );
+        assert!(!hotkeys.contains_key("F6"));
+        assert_eq!(hotkeys["<Alt>Left"].command, "nav.back");
+        assert_eq!(hotkeys["<Control>t"].command, "tab.new");
+    }
+
+    #[test]
+    fn a_config_that_did_not_parse_refuses_a_hotkey_change_and_writes_nothing() {
+        let temp = TempDir::new("hotkey-unwritable");
+        let home = temp.path();
+        let original = "this is not toml [\n";
+        let path = temp.write("config.toml", original);
+        let (mut file, problems) = ConfigFile::load_with(&path, home, &SpecialFolders::default());
+        assert!(!problems.is_empty());
+        assert!(!file.is_writable());
+        let before = file.config().clone();
+
+        let error = file
+            .apply(Change::BindHotkey {
+                accelerator: "F6".to_string(),
+                command: "nav.refresh".to_string(),
+            })
+            .expect_err("an unparsable file is never written");
+        assert!(matches!(error, ApplyError::Unparsable { .. }));
+        assert_eq!(file.config(), &before);
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn hotkey_commands_need_a_bindable_target_and_a_non_empty_accelerator() {
+        let temp = TempDir::new("hotkey-change-for");
+        let home = temp.path();
+        let path = temp.write("config.toml", "");
+        let (file, _) = ConfigFile::load_with(&path, home, &SpecialFolders::default());
+        let config = file.config();
+
+        let bindable = check(
+            "hotkey.set",
+            &["hotkey.set", "accelerator=<Control>j", "command=nav.back"],
+        );
+        assert_eq!(
+            change_for(&bindable, config, Path::new("/tmp")),
+            Some(Change::BindHotkey {
+                accelerator: "<Control>j".to_string(),
+                command: "nav.back".to_string(),
+            })
+        );
+
+        let unlisted = check(
+            "hotkey.set",
+            &["hotkey.set", "accelerator=<Control>1", "command=tab.focus"],
+        );
+        assert_eq!(change_for(&unlisted, config, Path::new("/tmp")), None);
+        let required_argument = check(
+            "hotkey.set",
+            &["hotkey.set", "accelerator=F6", "command=nav.go"],
+        );
+        assert_eq!(
+            change_for(&required_argument, config, Path::new("/tmp")),
+            None
+        );
+        // An empty accelerator never reaches change_for: a Text argument is
+        // refused by the registry's own parser.
+        assert!(
+            Registry::new()
+                .validate(
+                    Caller::Ui,
+                    &Invocation::new(
+                        "hotkey.set",
+                        vec![
+                            ("accelerator".to_string(), String::new()),
+                            ("command".to_string(), "nav.back".to_string()),
+                        ],
+                    ),
+                )
+                .is_err()
+        );
+
+        assert_eq!(
+            change_for(
+                &check("hotkey.reset", &["hotkey.reset", "command=nav.back"]),
+                config,
+                Path::new("/tmp")
+            ),
+            Some(Change::ResetHotkey {
+                command: "nav.back".to_string()
+            })
+        );
+        assert_eq!(
+            change_for(
+                &check("hotkey.reset", &["hotkey.reset"]),
+                config,
+                Path::new("/tmp")
+            ),
+            Some(Change::ResetAllHotkeys)
+        );
+        assert_eq!(
+            change_for(
+                &check("hotkey.remove", &["hotkey.remove", "accelerator=<Alt>Left"]),
+                config,
+                Path::new("/tmp")
+            ),
+            Some(Change::RemoveHotkey {
+                accelerator: "<Alt>Left".to_string()
+            })
+        );
+    }
+
     // ---------------------------------------------------------------------
     // Saving
     // ---------------------------------------------------------------------
@@ -3571,6 +4048,12 @@ order = "ascending"
             ("view.clear-folder-sort", &["view.clear-folder-sort"]),
             ("view.set-hidden", &["view.set-hidden", "enabled=true"]),
             ("view.toggle-hidden", &["view.toggle-hidden"]),
+            (
+                "hotkey.set",
+                &["hotkey.set", "accelerator=<Control>j", "command=nav.back"],
+            ),
+            ("hotkey.remove", &["hotkey.remove", "accelerator=<Alt>Left"]),
+            ("hotkey.reset", &["hotkey.reset"]),
             ("pins.add", &["pins.add", "path=/tmp"]),
             ("pins.remove", &["pins.remove", "path=/tmp"]),
             ("pins.move", &["pins.move", "from=0", "to=1"]),

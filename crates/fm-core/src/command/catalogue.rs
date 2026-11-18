@@ -3,7 +3,9 @@
 //! hotkeys, the agent socket and the CLI all read it, so a command exists
 //! exactly when it is listed here.
 
-use super::{ArgKind, ArgSpec, CommandSpec, ContextSource, Effect, Presence};
+use super::{
+    ArgKind, ArgSpec, Caller, CommandSpec, ContextSource, Effect, Presence, caller_allowed,
+};
 
 const SIDES: &[&str] = &["left", "right"];
 const SECTIONS: &[&str] = &["recent", "devices", "internal", "remote"];
@@ -94,6 +96,27 @@ const TRASH_ITEMS: ArgSpec = ArgSpec {
     name: "items",
     kind: ArgKind::TrashItems,
     presence: Presence::Required,
+    default: None,
+};
+
+const REQUIRED_ACCELERATOR: ArgSpec = ArgSpec {
+    name: "accelerator",
+    kind: ArgKind::Text,
+    presence: Presence::Required,
+    default: None,
+};
+
+const BINDABLE_COMMAND: ArgSpec = ArgSpec {
+    name: "command",
+    kind: ArgKind::Text,
+    presence: Presence::Required,
+    default: None,
+};
+
+const OPTIONAL_COMMAND: ArgSpec = ArgSpec {
+    name: "command",
+    kind: ArgKind::Text,
+    presence: Presence::Optional,
     default: None,
 };
 
@@ -681,6 +704,32 @@ pub const COMMANDS: &[CommandSpec] = &[
         undo: false,
         arguments: &[],
     },
+    // P2as: the Settings shortcut editor. Every entry is a UI-only Settings
+    // command; the registry refuses the agent socket, the CLI and hotkeys
+    // before a handler or a config write, so an agent can never rebind
+    // Delete. The dialog validates the accelerator with GTK; fm-core only
+    // checks that the target is bindable and the accelerator is not empty.
+    CommandSpec {
+        name: "hotkey.set",
+        summary: "Bind a keyboard shortcut to a command.",
+        effect: Effect::Settings,
+        undo: false,
+        arguments: &[REQUIRED_ACCELERATOR, BINDABLE_COMMAND],
+    },
+    CommandSpec {
+        name: "hotkey.remove",
+        summary: "Remove a keyboard shortcut.",
+        effect: Effect::Settings,
+        undo: false,
+        arguments: &[REQUIRED_ACCELERATOR],
+    },
+    CommandSpec {
+        name: "hotkey.reset",
+        summary: "Restore one command's shortcuts, or every bindable command's.",
+        effect: Effect::Settings,
+        undo: false,
+        arguments: &[OPTIONAL_COMMAND],
+    },
     // Kyle approved one Settings key for local automation on Nov 3. It is a
     // UI-only switch: the registry refuses Agent, Cli and Hotkey before any
     // handler or config write. The switch itself is the only caller.
@@ -809,6 +858,48 @@ pub const COMMANDS: &[CommandSpec] = &[
         arguments: &[],
     },
 ];
+
+/// Commands whose `app.rs` handler refuses every caller but `Caller::Ui`,
+/// even though the registry's caller rule would let a hotkey through. The
+/// shortcut editor must not offer them: a hotkey that always fails is worse
+/// than no row. `updates.check` is the one no-argument command in this list;
+/// the others also carry required arguments, so they are excluded twice.
+const HANDLER_UI_ONLY: &[&str] = &[
+    "file.open-with",
+    "file.open-as-admin",
+    "file.set-default-app",
+    "tab.open-as-admin",
+    "tab.leave-admin",
+    "updates.set-enabled",
+    "updates.check",
+    "integration.set-show-in-folder",
+];
+
+/// Whether a command may be the target of a keyboard shortcut: it takes no
+/// required argument, a hotkey can actually run it, and it is not one of the
+/// editor's own `hotkey.*` commands. Order follows the catalogue.
+pub fn bindable_commands() -> Vec<&'static str> {
+    COMMANDS
+        .iter()
+        .filter(|spec| {
+            spec.arguments
+                .iter()
+                .all(|argument| argument.presence != Presence::Required)
+                && !HANDLER_UI_ONLY.contains(&spec.name)
+                // The file chooser answers only its own fixed keys and never
+                // reads `[hotkeys]`, so a binding here would never fire.
+                && !PICKER_COMMANDS.contains(&spec.name)
+                && !spec.name.starts_with("hotkey.")
+                && caller_allowed(spec.name, spec.effect, Caller::Hotkey)
+        })
+        .map(|spec| spec.name)
+        .collect()
+}
+
+/// Whether one command is in [`bindable_commands`].
+pub fn is_bindable(name: &str) -> bool {
+    bindable_commands().contains(&name)
+}
 
 #[cfg(test)]
 mod tests {

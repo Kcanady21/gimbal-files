@@ -18,6 +18,7 @@ mod fileops;
 mod folder;
 mod frame;
 mod header;
+mod hotkeys;
 mod image;
 mod layout;
 mod log;

@@ -85,6 +85,9 @@ fn the_v1_catalogue_has_every_reviewed_command_in_order() {
         "view.clear-folder-sort",
         "view.set-hidden",
         "view.toggle-hidden",
+        "hotkey.set",
+        "hotkey.remove",
+        "hotkey.reset",
         "agent.set-enabled",
         "updates.set-enabled",
         "updates.check",
@@ -292,6 +295,96 @@ fn the_automation_switch_is_ui_only_and_the_denied_handler_is_never_reached() {
     assert_eq!(handler.seen.len(), 1);
     assert!(check(Caller::Ui, &["agent.set-enabled"]).is_err());
     assert!(check(Caller::Ui, &["agent.set-enabled", "enabled=maybe"]).is_err());
+}
+
+#[test]
+fn the_shortcut_editor_commands_are_ui_only_and_refused_for_every_other_caller() {
+    let invocations = [
+        vec!["hotkey.set", "accelerator=<Control>j", "command=nav.back"],
+        vec!["hotkey.remove", "accelerator=<Alt>Left"],
+        vec!["hotkey.reset"],
+        vec!["hotkey.reset", "command=nav.back"],
+    ];
+
+    for tokens in &invocations {
+        for caller in [Caller::Hotkey, Caller::Cli, Caller::Agent] {
+            let mut handler = Recorder::new(Outcome::Done);
+            let outcome = Registry::new().dispatch(caller, &parse_invocation(tokens), &mut handler);
+            assert!(
+                matches!(outcome, Outcome::Error(_)),
+                "{caller} ran {tokens:?}"
+            );
+            assert!(
+                handler.seen.is_empty(),
+                "{caller} reached the handler for {tokens:?}"
+            );
+        }
+
+        let mut handler = Recorder::new(Outcome::Done);
+        let outcome = Registry::new().dispatch(Caller::Ui, &parse_invocation(tokens), &mut handler);
+        assert_eq!(outcome, Outcome::Done, "{tokens:?}");
+        assert_eq!(handler.seen.len(), 1, "{tokens:?}");
+    }
+
+    // The arguments are required where they describe the change.
+    assert!(check(Caller::Ui, &["hotkey.set", "accelerator=F6"]).is_err());
+    assert!(check(Caller::Ui, &["hotkey.set", "command=nav.back"]).is_err());
+    assert!(check(Caller::Ui, &["hotkey.remove"]).is_err());
+    assert!(check(Caller::Ui, &["hotkey.reset", "command="]).is_err());
+}
+
+#[test]
+fn bindable_commands_take_no_required_argument_and_a_hotkey_may_run_them() {
+    let bindable = bindable_commands();
+    assert!(!bindable.is_empty());
+
+    for name in &bindable {
+        let spec = Registry::new()
+            .command(name)
+            .unwrap_or_else(|| panic!("{name} is not in the catalogue"));
+        assert!(
+            spec.arguments
+                .iter()
+                .all(|argument| argument.presence != Presence::Required),
+            "{name} takes a required argument"
+        );
+        assert!(
+            caller_allowed(name, spec.effect, Caller::Hotkey),
+            "{name} is refused for a hotkey"
+        );
+        assert!(
+            !name.starts_with("hotkey."),
+            "{name} is one of the editor's own commands"
+        );
+    }
+
+    // Excluded because the handler only accepts the UI.
+    for name in [
+        "tab.open-as-admin",
+        "tab.leave-admin",
+        "file.open-with",
+        "file.open-as-admin",
+        "updates.check",
+    ] {
+        assert!(!is_bindable(name), "{name} is UI-only at its handler");
+    }
+    // Excluded because it needs an argument or is UI-only at the registry.
+    // Excluded because only the file chooser answers them, with its own keys.
+    for name in ["picker.accept", "picker.cancel"] {
+        assert!(!is_bindable(name), "{name} belongs to the file chooser");
+    }
+    for name in ["tab.focus", "nav.go", "agent.set-enabled", "file.new-file"] {
+        assert!(!is_bindable(name), "{name} is not a bindable command");
+    }
+    for name in [
+        "nav.back",
+        "app.settings",
+        "file.properties",
+        "file.trash",
+        "pins.add",
+    ] {
+        assert!(is_bindable(name), "{name} should be bindable");
+    }
 }
 
 #[test]

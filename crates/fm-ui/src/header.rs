@@ -2541,6 +2541,13 @@ fn open_settings_menu(ui: &Rc<WindowUi>, anchor: &gtk::Button) {
         }
     });
 
+    let ui_keys = ui.clone();
+    menu_item(&popover, &menu, "Keyboard Shortcuts…", true, move || {
+        // Open after this popover has gone, like the Settings submenu does.
+        let ui = ui_keys.clone();
+        gtk::glib::idle_add_local_once(move || crate::hotkeys::show(&ui));
+    });
+
     popover.set_child(Some(&menu));
     close_on_closed(&popover);
     crate::popup::show(&popover);
