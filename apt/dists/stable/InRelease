@@ -8,14 +8,14 @@ Codename: stable
 Architectures: amd64
 Components: main
 Description: Gimbal Files apt repository
-Date: Mon, 16 Nov 2026 18:17:25 +0000
+Date: Thu, 19 Nov 2026 11:48:14 +0000
 SHA256:
- f69341f6d5f856166b398b47d734bb28a1d7694780bcffd428b3f45812d535a4 5043 main/binary-amd64/Packages
- 2c291a9e41b55822af1c2a69f3b0a654ae62a44f72c55e59a8f54b5ed3a93b28 1353 main/binary-amd64/Packages.gz
+ b8b5ca4cfd3064a8b4b3a6682c1a59589663c4590d95d375a815a29ea0115eb2 5044 main/binary-amd64/Packages
+ a5f4d54a9f907376b64cbeed08c5f8921cb64c2fd35d44a26362156700056d27 1360 main/binary-amd64/Packages.gz
 -----BEGIN PGP SIGNATURE-----
 
-iHUEARYIAB0WIQSzkWuZ7NhHza0ZNwuazpkux0QEbQUCavtJCwAKCRCazpkux0QE
-bTDyAQDMn3EktO7pTzJ9KsxxhGBA1BuXie2xpHTWHGnjPdpgowEAmk9DlszbEhz2
-4Bpvgms25Y9jszLxo/c/5SK8fG5QaAA=
-=JX5u
+iHUEARYIAB0WIQSzkWuZ7NhHza0ZNwuazpkux0QEbQUCav7ikQAKCRCazpkux0QE
+baBoAQChoyqXeaSnDq9egj7OwQQtclPmJ3i5JlDUxMRlka/RWwEAx/5hw6jET9OR
+4uIoTNu8ojJVMaNM3e8yvUrPDQmajQ4=
+=gySE
 -----END PGP SIGNATURE-----
