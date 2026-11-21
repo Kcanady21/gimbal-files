@@ -97,6 +97,10 @@ deb_build() {
             || deb_error "the app icon is missing"
         [[ -f "$repo_root/packaging/dbus/io.github.kcanady21.GimbalFiles.FileManager1.service" ]] \
             || deb_error "the FileManager1 activation file is missing"
+        [[ -f "$repo_root/packaging/dbus/org.freedesktop.impl.portal.desktop.gimbal.service" ]] \
+            || deb_error "the portal backend activation file is missing"
+        [[ -f "$repo_root/packaging/portal/gimbal.portal" ]] \
+            || deb_error "the portal backend description is missing"
 
         local homepage maintainer epoch
         homepage="$(workspace_repository)"
@@ -115,6 +119,7 @@ deb_build() {
             "$pkg/usr/share/applications" \
             "$pkg/usr/share/dbus-1/services" \
             "$pkg/usr/share/icons/hicolor/scalable/apps" \
+            "$pkg/usr/share/xdg-desktop-portal/portals" \
             "$pkg/usr/share/doc/gimbal-files" \
             "$pkg/DEBIAN" \
             "$meta/debian" \
@@ -140,6 +145,14 @@ deb_build() {
         install -m 0644 \
             "$repo_root/packaging/dbus/io.github.kcanady21.GimbalFiles.FileManager1.service" \
             "$pkg/usr/share/dbus-1/services/io.github.kcanady21.GimbalFiles.FileManager1.service"
+        # The portal backend and its description. The frontend reads the
+        # description from this folder and the bus starts the backend through
+        # the service file.
+        install -m 0644 \
+            "$repo_root/packaging/dbus/org.freedesktop.impl.portal.desktop.gimbal.service" \
+            "$pkg/usr/share/dbus-1/services/org.freedesktop.impl.portal.desktop.gimbal.service"
+        install -m 0644 "$repo_root/packaging/portal/gimbal.portal" \
+            "$pkg/usr/share/xdg-desktop-portal/portals/gimbal.portal"
         install -m 0644 "$repo_root/packaging/icons/io.github.kcanady21.GimbalFiles.svg" \
             "$pkg/usr/share/icons/hicolor/scalable/apps/io.github.kcanady21.GimbalFiles.svg"
         install -m 0644 "$repo_root/packaging/debian/copyright" \

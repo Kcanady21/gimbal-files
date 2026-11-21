@@ -4058,6 +4058,10 @@ order = "ascending"
             ("pins.remove", &["pins.remove", "path=/tmp"]),
             ("pins.move", &["pins.move", "from=0", "to=1"]),
             ("agent.set-enabled", &["agent.set-enabled", "enabled=true"]),
+            (
+                "integration.set-file-chooser",
+                &["integration.set-file-chooser", "enabled=true"],
+            ),
         ];
 
         let settings: Vec<&str> = Registry::new()
@@ -4069,6 +4073,12 @@ order = "ascending"
         assert_eq!(settings.len(), samples.len());
 
         for command_name in settings {
+            // P2av: this switch writes the user's portals.conf, not
+            // config.toml. app.rs handles it before `change_for`, so it is the
+            // one Settings command with no Change.
+            if command_name == "integration.set-file-chooser" {
+                continue;
+            }
             let Some((_, tokens)) = samples.iter().find(|(name, _)| *name == command_name) else {
                 panic!("no sample invocation for Settings command `{command_name}`");
             };

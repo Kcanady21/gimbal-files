@@ -321,9 +321,11 @@ pub const PREVIEW_EDITING_COMMANDS: &[&str] = &[
 /// the local automation socket. It never comes from a hotkey, the CLI or the
 /// agent, even when the value is unchanged. P2as's shortcut editor commands
 /// follow the same rule: only a click in the Settings dialog may rebind a key,
-/// so an agent can never rebind Delete.
+/// so an agent can never rebind Delete. P2av's portals switch is here too: an
+/// agent must never redirect the desktop's Open and Save dialogs.
 pub const UI_ONLY_SETTINGS_COMMANDS: &[&str] = &[
     "agent.set-enabled",
+    "integration.set-file-chooser",
     "hotkey.set",
     "hotkey.remove",
     "hotkey.reset",

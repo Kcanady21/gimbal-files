@@ -208,6 +208,61 @@ Gimbal, so the folder or item still opens in the window you have. The extra
 process makes no window, holds the service name only for the call and a
 two-second grace window, then exits.
 
+## Use Gimbal for Open and Save dialogs
+
+Gimbal can answer the desktop's Open and Save dialogs. It is off by default.
+Turn on **Use Gimbal for Open and Save dialogs** under **Settings →
+Integration**. Gimbal asks first, because the change restarts
+`xdg-desktop-portal.service`: an open file dialog or screen share in another
+app closes. The switch then:
+
+- writes `$XDG_CONFIG_HOME/xdg-desktop-portal/<desktop>-portals.conf`, or
+  `~/.config/xdg-desktop-portal/<desktop>-portals.conf` (`mango-portals.conf`
+  on Mango). If the file does not exist, Gimbal copies the configuration that
+  is in effect first, so every other portal setting is kept;
+- adds an explicit
+  `org.freedesktop.impl.portal.FileChooser=gimbal;…;gtk;` line and a comment
+  directly above it recording the old line;
+- keeps `gtk` last in the chain, so removing Gimbal falls back to the GTK
+  dialog rather than breaking Open and Save.
+
+Turning the switch off restores the marked line and removes the marker. It
+deletes the file only when Gimbal created it and it is still Gimbal's
+unchanged copy; a file you edited is kept, minus Gimbal's line. The **Test**
+button opens a real dialog through the frontend and shows the URI it answered
+(or "Cancelled"), whichever backend answers; it never opens the file.
+
+The state is read from the portals configuration every time Settings opens, so
+editing the file by hand shows correctly. To undo by hand instead, quit
+Gimbal, delete the `# Gimbal Files: was …` marker and the FileChooser line it
+marks (or delete the copied `<desktop>-portals.conf`), then run:
+
+```sh
+systemctl --user restart xdg-desktop-portal.service
+```
+
+### Which apps reach it
+
+| App family | Uses Gimbal's dialog? |
+| --- | --- |
+| Flatpak apps | always |
+| Zen, Firefox | with `widget.use-xdg-desktop-portal.file-picker = 1` in `about:config` |
+| GTK3 apps, not Flatpak | with `GTK_USE_PORTAL=1` |
+| GTK4 apps, not Flatpak | with `GDK_DEBUG=portals`; otherwise GTK draws its own dialog |
+| Qt apps | with `QT_QPA_PLATFORMTHEME=xdgdesktopportal` |
+| Chromium, Chrome, Electron apps (VS Code, Claude desktop) | usually; most ask the portal first |
+| LibreOffice, ONLYOFFICE | depends on the VCL or Qt backend; try it |
+
+An app that draws its own dialog never reaches the portal, whichever backend
+is configured.
+
+### Removing Gimbal
+
+`gimbal;gtk;` is deliberate: with Gimbal's package or tarball removed, the
+frontend skips the missing `gimbal` backend and uses GTK. Gimbal's package
+scripts and installer never touch your portals configuration — the switch is
+the only thing that writes it.
+
 ## Uninstall a tarball or source install
 
 From a checkout:

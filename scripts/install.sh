@@ -114,12 +114,15 @@ fi
 desktop_dir="$data_dir/applications"
 icon_dir="$data_dir/icons/hicolor/scalable/apps"
 dbus_dir="$data_dir/dbus-1/services"
+portal_dir="$data_dir/xdg-desktop-portal/portals"
 marker="$data_dir/gimbal-files/install.toml"
 
 app_id="io.github.kcanady21.GimbalFiles"
 desktop_name="$app_id.desktop"
 icon_name="$app_id.svg"
 service_name="$app_id.FileManager1.service"
+portal_name="gimbal.portal"
+portal_service_name="org.freedesktop.impl.portal.desktop.gimbal.service"
 
 refresh_caches() {
     if command -v update-desktop-database >/dev/null 2>&1; then
@@ -138,6 +141,8 @@ if $uninstall; then
         "$desktop_dir/$desktop_name" \
         "$icon_dir/$icon_name" \
         "$dbus_dir/$service_name" \
+        "$dbus_dir/$portal_service_name" \
+        "$portal_dir/$portal_name" \
         "$marker"; do
         if [[ -e "$file" || -L "$file" ]]; then
             rm -f -- "$file"
@@ -158,6 +163,8 @@ if [[ -f "$script_dir/latest.toml" && -f "$script_dir/bin/gimbal-files" ]]; then
     desktop_src="$script_dir/share/applications/$desktop_name"
     icon_src="$script_dir/share/icons/hicolor/scalable/apps/$icon_name"
     service_src="$script_dir/share/dbus-1/services/$service_name"
+    portal_src="$script_dir/share/xdg-desktop-portal/portals/$portal_name"
+    portal_service_src="$script_dir/share/dbus-1/services/$portal_service_name"
     version_file="$script_dir/latest.toml"
 else
     repo_root="$(cd -- "$script_dir/.." && pwd -P)"
@@ -168,6 +175,8 @@ else
     desktop_src="$repo_root/packaging/$desktop_name"
     icon_src="$repo_root/packaging/icons/$icon_name"
     service_src="$repo_root/packaging/dbus/$service_name"
+    portal_src="$repo_root/packaging/portal/$portal_name"
+    portal_service_src="$repo_root/packaging/dbus/$portal_service_name"
     version_file="$repo_root/Cargo.toml"
 fi
 
@@ -184,6 +193,8 @@ done
 [[ -f "$desktop_src" ]] || error "desktop entry not found at $desktop_src"
 [[ -f "$icon_src" ]] || error "app icon not found at $icon_src"
 [[ -f "$service_src" ]] || error "FileManager1 activation file not found at $service_src"
+[[ -f "$portal_src" ]] || error "portal backend description not found at $portal_src"
+[[ -f "$portal_service_src" ]] || error "portal activation file not found at $portal_service_src"
 
 if $tarball_mode; then
     version="$(sed -n 's/^[[:space:]]*version[[:space:]]*=[[:space:]]*"\(.*\)"[[:space:]]*$/\1/p' "$version_file" | head -n 1)"
@@ -192,7 +203,7 @@ else
 fi
 [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || error "could not read a version from $version_file"
 
-mkdir -p -- "$bin_dir" "$desktop_dir" "$icon_dir" "$dbus_dir" "$(dirname -- "$marker")"
+mkdir -p -- "$bin_dir" "$desktop_dir" "$icon_dir" "$dbus_dir" "$portal_dir" "$(dirname -- "$marker")"
 
 # Record real locations so P2v can compare a canonicalized current_exe with
 # bin_dir. The prefix stays as the absolute directory the caller chose.
@@ -201,6 +212,7 @@ data_dir="$(cd -- "$data_dir" && pwd -P)"
 desktop_dir="$data_dir/applications"
 icon_dir="$data_dir/icons/hicolor/scalable/apps"
 dbus_dir="$data_dir/dbus-1/services"
+portal_dir="$data_dir/xdg-desktop-portal/portals"
 marker="$data_dir/gimbal-files/install.toml"
 
 tmp_paths=()
@@ -266,6 +278,25 @@ tmp_paths+=("$service_tmp")
     done <"$service_src"
 } >"$service_tmp"
 install_file "$service_tmp" "$dbus_dir/$service_name" 0644
+
+# The portal backend runs as `--portal`, not `--gapplication-service`, so it
+# never shares the main app's process. Its Exec is quoted the same way.
+portal_service_tmp="$(dirname -- "$dbus_dir/$portal_service_name")/.$portal_service_name.src.$$"
+tmp_paths+=("$portal_service_tmp")
+{
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        case "$line" in
+            Exec=*) printf 'Exec=%s --portal\n' "$(dbus_quote "$bin_dir/gimbal-files")" ;;
+            *) printf '%s\n' "$line" ;;
+        esac
+    done <"$portal_service_src"
+} >"$portal_service_tmp"
+install_file "$portal_service_tmp" "$dbus_dir/$portal_service_name" 0644
+# $data_dir is usually $XDG_DATA_HOME, which xdg-desktop-portal 1.21 reads
+# for .portal files. A custom --prefix or --data-dir that the session's
+# XDG_DATA_HOME does not include is not read; the Settings row then says
+# "Not installed".
+install_file "$portal_src" "$portal_dir/$portal_name" 0644
 install_file "$icon_src" "$icon_dir/$icon_name" 0644
 
 toml_escape() {

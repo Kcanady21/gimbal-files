@@ -782,6 +782,22 @@ pub const COMMANDS: &[CommandSpec] = &[
             default: None,
         }],
     },
+    // P2av: the portals switch. It writes the user's portals.conf rather than
+    // config.toml, so app.rs handles it before the config change lookup.
+    // Only the Settings switch may call it: an agent must never switch the
+    // desktop's Open and Save dialogs.
+    CommandSpec {
+        name: "integration.set-file-chooser",
+        summary: "Use Gimbal for the desktop's Open and Save dialogs.",
+        effect: Effect::Settings,
+        undo: false,
+        arguments: &[ArgSpec {
+            name: "enabled",
+            kind: ArgKind::Bool,
+            presence: Presence::Required,
+            default: None,
+        }],
+    },
     CommandSpec {
         name: "pins.add",
         summary: "Pin a folder.",
@@ -953,6 +969,25 @@ mod tests {
         assert!(matches!(spec.arguments[0].kind, ArgKind::Bool));
         assert!(matches!(spec.arguments[0].presence, Presence::Required));
         assert!(!spec.summary.is_empty());
+    }
+
+    #[test]
+    fn file_chooser_is_a_ui_only_settings_command_with_a_required_bool() {
+        let spec = drive_command("integration.set-file-chooser");
+        assert_eq!(spec.effect, Effect::Settings);
+        assert!(!spec.undo);
+        assert_eq!(spec.arguments.len(), 1);
+        assert_eq!(spec.arguments[0].name, "enabled");
+        assert!(matches!(spec.arguments[0].kind, ArgKind::Bool));
+        assert!(matches!(spec.arguments[0].presence, Presence::Required));
+        assert!(super::super::UI_ONLY_SETTINGS_COMMANDS.contains(&spec.name));
+        for caller in [Caller::Agent, Caller::Cli, Caller::Hotkey] {
+            assert!(
+                !caller_allowed(spec.name, spec.effect, caller),
+                "{caller:?} must not switch the desktop's dialogs"
+            );
+        }
+        assert!(caller_allowed(spec.name, spec.effect, Caller::Ui));
     }
 
     #[test]

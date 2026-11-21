@@ -92,6 +92,7 @@ fn the_v1_catalogue_has_every_reviewed_command_in_order() {
         "updates.set-enabled",
         "updates.check",
         "integration.set-show-in-folder",
+        "integration.set-file-chooser",
         "pins.add",
         "pins.remove",
         "pins.move",
@@ -331,6 +332,33 @@ fn the_shortcut_editor_commands_are_ui_only_and_refused_for_every_other_caller()
     assert!(check(Caller::Ui, &["hotkey.set", "command=nav.back"]).is_err());
     assert!(check(Caller::Ui, &["hotkey.remove"]).is_err());
     assert!(check(Caller::Ui, &["hotkey.reset", "command="]).is_err());
+}
+
+#[test]
+fn the_file_chooser_switch_is_ui_only_and_refused_for_every_other_caller() {
+    let tokens = ["integration.set-file-chooser", "enabled=true"];
+
+    for caller in [Caller::Hotkey, Caller::Cli, Caller::Agent] {
+        let mut handler = Recorder::new(Outcome::Done);
+        let outcome = Registry::new().dispatch(caller, &parse_invocation(&tokens), &mut handler);
+        assert!(
+            matches!(outcome, Outcome::Error(_)),
+            "{caller} switched the desktop's dialogs"
+        );
+        assert!(
+            handler.seen.is_empty(),
+            "{caller} reached the handler for the file-chooser switch"
+        );
+    }
+
+    let mut handler = Recorder::new(Outcome::Done);
+    let outcome = Registry::new().dispatch(Caller::Ui, &parse_invocation(&tokens), &mut handler);
+    assert_eq!(outcome, Outcome::Done);
+    assert_eq!(handler.seen.len(), 1);
+
+    // The boolean is required and must be a boolean.
+    assert!(check(Caller::Ui, &["integration.set-file-chooser"]).is_err());
+    assert!(check(Caller::Ui, &["integration.set-file-chooser", "enabled=yes"]).is_err());
 }
 
 #[test]

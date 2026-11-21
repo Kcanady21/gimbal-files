@@ -16,7 +16,7 @@ use adw::prelude::*;
 use fm_core::command::{Caller, Invocation};
 use fm_core::config::{Config, SortBy, SortOrder, SortRule};
 use fm_core::workspace::{Group, Window, WindowId};
-use gtk::{gdk, glib, pango};
+use gtk::{gdk, gio, glib, pango};
 
 use crate::dnd;
 use crate::fileops::keys::entry_focused;
@@ -240,6 +240,14 @@ struct FileManager1Widgets {
     syncing: Rc<Cell<bool>>,
 }
 
+/// The Open and Save dialogs row while the Settings popover is open.
+struct FileChooserWidgets {
+    switch: gtk::Switch,
+    status: gtk::Label,
+    test: gtk::Button,
+    syncing: Rc<Cell<bool>>,
+}
+
 struct HiddenWidgets {
     switch: gtk::Switch,
     syncing: Rc<Cell<bool>>,
@@ -295,6 +303,8 @@ pub struct Header {
     update_widgets: RefCell<Option<UpdateWidgets>>,
     /// The open Settings menu's Integration switch and status.
     filemanager1_widgets: RefCell<Option<FileManager1Widgets>>,
+    /// The open Settings menu's Open and Save dialogs row.
+    file_chooser_widgets: RefCell<Option<FileChooserWidgets>>,
     /// The Settings menu's Show hidden files switch, while the menu is open.
     hidden_widgets: RefCell<Option<HiddenWidgets>>,
     /// The open Settings menu's Sort rows. The header owns them while the menu
@@ -439,6 +449,7 @@ impl Header {
             agent_widgets: RefCell::new(None),
             update_widgets: RefCell::new(None),
             filemanager1_widgets: RefCell::new(None),
+            file_chooser_widgets: RefCell::new(None),
             hidden_widgets: RefCell::new(None),
             sort_rows: RefCell::new(None),
             ui: RefCell::new(Weak::new()),
@@ -518,6 +529,29 @@ impl Header {
         switch.set_active(status.enabled);
         syncing.set(false);
         label.set_text(&status.text());
+    }
+
+    /// Sync the open Settings menu's Open and Save dialogs row. The switch is
+    /// read from the config file, never cached in config.toml.
+    pub fn refresh_file_chooser_status(&self, health: &fm_core::portals_conf::Health) {
+        let widgets = self.file_chooser_widgets.borrow().as_ref().map(|widgets| {
+            (
+                widgets.switch.clone(),
+                widgets.status.clone(),
+                widgets.test.clone(),
+                widgets.syncing.clone(),
+            )
+        });
+        let Some((switch, label, test, syncing)) = widgets else {
+            return;
+        };
+        syncing.set(true);
+        switch.set_active(fm_core::portals_conf::health_is_enabled(health));
+        syncing.set(false);
+        let missing = matches!(health, fm_core::portals_conf::Health::NotInstalled);
+        switch.set_sensitive(!missing);
+        test.set_sensitive(!missing);
+        label.set_text(&file_chooser_line(health));
     }
 
     /// Sync the open Settings menu's Show hidden files switch after a change
@@ -2457,6 +2491,81 @@ fn open_settings_menu(ui: &Rc<WindowUi>, anchor: &gtk::Button) {
     integration_status_label.add_css_class("dim-label");
     menu.append(&integration_status_label);
 
+    // Open and Save dialogs: the file is the truth. Each time this popover is
+    // built the chain is read again, so a hand edit shows correctly.
+    let chooser_health = ui
+        .process_upgrade()
+        .map(|process| process.file_chooser_health())
+        .unwrap_or(fm_core::portals_conf::Health::NotInstalled);
+
+    let chooser_row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+    chooser_row.add_css_class("gl-menu-item");
+    let chooser_label = gtk::Label::builder()
+        .label(FILE_CHOOSER_LABEL)
+        .halign(gtk::Align::Start)
+        .hexpand(true)
+        .build();
+    let chooser_switch = gtk::Switch::new();
+    chooser_switch.update_property(&[gtk::accessible::Property::Label(FILE_CHOOSER_LABEL)]);
+    chooser_switch.update_property(&[gtk::accessible::Property::Description(
+        FILE_CHOOSER_SUBTITLE,
+    )]);
+    chooser_row.append(&chooser_label);
+    chooser_row.append(&chooser_switch);
+    menu.append(&chooser_row);
+
+    let chooser_subtitle = gtk::Label::builder()
+        .label(FILE_CHOOSER_SUBTITLE)
+        .wrap(true)
+        .xalign(0.0)
+        .halign(gtk::Align::Start)
+        .build();
+    chooser_subtitle.add_css_class("dim-label");
+    menu.append(&chooser_subtitle);
+
+    let chooser_status_label = gtk::Label::builder()
+        .label(file_chooser_line(&chooser_health))
+        .wrap(true)
+        .xalign(0.0)
+        .halign(gtk::Align::Start)
+        .build();
+    chooser_status_label.add_css_class("dim-label");
+    menu.append(&chooser_status_label);
+
+    let chooser_buttons = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    chooser_buttons.add_css_class("gl-menu-item");
+    let chooser_test = gtk::Button::with_label(FILE_CHOOSER_TEST);
+    chooser_test.update_property(&[gtk::accessible::Property::Label(FILE_CHOOSER_TEST)]);
+    chooser_buttons.append(&chooser_test);
+    menu.append(&chooser_buttons);
+
+    let chooser_syncing = Rc::new(Cell::new(false));
+    *ui.header().file_chooser_widgets.borrow_mut() = Some(FileChooserWidgets {
+        switch: chooser_switch.clone(),
+        status: chooser_status_label.clone(),
+        test: chooser_test.clone(),
+        syncing: chooser_syncing.clone(),
+    });
+    ui.header().refresh_file_chooser_status(&chooser_health);
+
+    let ui_chooser = ui.clone();
+    let chooser_switch_widget = chooser_switch.clone();
+    let chooser_syncing_flag = chooser_syncing.clone();
+    chooser_switch.connect_active_notify(move |_| {
+        if chooser_syncing_flag.get() {
+            return;
+        }
+        let requested = chooser_switch_widget.is_active();
+        confirm_file_chooser(&ui_chooser, requested);
+    });
+
+    let ui_test = ui.clone();
+    let test_status = chooser_status_label.clone();
+    let test_button = chooser_test.clone();
+    chooser_test.connect_clicked(move |_| {
+        open_test_dialog(&ui_test, &test_status, &test_button);
+    });
+
     // Report a bug: both actions are local. The report command writes a file
     // the user reads and attaches; nothing is sent anywhere.
     let report_row = gtk::Box::new(gtk::Orientation::Vertical, 6);
@@ -2551,6 +2660,266 @@ fn open_settings_menu(ui: &Rc<WindowUi>, anchor: &gtk::Button) {
     popover.set_child(Some(&menu));
     close_on_closed(&popover);
     crate::popup::show(&popover);
+}
+
+const FILE_CHOOSER_LABEL: &str = "Use Gimbal for Open and Save dialogs";
+const FILE_CHOOSER_SUBTITLE: &str = "The desktop's portal service restarts when this changes.";
+const FILE_CHOOSER_TEST: &str = "Test";
+const FILE_CHOOSER_ASK_ON: &str = "Turn on Gimbal for Open and Save dialogs?";
+const FILE_CHOOSER_ASK_OFF: &str = "Turn off Gimbal for Open and Save dialogs?";
+const FILE_CHOOSER_ASK_BODY: &str = "The desktop's portal service restarts, so an open file dialog or screen share in another app will close.";
+const TEST_WAITING: &str = "Test: waiting for the dialog…";
+const PORTAL_BUS_NAME: &str = "org.freedesktop.portal.Desktop";
+const PORTAL_PATH: &str = "/org/freedesktop/portal/desktop";
+const REQUEST_INTERFACE: &str = "org.freedesktop.portal.Request";
+const FILE_CHOOSER_INTERFACE: &str = "org.freedesktop.portal.FileChooser";
+
+thread_local! {
+    /// The last Test result. The Test dialog takes focus and may close the
+    /// Settings popover, so the answer has to survive a rebuilt menu.
+    static LAST_TEST: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+fn last_test_text() -> Option<String> {
+    LAST_TEST.with(|text| text.borrow().clone())
+}
+
+fn set_last_test_text(text: impl Into<String>) {
+    LAST_TEST.with(|slot| *slot.borrow_mut() = Some(text.into()));
+}
+
+fn clear_last_test_text() {
+    LAST_TEST.with(|slot| *slot.borrow_mut() = None);
+}
+
+/// The status line: a Test answer wins until the next switch change, but a
+/// missing backend always says so first.
+fn file_chooser_line(health: &fm_core::portals_conf::Health) -> String {
+    if matches!(health, fm_core::portals_conf::Health::NotInstalled) {
+        return fm_core::portals_conf::status_text(health);
+    }
+    last_test_text().unwrap_or_else(|| fm_core::portals_conf::status_text(health))
+}
+
+/// Ask before restarting another app's dialog or screen share.
+fn confirm_file_chooser(ui: &Rc<WindowUi>, enabled: bool) {
+    let title = if enabled {
+        FILE_CHOOSER_ASK_ON
+    } else {
+        FILE_CHOOSER_ASK_OFF
+    };
+    let dialog = adw::AlertDialog::new(Some(title), Some(FILE_CHOOSER_ASK_BODY));
+    dialog.add_css_class("gimbal-look");
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("confirm", if enabled { "Turn On" } else { "Turn Off" });
+    dialog.set_default_response(Some("cancel"));
+    dialog.set_close_response("cancel");
+
+    let answered = Rc::new(Cell::new(false));
+    let ui_response = ui.clone();
+    let answered_response = answered.clone();
+    dialog.connect_response(None, move |_dialog, response| {
+        answered_response.set(true);
+        if response == "confirm" {
+            clear_last_test_text();
+            ui_response.dispatch(
+                Caller::Ui,
+                Invocation::new(
+                    "integration.set-file-chooser",
+                    vec![("enabled".to_string(), enabled.to_string())],
+                ),
+            );
+        }
+        refresh_file_chooser_now(&ui_response);
+    });
+
+    let ui_closed = ui.clone();
+    let answered_closed = answered.clone();
+    dialog.connect_closed(move |_| {
+        ui_closed.end_dialog();
+        if !answered_closed.get() {
+            refresh_file_chooser_now(&ui_closed);
+        }
+    });
+
+    ui.begin_dialog();
+    dialog.choose(Some(ui.window()), None::<&gtk::gio::Cancellable>, |_| {});
+}
+
+fn refresh_file_chooser_now(ui: &Rc<WindowUi>) {
+    if let Some(process) = ui.process_upgrade() {
+        process.refresh_file_chooser_status_all();
+    }
+}
+
+/// Open a real `org.freedesktop.portal.FileChooser.OpenFile` through the
+/// frontend. This proves the whole path whichever backend answers. The
+/// answered URI is shown; nothing is opened.
+fn open_test_dialog(ui: &Rc<WindowUi>, status: &gtk::Label, test: &gtk::Button) {
+    set_last_test_text(TEST_WAITING);
+    status.set_text(TEST_WAITING);
+    test.set_sensitive(false);
+
+    let Some(surface) = ui.window().surface() else {
+        call_test_open(String::new(), status, test);
+        return;
+    };
+    let Ok(toplevel) = surface.downcast::<gdk4_wayland::WaylandToplevel>() else {
+        call_test_open(String::new(), status, test);
+        return;
+    };
+
+    let status_export = status.clone();
+    let test_export = test.clone();
+    let started = toplevel.export_handle(move |_toplevel, result| {
+        let parent = match result {
+            Ok(handle) => format!("wayland:{handle}"),
+            Err(error) => {
+                crate::log!("portals", "cannot export the test dialog's parent: {error}");
+                String::new()
+            }
+        };
+        call_test_open(parent, &status_export, &test_export);
+    });
+    if !started {
+        call_test_open(String::new(), status, test);
+    }
+}
+
+fn call_test_open(parent: String, status: &gtk::Label, test: &gtk::Button) {
+    let Ok(connection) = gio::bus_get_sync(gio::BusType::Session, None::<&gio::Cancellable>) else {
+        status.set_text("Test: no session bus");
+        test.set_sensitive(true);
+        return;
+    };
+    let Some(unique) = connection.unique_name() else {
+        set_last_test_text("Test: no session bus");
+        status.set_text("Test: no session bus");
+        test.set_sensitive(true);
+        return;
+    };
+
+    let sender = unique.trim_start_matches(':').replace('.', "_");
+    let token = format!("gimbal_test_{}_{}", std::process::id(), test_serial());
+    let expected = format!("/org/freedesktop/portal/desktop/request/{sender}/{token}");
+
+    let response_sub: Rc<RefCell<Option<gio::SignalSubscription>>> = Rc::new(RefCell::new(None));
+    let subscription = subscribe_test_response(&connection, &expected, status, test, &response_sub);
+    *response_sub.borrow_mut() = Some(subscription);
+
+    let options = glib::VariantDict::new(None);
+    options.insert("handle_token", token.as_str());
+    options.insert("multiple", false);
+    options.insert("directory", false);
+    let parameters = (
+        parent.as_str(),
+        "Test dialog: nothing will be opened",
+        options.end(),
+    )
+        .to_variant();
+
+    let status_reply = status.clone();
+    let test_reply = test.clone();
+    let sub_reply = response_sub.clone();
+    let expected_reply = expected.clone();
+    let connection_reply = connection.clone();
+    connection.call(
+        Some(PORTAL_BUS_NAME),
+        PORTAL_PATH,
+        FILE_CHOOSER_INTERFACE,
+        "OpenFile",
+        Some(&parameters),
+        Some(glib::VariantTy::new("(o)").expect("valid signature")),
+        gio::DBusCallFlags::NONE,
+        5000,
+        None::<&gio::Cancellable>,
+        move |result| match result {
+            Ok(reply) => {
+                let handle = reply
+                    .get::<(String,)>()
+                    .map(|(handle,)| handle)
+                    .unwrap_or_default();
+                if handle != expected_reply {
+                    crate::log!(
+                        "portals",
+                        "the test request handle is {handle}, not {expected_reply}"
+                    );
+                    let subscription = subscribe_test_response(
+                        &connection_reply,
+                        &handle,
+                        &status_reply,
+                        &test_reply,
+                        &sub_reply,
+                    );
+                    *sub_reply.borrow_mut() = Some(subscription);
+                }
+            }
+            Err(error) => {
+                crate::log!("portals", "the test dialog call failed: {error}");
+                *sub_reply.borrow_mut() = None;
+                set_last_test_text(format!("Test: {error}"));
+                status_reply.set_text(&format!("Test: {error}"));
+                test_reply.set_sensitive(true);
+            }
+        },
+    );
+}
+
+fn subscribe_test_response(
+    connection: &gio::DBusConnection,
+    path: &str,
+    status: &gtk::Label,
+    test: &gtk::Button,
+    subscription: &Rc<RefCell<Option<gio::SignalSubscription>>>,
+) -> gio::SignalSubscription {
+    let status = status.clone();
+    let test = test.clone();
+    let subscription = subscription.clone();
+    connection.subscribe_to_signal(
+        Some(PORTAL_BUS_NAME),
+        Some(REQUEST_INTERFACE),
+        Some("Response"),
+        Some(path),
+        None,
+        gio::DBusSignalFlags::NONE,
+        move |signal| {
+            let Some((response, results)) = signal.parameters.get::<(u32, glib::VariantDict)>()
+            else {
+                return;
+            };
+            let text = match response {
+                0 => {
+                    let uris = results
+                        .lookup::<Vec<String>>("uris")
+                        .ok()
+                        .flatten()
+                        .unwrap_or_default();
+                    if uris.is_empty() {
+                        "Test: no file".to_string()
+                    } else {
+                        format!("Test: {}", uris.join(" "))
+                    }
+                }
+                1 => "Test: Cancelled".to_string(),
+                _ => "Test: the dialog failed".to_string(),
+            };
+            *subscription.borrow_mut() = None;
+            set_last_test_text(&text);
+            status.set_text(&text);
+            test.set_sensitive(true);
+        },
+    )
+}
+
+fn test_serial() -> u64 {
+    thread_local! {
+        static SERIAL: Cell<u64> = const { Cell::new(0) };
+    }
+    SERIAL.with(|serial| {
+        let value = serial.get() + 1;
+        serial.set(value);
+        value
+    })
 }
 
 fn agent_status_text(status: &crate::agent::AgentStatus) -> String {

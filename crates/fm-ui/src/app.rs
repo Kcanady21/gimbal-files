@@ -20,12 +20,14 @@ use adw::prelude::*;
 use fm_core::command::{Caller, CheckedCommand, Effect, Invocation, Outcome, Registry, Value};
 use fm_core::config::{self, Change, ConfigFile};
 use fm_core::fileops::{Decisions, Plan, Report, Request, TrashIdentity, TrashUri};
+use fm_core::portals_conf;
 use fm_core::preview::Selection;
 use fm_core::session::{self, SessionProblem};
 use fm_core::volumes::{DriveAction, RemovalFailureKind, RemovalStatus};
 use fm_core::workspace::{Event, Heights, TabId, WindowId, Workspace};
 use gtk::gio;
 use gtk::glib;
+use gtk::glib::variant::ToVariant;
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ffi::OsString;
@@ -44,6 +46,81 @@ use crate::save::{Debounce, SAVE_DELAY_MS, Saver};
 #[cfg(test)]
 use crate::search::SearchView;
 use crate::trash::{PageRoute, back_consumes_history, route_on_trash_page};
+
+/// Restart `xdg-desktop-portal.service` through the session bus's user
+/// manager. Spawning `systemctl` is deliberately not done: the service is a
+/// user unit, and the bus call is the same operation without a process.
+struct SystemdRestarter;
+
+impl portals_conf::Restarter for SystemdRestarter {
+    fn restart(&self) -> Result<(), String> {
+        let connection = gio::bus_get_sync(gio::BusType::Session, None::<&gio::Cancellable>)
+            .map_err(|error| format!("no session bus: {error}"))?;
+        let parameters = ("xdg-desktop-portal.service", "replace").to_variant();
+        connection
+            .call_sync(
+                Some("org.freedesktop.systemd1"),
+                "/org/freedesktop/systemd1",
+                "org.freedesktop.systemd1.Manager",
+                "RestartUnit",
+                Some(&parameters),
+                Some(glib::VariantTy::new("(o)").expect("valid signature")),
+                gio::DBusCallFlags::NONE,
+                5000,
+                None::<&gio::Cancellable>,
+            )
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+}
+
+/// The Settings row's state. It reads the real environment, the portal
+/// folders and the session bus; no file is written.
+fn file_chooser_health() -> portals_conf::Health {
+    let locations = portals_conf::Locations::from_environment();
+    let desktops = portals_conf::current_desktops();
+    let dirs = portals_conf::portal_dirs();
+    let installed = portals_conf::gimbal_portal_installed(&dirs) && bus_lists_gimbal();
+    let available = portals_conf::installed_backends(&dirs);
+    let files = portals_conf::config_files(
+        &desktops,
+        &locations.config_home,
+        &locations.config_dirs,
+        &locations.data_dirs,
+    );
+    let chain = portals_conf::effective_chain(&files, &available);
+    portals_conf::health(
+        installed,
+        &chain,
+        &available,
+        portals_conf::restart_pending(),
+    )
+}
+
+/// Whether the bus would start Gimbal's portal backend on demand.
+fn bus_lists_gimbal() -> bool {
+    const NAME: &str = "org.freedesktop.impl.portal.desktop.gimbal";
+    let Ok(connection) = gio::bus_get_sync(gio::BusType::Session, None::<&gio::Cancellable>) else {
+        return false;
+    };
+    let reply = connection.call_sync(
+        Some("org.freedesktop.DBus"),
+        "/org/freedesktop/DBus",
+        "org.freedesktop.DBus",
+        "ListActivatableNames",
+        None,
+        Some(glib::VariantTy::new("(as)").expect("valid signature")),
+        gio::DBusCallFlags::NONE,
+        1000,
+        None::<&gio::Cancellable>,
+    );
+    let Ok(reply) = reply else {
+        return false;
+    };
+    reply
+        .get::<(Vec<String>,)>()
+        .is_some_and(|(names,)| names.iter().any(|name| name == NAME))
+}
 
 pub struct Process {
     application: Option<adw::Application>,
@@ -685,6 +762,54 @@ impl Process {
         let status = crate::filemanager1::status();
         for ui in self.windows.borrow().values() {
             ui.header().refresh_filemanager1_status(&status);
+        }
+    }
+
+    /// Push the current Open and Save dialogs state into every open Settings
+    /// popover. The file is the truth: a hand edit shows correctly.
+    pub fn refresh_file_chooser_status_all(&self) {
+        let health = file_chooser_health();
+        for ui in self.windows.borrow().values() {
+            ui.header().refresh_file_chooser_status(&health);
+        }
+    }
+
+    /// The Settings row's state, read fresh every time.
+    pub fn file_chooser_health(&self) -> portals_conf::Health {
+        file_chooser_health()
+    }
+
+    /// `integration.set-file-chooser`: write or remove the user's portals
+    /// line, then restart the frontend. It never touches config.toml, so it is
+    /// handled here rather than through `config::change_for`.
+    fn set_file_chooser(self: &Rc<Self>, enabled: bool) -> Outcome {
+        let locations = portals_conf::Locations::from_environment();
+        let desktops = portals_conf::current_desktops();
+        let result = if enabled {
+            portals_conf::enable(&desktops, &locations, &SystemdRestarter)
+        } else {
+            portals_conf::disable(&desktops, &locations, &SystemdRestarter)
+        };
+        match result {
+            Ok(applied) => {
+                match &applied.restart_error {
+                    Some(error) => crate::log!(
+                        "portals",
+                        "the config is saved but the portal did not restart: {error}"
+                    ),
+                    None => crate::log!(
+                        "portals",
+                        "Open and Save dialogs are now {}",
+                        if enabled { "Gimbal" } else { "not Gimbal" }
+                    ),
+                }
+                self.refresh_file_chooser_status_all();
+                Outcome::Done
+            }
+            Err(error) => {
+                crate::log!("portals", "{error}");
+                Outcome::Failed(error.to_string())
+            }
         }
     }
 
@@ -3260,6 +3385,14 @@ impl Process {
             let outcome = self.set_agent_enabled(*enabled);
             self.refresh_agent_status_all();
             return outcome;
+        }
+        // P2av: the portal switch writes the user's portals.conf, never
+        // config.toml. The registry has already refused every caller but Ui.
+        if command.name() == "integration.set-file-chooser" {
+            let Some(Value::Bool(enabled)) = command.get("enabled") else {
+                return Outcome::Failed("integration.set-file-chooser needs a boolean".to_string());
+            };
+            return self.set_file_chooser(*enabled);
         }
 
         let current = self
