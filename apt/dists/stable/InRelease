@@ -8,14 +8,14 @@ Codename: stable
 Architectures: amd64
 Components: main
 Description: Gimbal Files apt repository
-Date: Thu, 19 Nov 2026 11:48:14 +0000
+Date: Sat, 21 Nov 2026 16:24:47 +0000
 SHA256:
- b8b5ca4cfd3064a8b4b3a6682c1a59589663c4590d95d375a815a29ea0115eb2 5044 main/binary-amd64/Packages
- a5f4d54a9f907376b64cbeed08c5f8921cb64c2fd35d44a26362156700056d27 1360 main/binary-amd64/Packages.gz
+ d7adfd7d2d6cbc5acaf78864a64330c7ffc8efdd1ba9a4e9dd9263c45fb03aed 5045 main/binary-amd64/Packages
+ 9b68c1d1384dd61eed9c4eed5a4d4ae2805187591e8d9258f969c3483bca5aa8 1358 main/binary-amd64/Packages.gz
 -----BEGIN PGP SIGNATURE-----
 
-iHUEARYIAB0WIQSzkWuZ7NhHza0ZNwuazpkux0QEbQUCav7ikQAKCRCazpkux0QE
-baBoAQChoyqXeaSnDq9egj7OwQQtclPmJ3i5JlDUxMRlka/RWwEAx/5hw6jET9OR
-4uIoTNu8ojJVMaNM3e8yvUrPDQmajQ4=
-=gySE
+iHUEARYIAB0WIQSzkWuZ7NhHza0ZNwuazpkux0QEbQUCawHGaAAKCRCazpkux0QE
+bRu+AQD7Xe5j6pM5H+Sk6v5153ctkmGNVJ6vjeoqRJQ0Ef3CoQD/SNny+B6XQpIc
+4nx0mNFkBCC7OJ49lCKGxXxlGam6KwM=
+=UYi5
 -----END PGP SIGNATURE-----
