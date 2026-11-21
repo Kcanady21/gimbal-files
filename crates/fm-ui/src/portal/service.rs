@@ -2,7 +2,7 @@
 //! The `org.freedesktop.impl.portal.FileChooser` backend.
 //!
 //! xdg-desktop-portal calls this process over D-Bus when an application asks
-//! for an Open dialog. The method call carries a Request object path; the
+//! for an Open or Save dialog. The method call carries a Request object path; the
 //! answer arrives later, as the return value of that same call, so the
 //! invocation is held while the dialog is up. This module owns the wire
 //! contract and the response bookkeeping; [`super::picker`] owns the window.
@@ -43,7 +43,7 @@ pub const RESPONSE_OTHER: u32 = 2;
 // The methods Gimbal answers. Copied from xdg-desktop-portal 1.21's
 // xdp-gnome/data/org.freedesktop.impl.portal.FileChooser.xml; the Qt
 // annotations and the documentation comments are dropped. OpenFile is F1;
-// SaveFile and SaveFiles are answered "not available" until F3.
+// SaveFile and SaveFiles are F3.
 const FILE_CHOOSER_XML: &str = r#"
 <node>
   <interface name="org.freedesktop.impl.portal.FileChooser">
@@ -115,12 +115,14 @@ impl Method {
     }
 }
 
-/// The options an OpenFile call can carry. Everything else is accepted and
-/// ignored: a chooser that refused an unfamiliar key would break applications
-/// that only wanted an ordinary dialog. A known key whose value is the wrong
-/// type is read as absent and named in `malformed`.
+/// The options a FileChooser call can carry. One type serves all three
+/// methods: every field is named for what it carries, and the parser only reads
+/// the keys the method knows. Everything else is accepted and ignored: a
+/// chooser that refused an unfamiliar key would break applications that only
+/// wanted an ordinary dialog. A known key whose value is the wrong type is read
+/// as absent and named in `malformed`.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct OpenOptions {
+pub struct CallOptions {
     /// The accept button's label, with mnemonic underlines allowed.
     pub accept_label: Option<String>,
     /// The suggested starting folder. It is only used if it exists and is a
@@ -140,6 +142,13 @@ pub struct OpenOptions {
     pub fixed_filter: Option<Filter>,
     /// The application's extra choices, in the order it sent them.
     pub choices: Vec<Choice>,
+    /// SaveFile: the name the entry starts with.
+    pub current_name: Option<String>,
+    /// SaveFile: an existing file to open the folder of and pre-select.
+    pub current_file: Option<PathBuf>,
+    /// SaveFiles: the names to save, each a NUL-terminated byte string. Kept as
+    /// bytes until [`super::save`] takes the last component and validates it.
+    pub files: Vec<Vec<u8>>,
     /// Known option keys this build does not act on. Each is logged once;
     /// unknown keys are ignored silently.
     pub ignored: Vec<&'static str>,
@@ -147,24 +156,32 @@ pub struct OpenOptions {
     pub malformed: Vec<&'static str>,
 }
 
-impl OpenOptions {
-    /// Whether the footer shows the filter dropdown. In folders-only mode the
-    /// filters are ignored, so the dropdown goes (a fixed `current_filter`
-    /// still applies, invisibly).
-    pub fn shows_filters(&self) -> bool {
-        !self.directory && !self.filters.is_empty()
+impl CallOptions {
+    /// Whether the footer shows the filter dropdown. OpenFile hides filters in
+    /// folders-only mode, SaveFile always shows them when it has any, and
+    /// SaveFiles never does.
+    pub fn shows_filters_for(&self, method: Method) -> bool {
+        match method {
+            Method::OpenFile => !self.directory && !self.filters.is_empty(),
+            Method::SaveFile => !self.filters.is_empty(),
+            Method::SaveFiles => false,
+        }
     }
 
     /// The filter the dialog starts with, or `None` when nothing filters files
     /// out of it.
-    pub fn start_filter(&self) -> Option<&Filter> {
-        if self.directory {
-            return None;
+    pub fn start_filter_for(&self, method: Method) -> Option<&Filter> {
+        match method {
+            Method::OpenFile if self.directory => None,
+            Method::SaveFiles => None,
+            Method::OpenFile | Method::SaveFile => {
+                if !self.filters.is_empty() {
+                    self.filters.get(self.current_filter.unwrap_or(0))
+                } else {
+                    self.fixed_filter.as_ref()
+                }
+            }
         }
-        if !self.filters.is_empty() {
-            return self.filters.get(self.current_filter.unwrap_or(0));
-        }
-        self.fixed_filter.as_ref()
     }
 }
 
@@ -210,21 +227,22 @@ pub struct Call {
     pub method: Method,
     pub app_id: String,
     pub title: Option<String>,
-    pub options: OpenOptions,
+    pub options: CallOptions,
 }
 
 impl Call {
     /// The accept button's label: the caller's, or the mode's own. A folder
-    /// picker says "Select", a file picker "Open".
+    /// picker says "Select", a file picker "Open", and both Save methods say
+    /// "Save".
     pub fn accept_label(&self) -> &str {
         self.options
             .accept_label
             .as_deref()
             .filter(|label| !label.is_empty())
-            .unwrap_or(if self.options.directory {
-                "Select"
-            } else {
-                "Open"
+            .unwrap_or(match self.method {
+                Method::SaveFile | Method::SaveFiles => "Save",
+                Method::OpenFile if self.options.directory => "Select",
+                Method::OpenFile => "Open",
             })
     }
 
@@ -237,8 +255,10 @@ impl Call {
     }
 }
 
-/// The known OpenFile option keys. `modal` is known but stays unimplemented
-/// until F4, so it is named in the log; every other key acts on the dialog.
+/// The option keys each method knows. A key another method knows is still
+/// unknown here: the dialog reads only the keys its own call can carry.
+/// `modal` is known to every method but stays unimplemented until F4, so it is
+/// the one key that reaches `ignored`.
 const KNOWN_OPEN_KEYS: &[&str] = &[
     "accept_label",
     "modal",
@@ -249,6 +269,31 @@ const KNOWN_OPEN_KEYS: &[&str] = &[
     "choices",
     "current_folder",
 ];
+const KNOWN_SAVE_FILE_KEYS: &[&str] = &[
+    "accept_label",
+    "modal",
+    "filters",
+    "current_filter",
+    "choices",
+    "current_name",
+    "current_folder",
+    "current_file",
+];
+const KNOWN_SAVE_FILES_KEYS: &[&str] = &[
+    "accept_label",
+    "modal",
+    "choices",
+    "current_folder",
+    "files",
+];
+
+fn known_keys(method: Method) -> &'static [&'static str] {
+    match method {
+        Method::OpenFile => KNOWN_OPEN_KEYS,
+        Method::SaveFile => KNOWN_SAVE_FILE_KEYS,
+        Method::SaveFiles => KNOWN_SAVE_FILES_KEYS,
+    }
+}
 
 /// The wire type of the `filters` option.
 const FILTERS_TYPE: &str = "a(sa(us))";
@@ -300,25 +345,31 @@ fn children(value: &glib::Variant) -> impl Iterator<Item = glib::Variant> {
     (0..value.n_children()).filter_map(|index| value.try_child_value(index))
 }
 
-/// Parse an OpenFile options vardict. Every key either changes the dialog or is
-/// named in `ignored` / `malformed` for the log; nothing here is an error.
-pub fn parse_open_options(options: &HashMap<String, glib::Variant>) -> OpenOptions {
+/// Parse one call's options vardict. Every key the method knows either changes
+/// the dialog or is named in `ignored` / `malformed` for the log; a key for
+/// another method is unknown and ignored silently. Nothing here is an error.
+pub fn parse_call_options(method: Method, options: &HashMap<String, glib::Variant>) -> CallOptions {
     let mut malformed: Vec<&'static str> = Vec::new();
     let accept_label =
         typed_option!(options, malformed, "accept_label", String).filter(|label| !label.is_empty());
     let current_folder = typed_option!(options, malformed, "current_folder", Vec<u8>)
         .and_then(|bytes| folder_from_bytes(&bytes));
-    let multiple = typed_option!(options, malformed, "multiple", bool).unwrap_or_default();
-    let directory = typed_option!(options, malformed, "directory", bool).unwrap_or_default();
 
-    let filters = match variant_option(options, &mut malformed, "filters", FILTERS_TYPE) {
-        Some(value) => children(value)
-            .filter_map(|entry| Filter::from_variant(&entry))
-            .collect(),
-        None => Vec::new(),
+    // SaveFiles has no filters at all, so those two keys are unknown to it and
+    // a wrong-typed one must stay silent.
+    let (filters, requested) = if method == Method::SaveFiles {
+        (Vec::new(), None)
+    } else {
+        let filters = match variant_option(options, &mut malformed, "filters", FILTERS_TYPE) {
+            Some(value) => children(value)
+                .filter_map(|entry| Filter::from_variant(&entry))
+                .collect(),
+            None => Vec::new(),
+        };
+        let requested = variant_option(options, &mut malformed, "current_filter", FILTER_TYPE)
+            .and_then(Filter::from_variant);
+        (filters, requested)
     };
-    let requested = variant_option(options, &mut malformed, "current_filter", FILTER_TYPE)
-        .and_then(Filter::from_variant);
     // The whole `(sa(us))` decides which entry is selected, as Nautilus does
     // (`nautilus-portal.c:539`). Two filters with the same name but different
     // rules are different filters.
@@ -342,21 +393,37 @@ pub fn parse_open_options(options: &HashMap<String, glib::Variant>) -> OpenOptio
         None => Vec::new(),
     };
 
-    let ignored = KNOWN_OPEN_KEYS
+    let (multiple, directory, current_name, current_file, files) = match method {
+        Method::OpenFile => (
+            typed_option!(options, malformed, "multiple", bool).unwrap_or_default(),
+            typed_option!(options, malformed, "directory", bool).unwrap_or_default(),
+            None,
+            None,
+            Vec::new(),
+        ),
+        Method::SaveFile => (
+            false,
+            false,
+            typed_option!(options, malformed, "current_name", String),
+            typed_option!(options, malformed, "current_file", Vec<u8>)
+                .and_then(|bytes| folder_from_bytes(&bytes)),
+            Vec::new(),
+        ),
+        Method::SaveFiles => (
+            false,
+            false,
+            None,
+            None,
+            typed_option!(options, malformed, "files", Vec<Vec<u8>>).unwrap_or_default(),
+        ),
+    };
+
+    let ignored = known_keys(method)
         .iter()
         .copied()
-        .filter(|key| {
-            *key != "accept_label"
-                && *key != "current_folder"
-                && *key != "multiple"
-                && *key != "directory"
-                && *key != "filters"
-                && *key != "current_filter"
-                && *key != "choices"
-                && options.contains_key(*key)
-        })
+        .filter(|key| *key == "modal" && options.contains_key(*key))
         .collect();
-    OpenOptions {
+    CallOptions {
         accept_label,
         current_folder,
         multiple,
@@ -365,6 +432,9 @@ pub fn parse_open_options(options: &HashMap<String, glib::Variant>) -> OpenOptio
         current_filter,
         fixed_filter,
         choices,
+        current_name,
+        current_file,
+        files,
         ignored,
         malformed,
     }
@@ -393,6 +463,23 @@ pub fn starting_folder(suggested: Option<&Path>, home: &Path) -> PathBuf {
         .filter(|path| path.is_dir())
         .map(Path::to_path_buf)
         .unwrap_or_else(|| home.to_path_buf())
+}
+
+/// The starting folder for a whole call. SaveFile opens the folder of
+/// `current_file` when it has one and it still exists, so the file can be
+/// selected; anything else follows [`starting_folder`].
+pub fn starting_folder_for(call: &Call, home: &Path) -> PathBuf {
+    if call.method == Method::SaveFile
+        && let Some(parent) = call
+            .options
+            .current_file
+            .as_deref()
+            .and_then(Path::parent)
+            .filter(|parent| parent.is_dir())
+    {
+        return parent.to_path_buf();
+    }
+    starting_folder(call.options.current_folder.as_deref(), home)
 }
 
 /// The empty `a{sv}` a cancelled or refused call returns.
@@ -440,16 +527,17 @@ impl Pick {
 }
 
 /// The `a{sv}` a successful call returns: one or more `file://` URIs, the
-/// choices, the chosen filter when the call had filters, and `writable`. Paths
-/// are encoded by GIO, so spaces and non-ASCII names come out percent-encoded
-/// exactly as the portal expects.
+/// choices, the chosen filter when the method reports one, and — for OpenFile
+/// only — `writable`. Paths are encoded by GIO, so spaces and non-ASCII names
+/// come out percent-encoded exactly as the portal expects.
 ///
 /// `writable` is always `true`: Kyle opens files in order to edit them, and a
 /// `false` here would make the document portal hand a sandboxed application a
 /// read-only copy of whatever it picked. Nautilus answers the same way unless
 /// its optional "Open Read-Only" box is ticked (`nautilus-portal.c:186-206`,
-/// `242-276`); Gimbal has no such box.
-pub fn results_for(pick: &Pick) -> HashMap<String, glib::Variant> {
+/// `242-276`); Gimbal has no such box. The Save methods carry no `writable`
+/// key at all (`nautilus-portal.c:236-262`).
+pub fn results_for(pick: &Pick, method: Method) -> HashMap<String, glib::Variant> {
     let mut results = HashMap::new();
     let uris = pick
         .paths
@@ -458,10 +546,15 @@ pub fn results_for(pick: &Pick) -> HashMap<String, glib::Variant> {
         .collect::<Vec<_>>();
     results.insert("uris".to_string(), uris.to_variant());
     results.insert("choices".to_string(), pick.choices.clone().to_variant());
-    if let Some(filter) = &pick.current_filter {
+    // SaveFiles carries no filters, so it has nothing to report back.
+    if method != Method::SaveFiles
+        && let Some(filter) = &pick.current_filter
+    {
         results.insert("current_filter".to_string(), filter.clone());
     }
-    results.insert("writable".to_string(), true.to_variant());
+    if method == Method::OpenFile {
+        results.insert("writable".to_string(), true.to_variant());
+    }
     results
 }
 
@@ -481,6 +574,7 @@ pub struct Request {
     handle: String,
     app_id: String,
     title: String,
+    method: Method,
     invocation: RefCell<Option<gio::DBusMethodInvocation>>,
     connection: gio::DBusConnection,
     registration: RefCell<Option<gio::RegistrationId>>,
@@ -493,6 +587,7 @@ impl std::fmt::Debug for Request {
         f.debug_struct("Request")
             .field("handle", &self.handle)
             .field("app_id", &self.app_id)
+            .field("method", &self.method)
             .field("finished", &self.finished.get())
             .finish()
     }
@@ -505,6 +600,7 @@ impl Request {
         connection: &gio::DBusConnection,
         handle: &str,
         invocation: &gio::DBusMethodInvocation,
+        method: Method,
         app_id: &str,
         title: &str,
     ) -> Result<Rc<Self>, String> {
@@ -512,6 +608,7 @@ impl Request {
             handle: handle.to_string(),
             app_id: app_id.to_string(),
             title: title.to_string(),
+            method,
             invocation: RefCell::new(Some(invocation.clone())),
             connection: connection.clone(),
             registration: RefCell::new(None),
@@ -604,7 +701,7 @@ impl Request {
         for path in &pick.paths {
             crate::log!("portal", "selected {}", path.display());
         }
-        self.complete(RESPONSE_SUCCESS, results_for(&pick))
+        self.complete(RESPONSE_SUCCESS, results_for(&pick, self.method))
     }
 }
 
@@ -745,23 +842,12 @@ impl Service {
             parent_window
         );
 
-        if method != Method::OpenFile {
-            // F3 implements saving. F1 answers a plain refusal, so the
-            // frontend falls back rather than waiting forever.
-            crate::log!(
-                "portal",
-                "{} is not implemented yet; answering other",
-                method.as_str()
-            );
-            invocation.return_value(Some(&(RESPONSE_OTHER, empty_results()).to_variant()));
-            return;
-        }
-
-        let options = parse_open_options(&options);
+        let options = parse_call_options(method, &options);
         if !options.ignored.is_empty() {
             crate::log!(
                 "portal",
-                "OpenFile ignores option(s) {}",
+                "{} ignores option(s) {}",
+                method.as_str(),
                 options.ignored.join(", ")
             );
         }
@@ -769,7 +855,8 @@ impl Service {
             // A value of the wrong type is read as absent, never refused.
             crate::log!(
                 "portal",
-                "OpenFile ignores malformed option(s) {}",
+                "{} ignores malformed option(s) {}",
+                method.as_str(),
                 options.malformed.join(", ")
             );
         }
@@ -782,7 +869,8 @@ impl Service {
         };
         let title = call.title().to_string();
 
-        let request = match Request::new(connection, &handle, &invocation, &app_id, &title) {
+        let request = match Request::new(connection, &handle, &invocation, method, &app_id, &title)
+        {
             Ok(request) => request,
             Err(error) => {
                 crate::log!("portal", "{error}");

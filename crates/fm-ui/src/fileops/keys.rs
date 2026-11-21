@@ -14,10 +14,12 @@ use gtk::{gdk, prelude::*};
 /// entry itself is always false; the entry and every other ancestor of the
 /// focus widget carry `FOCUS_WITHIN` instead (`gtk/gtkwindow.c:5280-5310`).
 ///
-/// The window only reports a logical focus here: `FOCUS_WITHIN` is set whether
-/// or not the window is the active toplevel, which is what both the main
-/// window's hotkey guard (`commands.rs`) and the portal dialog's own key
-/// controller (`portal::picker`) need.
+/// `FOCUS_WITHIN` is set as soon as focus moves into the entry, even in a
+/// window that was never activated. GTK clears it when an active window stops
+/// being active and sets it again on reactivation (`gtk/gtkwindow.c:6153-6185`).
+/// That is what the main window's hotkey guard (`commands.rs`) and the portal
+/// dialog's own key controller (`portal::picker`) need: an inactive window gets
+/// no key events to guard.
 pub fn entry_focused(entry: &gtk::Entry) -> bool {
     entry.state_flags().contains(gtk::StateFlags::FOCUS_WITHIN)
 }

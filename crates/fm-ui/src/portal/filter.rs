@@ -190,6 +190,68 @@ impl SearchResultFilter for SearchFilter {
     }
 }
 
+/// The extension a filter's first simple glob names: the first rule of the
+/// form `*.ext` with no other wildcard in it. A MIME-only filter, a `*` filter
+/// or a glob like `*.tar.?z` names nothing this rule can use.
+fn simple_extension(filter: &Filter) -> Option<String> {
+    filter.rules.iter().find_map(|rule| {
+        if rule.kind != RULE_GLOB {
+            return None;
+        }
+        let extension = rule.pattern.strip_prefix("*.")?;
+        if extension.is_empty()
+            || extension
+                .chars()
+                .any(|c| matches!(c, '*' | '?' | '[' | ']' | '\\' | '/'))
+        {
+            return None;
+        }
+        Some(extension.to_string())
+    })
+}
+
+/// Split a display name at its last dot, unless the dot is the first character:
+/// `.bashrc` has no extension, while `notes.txt` keeps `notes` and `txt`.
+fn split_extension(name: &str) -> Option<(&str, &str)> {
+    let dot = name.rfind('.')?;
+    if dot == 0 {
+        None
+    } else {
+        Some((&name[..dot], &name[dot + 1..]))
+    }
+}
+
+/// The name with its extension replaced when the filter dropdown changes, or
+/// `None` to leave the name alone.
+///
+/// The new filter's first simple `*.ext` glob supplies the new extension. It
+/// applies only when the current name's extension matches one of the **old**
+/// filter's globs, ASCII case-insensitively: a name with no extension, an
+/// extension the old filter does not list, a MIME-only filter or a `*` filter
+/// on either side changes nothing.
+///
+/// The rule is GTK's and Nautilus's (`nautilus-file-chooser.c:411-510`): change
+/// the suffix with the filter, but never guess one for a name the old filter
+/// did not claim.
+pub fn follow_extension(name: &str, old: Option<&Filter>, new: Option<&Filter>) -> Option<String> {
+    let new_extension = simple_extension(new?)?;
+    let old = old?;
+    let (stem, _) = split_extension(name)?;
+    let lower_name = name.to_ascii_lowercase();
+    let matches_old = old.rules.iter().any(|rule| {
+        // A bare `*` matches every name but claims no extension, and neither
+        // does a glob with no dot in it. Only an extension-bearing glob can
+        // hand its suffix to the new filter.
+        rule.kind == RULE_GLOB
+            && rule.pattern.contains('.')
+            && fnmatch(&rule.pattern.to_ascii_lowercase(), &lower_name)
+    });
+    if !matches_old {
+        return None;
+    }
+    Some(format!("{stem}.{new_extension}"))
+}
+
 /// Shell glob matching with `fnmatch` rules: `*`, `?`, `[abc]`, `[!abc]`,
 /// ranges, and a backslash escape.
 ///

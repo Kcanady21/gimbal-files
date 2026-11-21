@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! The Open dialog itself.
+//! The Open and Save dialogs themselves.
 //!
 //! A picker is an ordinary model window in the workspace — one group, one tab,
 //! one folder — with a small view of its own instead of `WindowUi`: a nav row,
 //! the main app's `Sidebar` and `FolderView`, a status line, and a footer. The
 //! model gives it navigation, history, selection and sorting for free; the
-//! registry entry below is how the rest of the app knows the window is read-only.
+//! registry entry below is how the rest of the app knows the window is a picker.
 //!
 //! The portal service ([`super::service`]) hands each call a [`Request`]. The
 //! picker answers it exactly once: accept, cancel, Close from the portal, or a
@@ -24,8 +24,11 @@
 //! - **search**, in the nav row and on Ctrl+F, scoped to the folder the dialog
 //!   is showing, with the same rules applied to its results in the worker.
 //!
-//! It stays what F1 made it: read-only. Nothing here writes a file, the config,
-//! or a session, and no agent can reach it.
+//! Save adds a Name entry and a folder pick on the same window. It answers a
+//! `file://` URI and writes nothing: the application writes the file. The one
+//! exception is New Folder, which creates exactly the folder the user asked for
+//! through `file.new-folder`; no other file-changing command is accepted, and
+//! the picker still writes no config and no session.
 
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
@@ -45,7 +48,8 @@ use fm_core::search::SearchResultFilter;
 use fm_core::workspace::{TabId, Window, WindowId};
 
 use super::filter::{SearchFilter, ViewRules};
-use super::service::{self, Call, DialogHost, Pick, Request};
+use super::save::{self, CollisionChoice, SaveTarget};
+use super::service::{self, Call, DialogHost, Method, Pick, Request};
 use crate::app::Process;
 use crate::fileops::keys::entry_focused;
 use crate::folder::{ClickRequest, FolderView, GridFilter, StatusLine};
@@ -267,6 +271,25 @@ impl Mode {
             (true, true) => "folders+multiple",
         }
     }
+
+    /// The grid's rules for one call. SaveFile picks one file by name; SaveFiles
+    /// is a folder picker and ignores `multiple`; Open follows its options.
+    pub fn for_call(call: &Call) -> Self {
+        match call.method {
+            Method::OpenFile => Self {
+                multiple: call.options.multiple,
+                folders_only: call.options.directory,
+            },
+            Method::SaveFile => Self {
+                multiple: false,
+                folders_only: false,
+            },
+            Method::SaveFiles => Self {
+                multiple: false,
+                folders_only: true,
+            },
+        }
+    }
 }
 
 /// Nothing chosen where one is needed, or too many chosen where one is allowed.
@@ -420,6 +443,24 @@ pub(crate) struct Picker {
     /// The file-type filter dropdown, and the row of the app's own choices.
     filters: Option<gtk::DropDown>,
     choices: Vec<ChoiceControl>,
+    /// SaveFile's Name entry, at the start of the footer.
+    name_entry: Option<gtk::Entry>,
+    /// SaveFiles' footer line, saying what will be saved.
+    save_summary: Option<gtk::Label>,
+    /// SaveFile's and SaveFiles' New Folder button, beside the address bar.
+    new_folder: Option<gtk::Button>,
+    /// The folder's `access::can-write` as last shown, for `save_target`.
+    writable: Cell<bool>,
+    /// The last selection a click produced, so the Name entry follows a click
+    /// once and does not overwrite typing on every refresh.
+    last_selection: RefCell<BTreeSet<OsString>>,
+    /// SaveFiles' validated names, in the order the call sent them.
+    file_names: Vec<OsString>,
+    /// The open overwrite or collision alert, kept alive while it is up.
+    alert: RefCell<Option<adw::AlertDialog>>,
+    /// This picker as a weak reference, for the alert callbacks that outlive
+    /// the method that presented them.
+    self_weak: RefCell<Weak<Picker>>,
     open: gtk::Button,
     /// The folder and tab the grid is showing, so a refresh only reloads when
     /// the model's folder actually changed.
@@ -456,13 +497,12 @@ impl Picker {
             call,
             hold,
         } = options;
-        let mode = Mode {
-            multiple: call.options.multiple,
-            folders_only: call.options.directory,
-        };
+        let mode = Mode::for_call(&call);
+        let save_files = call.method == Method::SaveFiles;
+        let file_names = save::save_files_names(&call.options.files).unwrap_or_default();
         let rules = Rc::new(RefCell::new(ViewRules {
             folders_only: mode.folders_only,
-            filter: call.options.start_filter().cloned(),
+            filter: call.options.start_filter_for(call.method).cloned(),
             show_hidden: process.show_hidden(),
         }));
         let grid_filter: GridFilter = {
@@ -508,6 +548,18 @@ impl Picker {
         let refresh = icon_button("view-refresh-symbolic");
         path.append(&refresh);
         row.append(&path);
+
+        // Save modes may create one folder: the only file-changing command this
+        // window can run. It sits beside the address bar, where the next Save
+        // lands is the folder being shown.
+        let new_folder = if call.method == Method::OpenFile {
+            None
+        } else {
+            let button = icon_button("folder-new-symbolic");
+            button.set_tooltip_text(Some("New Folder"));
+            row.append(&button);
+            Some(button)
+        };
 
         // Search, after the address bar, with the main header's own classes so
         // the two look like one control. The button stands where the field will
@@ -584,17 +636,55 @@ impl Picker {
         right.append(status.widget());
         paned.set_end_child(Some(&right));
 
-        // The footer: the app's filter and its choices on the left, Cancel and
-        // Open on the right. Both halves are one row, so a narrow dialog squeezes
-        // the dropdowns rather than clipping the buttons.
+        // The footer: SaveFile's Name entry, the app's filter and its choices on
+        // the left, Cancel and the accept button on the right. Both halves are
+        // one row, so a narrow dialog squeezes the dropdowns rather than
+        // clipping the buttons.
         let footer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         footer.add_css_class("gl-action-row");
         footer.set_spacing(scaled(GAP_S, scale));
+        let name_entry = if call.method == Method::SaveFile {
+            let entry = gtk::Entry::new();
+            entry.set_placeholder_text(Some("Name"));
+            entry.set_hexpand(true);
+            entry.set_valign(gtk::Align::Center);
+            entry.set_tooltip_text(Some("The file to save"));
+            // `current_file` wins over `current_name`, and its basename is what
+            // the grid's selection will show too.
+            let initial = call
+                .options
+                .current_file
+                .as_ref()
+                .and_then(|path| path.file_name())
+                .map(|name| name.to_string_lossy().into_owned())
+                .or_else(|| call.options.current_name.clone())
+                .unwrap_or_default();
+            entry.set_text(&initial);
+            footer.append(&entry);
+            Some(entry)
+        } else {
+            None
+        };
+        let save_summary = if save_files {
+            let label = gtk::Label::new(Some(&save::save_files_summary(&file_names)));
+            label.set_xalign(0.0);
+            label.set_hexpand(true);
+            label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+            label.set_valign(gtk::Align::Center);
+            footer.append(&label);
+            Some(label)
+        } else {
+            None
+        };
         let filters = build_filter_dropdown(&call, &footer);
         let choices = build_choices(&call, &footer, scale);
-        let spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-        spacer.set_hexpand(true);
-        footer.append(&spacer);
+        // The Name entry or the save summary takes the spare width; only the
+        // Open footer needs a spacer before its buttons.
+        if name_entry.is_none() && save_summary.is_none() {
+            let spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+            spacer.set_hexpand(true);
+            footer.append(&spacer);
+        }
         let cancel = action_button("Cancel", false);
         let open = action_button(call.accept_label(), true);
         footer.append(&cancel);
@@ -623,6 +713,14 @@ impl Picker {
             status_row: status.widget().clone(),
             filters,
             choices,
+            name_entry: name_entry.clone(),
+            save_summary,
+            new_folder: new_folder.clone(),
+            writable: Cell::new(false),
+            last_selection: RefCell::new(BTreeSet::new()),
+            file_names,
+            alert: RefCell::new(None),
+            self_weak: RefCell::new(Weak::new()),
             open: open.clone(),
             displayed: RefCell::new(None),
             hidden: Cell::new(process.show_hidden()),
@@ -635,6 +733,7 @@ impl Picker {
             request: RefCell::new(Some(request.clone())),
             blur: RefCell::new(None),
         });
+        *picker.self_weak.borrow_mut() = Rc::downgrade(&picker);
         // The grid's rows follow the call's rules from the first listing.
         picker.apply_grid_filter();
 
@@ -714,6 +813,41 @@ impl Picker {
                 }
             }
         });
+
+        if let Some(entry) = &picker.name_entry {
+            // Enter in the Name entry is Save.
+            entry.connect_activate({
+                let picker = Rc::downgrade(&picker);
+                move |_| {
+                    if let Some(picker) = picker.upgrade() {
+                        picker.accept();
+                    }
+                }
+            });
+            // Every keystroke re-decides whether Save is available and what the
+            // status line says.
+            entry.connect_changed({
+                let picker = Rc::downgrade(&picker);
+                move |_| {
+                    if let Some(picker) = picker.upgrade()
+                        && let Some(process) = picker.process.upgrade()
+                    {
+                        picker.refresh_accept(&process);
+                    }
+                }
+            });
+        }
+
+        if let Some(button) = &picker.new_folder {
+            button.connect_clicked({
+                let picker = Rc::downgrade(&picker);
+                move |button| {
+                    if let Some(picker) = picker.upgrade() {
+                        picker.open_new_folder(button);
+                    }
+                }
+            });
+        }
 
         // The dropdown, once it holds its starting filter: a change re-filters
         // the grid, drops what the new filter hides, and restarts a query that
@@ -799,7 +933,9 @@ impl Picker {
             // same shared check. The dialog's shortcuts — Ctrl+F, Ctrl+H,
             // Ctrl+L, F5 — still work while you type, so Ctrl+H on the results
             // page re-asks the query.
-            let typing = entry_focused(&picker.path_entry) || entry_focused(&picker.search_entry);
+            let typing = entry_focused(&picker.path_entry)
+                || entry_focused(&picker.search_entry)
+                || picker.name_entry.as_ref().is_some_and(entry_focused);
             if typing && crate::fileops::keys::entry_owns_key(key, modifiers) {
                 return glib::Propagation::Proceed;
             }
@@ -832,14 +968,31 @@ impl Picker {
         // ran `refresh` before this view existed.
         if let Some(window) = process.window_snapshot(id) {
             picker.show(process, &window);
+            // SaveFile with `current_file`: its folder is showing, so select
+            // the file in the grid. The selection follows into the Name entry,
+            // which already holds the same basename.
+            if picker.call.method == Method::SaveFile
+                && let Some(file) = picker.call.options.current_file.clone()
+                && let Some(name) = file.file_name()
+                && let Some(tab) = window.tab(window.focused_tab)
+            {
+                process.file_click_tab(id, Some(tab.id), ClickRequest::Plain(name.to_os_string()));
+            }
         }
         picker
     }
 
     fn present(&self) {
         self.window.present();
-        // Focus the grid, not the address entry: the dialog opens ready to
-        // receive arrow keys and Enter.
+        if let Some(entry) = &self.name_entry {
+            // Save opens ready to type a name, with the part before the
+            // extension selected exactly as rename does.
+            entry.grab_focus();
+            entry.select_region(0, save::stem_selection(&entry.text()));
+            return;
+        }
+        // Open focuses the grid, not the address entry: the dialog opens ready
+        // to receive arrow keys and Enter.
         self.folder.grab_grid_focus();
     }
 
@@ -857,9 +1010,15 @@ impl Picker {
 
     /// The mode the call asked for.
     fn mode(&self) -> Mode {
-        Mode {
-            multiple: self.call.options.multiple,
-            folders_only: self.call.options.directory,
+        Mode::for_call(&self.call)
+    }
+
+    /// What the log calls this dialog's save shape.
+    fn mode_label(&self) -> &'static str {
+        match self.call.method {
+            Method::OpenFile => self.mode().label(),
+            Method::SaveFile => "save-file",
+            Method::SaveFiles => "save-files",
         }
     }
 
@@ -894,15 +1053,26 @@ impl Picker {
             self.folder
                 .set_folder(&tab.folder, rule, tab.scroll_anchor.clone(), true, false);
             *self.displayed.borrow_mut() = Some((tab.id, tab.folder.clone()));
+            // The folder the next Save lands in: ask once per folder, not on
+            // every keypress.
+            self.writable.set(save::folder_writable(&tab.folder));
         }
         self.folder.set_selection(&tab.selection);
+        if self.call.method == Method::SaveFile {
+            self.follow_selection(&tab.folder, &tab.selection.names);
+        }
+        if let Some(label) = &self.save_summary
+            && self.call.method == Method::SaveFiles
+        {
+            label.set_text(&save::save_files_summary(&self.file_names));
+        }
         let accept = self.accept_now(process);
         self.open.set_sensitive(matches!(accept, Accept::Pick(_)));
         self.show_status(&tab.folder, &accept);
         self.sidebar.set_current_folder(Some(&view.folder));
     }
 
-    /// What Open would answer for the model's current state.
+    /// What the accept button would do for the model's current state.
     fn accept_now(&self, process: &Rc<Process>) -> Accept {
         let Some(window) = process.window_snapshot(self.id) else {
             return Accept::Refused(ONE_FILE);
@@ -910,19 +1080,87 @@ impl Picker {
         let Some(tab) = window.tab(window.focused_tab) else {
             return Accept::Refused(ONE_FILE);
         };
-        accept_for(
-            self.mode(),
-            &tab.folder,
-            &self.folder.listed_names(),
-            &tab.selection.names,
-        )
+        match self.call.method {
+            Method::OpenFile => accept_for(
+                self.mode(),
+                &tab.folder,
+                &self.folder.listed_names(),
+                &tab.selection.names,
+            ),
+            Method::SaveFile => {
+                let typed = self
+                    .name_entry
+                    .as_ref()
+                    .map(|entry| entry.text().to_string())
+                    .unwrap_or_default();
+                if let Some(result) = self.typed_path(&typed, &process.home()) {
+                    return match result {
+                        Ok((folder, _)) => Accept::Pick(vec![folder]),
+                        Err(reason) => Accept::Refused(reason),
+                    };
+                }
+                match save::save_target(&tab.folder, &typed, self.writable.get(), &save::inspect) {
+                    SaveTarget::Refused(reason) => Accept::Refused(reason),
+                    SaveTarget::Enter(path)
+                    | SaveTarget::Overwrite(path)
+                    | SaveTarget::Save(path) => Accept::Pick(vec![path]),
+                }
+            }
+            Method::SaveFiles => {
+                match accept_for(
+                    self.mode(),
+                    &tab.folder,
+                    &self.folder.listed_names(),
+                    &tab.selection.names,
+                ) {
+                    Accept::Pick(paths)
+                        if !paths
+                            .first()
+                            .is_some_and(|folder| save::folder_writable(folder)) =>
+                    {
+                        Accept::Refused(save::NOT_WRITABLE)
+                    }
+                    other => other,
+                }
+            }
+        }
+    }
+
+    /// Re-decide the accept button and the status line after a Name change.
+    fn refresh_accept(&self, process: &Rc<Process>) {
+        let accept = self.accept_now(process);
+        self.open.set_sensitive(matches!(accept, Accept::Pick(_)));
+        if let Some(window) = process.window_snapshot(self.id)
+            && let Some(tab) = window.tab(window.focused_tab)
+        {
+            self.show_status(&tab.folder, &accept);
+        }
     }
 
     /// Put the dialog's own words on the status line, or leave the grid's
     /// counts there.
     fn show_status(&self, folder: &Path, accept: &Accept) {
-        if let Some(text) = status_for(self.mode(), folder, accept) {
-            self.status.set_counts(text);
+        match self.call.method {
+            Method::OpenFile => {
+                if let Some(text) = status_for(self.mode(), folder, accept) {
+                    self.status.set_counts(text);
+                }
+            }
+            Method::SaveFile | Method::SaveFiles => match accept {
+                // The gate keeps the grid from writing its counts over the
+                // reason when a listing finishes: without it a dialog opened
+                // in /usr showed "Folders: 12" beside a disabled Save.
+                Accept::Refused(reason) => {
+                    self.folder.set_status_gate(false);
+                    self.status.set_counts((*reason).to_string());
+                }
+                // A refusal must not outlive the name that caused it: put the
+                // grid's own counts back as soon as the answer is allowed.
+                Accept::Pick(_) => {
+                    self.folder.set_status_gate(true);
+                    self.folder.refresh_status();
+                }
+            },
         }
     }
 
@@ -945,13 +1183,33 @@ impl Picker {
         let Some(filter) = self.call.options.filters.get(index).cloned() else {
             return;
         };
+        let old = self.rules.borrow().filter.clone();
         let name = filter.name.clone();
+        // SaveFile: a name the old filter claimed gets the new filter's simple
+        // extension. A name the old filter did not claim keeps what the user
+        // typed.
+        if self.call.method == Method::SaveFile
+            && let Some(entry) = &self.name_entry
+        {
+            let typed = entry.text().to_string();
+            if let Some(updated) =
+                super::filter::follow_extension(&typed, old.as_ref(), Some(&filter))
+            {
+                entry.set_text(&updated);
+                entry.set_position(-1);
+                crate::log!(
+                    "portal",
+                    "the name's extension follows the filter: {typed:?} -> {updated:?}"
+                );
+            }
+        }
         self.rules.borrow_mut().filter = Some(filter);
         self.apply_grid_filter();
         crate::log!("portal", "dialog filter is now {name:?}");
         if let Some(process) = self.process.upgrade() {
             self.drop_hidden_selection(&process);
             self.restart_search(&process);
+            self.refresh_accept(&process);
         }
     }
 
@@ -1075,8 +1333,34 @@ impl Picker {
     /// A row the user activated, or a file they typed: a folder picker has no
     /// answer for a file, and a file picker answers with this one file however
     /// many happen to be selected — a double-click means "this one".
+    ///
+    /// In SaveFile a double-click on a file means "save as this file": put its
+    /// name in the entry and press Save, which asks before replacing it.
     fn open_row(&self, path: &Path) {
+        if self.call.method == Method::SaveFile {
+            if let Err(message) = self.save_file_path(path) {
+                self.refuse(message);
+            }
+            return;
+        }
         self.accept_path(path);
+    }
+
+    /// "Save as this file": a clicked row or a search result. The file's own
+    /// folder and name are the answer, so a result outside the folder being
+    /// shown still saves where it lives; an existing file asks first.
+    fn save_file_path(&self, path: &Path) -> Result<(), &'static str> {
+        self.set_name_from_path(path);
+        let folder = path.parent().unwrap_or_else(|| Path::new("/"));
+        if !save::folder_writable(folder) {
+            return Err(save::NOT_WRITABLE);
+        }
+        if path.is_file() {
+            self.confirm_overwrite(folder, path);
+        } else {
+            self.answer(self.pick(vec![path.to_path_buf()]));
+        }
+        Ok(())
     }
 
     /// Answer with one explicit path, if the dialog's rules admit it.
@@ -1134,6 +1418,11 @@ impl Picker {
     /// same way the standing hint is — never as a held summary — so the next
     /// selection change takes it back without a timer.
     fn refuse(&self, message: &str) {
+        // In Save the refusal stays until the name or folder changes (see
+        // `show_status`); Open's refusals are unchanged since P2an.
+        if self.call.method != Method::OpenFile {
+            self.folder.set_status_gate(false);
+        }
         self.status.set_counts(message.to_string());
         crate::log!("portal", "accept refused: {message}");
     }
@@ -1173,7 +1462,7 @@ impl Picker {
         crate::log!(
             "portal",
             "{}",
-            pick.log_line(self.mode().label(), filter.as_deref())
+            pick.log_line(self.mode_label(), filter.as_deref())
         );
         let Some(request) = self.request.borrow_mut().take() else {
             crate::log!("portal", "the dialog had no request to answer");
@@ -1182,22 +1471,292 @@ impl Picker {
         request.accept(pick);
     }
 
-    /// Answer the call with what Open picks under the dialog's mode.
+    /// Answer the call with what the dialog accepts under its mode.
     pub(crate) fn accept(&self) -> Outcome {
         let Some(process) = self.process.upgrade() else {
             return Outcome::Failed("the file chooser has no process".to_string());
         };
-        match self.accept_now(&process) {
-            Accept::Pick(paths) => {
-                let pick = self.pick(paths);
-                self.answer(pick);
-                Outcome::Done
-            }
-            Accept::Refused(message) => {
-                self.refuse(message);
-                Outcome::Failed(message.to_string())
+        match self.call.method {
+            Method::OpenFile => match self.accept_now(&process) {
+                Accept::Pick(paths) => {
+                    self.answer(self.pick(paths));
+                    Outcome::Done
+                }
+                Accept::Refused(message) => {
+                    self.refuse(message);
+                    Outcome::Failed(message.to_string())
+                }
+            },
+            Method::SaveFile => match self.save_file_now(&process) {
+                Ok(()) => Outcome::Done,
+                Err(message) => {
+                    self.refuse(message);
+                    Outcome::Failed(message.to_string())
+                }
+            },
+            Method::SaveFiles => match self.save_files_now(&process) {
+                Ok(()) => Outcome::Done,
+                Err(message) => {
+                    self.refuse(message);
+                    Outcome::Failed(message.to_string())
+                }
+            },
+        }
+    }
+
+    /// Put a clicked file's name in the SaveFile entry. A folder click leaves
+    /// the entry alone: the selection is never the answer.
+    fn follow_selection(&self, folder: &Path, selection: &BTreeSet<OsString>) {
+        let previous = self.last_selection.borrow().clone();
+        if previous == *selection {
+            return;
+        }
+        *self.last_selection.borrow_mut() = selection.clone();
+        if selection.len() != 1 {
+            return;
+        }
+        let Some(name) = selection.iter().next() else {
+            return;
+        };
+        if folder.join(name).is_file()
+            && let Some(entry) = &self.name_entry
+        {
+            let text = name.to_string_lossy();
+            if entry.text() != text.as_ref() {
+                entry.set_text(&text);
+                entry.set_position(-1);
             }
         }
+    }
+
+    fn set_name_from_path(&self, path: &Path) {
+        let Some(name) = path.file_name() else {
+            return;
+        };
+        if let Some(entry) = &self.name_entry {
+            let text = name.to_string_lossy();
+            if entry.text() != text.as_ref() {
+                entry.set_text(&text);
+            }
+            entry.set_position(-1);
+        }
+    }
+
+    /// A typed absolute path or `~/` path: the folder it names and its last
+    /// component. `None` for an ordinary name. The path does not save; it moves
+    /// the dialog and leaves the last component in the entry.
+    fn typed_path(
+        &self,
+        typed: &str,
+        home: &Path,
+    ) -> Option<Result<(PathBuf, Option<OsString>), &'static str>> {
+        if !typed.starts_with('/') && !typed.starts_with("~/") {
+            return typed.contains('/').then_some(Err(save::NAME_HAS_SLASH));
+        }
+        if typed == "~/" {
+            return Some(Ok((home.to_path_buf(), None)));
+        }
+        let expanded = expand_home(typed, home);
+        let (folder, last) = match expanded.file_name() {
+            Some(last) => (
+                expanded
+                    .parent()
+                    .map(Path::to_path_buf)
+                    .unwrap_or_else(|| PathBuf::from("/")),
+                Some(last.to_os_string()),
+            ),
+            None => (expanded, None),
+        };
+        if folder.is_dir() {
+            Some(Ok((folder, last)))
+        } else {
+            Some(Err(save::NO_SUCH_FOLDER))
+        }
+    }
+
+    /// SaveFile's accept: a typed path moves the dialog first; otherwise enter
+    /// an existing folder, confirm an overwrite, or answer the URI. The backend
+    /// never creates or writes the file.
+    fn save_file_now(&self, process: &Rc<Process>) -> Result<(), &'static str> {
+        let Some(window) = process.window_snapshot(self.id) else {
+            return Err(GONE);
+        };
+        let Some(tab) = window.tab(window.focused_tab) else {
+            return Err(GONE);
+        };
+        let typed = self
+            .name_entry
+            .as_ref()
+            .map(|entry| entry.text().to_string())
+            .unwrap_or_default();
+        if let Some(result) = self.typed_path(&typed, &process.home()) {
+            let (folder, last) = result?;
+            if let Some(entry) = &self.name_entry {
+                entry.set_text(
+                    &last
+                        .as_deref()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_default(),
+                );
+            }
+            process.nav_go_path(self.id, folder.clone());
+            if let Some(entry) = &self.name_entry {
+                entry.grab_focus();
+            }
+            crate::log!(
+                "portal",
+                "moved to {} from the Name entry",
+                folder.display()
+            );
+            return Ok(());
+        }
+        match save::save_target(&tab.folder, &typed, self.writable.get(), &save::inspect) {
+            SaveTarget::Refused(reason) => Err(reason),
+            SaveTarget::Enter(path) => {
+                self.enter_folder(process, &path);
+                Ok(())
+            }
+            SaveTarget::Overwrite(path) => {
+                self.confirm_overwrite(&tab.folder, &path);
+                Ok(())
+            }
+            SaveTarget::Save(path) => {
+                self.answer(self.pick(vec![path]));
+                Ok(())
+            }
+        }
+    }
+
+    /// SaveFiles' accept: the selected folder (or this one), then the collision
+    /// question when a target already exists.
+    fn save_files_now(&self, process: &Rc<Process>) -> Result<(), &'static str> {
+        let Some(window) = process.window_snapshot(self.id) else {
+            return Err(GONE);
+        };
+        let Some(tab) = window.tab(window.focused_tab) else {
+            return Err(GONE);
+        };
+        let folder = match accept_for(
+            self.mode(),
+            &tab.folder,
+            &self.folder.listed_names(),
+            &tab.selection.names,
+        ) {
+            Accept::Pick(paths) => paths.first().cloned().ok_or("Select a folder")?,
+            Accept::Refused(reason) => return Err(reason),
+        };
+        if !save::folder_writable(&folder) {
+            return Err(save::NOT_WRITABLE);
+        }
+        // No files: the chosen folder's own URI, as Nautilus answers
+        // (`nautilus-portal.c:262` onward, the else branch).
+        if self.file_names.is_empty() {
+            self.answer(self.pick(vec![folder]));
+            return Ok(());
+        }
+        let clashes = save::clashing(&folder, &self.file_names, &save::inspect);
+        if clashes.is_empty() {
+            let paths = self
+                .file_names
+                .iter()
+                .map(|name| folder.join(name))
+                .collect();
+            self.answer(self.pick(paths));
+            return Ok(());
+        }
+        self.confirm_collisions(&folder, &clashes);
+        Ok(())
+    }
+
+    /// Enter a folder the typed name names, and clear the entry. Not an answer:
+    /// the next Save lands inside it.
+    fn enter_folder(&self, process: &Rc<Process>, path: &Path) {
+        if let Some(entry) = &self.name_entry {
+            entry.set_text("");
+        }
+        process.nav_go_path(self.id, path.to_path_buf());
+        if let Some(entry) = &self.name_entry {
+            entry.grab_focus();
+        }
+        crate::log!("portal", "entered {} instead of saving", path.display());
+    }
+
+    /// The overwrite question, with Replace destructive and Cancel the default.
+    fn confirm_overwrite(&self, folder: &Path, path: &Path) {
+        let name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string());
+        let body = format!(
+            "“{}” already exists in “{}”. Saving will replace its contents.",
+            name,
+            folder.display()
+        );
+        let dialog = adw::AlertDialog::new(Some("Replace the existing file?"), Some(&body));
+        dialog.add_css_class("gimbal-look");
+        dialog.add_response("cancel", "Cancel");
+        dialog.add_response("replace", "Replace");
+        dialog.set_response_appearance("replace", adw::ResponseAppearance::Destructive);
+        dialog.set_default_response(Some("cancel"));
+        dialog.set_close_response("cancel");
+
+        let path = path.to_path_buf();
+        let logged = path.clone();
+        let weak = self.self_weak.borrow().clone();
+        dialog.connect_response(None, move |dialog, response| {
+            let Some(picker) = weak.upgrade() else {
+                return;
+            };
+            picker.alert.borrow_mut().take();
+            if response == "replace" {
+                picker.answer(picker.pick(vec![path.clone()]));
+            } else if let Some(entry) = &picker.name_entry {
+                // Cancel comes back to the dialog with the name ready to edit.
+                entry.grab_focus();
+                entry.select_region(0, save::stem_selection(&entry.text()));
+            }
+            let _ = dialog;
+        });
+        *self.alert.borrow_mut() = Some(dialog.clone());
+        dialog.present(Some(&self.window));
+        crate::log!("portal", "asking before replacing {}", logged.display());
+    }
+
+    /// The SaveFiles collision question: Keep Both, Replace or Cancel.
+    fn confirm_collisions(&self, folder: &Path, clashes: &[usize]) {
+        let body = save::collision_text(folder, &self.file_names, clashes);
+        let dialog = adw::AlertDialog::new(Some("Some files already exist"), Some(&body));
+        dialog.add_css_class("gimbal-look");
+        dialog.add_response("cancel", "Cancel");
+        dialog.add_response("replace", "Replace");
+        dialog.add_response("keep-both", "Keep Both");
+        dialog.set_default_response(Some("keep-both"));
+        dialog.set_close_response("cancel");
+
+        let folder = folder.to_path_buf();
+        let logged_folder = folder.clone();
+        let weak = self.self_weak.borrow().clone();
+        dialog.connect_response(None, move |_, response| {
+            let Some(picker) = weak.upgrade() else {
+                return;
+            };
+            picker.alert.borrow_mut().take();
+            let choice = match response {
+                "keep-both" => CollisionChoice::KeepBoth,
+                "replace" => CollisionChoice::Replace,
+                _ => return,
+            };
+            let paths = save::resolve_names(&folder, &picker.file_names, choice, &save::inspect);
+            picker.answer(picker.pick(paths));
+        });
+        *self.alert.borrow_mut() = Some(dialog.clone());
+        dialog.present(Some(&self.window));
+        crate::log!(
+            "portal",
+            "asking about {} clashing name(s) in {}",
+            clashes.len(),
+            logged_folder.display()
+        );
     }
 
     /// Answer "user cancelled", unless the call was already answered.
@@ -1209,6 +1768,119 @@ impl Picker {
         };
         request.complete(service::RESPONSE_CANCELLED, service::empty_results());
         Outcome::Done
+    }
+
+    /// The New Folder popover. The picker's own small version of
+    /// `fileops/dialogs.rs:219` / `open_name_form` (`:261`): a name entry, Cancel
+    /// and Create, anchored to the header button. The folder it creates is the
+    /// one the grid is showing, so the next Save lands there.
+    fn open_new_folder(&self, button: &gtk::Button) {
+        let Some(process) = self.process.upgrade() else {
+            return;
+        };
+        let Some(window) = process.window_snapshot(self.id) else {
+            return;
+        };
+        let Some(tab) = window.tab(window.focused_tab) else {
+            return;
+        };
+        let folder = tab.folder.clone();
+        let popover = gtk::Popover::new();
+        popover.set_parent(button);
+        popover.set_has_arrow(true);
+        let box_ = gtk::Box::new(gtk::Orientation::Vertical, scaled(GAP_S, self.scale));
+        box_.add_css_class("gl-menu");
+        let entry = gtk::Entry::new();
+        entry.set_placeholder_text(Some("Folder name"));
+        box_.append(&entry);
+        let row = gtk::Box::new(gtk::Orientation::Horizontal, scaled(GAP_S, self.scale));
+        let cancel = gtk::Button::with_label("Cancel");
+        cancel.add_css_class("gl-menu-item");
+        let popover_cancel = popover.clone();
+        cancel.connect_clicked(move |_| popover_cancel.popdown());
+        let create = gtk::Button::with_label("Create");
+        create.add_css_class("gl-menu-item");
+        create.add_css_class("suggested-action");
+        row.append(&cancel);
+        row.append(&create);
+        box_.append(&row);
+        popover.set_child(Some(&box_));
+
+        let create_now = {
+            let weak = self.self_weak.borrow().clone();
+            let entry = entry.clone();
+            let popover = popover.clone();
+            let folder = folder.clone();
+            move || {
+                let Some(picker) = weak.upgrade() else {
+                    return;
+                };
+                let name = entry.text().trim().to_string();
+                popover.popdown();
+                picker.create_folder(&folder, &name);
+            }
+        };
+        let create_click = create_now.clone();
+        create.connect_clicked(move |_| create_click());
+        entry.connect_activate(move |_| create_now());
+        popover.connect_closed(|popover| {
+            if popover.parent().is_some() {
+                popover.unparent();
+            }
+        });
+
+        crate::popup::show(&popover);
+        entry.grab_focus();
+    }
+
+    /// Create one folder through `file.new-folder` as `Caller::Ui`, then open it
+    /// when the worker's creation has landed.
+    fn create_folder(&self, folder: &Path, name: &str) {
+        if name.is_empty() {
+            crate::log!("portal", "an empty folder name was ignored");
+            return;
+        }
+        if !fm_core::fileops::is_valid_name(name) {
+            self.refuse(save::BAD_NAME);
+            return;
+        }
+        if !self.writable.get() {
+            self.refuse(save::NOT_WRITABLE);
+            return;
+        }
+        self.dispatch(Invocation::new(
+            "file.new-folder",
+            vec![
+                ("name".to_string(), name.to_string()),
+                ("in".to_string(), folder.to_string_lossy().into_owned()),
+            ],
+        ));
+        let target = folder.join(name);
+        let weak = self.self_weak.borrow().clone();
+        let mut tries = 0u32;
+        glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
+            let Some(picker) = weak.upgrade() else {
+                return glib::ControlFlow::Break;
+            };
+            if target.is_dir() {
+                picker.dispatch(Invocation::new(
+                    "nav.go",
+                    vec![("path".to_string(), target.to_string_lossy().into_owned())],
+                ));
+                return glib::ControlFlow::Break;
+            }
+            tries += 1;
+            if tries >= 40 {
+                crate::log!(
+                    "portal",
+                    "New Folder did not appear at {}",
+                    target.display()
+                );
+                glib::ControlFlow::Break
+            } else {
+                glib::ControlFlow::Continue
+            }
+        });
     }
 
     /// The results page, built the first time a query needs one and parented
@@ -1399,6 +2071,11 @@ impl SearchSurface for Picker {
         // says why it will not, on the results page the user is looking at (the
         // dialog's own status line is hidden under it). Nothing navigates.
         self.process.upgrade()?;
+        if self.call.method == Method::SaveFile {
+            // "Save as this file": fill the entry and answer that path, asking
+            // first when it already exists.
+            return Some(self.save_file_path(path));
+        }
         Some(match self.refusal(path) {
             Some(message) => {
                 crate::log!("portal", "accept refused: {message}");
@@ -1417,7 +2094,7 @@ impl SearchSurface for Picker {
 /// and no "All files" entry is added — the application decides its own list, as
 /// neither GTK's nor Nautilus's backends do.
 fn build_filter_dropdown(call: &Call, footer: &gtk::Box) -> Option<gtk::DropDown> {
-    if !call.options.shows_filters() {
+    if !call.options.shows_filters_for(call.method) {
         return None;
     }
     let names: Vec<&str> = call
@@ -1434,7 +2111,7 @@ fn build_filter_dropdown(call: &Call, footer: &gtk::Box) -> Option<gtk::DropDown
     drop.set_hexpand(false);
     // The entry the call named, or the first: `current_filter` is matched as a
     // whole `(sa(us))` value when the list is read, so this is already the right
-    // row (`OpenOptions::current_filter`).
+    // row (`CallOptions::current_filter`).
     drop.set_selected(call.options.current_filter.unwrap_or(0) as u32);
     footer.append(&drop);
     Some(drop)
@@ -1442,7 +2119,7 @@ fn build_filter_dropdown(call: &Call, footer: &gtk::Box) -> Option<gtk::DropDown
 
 /// The footer's row of the application's own choices: a checkbox for a choice
 /// with no options, a dropdown of the options for one that has them. A malformed
-/// choice never reaches here — `parse_open_options` skips it with a log line.
+/// choice never reaches here — `parse_call_options` skips it with a log line.
 fn build_choices(call: &Call, footer: &gtk::Box, scale: f64) -> Vec<ChoiceControl> {
     let mut controls = Vec::new();
     for choice in &call.options.choices {
@@ -1561,23 +2238,38 @@ impl PickerHost {
 
 impl DialogHost for PickerHost {
     fn open(&self, request: Rc<Request>, call: &Call) -> Result<(), String> {
+        // SaveFiles with a name that can never be legal fails the whole call:
+        // a dialog for it could never answer, so none is shown.
+        if call.method == Method::SaveFiles
+            && let Err(index) = save::save_files_names(&call.options.files)
+        {
+            crate::log!(
+                "portal",
+                "SaveFiles file {} is not a valid name; answering other",
+                index
+            );
+            request.complete(service::RESPONSE_OTHER, service::empty_results());
+            return Ok(());
+        }
         let home = self.process.home();
-        let folder = service::starting_folder(call.options.current_folder.as_deref(), &home);
+        let folder = service::starting_folder_for(call, &home);
+        let mode = Mode::for_call(call);
         crate::log!(
             "portal",
-            "opening the dialog at {} for {:?} ({}{}, {} filter(s), {} choice(s))",
+            "opening the {} dialog at {} for {:?} ({}{}, {} filter(s), {} choice(s))",
+            match call.method {
+                Method::OpenFile => "open",
+                Method::SaveFile => "save",
+                Method::SaveFiles => "save-files",
+            },
             folder.display(),
             call.app_id,
-            if call.options.directory {
+            if mode.folders_only {
                 "folders"
             } else {
                 "files"
             },
-            if call.options.multiple {
-                "+multiple"
-            } else {
-                ""
-            },
+            if mode.multiple { "+multiple" } else { "" },
             call.options.filters.len(),
             call.options.choices.len()
         );
@@ -1590,6 +2282,140 @@ impl DialogHost for PickerHost {
         match self.process.open_picker_window(folder, options) {
             Some(_id) => Ok(()),
             None => Err("the model refused a new window".to_string()),
+        }
+    }
+}
+
+/// Test hooks for the real-picker regression in `portal/tests.rs`. The test
+/// drives the same methods a click or Enter reaches; no desktop input is
+/// injected.
+#[cfg(test)]
+pub(crate) mod testing {
+    use super::*;
+
+    /// Every live picker, oldest first.
+    pub(crate) fn live() -> Vec<Rc<Picker>> {
+        PICKERS.with(|map| {
+            map.borrow()
+                .values()
+                .filter_map(|entry| match entry {
+                    Entry::Live(picker) => Some(picker.clone()),
+                    Entry::Pending(_) => None,
+                })
+                .collect()
+        })
+    }
+
+    impl Picker {
+        pub(crate) fn name_text(&self) -> Option<String> {
+            self.name_entry
+                .as_ref()
+                .map(|entry| entry.text().to_string())
+        }
+
+        pub(crate) fn name_selection(&self) -> Option<(i32, i32)> {
+            self.name_entry
+                .as_ref()
+                .and_then(|entry| entry.selection_bounds())
+        }
+
+        /// Whether the window's focus widget is inside the Name entry. Asked
+        /// of the window, not `FOCUS_WITHIN`: GTK clears that flag when the
+        /// window stops being the active one (`gtkwindow.c:6153-6185`), and a
+        /// test window on Kyle's desktop may never be activated.
+        pub(crate) fn name_focused(&self) -> bool {
+            let Some(entry) = &self.name_entry else {
+                return false;
+            };
+            let entry: gtk::Widget = entry.clone().upcast();
+            gtk::prelude::GtkWindowExt::focus(&self.window)
+                .is_some_and(|focus| focus == entry || focus.is_ancestor(&entry))
+        }
+
+        pub(crate) fn set_name(&self, text: &str) {
+            if let Some(entry) = &self.name_entry {
+                entry.set_text(text);
+            }
+        }
+
+        /// Enter in the Name entry: the entry's `activate` signal.
+        pub(crate) fn press_enter_in_name(&self) {
+            if let Some(entry) = &self.name_entry {
+                entry.emit_by_name::<()>("activate", &[]);
+            }
+        }
+
+        pub(crate) fn save_enabled(&self) -> bool {
+            self.open.is_sensitive()
+        }
+
+        pub(crate) fn select_filter(&self, index: u32) {
+            if let Some(dropdown) = &self.filters {
+                dropdown.set_selected(index);
+            }
+        }
+
+        pub(crate) fn shown_folder(&self) -> Option<PathBuf> {
+            self.displayed
+                .borrow()
+                .as_ref()
+                .map(|(_, folder)| folder.clone())
+        }
+
+        /// Every visible label under the status row, the footer and the
+        /// window: refusals and the SaveFiles summary land there.
+        pub(crate) fn texts(&self) -> Vec<String> {
+            let mut texts = Vec::new();
+            let mut stack = vec![self.window.clone().upcast::<gtk::Widget>()];
+            while let Some(widget) = stack.pop() {
+                if !widget.is_visible() {
+                    continue;
+                }
+                if let Some(label) = widget.downcast_ref::<gtk::Label>() {
+                    texts.push(label.text().to_string());
+                }
+                let mut child = widget.first_child();
+                while let Some(next) = child {
+                    child = next.next_sibling();
+                    stack.push(next);
+                }
+            }
+            texts
+        }
+
+        pub(crate) fn alert_body(&self) -> Option<String> {
+            self.alert
+                .borrow()
+                .as_ref()
+                .map(|alert| alert.body().to_string())
+        }
+
+        /// Answer the open alert as its button would, then take it down.
+        pub(crate) fn respond_to_alert(&self, response: &str) {
+            let alert = self.alert.borrow().clone();
+            if let Some(alert) = alert {
+                alert.emit_by_name::<()>("response", &[&response]);
+                alert.force_close();
+            }
+        }
+
+        pub(crate) fn new_folder_here(&self, name: &str) {
+            if let Some(folder) = self.shown_folder() {
+                self.create_folder(&folder, name);
+            }
+        }
+
+        pub(crate) fn has_new_folder_button(&self) -> bool {
+            self.new_folder
+                .as_ref()
+                .is_some_and(|button| button.is_visible())
+        }
+
+        pub(crate) fn click_file(&self, name: &str) {
+            if let Some(folder) = self.shown_folder() {
+                let selection = BTreeSet::from([OsString::from(name)]);
+                self.follow_selection(&folder, &selection);
+            }
         }
     }
 }
@@ -2118,6 +2944,10 @@ mod tests {
         assert_eq!(picker_shortcut(Key::a, none), None);
         assert_eq!(picker_shortcut(Key::f, none), None);
         assert_eq!(picker_shortcut(Key::F5, control), Some("nav.refresh"));
+
+        // F3's one file effect is allowed, but no key is bound to it.
+        assert!(crate::app::picker_accepts("file.new-folder"));
+        assert_eq!(picker_shortcut(Key::N, control | alt), None);
     }
 
     #[test]

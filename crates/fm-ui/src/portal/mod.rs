@@ -9,11 +9,13 @@
 //! (`ApplicationBuilder::inactivity_timeout`), so the process does not linger
 //! between dialogs.
 //!
-//! Only F1 exists: a basic single-file Open dialog. SaveFile and SaveFiles are
-//! answered "not available" until F3.
+//! OpenFile, SaveFile and SaveFiles are answered. Save is the same picker with
+//! a Name entry (SaveFile) or a folder pick (SaveFiles); the backend answers a
+//! `file://` URI and never creates or writes the file.
 
 pub mod filter;
 pub mod picker;
+pub mod save;
 pub mod service;
 #[cfg(test)]
 mod tests;

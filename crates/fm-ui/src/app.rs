@@ -5009,13 +5009,16 @@ fn log_outcome(invocation: &Invocation, outcome: &Outcome) {
     }
 }
 
-/// The commands a picker window answers (P2am F1, extended by P2an F2):
-/// navigation, selection, the two sort commands and the hidden-files switch,
-/// the dialog's own two answers, and `search.open`. The catalogue's picker
-/// names are included from the one list, so the window and the caller rules
-/// cannot drift apart. `search.open` is `Effect::View`: it reads the model's
-/// folder, hands a query to the read-only worker and shows the results page,
-/// and writes no config, no session and no file.
+/// The commands a picker window answers (P2am F1, extended by P2an F2 and
+/// P2at F3): navigation, selection, the two sort commands and the hidden-files
+/// switch, the dialog's own two answers, `search.open`, and — for Save only —
+/// `file.new-folder`. The catalogue's picker names are included from the one
+/// list, so the window and the caller rules cannot drift apart. `search.open`
+/// is `Effect::View`: it reads the model's folder, hands a query to the
+/// read-only worker and shows the results page, and writes no config, no
+/// session and no file. `file.new-folder` is the one file-changing command the
+/// picker may run: New Folder creates exactly the folder the user asked for and
+/// nothing else, and it is never bound to a key.
 pub(crate) fn picker_accepts(name: &str) -> bool {
     fm_core::command::PICKER_COMMANDS.contains(&name)
         || matches!(
@@ -5033,6 +5036,7 @@ pub(crate) fn picker_accepts(name: &str) -> bool {
                 | "view.clear-folder-sort"
                 | "view.set-hidden"
                 | "view.toggle-hidden"
+                | "file.new-folder"
         )
 }
 
