@@ -68,6 +68,9 @@ impl Reply {
 /// it; dropping the reference closes it).
 struct Bus {
     context: glib::MainContext,
+    /// The D-Bus call timeout. Two seconds, except for a held dialog that a
+    /// person closes by hand (`GIMBAL_HOLD_PARENT_TEST`).
+    timeout_ms: Cell<i32>,
     _server: gio::DBusServer,
     _server_connection: Rc<RefCell<Option<gio::DBusConnection>>>,
     client: gio::DBusConnection,
@@ -122,6 +125,7 @@ impl Bus {
 
         Self {
             context,
+            timeout_ms: Cell::new(2000),
             _server: server,
             _server_connection: server_connection,
             client,
@@ -147,7 +151,7 @@ impl Bus {
             Some(&parameters),
             None,
             gio::DBusCallFlags::NONE,
-            2000,
+            self.timeout_ms.get(),
             None::<&gio::Cancellable>,
             move |result| {
                 *slot.borrow_mut() = Some(result.map_err(|error| error.to_string()));
@@ -245,6 +249,16 @@ fn pick_one(path: &std::path::Path) -> service::Pick {
 const HANDLE: &str = "/org/freedesktop/portal/desktop/request/1_42/t1";
 
 fn open_file(bus: &Bus, app_id: &str, title: &str, extra: HashMap<String, glib::Variant>) -> Reply {
+    open_file_as(bus, app_id, String::new(), title, extra)
+}
+
+fn open_file_as(
+    bus: &Bus,
+    app_id: &str,
+    parent_window: String,
+    title: &str,
+    extra: HashMap<String, glib::Variant>,
+) -> Reply {
     bus.call(
         service::OBJECT_PATH,
         service::INTERFACE,
@@ -253,7 +267,7 @@ fn open_file(bus: &Bus, app_id: &str, title: &str, extra: HashMap<String, glib::
             (
                 glib::variant::ObjectPath::try_from(HANDLE).expect("a valid handle"),
                 app_id.to_string(),
-                String::new(),
+                parent_window,
                 title.to_string(),
                 extra,
             )
@@ -311,17 +325,131 @@ fn a_missing_or_empty_start_folder_falls_back_to_home() {
     let file = folder.join("not-a-folder");
     std::fs::write(&file, b"x").expect("file");
 
-    assert_eq!(service::starting_folder(None, &home), home);
+    assert_eq!(service::starting_folder(None, None, &home), home);
     assert_eq!(
-        service::starting_folder(Some(&scratch.path().join("gone")), &home),
+        service::starting_folder(Some(&scratch.path().join("gone")), None, &home),
         home
     );
-    assert_eq!(service::starting_folder(Some(&file), &home), home);
-    assert_eq!(service::starting_folder(Some(&folder), &home), folder);
+    assert_eq!(service::starting_folder(Some(&file), None, &home), home);
+    assert_eq!(service::starting_folder(Some(&folder), None, &home), folder);
+    // A remembered folder is second only to an existing suggestion.
+    assert_eq!(
+        service::starting_folder(Some(&scratch.path().join("gone")), Some(&folder), &home),
+        folder
+    );
 }
 
 #[test]
-fn parse_open_options_keeps_the_label_and_names_only_the_key_it_still_ignores() {
+fn parent_handles_read_wayland_x11_and_nothing() {
+    use service::Parent;
+
+    assert_eq!(
+        service::parent_handle("wayland:abc123"),
+        Parent::Wayland("abc123".to_string())
+    );
+    // The handle keeps everything after the prefix, including its own colons.
+    assert_eq!(
+        service::parent_handle("wayland:1:2:3"),
+        Parent::Wayland("1:2:3".to_string())
+    );
+    assert_eq!(
+        service::parent_handle("x11:3a00007"),
+        Parent::X11(0x3a0_0007)
+    );
+    assert_eq!(
+        service::parent_handle("x11:3A00007"),
+        Parent::X11(0x3a0_0007),
+        "hex digits may be upper case"
+    );
+    assert_eq!(service::parent_handle("x11:0"), Parent::None);
+
+    for handle in [
+        "",
+        "wayland:",
+        "x11:",
+        "x11:not-hex",
+        "wayland",
+        "x11",
+        "gtk:123",
+        "  wayland:abc",
+    ] {
+        assert_eq!(
+            service::parent_handle(handle),
+            Parent::None,
+            "{handle:?} names no usable parent"
+        );
+    }
+}
+
+#[test]
+fn starting_folder_for_follows_save_file_current_folder_remembered_and_home() {
+    let scratch = Scratch::new("start-order");
+    let home = scratch.path().join("home");
+    let requested = scratch.path().join("requested");
+    let remembered = scratch.path().join("remembered");
+    let file_folder = scratch.path().join("with-file");
+    std::fs::create_dir_all(&home).expect("home");
+    std::fs::create_dir_all(&requested).expect("requested");
+    std::fs::create_dir_all(&remembered).expect("remembered");
+    std::fs::create_dir_all(&file_folder).expect("file folder");
+
+    let call = |method: Method, entries: &[(&str, glib::Variant)]| Call {
+        method,
+        app_id: "org.example.App".to_string(),
+        parent_window: String::new(),
+        title: None,
+        options: service::parse_call_options(method, &options(entries)),
+    };
+
+    // 1. SaveFile's current_file folder beats everything else.
+    let with_file = call(
+        Method::SaveFile,
+        &[(
+            "current_file",
+            nul_path(&file_folder.join("a.txt")).to_variant(),
+        )],
+    );
+    assert_eq!(
+        service::starting_folder_for(&with_file, &home, Some(&remembered)),
+        file_folder
+    );
+
+    // 2. An existing current_folder beats the remembered one.
+    let asked = call(
+        Method::OpenFile,
+        &[("current_folder", nul_path(&requested).to_variant())],
+    );
+    assert_eq!(
+        service::starting_folder_for(&asked, &home, Some(&remembered)),
+        requested
+    );
+
+    // 3. With no current_folder, the remembered folder is used.
+    let plain = call(Method::OpenFile, &[]);
+    assert_eq!(
+        service::starting_folder_for(&plain, &home, Some(&remembered)),
+        remembered
+    );
+
+    // A remembered folder that no longer exists (or is now a file) falls
+    // through to home.
+    assert_eq!(
+        service::starting_folder_for(&plain, &home, Some(&scratch.path().join("gone"))),
+        home
+    );
+    let not_a_folder = scratch.path().join("not-a-folder");
+    std::fs::write(&not_a_folder, b"x").expect("file");
+    assert_eq!(
+        service::starting_folder_for(&plain, &home, Some(&not_a_folder)),
+        home
+    );
+
+    // 4. Nothing usable is home.
+    assert_eq!(service::starting_folder_for(&plain, &home, None), home);
+}
+
+#[test]
+fn parse_open_options_keeps_the_label_and_reads_every_key() {
     let parsed = parse_open_options(&options(&[
         ("accept_label", "_Open".to_variant()),
         ("modal", true.to_variant()),
@@ -357,8 +485,7 @@ fn parse_open_options_keeps_the_label_and_names_only_the_key_it_still_ignores() 
     assert_eq!(parsed.filters.len(), 1);
     assert_eq!(parsed.filters[0].name, "Images");
     assert_eq!(parsed.choices.len(), 1);
-    // Only `modal` is left unimplemented until F4; an unknown key is silent.
-    assert_eq!(parsed.ignored, vec!["modal"]);
+    assert!(parsed.modal, "`modal` is read, and absent means true");
     assert!(parsed.malformed.is_empty());
 }
 
@@ -372,7 +499,19 @@ fn the_options_default_to_one_file_a_folder_and_no_filter_or_choice() {
     assert_eq!(parsed.current_filter, None);
     assert_eq!(parsed.start_filter_for(Method::OpenFile), None);
     assert!(!parsed.shows_filters_for(Method::OpenFile));
-    assert!(parsed.ignored.is_empty() && parsed.malformed.is_empty());
+    assert!(parsed.modal, "a call with no `modal` is modal");
+    assert!(parsed.malformed.is_empty());
+}
+
+#[test]
+fn modal_is_true_when_absent_and_false_only_when_the_call_says_so() {
+    assert!(parse_open_options(&HashMap::new()).modal);
+    assert!(parse_open_options(&options(&[("modal", true.to_variant())])).modal);
+    assert!(!parse_open_options(&options(&[("modal", false.to_variant())])).modal);
+    // A wrong type is absent, which means modal, and is named once.
+    let parsed = parse_open_options(&options(&[("modal", "no".to_variant())]));
+    assert!(parsed.modal);
+    assert_eq!(parsed.malformed, vec!["modal"]);
 }
 
 #[test]
@@ -429,7 +568,6 @@ fn savefile_options_read_current_name_current_file_and_current_folder() {
     // `multiple` is Open's key: unknown to SaveFile, so silent and absent.
     assert!(!parsed.multiple);
     assert!(parsed.malformed.is_empty());
-    assert_eq!(parsed.ignored, Vec::<&'static str>::new());
 }
 
 #[test]
@@ -506,13 +644,14 @@ fn starting_folder_for_savefile_prefers_the_current_files_folder() {
     let call = Call {
         method: Method::SaveFile,
         app_id: String::new(),
+        parent_window: String::new(),
         title: None,
         options: service::parse_call_options(
             Method::SaveFile,
             &options(&[("current_file", nul_path(&file).to_variant())]),
         ),
     };
-    assert_eq!(service::starting_folder_for(&call, &home), folder);
+    assert_eq!(service::starting_folder_for(&call, &home, None), folder);
 
     // A file whose folder is gone falls back to `current_folder` or home.
     let call = Call {
@@ -528,7 +667,7 @@ fn starting_folder_for_savefile_prefers_the_current_files_folder() {
         ),
         ..call
     };
-    assert_eq!(service::starting_folder_for(&call, &home), home);
+    assert_eq!(service::starting_folder_for(&call, &home, None), home);
 }
 
 #[test]
@@ -729,6 +868,7 @@ fn folders_only_mode_hides_the_filter_dropdown_and_the_default_label_says_select
     let call = |directory: bool| Call {
         method: Method::OpenFile,
         app_id: "org.example.App".to_string(),
+        parent_window: String::new(),
         title: None,
         options: parse_open_options(&options(&[
             ("filters", images.clone()),
@@ -867,6 +1007,7 @@ fn an_empty_accept_label_falls_back_to_open_and_a_title_to_the_app_name() {
     let call = Call {
         method: Method::OpenFile,
         app_id: "org.example.App".to_string(),
+        parent_window: String::new(),
         title: None,
         options: CallOptions {
             accept_label: Some(String::new()),
@@ -880,6 +1021,7 @@ fn an_empty_accept_label_falls_back_to_open_and_a_title_to_the_app_name() {
         let save = Call {
             method,
             app_id: "org.example.App".to_string(),
+            parent_window: String::new(),
             title: None,
             options: CallOptions::default(),
         };
@@ -1021,6 +1163,16 @@ fn a_second_answer_is_a_no_op_after_accept() {
 }
 
 fn chooser_call(bus: &Bus, method: &str, extra: HashMap<String, glib::Variant>) -> Reply {
+    chooser_call_as(bus, method, "org.example.App", String::new(), extra)
+}
+
+fn chooser_call_as(
+    bus: &Bus,
+    method: &str,
+    app_id: &str,
+    parent_window: String,
+    extra: HashMap<String, glib::Variant>,
+) -> Reply {
     bus.call(
         service::OBJECT_PATH,
         service::INTERFACE,
@@ -1028,8 +1180,8 @@ fn chooser_call(bus: &Bus, method: &str, extra: HashMap<String, glib::Variant>) 
         Some(
             (
                 glib::variant::ObjectPath::try_from(HANDLE).expect("a valid handle"),
-                "org.example.App".to_string(),
-                String::new(),
+                app_id.to_string(),
+                parent_window,
                 "Save".to_string(),
                 extra,
             )
@@ -2092,4 +2244,245 @@ fn real_save_dialog_answers_names_paths_and_collisions_inner() {
         1,
         "SaveFiles wrote nothing"
     );
+
+    // P2au: the last folder per app id, written only on success.
+    let state_path = fm_core::picker_state::default_path().expect("a scratch state path");
+    let saved = fm_core::picker_state::PickerState::load(&state_path).0;
+    assert_eq!(
+        saved
+            .folder_for("org.example.App")
+            .map(std::path::Path::to_path_buf),
+        Some(multi.clone()),
+        "the last successful SaveFiles folder is remembered"
+    );
+    let folders_before = saved.folders().clone();
+    let home = process.home();
+
+    // The same app id with no `current_folder` opens where it last saved.
+    let reply = chooser_call_as(
+        &bus,
+        "SaveFile",
+        "org.example.App",
+        String::new(),
+        HashMap::new(),
+    );
+    let picker = one_picker();
+    settle();
+    assert_eq!(
+        picker.shown_folder().as_deref(),
+        Some(multi.as_path()),
+        "the remembered folder comes after current_folder and before home"
+    );
+    assert!(picker.is_modal(), "a call with no `modal` is modal");
+    picker.cancel();
+    let (response, _) = reply_parts(&bus.wait(&reply).expect("a cancel reply"));
+    assert_eq!(response, RESPONSE_CANCELLED);
+    drop(picker);
+    settle();
+
+    // A different app id has no memory: it opens at home.
+    let reply = chooser_call_as(
+        &bus,
+        "SaveFile",
+        "org.example.Other",
+        String::new(),
+        HashMap::new(),
+    );
+    let picker = one_picker();
+    settle();
+    assert_eq!(picker.shown_folder(), Some(home.clone()));
+    picker.cancel();
+    let (response, _) = reply_parts(&bus.wait(&reply).expect("a cancel reply"));
+    assert_eq!(response, RESPONSE_CANCELLED);
+    drop(picker);
+    settle();
+
+    // `modal = false` leaves the window non-modal.
+    let mut extra = HashMap::new();
+    extra.insert("modal".to_string(), false.to_variant());
+    let reply = chooser_call_as(&bus, "SaveFile", "org.example.Modal", String::new(), extra);
+    let picker = one_picker();
+    settle();
+    assert!(!picker.is_modal(), "`modal = false` is honoured");
+    picker.cancel();
+    let (response, _) = reply_parts(&bus.wait(&reply).expect("a cancel reply"));
+    assert_eq!(response, RESPONSE_CANCELLED);
+    drop(picker);
+    settle();
+
+    // Cancelling changes no remembered folder.
+    let after = fm_core::picker_state::PickerState::load(&state_path).0;
+    assert_eq!(after.folders(), &folders_before, "Cancel writes no folder");
+    // None of these dialogs had a parent, so Mango tiled them and their size
+    // was the compositor's: nothing is remembered.
+    assert_eq!(
+        after.size(),
+        None,
+        "an unattached dialog's size is not remembered"
+    );
+}
+
+/// P2au's transient probe, in the same child-process shape as P2at's save
+/// regression: a real GTK process, scratch `XDG_CONFIG_HOME` / `XDG_STATE_HOME`,
+/// a second real toplevel exported like a native app would export it, and an
+/// OpenFile carrying `wayland:<handle>`. A display without `xdg-foreign` says
+/// so and passes as skipped.
+#[test]
+fn real_open_dialog_attaches_to_a_wayland_parent() {
+    let scratch = Scratch::new("parent-widget-env");
+    let config = scratch.path().join("config");
+    let state = scratch.path().join("state");
+    std::fs::create_dir_all(&config).expect("scratch config");
+    std::fs::create_dir_all(&state).expect("scratch state");
+    let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+        .args([
+            "--exact",
+            "portal::tests::real_open_dialog_attaches_to_a_wayland_parent_inner",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env("XDG_CONFIG_HOME", &config)
+        .env("XDG_STATE_HOME", &state)
+        .output()
+        .expect("the owned parent-window regression process");
+    assert!(
+        output.status.success(),
+        "the real parent-window regression failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+        "the inner regression did not run"
+    );
+    if std::env::var_os("GIMBAL_HOLD_PARENT_TEST").is_some() {
+        for line in String::from_utf8_lossy(&output.stdout).lines() {
+            if line.starts_with("remembered size") {
+                eprintln!("{line}");
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "runs in its own process through the subprocess widget regression"]
+fn real_open_dialog_attaches_to_a_wayland_parent_inner() {
+    gtk::init().expect("the parent-window regression needs a GTK display");
+    adw::init().expect("libadwaita init");
+    let context = glib::MainContext::default();
+    let settle = || pump_for(&context, Duration::from_millis(150));
+
+    let application = adw::Application::builder()
+        .application_id("io.github.kcanady21.GimbalFiles.PortalParentTest")
+        .flags(gio::ApplicationFlags::NON_UNIQUE)
+        .build();
+    application
+        .register(None::<&gio::Cancellable>)
+        .expect("register the owned test application");
+    let process = crate::app::Process::portal(&application);
+    let host = picker::PickerHost::new(&process, &application);
+    let service = service::Service::new();
+    service.set_host(host);
+    let bus = Bus::service(&service, Scratch::new("parent-widget-bus"));
+
+    // A real second toplevel, exported through xdg-foreign exactly as a native
+    // Wayland app would export its own.
+    let parent = adw::ApplicationWindow::builder()
+        .application(&application)
+        .build();
+    parent.set_default_size(400, 300);
+    parent.present();
+    settle();
+
+    let Some(toplevel) = parent
+        .surface()
+        .and_then(|surface| surface.downcast::<gdk4_wayland::WaylandToplevel>().ok())
+    else {
+        eprintln!("skipped: this display has no Wayland toplevel to export from");
+        parent.destroy();
+        return;
+    };
+    let exported: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+    let got = exported.clone();
+    let started = toplevel.export_handle(move |_, result| {
+        if let Ok(handle) = result {
+            *got.borrow_mut() = Some(handle.to_string());
+        }
+    });
+    if !started {
+        eprintln!("skipped: the compositor has no xdg-foreign export");
+        parent.destroy();
+        return;
+    }
+    pump_until(&context, Duration::from_secs(3), || {
+        exported.borrow().is_some()
+    });
+    let Some(handle) = exported.borrow().clone() else {
+        eprintln!("skipped: no exported handle arrived (the compositor has no xdg-foreign?)");
+        parent.destroy();
+        return;
+    };
+
+    let holding = std::env::var_os("GIMBAL_HOLD_PARENT_TEST").is_some();
+    if holding {
+        bus.timeout_ms.set(150_000);
+    }
+    let reply = open_file_as(
+        &bus,
+        "org.example.App",
+        format!("wayland:{handle}"),
+        "Open",
+        HashMap::new(),
+    );
+    pump_until(&context, Duration::from_secs(5), || {
+        picker::testing::live().len() == 1
+    });
+    let live = picker::testing::live();
+    assert_eq!(live.len(), 1, "exactly one live picker");
+    let picker = live[0].clone();
+    settle();
+
+    match picker.transient_attached() {
+        Some(true) => {}
+        Some(false) | None => {
+            eprintln!("skipped: this display has no xdg-foreign importer");
+            picker.cancel();
+            let _ = bus.wait(&reply);
+            drop(picker);
+            parent.destroy();
+            settle();
+            return;
+        }
+    }
+    assert!(picker.is_modal(), "the default is modal");
+
+    if holding {
+        // A person's look (P2au's run script): leave the attached dialog up
+        // until it is closed by hand, for at most two minutes.
+        eprintln!("holding: the dialog stays open until you close it");
+        pump_until(&context, Duration::from_secs(120), || reply.answered());
+        let _ = bus.wait(&reply);
+    } else {
+        // The window is attached and modal; take it down through its own Cancel.
+        picker.cancel();
+        let (response, _) = reply_parts(&bus.wait(&reply).expect("a cancel reply"));
+        assert_eq!(response, RESPONSE_CANCELLED);
+    }
+    drop(picker);
+    parent.destroy();
+    settle();
+
+    // An attached dialog floats at a size the user can choose, so its size
+    // is remembered on close, whatever the response.
+    let state_path = fm_core::picker_state::default_path().expect("a scratch state path");
+    let remembered = fm_core::picker_state::PickerState::load(&state_path).0;
+    assert!(
+        remembered
+            .size()
+            .is_some_and(|(width, height)| width > 0 && height > 0),
+        "the attached dialog's size is remembered"
+    );
+    if let Some((width, height)) = remembered.size() {
+        println!("remembered size: {width} x {height}");
+    }
 }

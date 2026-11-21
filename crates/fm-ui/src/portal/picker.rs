@@ -43,6 +43,7 @@ use gtk::glib;
 
 use fm_core::command::{Caller, CheckedCommand, Invocation, Outcome};
 use fm_core::config::{Change, SortRule};
+use fm_core::picker_state::{self, PickerState};
 use fm_core::preview::Selection;
 use fm_core::search::SearchResultFilter;
 use fm_core::workspace::{TabId, Window, WindowId};
@@ -81,6 +82,8 @@ pub struct PickerOptions {
     /// request is answered (or when the options are dropped, if the window was
     /// never built), never before: the process must outlive its dialog.
     pub hold: gio::ApplicationHoldGuard,
+    /// The shared size the last dialog was resized to, if one was remembered.
+    pub size: Option<(i32, i32)>,
 }
 
 /// Park a picker's options for the model window `id`, before `apply_events`
@@ -481,6 +484,10 @@ pub(crate) struct Picker {
     search_programmatic: Cell<bool>,
     request: RefCell<Option<Rc<Request>>>,
     blur: RefCell<Option<Blur>>,
+    /// The result of attaching to the call's Wayland parent, when it named one:
+    /// `Some(true)` attached, `Some(false)` refused, `None` no attachment was
+    /// attempted.
+    transient: Cell<Option<bool>>,
 }
 
 impl Picker {
@@ -496,6 +503,7 @@ impl Picker {
             request,
             call,
             hold,
+            size,
         } = options;
         let mode = Mode::for_call(&call);
         let save_files = call.method == Method::SaveFiles;
@@ -514,13 +522,14 @@ impl Picker {
             .application(application)
             .title(call.title())
             .build();
-        window.set_default_size(
-            scaled(f64::from(PICKER_W), scale),
-            scaled(f64::from(PICKER_H), scale),
-        );
+        let (width, height) = dialog_size(size, scale);
+        window.set_default_size(width, height);
         window.add_css_class("gimbal-look");
-        // The dialog is modal to the calling application through the portal's
-        // parent window; Gimbal's own process has nothing else to keep usable.
+        // The portal says a missing `modal` means true. On a compositor with
+        // `xdg_wm_dialog_v1` this marks the dialog modal to the application; on
+        // Mango, which has no such protocol, it adds nothing beyond the float
+        // that setting a parent already gives (P2au notes).
+        window.set_modal(call.options.modal);
 
         let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
         window.set_content(Some(&root));
@@ -732,16 +741,21 @@ impl Picker {
             search_programmatic: Cell::new(false),
             request: RefCell::new(Some(request.clone())),
             blur: RefCell::new(None),
+            transient: Cell::new(None),
         });
         *picker.self_weak.borrow_mut() = Rc::downgrade(&picker);
         // The grid's rows follow the call's rules from the first listing.
         picker.apply_grid_filter();
 
-        // The request's completion closes this window and releases the
-        // application hold. Installed before Present so a Close from the
-        // portal in the same tick still finds it.
+        // The request's completion saves the shared size, closes this window
+        // and releases the application hold. Installed before Present so a
+        // Close from the portal in the same tick still finds it.
+        let weak_picker = Rc::downgrade(&picker);
         let weak_process = Rc::downgrade(process);
         request.set_on_done(move || {
+            if let Some(picker) = weak_picker.upgrade() {
+                picker.remember_size();
+            }
             // Dropping the guard is the release (`gio`'s hold is RAII).
             drop(hold);
             if let Some(process) = weak_process.upgrade() {
@@ -984,6 +998,10 @@ impl Picker {
 
     fn present(&self) {
         self.window.present();
+        // The surface exists after `present`, and GTK can now import the
+        // calling app's exported handle. A refusal only logs; the dialog is
+        // already on screen.
+        self.attach_parent();
         if let Some(entry) = &self.name_entry {
             // Save opens ready to type a name, with the part before the
             // extension selected exactly as rename does.
@@ -994,6 +1012,146 @@ impl Picker {
         // Open focuses the grid, not the address entry: the dialog opens ready
         // to receive arrow keys and Enter.
         self.folder.grab_grid_focus();
+    }
+
+    /// Attach the dialog to the calling app's window when the call named a
+    /// Wayland parent. `wayland:` handles go through `xdg-foreign` v1, falling
+    /// back to v2 (GTK imports the handle itself). An X11 window cannot be
+    /// attached from a Wayland GTK window, and an empty handle names nothing.
+    fn attach_parent(&self) {
+        match service::parent_handle(&self.call.parent_window) {
+            service::Parent::None => {}
+            service::Parent::X11(_) => {
+                crate::log!("portal", "parent is an X11 window; not attached");
+            }
+            service::Parent::Wayland(handle) => {
+                let result = self
+                    .window
+                    .surface()
+                    .and_then(|surface| surface.downcast::<gdk4_wayland::WaylandToplevel>().ok())
+                    .map(|toplevel| toplevel.set_transient_for_exported(&handle));
+                self.transient.set(result);
+                match result {
+                    Some(true) => crate::log!("portal", "attached to the app's parent window"),
+                    Some(false) => {
+                        crate::log!(
+                            "portal",
+                            "the app's parent handle was refused; not attached"
+                        )
+                    }
+                    None => crate::log!(
+                        "portal",
+                        "the window has no Wayland surface; parent not attached"
+                    ),
+                }
+            }
+        }
+    }
+
+    /// Write the one shared dialog size when this dialog closes, whatever the
+    /// response was. A bad or missing state file never stops the close.
+    fn remember_size(&self) {
+        // Only a size the user could have chosen is remembered. Mango floats a
+        // dialog only when it has a parent; without one it tiles it, and that
+        // tiled size (or a maximized or fullscreen one) is the compositor's,
+        // not the user's. Remembering it would make every later dialog open
+        // at half a screen.
+        if self.transient.get() != Some(true)
+            || self.window.is_maximized()
+            || self.window.is_fullscreen()
+        {
+            return;
+        }
+        let width = self.window.width();
+        let height = self.window.height();
+        if width <= 0 || height <= 0 {
+            return;
+        }
+        let Some(path) = picker_state::default_path() else {
+            return;
+        };
+        let minimum = (
+            scaled(f64::from(PICKER_W / 2), self.scale),
+            scaled(f64::from(PICKER_H / 2), self.scale),
+        );
+        let (mut state, problem) = PickerState::load(&path);
+        if let Some(problem) = problem {
+            crate::log!("portal", "{problem}");
+        }
+        state.set_size(width.max(minimum.0), height.max(minimum.1));
+        if let Err(error) = state.save(&path) {
+            crate::log!("portal", "cannot write {}: {error}", path.display());
+        }
+    }
+
+    /// Remember where this app's successful dialog answered. Cancel, Close and
+    /// every refusal write nothing. A failure is one log line, never a failed
+    /// dialog.
+    fn remember_folder(&self, folder: Option<PathBuf>) {
+        let Some(folder) = folder else {
+            return;
+        };
+        let Some(path) = picker_state::default_path() else {
+            return;
+        };
+        let (mut state, problem) = PickerState::load(&path);
+        if let Some(problem) = problem {
+            crate::log!("portal", "{problem}");
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .unwrap_or(0);
+        if !state.set_folder(&self.call.app_id, &folder, now) {
+            crate::log!(
+                "portal",
+                "not remembering {}: the folder is relative or not UTF-8",
+                folder.display()
+            );
+            return;
+        }
+        if let Err(error) = state.save(&path) {
+            crate::log!("portal", "cannot write {}: {error}", path.display());
+            return;
+        }
+        crate::log!(
+            "portal",
+            "remembered {} for app {:?}",
+            folder.display(),
+            self.call.app_id
+        );
+    }
+
+    /// The folder a successful answer remembers: for OpenFile the folder the
+    /// grid was showing (in folders-only mode, not the folder that was picked);
+    /// for SaveFile the answered file's folder; for SaveFiles the chosen folder.
+    fn answered_folder(&self, pick: &Pick) -> Option<PathBuf> {
+        match self.call.method {
+            Method::OpenFile => self
+                .displayed
+                .borrow()
+                .as_ref()
+                .map(|(_, folder)| folder.clone())
+                .or_else(|| {
+                    pick.paths
+                        .first()
+                        .and_then(|path| path.parent())
+                        .map(Path::to_path_buf)
+                }),
+            Method::SaveFile => pick
+                .paths
+                .first()
+                .and_then(|path| path.parent())
+                .map(Path::to_path_buf),
+            Method::SaveFiles => {
+                let first = pick.paths.first()?;
+                if self.file_names.is_empty() {
+                    Some(first.clone())
+                } else {
+                    first.parent().map(Path::to_path_buf)
+                }
+            }
+        }
     }
 
     /// Destroy the GTK window. The request is answered by `destroy` if nothing
@@ -1458,6 +1616,10 @@ impl Picker {
     }
 
     fn answer(&self, pick: Pick) {
+        // Only a successful answer is remembered: Cancel, Close and refusals
+        // never reach this method, and a request already answered by Close
+        // makes `accept` return false.
+        let folder = self.answered_folder(&pick);
         let filter = self.active_filter().map(|filter| filter.name);
         crate::log!(
             "portal",
@@ -1468,7 +1630,9 @@ impl Picker {
             crate::log!("portal", "the dialog had no request to answer");
             return;
         };
-        request.accept(pick);
+        if request.accept(pick) {
+            self.remember_folder(folder);
+        }
     }
 
     /// Answer the call with what the dialog accepts under its mode.
@@ -2221,6 +2385,23 @@ fn expand_home(text: &str, home: &Path) -> PathBuf {
     }
 }
 
+/// The size a new dialog opens at: the remembered shared size when there is
+/// one, otherwise `PICKER_W` × `PICKER_H` scaled. Either way a bad remembered
+/// value is lifted to half the default, so the dialog never opens unusably
+/// small.
+pub fn dialog_size(remembered: Option<(i32, i32)>, scale: f64) -> (i32, i32) {
+    let default = (
+        scaled(f64::from(PICKER_W), scale),
+        scaled(f64::from(PICKER_H), scale),
+    );
+    let minimum = (
+        scaled(f64::from(PICKER_W / 2), scale),
+        scaled(f64::from(PICKER_H / 2), scale),
+    );
+    let (width, height) = remembered.unwrap_or(default);
+    (width.max(minimum.0), height.max(minimum.1))
+}
+
 /// The picker process's dialog host. Created once per process.
 pub struct PickerHost {
     process: Rc<Process>,
@@ -2252,7 +2433,23 @@ impl DialogHost for PickerHost {
             return Ok(());
         }
         let home = self.process.home();
-        let folder = service::starting_folder_for(call, &home);
+        // The picker's own state, never the session or the config. A bad file
+        // is one log line and an empty state; it never stops a dialog.
+        let (state, problem) = match picker_state::default_path() {
+            Some(path) => PickerState::load(&path),
+            None => (
+                PickerState::default(),
+                Some(
+                    "no state folder (HOME and XDG_STATE_HOME are unset); no folder or size will be remembered"
+                        .to_string(),
+                ),
+            ),
+        };
+        if let Some(problem) = problem {
+            crate::log!("portal", "{problem}");
+        }
+        let remembered = state.folder_for(&call.app_id).map(Path::to_path_buf);
+        let folder = service::starting_folder_for(call, &home, remembered.as_deref());
         let mode = Mode::for_call(call);
         crate::log!(
             "portal",
@@ -2277,6 +2474,7 @@ impl DialogHost for PickerHost {
             request: request.clone(),
             call: call.clone(),
             hold: self.application.hold(),
+            size: state.size(),
         };
         // A refused window drops the options, which releases the hold.
         match self.process.open_picker_window(folder, options) {
@@ -2347,6 +2545,17 @@ pub(crate) mod testing {
 
         pub(crate) fn save_enabled(&self) -> bool {
             self.open.is_sensitive()
+        }
+
+        pub(crate) fn is_modal(&self) -> bool {
+            self.window.is_modal()
+        }
+
+        /// `Some(true)` when the call named a Wayland parent and GTK attached
+        /// the dialog, `Some(false)` when the handle was refused, `None` when
+        /// the call named no Wayland parent.
+        pub(crate) fn transient_attached(&self) -> Option<bool> {
+            self.transient.get()
         }
 
         pub(crate) fn select_filter(&self, index: u32) {
@@ -2957,6 +3166,23 @@ mod tests {
         assert_eq!(expand_home("~/Pictures", home), home.join("Pictures"));
         assert_eq!(expand_home("/srv/data", home), PathBuf::from("/srv/data"));
         assert_eq!(expand_home("relative", home), PathBuf::from("relative"));
+    }
+
+    #[test]
+    fn the_dialog_size_uses_the_remembered_one_and_never_goes_below_half() {
+        assert_eq!(dialog_size(None, 1.0), (PICKER_W, PICKER_H));
+        assert_eq!(dialog_size(Some((1600, 1000)), 1.0), (1600, 1000));
+        assert_eq!(
+            dialog_size(Some((10, 10)), 1.0),
+            (PICKER_W / 2, PICKER_H / 2),
+            "a bad remembered size is lifted to half the default"
+        );
+        assert_eq!(dialog_size(Some((3000, 2000)), 2.0), (3000, 2000));
+        assert_eq!(
+            dialog_size(Some((10, 10)), 2.0),
+            (PICKER_W, PICKER_H),
+            "the floor follows the scale"
+        );
     }
 
     #[test]

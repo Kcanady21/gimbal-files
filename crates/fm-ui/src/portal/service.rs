@@ -149,10 +149,11 @@ pub struct CallOptions {
     /// SaveFiles: the names to save, each a NUL-terminated byte string. Kept as
     /// bytes until [`super::save`] takes the last component and validates it.
     pub files: Vec<Vec<u8>>,
-    /// Known option keys this build does not act on. Each is logged once;
-    /// unknown keys are ignored silently.
-    pub ignored: Vec<&'static str>,
-    /// Known option keys whose value could not be read. Also logged once.
+    /// Whether the dialog is modal to the application. The portal spec says a
+    /// missing `modal` means true, so an old caller gets a dialog, not a stray
+    /// window.
+    pub modal: bool,
+    /// Known option keys whose value could not be read. Each is logged once.
     pub malformed: Vec<&'static str>,
 }
 
@@ -226,6 +227,8 @@ impl Choice {
 pub struct Call {
     pub method: Method,
     pub app_id: String,
+    /// The `parent_window` argument: `wayland:<handle>`, `x11:<xid>` or empty.
+    pub parent_window: String,
     pub title: Option<String>,
     pub options: CallOptions,
 }
@@ -255,45 +258,9 @@ impl Call {
     }
 }
 
-/// The option keys each method knows. A key another method knows is still
-/// unknown here: the dialog reads only the keys its own call can carry.
-/// `modal` is known to every method but stays unimplemented until F4, so it is
-/// the one key that reaches `ignored`.
-const KNOWN_OPEN_KEYS: &[&str] = &[
-    "accept_label",
-    "modal",
-    "multiple",
-    "directory",
-    "filters",
-    "current_filter",
-    "choices",
-    "current_folder",
-];
-const KNOWN_SAVE_FILE_KEYS: &[&str] = &[
-    "accept_label",
-    "modal",
-    "filters",
-    "current_filter",
-    "choices",
-    "current_name",
-    "current_folder",
-    "current_file",
-];
-const KNOWN_SAVE_FILES_KEYS: &[&str] = &[
-    "accept_label",
-    "modal",
-    "choices",
-    "current_folder",
-    "files",
-];
-
-fn known_keys(method: Method) -> &'static [&'static str] {
-    match method {
-        Method::OpenFile => KNOWN_OPEN_KEYS,
-        Method::SaveFile => KNOWN_SAVE_FILE_KEYS,
-        Method::SaveFiles => KNOWN_SAVE_FILES_KEYS,
-    }
-}
+// Every option key the three methods carry is acted on now: `modal` and the
+// rest are read below. A key for another method is unknown and ignored
+// silently, as before.
 
 /// The wire type of the `filters` option.
 const FILTERS_TYPE: &str = "a(sa(us))";
@@ -346,12 +313,14 @@ fn children(value: &glib::Variant) -> impl Iterator<Item = glib::Variant> {
 }
 
 /// Parse one call's options vardict. Every key the method knows either changes
-/// the dialog or is named in `ignored` / `malformed` for the log; a key for
-/// another method is unknown and ignored silently. Nothing here is an error.
+/// the dialog or is named in `malformed` for the log; a key for another method
+/// is unknown and ignored silently. Nothing here is an error.
 pub fn parse_call_options(method: Method, options: &HashMap<String, glib::Variant>) -> CallOptions {
     let mut malformed: Vec<&'static str> = Vec::new();
     let accept_label =
         typed_option!(options, malformed, "accept_label", String).filter(|label| !label.is_empty());
+    // The portal spec: `modal` defaults to true when the caller does not say.
+    let modal = typed_option!(options, malformed, "modal", bool).unwrap_or(true);
     let current_folder = typed_option!(options, malformed, "current_folder", Vec<u8>)
         .and_then(|bytes| folder_from_bytes(&bytes));
 
@@ -418,11 +387,6 @@ pub fn parse_call_options(method: Method, options: &HashMap<String, glib::Varian
         ),
     };
 
-    let ignored = known_keys(method)
-        .iter()
-        .copied()
-        .filter(|key| *key == "modal" && options.contains_key(*key))
-        .collect();
     CallOptions {
         accept_label,
         current_folder,
@@ -435,7 +399,7 @@ pub fn parse_call_options(method: Method, options: &HashMap<String, glib::Varian
         current_name,
         current_file,
         files,
-        ignored,
+        modal,
         malformed,
     }
 }
@@ -456,19 +420,31 @@ pub fn folder_from_bytes(bytes: &[u8]) -> Option<PathBuf> {
     path.is_absolute().then_some(path)
 }
 
-/// The starting folder for a dialog: the suggested one when it exists and is a
-/// directory, otherwise the user's home.
-pub fn starting_folder(suggested: Option<&Path>, home: &Path) -> PathBuf {
+/// The starting folder for a dialog, after SaveFile's `current_file` rule:
+/// the suggested folder when it exists and is a directory, then a remembered
+/// one, otherwise the user's home.
+pub fn starting_folder(
+    suggested: Option<&Path>,
+    remembered: Option<&Path>,
+    home: &Path,
+) -> PathBuf {
     suggested
         .filter(|path| path.is_dir())
+        .or_else(|| remembered.filter(|path| path.is_dir()))
         .map(Path::to_path_buf)
         .unwrap_or_else(|| home.to_path_buf())
 }
 
-/// The starting folder for a whole call. SaveFile opens the folder of
-/// `current_file` when it has one and it still exists, so the file can be
-/// selected; anything else follows [`starting_folder`].
-pub fn starting_folder_for(call: &Call, home: &Path) -> PathBuf {
+/// The starting folder for a whole call, in the order P2au fixed:
+///
+/// 1. SaveFile's `current_file` folder, when it still exists, so the file can
+///    be selected;
+/// 2. the call's `current_folder`, when it still exists: the app asked for a
+///    place, so it wins over anything remembered;
+/// 3. `remembered`, the last folder this app answered in, when it still is a
+///    directory;
+/// 4. home.
+pub fn starting_folder_for(call: &Call, home: &Path, remembered: Option<&Path>) -> PathBuf {
     if call.method == Method::SaveFile
         && let Some(parent) = call
             .options
@@ -479,7 +455,40 @@ pub fn starting_folder_for(call: &Call, home: &Path) -> PathBuf {
     {
         return parent.to_path_buf();
     }
-    starting_folder(call.options.current_folder.as_deref(), home)
+    starting_folder(call.options.current_folder.as_deref(), remembered, home)
+}
+
+/// What a portal call's `parent_window` names.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Parent {
+    /// A native Wayland app's `xdg-foreign` export handle, without the prefix.
+    Wayland(String),
+    /// An XWayland app's X11 window id.
+    X11(u64),
+    /// No usable parent: empty, missing a prefix, or an unreadable value.
+    None,
+}
+
+/// Read the portal's `parent_window` string. The frontend sends
+/// `wayland:<xdg-foreign handle>`, `x11:<hex XID>`, or an empty string when the
+/// app did not say. A bad handle is `Parent::None`, never an error: the dialog
+/// still has to open.
+pub fn parent_handle(handle: &str) -> Parent {
+    if let Some(exported) = handle.strip_prefix("wayland:") {
+        return if exported.is_empty() {
+            Parent::None
+        } else {
+            Parent::Wayland(exported.to_string())
+        };
+    }
+    if let Some(xid) = handle.strip_prefix("x11:") {
+        return u64::from_str_radix(xid, 16)
+            .ok()
+            .filter(|xid| *xid != 0)
+            .map(Parent::X11)
+            .unwrap_or(Parent::None);
+    }
+    Parent::None
 }
 
 /// The empty `a{sv}` a cancelled or refused call returns.
@@ -843,14 +852,6 @@ impl Service {
         );
 
         let options = parse_call_options(method, &options);
-        if !options.ignored.is_empty() {
-            crate::log!(
-                "portal",
-                "{} ignores option(s) {}",
-                method.as_str(),
-                options.ignored.join(", ")
-            );
-        }
         if !options.malformed.is_empty() {
             // A value of the wrong type is read as absent, never refused.
             crate::log!(
@@ -864,6 +865,7 @@ impl Service {
         let call = Call {
             method,
             app_id: app_id.clone(),
+            parent_window,
             title: Some(title).filter(|title| !title.is_empty()),
             options,
         };

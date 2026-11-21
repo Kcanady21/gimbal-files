@@ -17,6 +17,7 @@ pub mod folder_size;
 pub(crate) mod fsutil;
 pub mod logfile;
 pub mod openwith;
+pub mod picker_state;
 pub mod preview;
 pub mod properties;
 pub mod search;

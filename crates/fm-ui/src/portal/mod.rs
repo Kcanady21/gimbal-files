@@ -12,6 +12,11 @@
 //! OpenFile, SaveFile and SaveFiles are answered. Save is the same picker with
 //! a Name entry (SaveFile) or a folder pick (SaveFiles); the backend answers a
 //! `file://` URI and never creates or writes the file.
+//!
+//! The dialog attaches to the calling app's `parent_window` through
+//! `xdg-foreign`, is modal unless the call says otherwise, remembers the last
+//! folder per `app_id` and the one dialog size in its own state file (never the
+//! session or the config), and carries the call's title (P2au).
 
 pub mod filter;
 pub mod picker;
