@@ -74,13 +74,26 @@ impl portals_conf::Restarter for SystemdRestarter {
     }
 }
 
-/// The Settings row's state. It reads the real environment, the portal
-/// folders and the session bus; no file is written.
-fn file_chooser_health() -> portals_conf::Health {
+/// The bus name the portal backend installs as, which the session bus's
+/// activatable list must carry for the Settings row to say Gimbal.
+const GIMBAL_PORTAL_BUS_NAME: &str = "org.freedesktop.impl.portal.desktop.gimbal";
+
+/// Everything the Open and Save dialogs state is read from, minus the
+/// session bus's answer. The file reads are small and stay synchronous; the
+/// bus call blocks for up to a second and runs asynchronously instead
+/// (P2aw).
+struct ChooserParts {
+    disk_installed: bool,
+    chain: Vec<String>,
+    available: Vec<String>,
+    pending_restart: bool,
+}
+
+fn file_chooser_parts() -> ChooserParts {
     let locations = portals_conf::Locations::from_environment();
     let desktops = portals_conf::current_desktops();
     let dirs = portals_conf::portal_dirs();
-    let installed = portals_conf::gimbal_portal_installed(&dirs) && bus_lists_gimbal();
+    let disk_installed = portals_conf::gimbal_portal_installed(&dirs);
     let available = portals_conf::installed_backends(&dirs);
     let files = portals_conf::config_files(
         &desktops,
@@ -89,37 +102,44 @@ fn file_chooser_health() -> portals_conf::Health {
         &locations.data_dirs,
     );
     let chain = portals_conf::effective_chain(&files, &available);
+    ChooserParts {
+        disk_installed,
+        chain,
+        available,
+        pending_restart: portals_conf::restart_pending(),
+    }
+}
+
+/// The Settings row's state for an `installed` verdict, from the injected
+/// parts. Pure, so each `Health` state is testable: the synchronous path it
+/// replaces passed `bus_lists_gimbal()` inside `installed`, and so does the
+/// asynchronous path through its injected bus answer (P2aw).
+fn file_chooser_health_with(parts: &ChooserParts, installed: bool) -> portals_conf::Health {
     portals_conf::health(
         installed,
-        &chain,
-        &available,
-        portals_conf::restart_pending(),
+        &parts.chain,
+        &parts.available,
+        parts.pending_restart,
     )
 }
 
-/// Whether the bus would start Gimbal's portal backend on demand.
-fn bus_lists_gimbal() -> bool {
-    const NAME: &str = "org.freedesktop.impl.portal.desktop.gimbal";
-    let Ok(connection) = gio::bus_get_sync(gio::BusType::Session, None::<&gio::Cancellable>) else {
-        return false;
-    };
-    let reply = connection.call_sync(
-        Some("org.freedesktop.DBus"),
-        "/org/freedesktop/DBus",
-        "org.freedesktop.DBus",
-        "ListActivatableNames",
-        None,
-        Some(glib::VariantTy::new("(as)").expect("valid signature")),
-        gio::DBusCallFlags::NONE,
-        1000,
-        None::<&gio::Cancellable>,
-    );
-    let Ok(reply) = reply else {
-        return false;
-    };
-    reply
-        .get::<(Vec<String>,)>()
-        .is_some_and(|(names,)| names.iter().any(|name| name == NAME))
+/// Whether the bus's activatable list starts Gimbal's portal backend on
+/// demand. Pure over the reply, so the async path can be tested with a
+/// chosen list.
+fn bus_list_has_gimbal(activatable: &[String]) -> bool {
+    activatable
+        .iter()
+        .any(|name| name == GIMBAL_PORTAL_BUS_NAME)
+}
+
+/// Fill every open Settings row in with the full state, from the files and
+/// the bus's injected answer (P2aw).
+fn fill_file_chooser_status(process: &Rc<Process>, listed_on_bus: bool) {
+    let parts = file_chooser_parts();
+    let health = file_chooser_health_with(&parts, parts.disk_installed && listed_on_bus);
+    for ui in process.windows.borrow().values() {
+        ui.header().refresh_file_chooser_status(&health);
+    }
 }
 
 pub struct Process {
@@ -766,17 +786,79 @@ impl Process {
     }
 
     /// Push the current Open and Save dialogs state into every open Settings
-    /// popover. The file is the truth: a hand edit shows correctly.
-    pub fn refresh_file_chooser_status_all(&self) {
-        let health = file_chooser_health();
-        for ui in self.windows.borrow().values() {
-            ui.header().refresh_file_chooser_status(&health);
+    /// popover. The file is the truth: a hand edit shows correctly. The bus
+    /// call runs asynchronously (P2aw): the row shows "Checking…" until the
+    /// answer fills it in, in this window and every other one.
+    pub fn refresh_file_chooser_status_all(self: &Rc<Self>) {
+        let parts = file_chooser_parts();
+        let disk_health = file_chooser_health_with(&parts, parts.disk_installed);
+        if matches!(disk_health, portals_conf::Health::NotInstalled) {
+            // The `.portal` files are missing; no bus answer can change that,
+            // so the row never says "Checking…".
+            for ui in self.windows.borrow().values() {
+                ui.header().refresh_file_chooser_status(&disk_health);
+            }
+            return;
         }
+        for ui in self.windows.borrow().values() {
+            ui.header().refresh_file_chooser_checking(&disk_health);
+        }
+        let process = self.clone();
+        gio::bus_get(
+            gio::BusType::Session,
+            None::<&gio::Cancellable>,
+            move |result| {
+                let listed = match result {
+                    Ok(connection) => {
+                        let process = process.clone();
+                        connection.call(
+                            Some("org.freedesktop.DBus"),
+                            "/org/freedesktop/DBus",
+                            "org.freedesktop.DBus",
+                            "ListActivatableNames",
+                            None::<&glib::Variant>,
+                            Some(glib::VariantTy::new("(as)").expect("valid signature")),
+                            gio::DBusCallFlags::NONE,
+                            1000,
+                            None::<&gio::Cancellable>,
+                            move |reply: Result<glib::Variant, glib::Error>| {
+                                let listed = match reply {
+                                    Ok(reply) => reply
+                                        .get::<(Vec<String>,)>()
+                                        .map(|(names,)| bus_list_has_gimbal(&names))
+                                        .unwrap_or(false),
+                                    Err(error) => {
+                                        crate::log!(
+                                            "portals",
+                                            "ListActivatableNames failed: {error}"
+                                        );
+                                        // The same text the synchronous path
+                                        // showed when the bus could not be asked.
+                                        false
+                                    }
+                                };
+                                fill_file_chooser_status(&process, listed);
+                            },
+                        );
+                        return;
+                    }
+                    Err(error) => {
+                        crate::log!("portals", "no session bus to ask about Gimbal: {error}");
+                        // The same text the synchronous path showed when the bus
+                        // could not be asked.
+                        false
+                    }
+                };
+                fill_file_chooser_status(&process, listed);
+            },
+        );
     }
 
-    /// The Settings row's state, read fresh every time.
-    pub fn file_chooser_health(&self) -> portals_conf::Health {
-        file_chooser_health()
+    /// The Settings row's state from the files alone, read fresh every time.
+    /// The session-bus answer arrives separately (P2aw).
+    pub fn file_chooser_health_without_bus(&self) -> portals_conf::Health {
+        let parts = file_chooser_parts();
+        file_chooser_health_with(&parts, parts.disk_installed)
     }
 
     /// `integration.set-file-chooser`: write or remove the user's portals
@@ -4844,6 +4926,7 @@ impl Process {
             *self.openwith_anchor.borrow_mut() = Some(anchor.clone());
             dialogs::show_menu(
                 &ui,
+                "item menu",
                 anchor,
                 &menus::item_menu_in_scope(
                     &items,
@@ -4892,7 +4975,7 @@ impl Process {
             // The anchor is the whole grid scroller: point at the click, or
             // the popover lands at the scroller's edge, outside the window
             // (Claude's P2k review).
-            dialogs::show_menu(&ui, anchor, &items, Some(at));
+            dialogs::show_menu(&ui, "empty-space menu", anchor, &items, Some(at));
         }
     }
 
@@ -5353,6 +5436,114 @@ mod tests {
             dirty,
             saving,
         }
+    }
+
+    fn chooser_parts(disk_installed: bool, chain: &[&str], pending_restart: bool) -> ChooserParts {
+        ChooserParts {
+            disk_installed,
+            chain: chain.iter().map(|name| name.to_string()).collect(),
+            available: vec![
+                fm_core::portals_conf::GIMBAL.to_string(),
+                fm_core::portals_conf::GTK.to_string(),
+            ],
+            pending_restart,
+        }
+    }
+
+    /// The asynchronous Open and Save dialogs check fills in the same text
+    /// the synchronous one did, for every `Health` state, with the bus's
+    /// answer injected (P2aw).
+    #[test]
+    fn the_bus_answer_fills_in_the_same_health_text_for_every_state() {
+        let bus_answer = |answer: bool| -> Vec<String> {
+            if answer {
+                vec![GIMBAL_PORTAL_BUS_NAME.to_string()]
+            } else {
+                Vec::new()
+            }
+        };
+        let health = |parts: &ChooserParts, answer: &Vec<String>| {
+            file_chooser_health_with(parts, parts.disk_installed && bus_list_has_gimbal(answer))
+        };
+
+        // Files installed, bus lists Gimbal: Gimbal handles the dialogs.
+        let parts = chooser_parts(true, &[fm_core::portals_conf::GIMBAL], false);
+        assert_eq!(
+            health(&parts, &bus_answer(true)),
+            portals_conf::Health::Gimbal
+        );
+        assert_eq!(
+            portals_conf::status_text(&health(&parts, &bus_answer(true))),
+            "Open and Save dialogs: Gimbal"
+        );
+
+        // Files installed, bus does not list Gimbal: not installed, exactly
+        // what the synchronous path said when the bus kept the name off.
+        assert_eq!(
+            health(&parts, &bus_answer(false)),
+            portals_conf::Health::NotInstalled
+        );
+        assert_eq!(
+            portals_conf::status_text(&health(&parts, &bus_answer(false))),
+            "Not installed: the portal backend files are missing"
+        );
+
+        // Files missing: no bus answer can install them.
+        let parts = chooser_parts(false, &[fm_core::portals_conf::GIMBAL], false);
+        assert_eq!(
+            health(&parts, &bus_answer(true)),
+            portals_conf::Health::NotInstalled
+        );
+
+        // Another backend first in the chain.
+        let parts = chooser_parts(true, &[fm_core::portals_conf::GTK], false);
+        assert_eq!(
+            health(&parts, &bus_answer(true)),
+            portals_conf::Health::Backend(fm_core::portals_conf::GTK.to_string())
+        );
+        assert_eq!(
+            portals_conf::status_text(&health(&parts, &bus_answer(true))),
+            "Open and Save dialogs: GTK"
+        );
+
+        // The chain names no backend: none.
+        let parts = chooser_parts(true, &["none"], false);
+        assert_eq!(
+            health(&parts, &bus_answer(true)),
+            portals_conf::Health::None
+        );
+        assert_eq!(
+            portals_conf::status_text(&health(&parts, &bus_answer(true))),
+            "Open and Save dialogs: none"
+        );
+
+        // A pending restart reports the saved state, enabled or not.
+        let parts = chooser_parts(true, &[fm_core::portals_conf::GIMBAL], true);
+        assert_eq!(
+            health(&parts, &bus_answer(true)),
+            portals_conf::Health::PendingRestart { enabled: true }
+        );
+        let parts = chooser_parts(true, &[fm_core::portals_conf::GTK], true);
+        assert_eq!(
+            health(&parts, &bus_answer(true)),
+            portals_conf::Health::PendingRestart { enabled: false }
+        );
+        assert_eq!(
+            portals_conf::status_text(&health(&parts, &bus_answer(true))),
+            "Saved; sign out and back in to apply"
+        );
+
+        // The bus's answer only counts when it is Gimbal's backend name.
+        assert!(bus_list_has_gimbal(&[GIMBAL_PORTAL_BUS_NAME.to_string()]));
+        assert!(bus_list_has_gimbal(&[
+            "org.freedesktop.impl.portal.gtk".to_string(),
+            GIMBAL_PORTAL_BUS_NAME.to_string(),
+        ]));
+        assert!(!bus_list_has_gimbal(&[
+            "org.freedesktop.impl.portal.gtk".to_string(),
+            "org.freedesktop.impl.portal.kde".to_string(),
+        ]));
+        assert!(!bus_list_has_gimbal(&[]));
     }
 
     #[test]
@@ -6839,6 +7030,27 @@ mod tests {
         LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
+    /// A background menu's button rows. The popover's child is the capped
+    /// scroller (P2aw), whose auto-added viewport holds the menu
+    /// (gtkscrolledwindow.c:4394).
+    fn menu_rows(popover: &gtk::Popover) -> Vec<gtk::Button> {
+        let viewport = popover
+            .child()
+            .and_downcast::<gtk::ScrolledWindow>()
+            .expect("the capped scroller")
+            .child()
+            .and_downcast::<gtk::Viewport>()
+            .expect("the scroller's viewport");
+        viewport
+            .child()
+            .expect("the menu")
+            .observe_children()
+            .snapshot()
+            .into_iter()
+            .filter_map(|widget| widget.downcast::<gtk::Button>().ok())
+            .collect()
+    }
+
     #[test]
     fn new_folder_menu_keeps_the_click_position_and_creates_the_folder() {
         let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
@@ -6895,12 +7107,8 @@ mod tests {
             .last_child()
             .and_downcast::<gtk::Popover>()
             .expect("background menu");
-        let menu_body = menu.child().expect("menu body");
-        let new_folder = menu_body
-            .observe_children()
-            .snapshot()
+        let new_folder = menu_rows(&menu)
             .into_iter()
-            .filter_map(|widget| widget.downcast::<gtk::Button>().ok())
             .find(|button| {
                 button
                     .child()
@@ -7014,12 +7222,8 @@ mod tests {
             .last_child()
             .and_downcast::<gtk::Popover>()
             .expect("background menu");
-        let menu_body = menu.child().expect("menu body");
-        let new_file = menu_body
-            .observe_children()
-            .snapshot()
+        let new_file = menu_rows(&menu)
             .into_iter()
-            .filter_map(|widget| widget.downcast::<gtk::Button>().ok())
             .find(|button| {
                 button
                     .child()
@@ -7080,6 +7284,114 @@ mod tests {
             "New File… must create a zero-byte file"
         );
         ui.window().close();
+    }
+
+    #[test]
+    fn real_settings_menu_in_a_short_window_fits_inside_it() {
+        let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                "app::tests::real_settings_menu_in_a_short_window_fits_inside_it_inner",
+                "--ignored",
+                "--nocapture",
+            ])
+            .output()
+            .expect("the owned Settings cap widget process");
+        assert!(
+            output.status.success(),
+            "the Settings cap regression failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    #[ignore = "runs in its own process through the subprocess widget regression"]
+    fn real_settings_menu_in_a_short_window_fits_inside_it_inner() {
+        let _guard = gtk_test_lock();
+        gtk::init().expect("the Settings cap regression needs a GTK display");
+        adw::init().expect("libadwaita init");
+        let application = adw::Application::builder()
+            .application_id("org.gimbal.Files.SettingsCapTest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        application
+            .register(None::<&gio::Cancellable>)
+            .expect("register the owned non-unique test application");
+        let scratch = search_scratch("settings-cap");
+        let process = gtk_search_process(
+            &scratch,
+            &application,
+            Rc::new(crate::search::SearchRuntime::production()),
+        );
+        let window = seed_gtk_window(&process, scratch.root.join("home"));
+        let ui = process.window(window).expect("real window");
+        let gtk_window = ui.window();
+        gtk_window.set_default_size(600, 500);
+        ui.present();
+        let context = glib::MainContext::default();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while gtk_window.height() == 0 {
+            context.iteration(false);
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the window never got its size"
+            );
+        }
+
+        let scale = process.scale();
+        let height = gtk_window.height();
+        let width = gtk_window.width();
+
+        // A menu shaped like Settings: rows, switches and wrapped notes until
+        // it is far taller than the window the compositor gave the test.
+        let menu = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        menu.add_css_class("gl-menu");
+        for row in 0..40 {
+            let item = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+            item.add_css_class("gl-menu-item");
+            item.append(&gtk::Label::new(Some(&format!("Row {row}"))));
+            item.append(&gtk::Switch::new());
+            menu.append(&item);
+        }
+        let cap = crate::popup::menu_height_cap(scale, height, 0);
+        assert!(
+            cap > 0
+                && cap <= height - crate::look::tokens::scaled(crate::look::tokens::GAP_M, scale),
+            "the cap must leave one margin of the {height}-px window, got {cap}"
+        );
+        let scroller = crate::popup::capped_scroller(&menu, cap, width);
+        let (_, scroller_height, _, _) = scroller.measure(gtk::Orientation::Vertical, width);
+        assert!(
+            scroller_height <= cap,
+            "the capped scroller must stay within the cap: {scroller_height} px against {cap}"
+        );
+        assert_eq!(
+            scroller.vscrollbar_policy(),
+            gtk::PolicyType::Always,
+            "content taller than the cap must scroll"
+        );
+
+        // The same menu, short: no scrollbar, and the natural height.
+        let short = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        short.add_css_class("gl-menu");
+        short.append(&gtk::Label::new(Some("Only one row")));
+        let short_scroller = crate::popup::capped_scroller(&short, cap, width);
+        assert_eq!(
+            short_scroller.vscrollbar_policy(),
+            gtk::PolicyType::Never,
+            "content shorter than the cap must not scroll"
+        );
+        let (_, short_natural, _, _) = short.measure(gtk::Orientation::Vertical, width);
+        let (_, short_scroller_height, _, _) =
+            short_scroller.measure(gtk::Orientation::Vertical, width);
+        assert!(
+            short_scroller_height <= short_natural + 2,
+            "a short menu must not gain height from the scroller: \
+             {short_scroller_height} px against {short_natural}"
+        );
+
+        gtk_window.close();
     }
 
     /// The real widget/main-loop regression runs in its own process. GTK's

@@ -554,6 +554,30 @@ impl Header {
         label.set_text(&file_chooser_line(health));
     }
 
+    /// The Open and Save dialogs row's first paint, while the session-bus
+    /// answer is in flight (P2aw). The switch follows the files alone; the
+    /// status line shows a last Test answer, or "Checking…".
+    pub fn refresh_file_chooser_checking(&self, disk_health: &fm_core::portals_conf::Health) {
+        let widgets = self.file_chooser_widgets.borrow().as_ref().map(|widgets| {
+            (
+                widgets.switch.clone(),
+                widgets.status.clone(),
+                widgets.test.clone(),
+                widgets.syncing.clone(),
+            )
+        });
+        let Some((switch, label, test, syncing)) = widgets else {
+            return;
+        };
+        syncing.set(true);
+        switch.set_active(fm_core::portals_conf::health_is_enabled(disk_health));
+        syncing.set(false);
+        let missing = matches!(disk_health, fm_core::portals_conf::Health::NotInstalled);
+        switch.set_sensitive(!missing);
+        test.set_sensitive(!missing);
+        label.set_text(&initial_file_chooser_line(disk_health));
+    }
+
     /// Sync the open Settings menu's Show hidden files switch after a change
     /// from anywhere else: the Ctrl+H hotkey, the empty-space menu, another
     /// window, the CLI or the agent.
@@ -1169,7 +1193,7 @@ impl Header {
     /// rebuild to get a fitting list.
     fn open_accordion(self: &Rc<Self>, accordion: &Rc<Accordion>) {
         self.apply_accordion_cap(accordion);
-        crate::popup::show(&accordion.popover);
+        crate::popup::show_named("accordion", &accordion.popover);
     }
 
     fn apply_accordion_cap(self: &Rc<Self>, accordion: &Accordion) {
@@ -1610,9 +1634,12 @@ impl Header {
             });
         }
 
-        popover.set_child(Some(&menu));
+        // The pill menu can hold up to seven rows, which a short window
+        // cannot show; the cap is the whole window minus one margin, since
+        // the menu may flip above its pill (P2aw).
+        popover.set_child(Some(&capped_menu_scroller(ui, &menu)));
         close_on_closed(&popover);
-        crate::popup::show(&popover);
+        crate::popup::show_named("pill menu", &popover);
     }
 
     fn open_add_group_menu(
@@ -1658,9 +1685,11 @@ impl Header {
                     .build(),
             );
         }
-        popover.set_child(Some(&menu));
+        // One row per pill: as many rows as there are tabs, so the menu can
+        // outgrow a short window like the Settings menu can (P2aw).
+        popover.set_child(Some(&capped_menu_scroller(ui, &menu)));
         close_on_closed(&popover);
-        crate::popup::show(&popover);
+        crate::popup::show_named("add-group menu", &popover);
     }
 
     fn open_rename_popover(
@@ -1712,7 +1741,7 @@ impl Header {
                 popover.unparent();
             }
         });
-        crate::popup::show(&popover);
+        crate::popup::show_named("rename group", &popover);
         entry.grab_focus();
         entry.select_region(0, -1);
         let weak_entry = entry.downgrade();
@@ -2088,7 +2117,7 @@ fn open_main_menu(ui: &Rc<WindowUi>, anchor: &gtk::Button) {
     });
     popover.set_child(Some(&menu));
     close_on_closed(&popover);
-    crate::popup::show(&popover);
+    crate::popup::show_named("main menu", &popover);
 }
 
 /// The Settings submenu. The switch is the only path to `agent.set-enabled`
@@ -2492,10 +2521,14 @@ fn open_settings_menu(ui: &Rc<WindowUi>, anchor: &gtk::Button) {
     menu.append(&integration_status_label);
 
     // Open and Save dialogs: the file is the truth. Each time this popover is
-    // built the chain is read again, so a hand edit shows correctly.
-    let chooser_health = ui
+    // built the chain is read again, so a hand edit shows correctly. The
+    // session-bus call that completes the check blocks for up to a second, so
+    // it no longer runs while this menu is built (P2aw): the row starts at
+    // "Checking…" and fills in when the bus answers. The small file reads
+    // stay synchronous.
+    let disk_health = ui
         .process_upgrade()
-        .map(|process| process.file_chooser_health())
+        .map(|process| process.file_chooser_health_without_bus())
         .unwrap_or(fm_core::portals_conf::Health::NotInstalled);
 
     let chooser_row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
@@ -2524,7 +2557,7 @@ fn open_settings_menu(ui: &Rc<WindowUi>, anchor: &gtk::Button) {
     menu.append(&chooser_subtitle);
 
     let chooser_status_label = gtk::Label::builder()
-        .label(file_chooser_line(&chooser_health))
+        .label(initial_file_chooser_line(&disk_health))
         .wrap(true)
         .xalign(0.0)
         .halign(gtk::Align::Start)
@@ -2546,7 +2579,13 @@ fn open_settings_menu(ui: &Rc<WindowUi>, anchor: &gtk::Button) {
         test: chooser_test.clone(),
         syncing: chooser_syncing.clone(),
     });
-    ui.header().refresh_file_chooser_status(&chooser_health);
+    ui.header().refresh_file_chooser_checking(&disk_health);
+
+    // The bus answer repaints the row, in this window and every other one
+    // with the menu open (P2aw).
+    if let Some(process) = ui.process_upgrade() {
+        process.refresh_file_chooser_status_all();
+    }
 
     let ui_chooser = ui.clone();
     let chooser_switch_widget = chooser_switch.clone();
@@ -2657,14 +2696,35 @@ fn open_settings_menu(ui: &Rc<WindowUi>, anchor: &gtk::Button) {
         gtk::glib::idle_add_local_once(move || crate::hotkeys::show(&ui));
     });
 
-    popover.set_child(Some(&menu));
+    // The menu's rows, statuses and buttons outgrow a small window: cap the
+    // menu at the space between the ☰ button's bottom and the window's
+    // bottom, less one GAP_M (P2aw). The menu is rebuilt on every open, so a
+    // resized window is honoured on the next open; resizing while Settings
+    // is open leaves the cap as it is.
+    let scale = ui.header().scale.get();
+    let window = ui.window();
+    let window_height = if window.height() > 0 {
+        window.height()
+    } else {
+        scaled(f64::from(DEFAULT_H), scale)
+    };
+    let anchor_bottom = ui
+        .header()
+        .menu_button
+        .compute_bounds(window)
+        .map(|bounds| (bounds.y() + bounds.height()).round() as i32)
+        .unwrap_or_else(|| scaled(HEADER_H, scale));
+    let cap = crate::popup::menu_height_cap(scale, window_height, anchor_bottom);
+    let scroller = crate::popup::capped_scroller(&menu, cap, window.width());
+    popover.set_child(Some(&scroller));
     close_on_closed(&popover);
-    crate::popup::show(&popover);
+    crate::popup::show_named("settings", &popover);
 }
 
 const FILE_CHOOSER_LABEL: &str = "Use Gimbal for Open and Save dialogs";
 const FILE_CHOOSER_SUBTITLE: &str = "The desktop's portal service restarts when this changes.";
 const FILE_CHOOSER_TEST: &str = "Test";
+const FILE_CHOOSER_CHECKING: &str = "Checking…";
 const FILE_CHOOSER_ASK_ON: &str = "Turn on Gimbal for Open and Save dialogs?";
 const FILE_CHOOSER_ASK_OFF: &str = "Turn off Gimbal for Open and Save dialogs?";
 const FILE_CHOOSER_ASK_BODY: &str = "The desktop's portal service restarts, so an open file dialog or screen share in another app will close.";
@@ -2699,6 +2759,33 @@ fn file_chooser_line(health: &fm_core::portals_conf::Health) -> String {
         return fm_core::portals_conf::status_text(health);
     }
     last_test_text().unwrap_or_else(|| fm_core::portals_conf::status_text(health))
+}
+
+/// The status line's first paint, before the session-bus answer arrives
+/// (P2aw): a missing `.portal` file says so at once, a last Test answer wins
+/// until the next switch change, and only a files-installed Gimbal waits for
+/// the bus answer.
+fn initial_file_chooser_line(disk_health: &fm_core::portals_conf::Health) -> String {
+    if matches!(disk_health, fm_core::portals_conf::Health::NotInstalled) {
+        return fm_core::portals_conf::status_text(disk_health);
+    }
+    last_test_text().unwrap_or_else(|| FILE_CHOOSER_CHECKING.to_string())
+}
+
+/// A pill menu's child: the menu in a scroller capped at the whole window,
+/// since the menu may flip above its pill (P2aw). Built fresh with the
+/// popover, so a resized window is honoured on the next open; resizing while
+/// open leaves the cap as it is.
+fn capped_menu_scroller(ui: &Rc<WindowUi>, menu: &gtk::Box) -> gtk::ScrolledWindow {
+    let scale = ui.header().scale.get();
+    let window = ui.window();
+    let window_height = if window.height() > 0 {
+        window.height()
+    } else {
+        scaled(f64::from(DEFAULT_H), scale)
+    };
+    let cap = crate::popup::menu_height_cap(scale, window_height, 0);
+    crate::popup::capped_scroller(menu, cap, window.width())
 }
 
 /// Ask before restarting another app's dialog or screen share.
@@ -2807,16 +2894,7 @@ fn call_test_open(parent: String, status: &gtk::Label, test: &gtk::Button) {
     let subscription = subscribe_test_response(&connection, &expected, status, test, &response_sub);
     *response_sub.borrow_mut() = Some(subscription);
 
-    let options = glib::VariantDict::new(None);
-    options.insert("handle_token", token.as_str());
-    options.insert("multiple", false);
-    options.insert("directory", false);
-    let parameters = (
-        parent.as_str(),
-        "Test dialog: nothing will be opened",
-        options.end(),
-    )
-        .to_variant();
+    let parameters = test_open_parameters(&parent, &token);
 
     let status_reply = status.clone();
     let test_reply = test.clone();
@@ -2835,11 +2913,12 @@ fn call_test_open(parent: String, status: &gtk::Label, test: &gtk::Button) {
         None::<&gio::Cancellable>,
         move |result| match result {
             Ok(reply) => {
+                // The reply is `(o)`: an object path, not a string.
                 let handle = reply
-                    .get::<(String,)>()
-                    .map(|(handle,)| handle)
+                    .get::<(glib::variant::ObjectPath,)>()
+                    .map(|(handle,)| handle.as_str().to_string())
                     .unwrap_or_default();
-                if handle != expected_reply {
+                if !handle.is_empty() && handle != expected_reply {
                     crate::log!(
                         "portals",
                         "the test request handle is {handle}, not {expected_reply}"
@@ -2863,6 +2942,21 @@ fn call_test_open(parent: String, status: &gtk::Label, test: &gtk::Button) {
             }
         },
     );
+}
+
+/// The portal `OpenFile` arguments for the Settings Test button: exactly
+/// `(ssa{sv})`. Built element by element: a `glib::Variant` inside a Rust tuple
+/// is boxed as `v`, and the portal refused that `(ssv)` (Kyle, Nov 21, 0.1.7).
+fn test_open_parameters(parent: &str, token: &str) -> glib::Variant {
+    let options = glib::VariantDict::new(None);
+    options.insert("handle_token", token);
+    options.insert("multiple", false);
+    options.insert("directory", false);
+    glib::Variant::tuple_from_iter([
+        parent.to_variant(),
+        "Test dialog: nothing will be opened".to_variant(),
+        options.end(),
+    ])
 }
 
 fn subscribe_test_response(
@@ -3236,7 +3330,7 @@ fn scroll_row_into_view(accordion: &Accordion, index: usize) {
 }
 
 fn take_down(popover: &gtk::Popover) {
-    popover.popdown();
+    crate::popup::popdown(popover);
     if popover.parent().is_some() {
         popover.unparent();
     }
@@ -3301,6 +3395,17 @@ fn expand_home(text: &str, home: &Path) -> PathBuf {
 mod tests {
     use super::*;
     use fm_core::workspace::Workspace;
+
+    #[test]
+    fn the_test_button_sends_the_portal_its_exact_signature() {
+        let parameters = test_open_parameters("wayland:abc", "gimbal_test_1_1");
+        assert_eq!(parameters.type_().as_str(), "(ssa{sv})");
+        let options = glib::VariantDict::new(Some(&parameters.child_value(2)));
+        let token = options
+            .lookup_value("handle_token", None)
+            .and_then(|value| value.get::<String>());
+        assert_eq!(token.as_deref(), Some("gimbal_test_1_1"));
+    }
 
     #[test]
     fn the_new_tab_button_names_the_same_command_as_control_t() {

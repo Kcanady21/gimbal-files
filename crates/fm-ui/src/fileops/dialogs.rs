@@ -16,15 +16,17 @@ use gtk::{gdk, gio, glib};
 use crate::fileops::conflict::ConflictFlow;
 use crate::fileops::menu::{MenuAction, MenuItem};
 use crate::frame::WindowUi;
+use crate::look::tokens::{DEFAULT_H, scaled};
 
 pub type ConflictDone = Rc<dyn Fn(fm_core::fileops::Decisions)>;
 
 /// Show a popover built from the pure menu.
-/// Show a command menu on `anchor`. `at` is a point in the anchor's
-/// coordinates to aim at; without it the popover points at the whole anchor,
-/// which suits a small widget like a grid cell.
+/// Show a command menu on `anchor`, named `name` in the popup log. `at` is a
+/// point in the anchor's coordinates to aim at; without it the popover points
+/// at the whole anchor, which suits a small widget like a grid cell.
 pub fn show_menu(
     ui: &Rc<WindowUi>,
+    name: &str,
     anchor: &gtk::Widget,
     items: &[MenuItem],
     at: Option<(f64, f64)>,
@@ -97,9 +99,25 @@ pub fn show_menu(
         menu.append(&button);
     }
 
-    popover.set_child(Some(&menu));
+    // A dozen or more rows can outgrow a short window, and the menu may flip
+    // above its anchor, so the cap is the whole window minus one margin
+    // (P2aw). Built fresh with the popover, so a resized window is honoured
+    // on the next open.
+    let scale = ui
+        .process_upgrade()
+        .map(|process| process.scale())
+        .unwrap_or(1.0);
+    let window = ui.window();
+    let window_height = if window.height() > 0 {
+        window.height()
+    } else {
+        scaled(f64::from(DEFAULT_H), scale)
+    };
+    let cap = crate::popup::menu_height_cap(scale, window_height, 0);
+    let scroller = crate::popup::capped_scroller(&menu, cap, window.width());
+    popover.set_child(Some(&scroller));
     close_on_closed(&popover);
-    crate::popup::show(&popover);
+    crate::popup::show_named(name, &popover);
 }
 
 fn run_action(ui: &Rc<WindowUi>, anchor: &gtk::Widget, item: &MenuItem, at: Option<(f64, f64)>) {
@@ -176,7 +194,7 @@ pub fn open_rename(ui: &Rc<WindowUi>, anchor: &gtk::Widget, path: &Path) {
             popover.unparent();
         }
     });
-    crate::popup::show(&popover);
+    crate::popup::show_named("rename item", &popover);
     entry.grab_focus();
     entry.select_region(0, selection);
 }
@@ -318,7 +336,7 @@ fn open_name_form(
             popover.unparent();
         }
     });
-    crate::popup::show(&popover);
+    crate::popup::show_named("new-name form", &popover);
     entry.grab_focus();
 }
 
@@ -610,7 +628,7 @@ fn popover_at(anchor: &gtk::Widget, at: Option<(f64, f64)>) -> gtk::Popover {
 }
 
 fn take_down(popover: &gtk::Popover) {
-    popover.popdown();
+    crate::popup::popdown(popover);
     if popover.parent().is_some() {
         popover.unparent();
     }
